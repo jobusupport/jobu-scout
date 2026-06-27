@@ -1,0 +1,9 @@
+.env
+node_modules/
+output/
+voodoo-scout.db
+voodoo-scout.db-shm
+voodoo-scout.db-wal
+temp-screenshots/
+storage/
+

@@ -1,0 +1,16 @@
+{
+  "name": "gamechanger-playwright",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "login": "node src/login-gamechanger.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@playwright/test": "^1.56.0",
+    "dotenv": "^17.2.3"
+  }
+}

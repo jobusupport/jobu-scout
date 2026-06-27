@@ -1,0 +1,33 @@
+{
+  "name": "gamechanger-scraper",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "login": "node src/login-gamechanger.js",
+    "teams": "node src/test-read-teams.js",
+    "search-teams": "node src/search-gamechanger-teams.js",
+    "save-gamechanger-session": "node src/login-gamechanger-session.js",
+    "collect-gamechanger-screenshots": "node src/collect-gamechanger-screenshots.js",
+    "generate-report": "node src/generate-report.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@napi-rs/canvas": "^1.0.0",
+    "@supabase/supabase-js": "^2.108.2",
+    "better-sqlite3": "^12.10.0",
+    "csv-parse": "^6.2.1",
+    "docx": "^9.7.1",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "playwright": "^1.60.0",
+    "sharp": "^0.34.5"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.60.0"
+  }
+}
