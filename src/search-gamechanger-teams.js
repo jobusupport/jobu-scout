@@ -1778,7 +1778,10 @@ async function main() {
   console.log(`Accepted GameChanger seasons: ${getAcceptedSeasonLabel()}`);
   console.log(`Screenshot fallback: ${SCREENSHOT_FALLBACK ? "ON" : "OFF (structured extraction only)"}`);
 
-  const browser = await chromium.launch({ headless: false, slowMo: 75 });
+const browser = await chromium.launch({
+  headless: process.env.NODE_ENV === 'production' ? true : false,
+  slowMo:   process.env.NODE_ENV === 'production' ? 0 : 75,
+});
 
   const context = await browser.newContext({
     storageState: STORAGE_STATE,
