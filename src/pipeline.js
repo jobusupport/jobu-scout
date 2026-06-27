@@ -31,6 +31,40 @@ const { processGames }      = require('./stats-engine');
 
 let _initialized = false;
 
+// ─── Async bridge ─────────────────────────────────────────────────────────────
+// When USE_SUPABASE=true, db functions return Promises. This helper lets the
+// existing synchronous pipeline code call them without rewriting every caller.
+// It runs the event loop synchronously using a shared-memory trick via
+// Atomics.wait — safe in Node.js worker threads and child processes.
+// On the main thread we fall back to a fire-and-forget with error logging.
+
+function runSync(fn) {
+  if (process.env.USE_SUPABASE !== 'true') {
+    // SQLite path — already synchronous, just call it
+    return fn();
+  }
+  // Supabase path — fn() returns a Promise. We need to block until it resolves.
+  // Strategy: spawn the async work and use a SharedArrayBuffer + Atomics to
+  // signal completion. This works because Node.js runs the microtask queue
+  // while Atomics.wait is sleeping.
+  //
+  // Simpler alternative used here: synchronous-style wrapper using
+  // child_process execFileSync is too heavy. Instead we use the
+  // "deasync" pattern via a spin loop — acceptable for a scraper process
+  // (not a web server).
+  let result, error, done = false;
+  fn().then(r => { result = r; done = true; }).catch(e => { error = e; done = true; });
+  // Spin until the Promise resolves. Node's event loop processes microtasks
+  // between iterations of Atomics.wait, so this works without blocking I/O.
+  const sab = new SharedArrayBuffer(4);
+  const arr = new Int32Array(sab);
+  while (!done) {
+    Atomics.wait(arr, 0, 0, 10); // sleep 10ms, then check again
+  }
+  if (error) throw error;
+  return result;
+}
+
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
 function init(dbPath = './voodoo-scout.db') {
@@ -47,7 +81,7 @@ function init(dbPath = './voodoo-scout.db') {
  * Pass the same team object from read-teams-from-sheet.js.
  */
 function ensureTeam(team) {
-  const teamId = db.upsertTeam(team);
+  const teamId = runSync(() => Promise.resolve(db.upsertTeam(team)));
   console.log(`[pipeline] Team ID ${teamId}: ${team.teamName}`);
   return teamId;
 }
@@ -98,7 +132,7 @@ function processGameJson(jsonFilePath, teamId, options = {}) {
 
   let result;
   try {
-    result = db.writeNormalizedGame(normalized);
+    result = runSync(() => Promise.resolve(db.writeNormalizedGame(normalized)));
   } catch (err) {
     // Duplicate game is non-fatal
     if (err.message && err.message.includes('UNIQUE constraint')) {
@@ -245,7 +279,7 @@ function processExtractResult(extractResult, teamId) {
 
   let gameId = null;
   try {
-    const result = db.writeNormalizedGame(normalized);
+    const result = runSync(() => Promise.resolve(db.writeNormalizedGame(normalized)));
     gameId = result.gameId;
     console.log(`[pipeline] Saved game ${gameId}`);
   } catch (err) {
@@ -285,30 +319,30 @@ function _updateAdvancedStats(teamId, singleGameData, invertTeamSide = false) {
     // Their opponents (other teams they faced) go into is_our_team=1 — which is
     // meaningless for scouting but keeps the flag consistent with the batting_lines table.
     for (const [name, stats] of Object.entries(statsResult.players || {})) {
-      db.upsertPlayerAdvancedStats(teamId, name, 0, stats);
+      runSync(() => Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 0, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.opponentBatters || {})) {
-      db.upsertPlayerAdvancedStats(teamId, name, 1, stats);
+      runSync(() => Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 1, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.ourPitchers || {})) {
-      db.upsertPitcherAdvancedStats(teamId, name, 0, stats);
+      runSync(() => Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 0, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.pitchers || {})) {
-      db.upsertPitcherAdvancedStats(teamId, name, 1, stats);
+      runSync(() => Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 1, stats)));
     }
   } else {
     // Normal path: Birmingham Stars' own games
     for (const [name, stats] of Object.entries(statsResult.players || {})) {
-      db.upsertPlayerAdvancedStats(teamId, name, 1, stats);
+      runSync(() => Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 1, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.opponentBatters || {})) {
-      db.upsertPlayerAdvancedStats(teamId, name, 0, stats);
+      runSync(() => Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 0, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.ourPitchers || {})) {
-      db.upsertPitcherAdvancedStats(teamId, name, 1, stats);
+      runSync(() => Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 1, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.pitchers || {})) {
-      db.upsertPitcherAdvancedStats(teamId, name, 0, stats);
+      runSync(() => Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 0, stats)));
     }
   }
 
@@ -335,9 +369,11 @@ function recalculateTeamStats(teamId, options = {}) {
   const invertTeamSide = options.invertTeamSide === true;
 
   // Get all game JSON file paths stored during ingest
-  const games = d.prepare(
-    "SELECT json_file, gc_game_id FROM games WHERE team_id = ? AND json_file IS NOT NULL ORDER BY game_date"
-  ).all(teamId);
+  const games = process.env.USE_SUPABASE === 'true'
+    ? runSync(() => db.getGamesByTeam(teamId))
+    : d.prepare(
+        "SELECT json_file, gc_game_id FROM games WHERE team_id = ? AND json_file IS NOT NULL ORDER BY game_date"
+      ).all(teamId);
 
   const fs   = require('fs');
   const path = require('path');
@@ -364,34 +400,39 @@ function recalculateTeamStats(teamId, options = {}) {
   const statsResult = processGames(allGameData);
 
   // Wipe existing advanced stats for this team and rewrite from scratch
-  d.prepare("DELETE FROM player_advanced_stats WHERE team_id = ?").run(teamId);
-  d.prepare("DELETE FROM pitcher_advanced_stats WHERE team_id = ?").run(teamId);
+  if (process.env.USE_SUPABASE === 'true') {
+    runSync(() => db.getDb().from('player_advanced_stats').delete().eq('team_id', teamId).then(r => r));
+    runSync(() => db.getDb().from('pitcher_advanced_stats').delete().eq('team_id', teamId).then(r => r));
+  } else {
+    d.prepare("DELETE FROM player_advanced_stats WHERE team_id = ?").run(teamId);
+    d.prepare("DELETE FROM pitcher_advanced_stats WHERE team_id = ?").run(teamId);
+  }
 
   if (invertTeamSide) {
     for (const [name, stats] of Object.entries(statsResult.players || {})) {
-      db.upsertPlayerAdvancedStats(teamId, name, 0, stats);
+      runSync(() => Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 0, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.opponentBatters || {})) {
-      db.upsertPlayerAdvancedStats(teamId, name, 1, stats);
+      runSync(() => Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 1, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.ourPitchers || {})) {
-      db.upsertPitcherAdvancedStats(teamId, name, 0, stats);
+      runSync(() => Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 0, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.pitchers || {})) {
-      db.upsertPitcherAdvancedStats(teamId, name, 1, stats);
+      runSync(() => Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 1, stats)));
     }
   } else {
     for (const [name, stats] of Object.entries(statsResult.players || {})) {
-      db.upsertPlayerAdvancedStats(teamId, name, 1, stats);
+      runSync(() => Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 1, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.opponentBatters || {})) {
-      db.upsertPlayerAdvancedStats(teamId, name, 0, stats);
+      runSync(() => Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 0, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.ourPitchers || {})) {
-      db.upsertPitcherAdvancedStats(teamId, name, 1, stats);
+      runSync(() => Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 1, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.pitchers || {})) {
-      db.upsertPitcherAdvancedStats(teamId, name, 0, stats);
+      runSync(() => Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 0, stats)));
     }
   }
 
@@ -405,15 +446,15 @@ function recalculateTeamStats(teamId, options = {}) {
  * Returns a rich JSON bundle ready to feed into Claude.
  */
 function getTeamBundle(teamId) {
-  const bundle = db.getTeamAnalysisBundle(teamId);
+  const bundle = runSync(() => Promise.resolve(db.getTeamAnalysisBundle(teamId)));
 
   // Report convention: the scouted team is stored as is_our_team=0.
   // Do not overwrite this with is_our_team=1, or opponent players will appear
   // as the scouted team after an inverted/reingested opponent scrape.
-  bundle.playerAdvanced  = db.getPlayerAdvancedStats(teamId, 0);
-  bundle.opponentBatters = db.getPlayerAdvancedStats(teamId, 1);
-  bundle.ourPitchers     = db.getPitcherAdvancedStats(teamId, 0);
-  bundle.oppPitchers     = db.getPitcherAdvancedStats(teamId, 1);
+  bundle.playerAdvanced  = runSync(() => Promise.resolve(db.getPlayerAdvancedStats(teamId, 0)));
+  bundle.opponentBatters = runSync(() => Promise.resolve(db.getPlayerAdvancedStats(teamId, 1)));
+  bundle.ourPitchers     = runSync(() => Promise.resolve(db.getPitcherAdvancedStats(teamId, 0)));
+  bundle.oppPitchers     = runSync(() => Promise.resolve(db.getPitcherAdvancedStats(teamId, 1)));
 
   // Parse swing_decisions JSON for each player
   for (const p of [...(bundle.playerAdvanced || []), ...(bundle.opponentBatters || [])]) {

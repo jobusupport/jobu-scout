@@ -26,6 +26,19 @@ let _db = null;  // module-level singleton
  * Call once at app startup.
  */
 function init(dbPath = './voodoo-scout.db') {
+  // ── Supabase switch ──────────────────────────────────────────────────────
+  // When USE_SUPABASE=true, transparently delegate everything to db-supabase.js.
+  // All callers (pipeline.js, reingest-games.js, etc.) stay completely unchanged.
+  if (process.env.USE_SUPABASE === 'true') {
+    const sbDb = require('./db-supabase');
+    sbDb.init();
+    // Replace every export on this module with the async Supabase version.
+    // pipeline.js will call these via runSync() which handles the Promise.
+    Object.assign(module.exports, sbDb);
+    return sbDb.getDb();
+  }
+  // ────────────────────────────────────────────────────────────────────────
+
   if (_db) return _db;
 
   const Database = require('better-sqlite3');
