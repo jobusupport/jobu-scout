@@ -3,9 +3,27 @@
 if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
 }
+
+// Railway should provide USE_SUPABASE=true, but production should still use
+// Supabase whenever the Supabase connection config is present. This prevents
+// an accidental production fallback to the local SQLite layer.
+const hasSupabaseRuntimeConfig = Boolean(
+  process.env.SUPABASE_URL &&
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+const explicitUseSupabase =
+  String(process.env.USE_SUPABASE || '').trim().toLowerCase() === 'true';
+const shouldUseSupabase =
+  explicitUseSupabase ||
+  (process.env.NODE_ENV === 'production' && hasSupabaseRuntimeConfig);
+
+process.env.USE_SUPABASE = shouldUseSupabase ? 'true' : 'false';
+
 console.log('[env] Runtime config:', {
   NODE_ENV: process.env.NODE_ENV,
   USE_SUPABASE: process.env.USE_SUPABASE,
+  explicitUseSupabase,
+  shouldUseSupabase,
   hasSupabaseUrl: !!process.env.SUPABASE_URL,
   hasSupabaseAnonKey: !!process.env.SUPABASE_ANON_KEY,
   hasSupabaseServiceRoleKey: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
@@ -22,7 +40,7 @@ let SQLiteDatabase = null;
 // ── Supabase ─────────────────────────────────────────────────────────────────
 const { createClient } = require('@supabase/supabase-js');
 
-const USE_SUPABASE = String(process.env.USE_SUPABASE || '').toLowerCase() === 'true';
+const USE_SUPABASE = String(process.env.USE_SUPABASE || '').trim().toLowerCase() === 'true';
 const HAS_SUPABASE_CONFIG = Boolean(
   process.env.SUPABASE_URL &&
   process.env.SUPABASE_ANON_KEY &&

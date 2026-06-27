@@ -20,7 +20,16 @@ const path = require('path');
 let _db = null;  // module-level singleton
 
 function useSupabase() {
-  return String(process.env.USE_SUPABASE || '').toLowerCase() === 'true';
+  const explicitUseSupabase =
+    String(process.env.USE_SUPABASE || '').trim().toLowerCase() === 'true';
+
+  const hasSupabaseRuntimeConfig = Boolean(
+    process.env.SUPABASE_URL &&
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+  );
+
+  return explicitUseSupabase ||
+    (process.env.NODE_ENV === 'production' && hasSupabaseRuntimeConfig);
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
