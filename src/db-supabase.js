@@ -31,8 +31,23 @@ function init() {
   }
 
   _supabase = createClient(url, key);
-  console.log('[db-supabase] Connected to Supabase.');
+  console.log('[db-supabase] Supabase client initialized.');
   return _supabase;
+}
+
+async function verifyConnection() {
+  const sb = init();
+  const { error } = await sb
+    .from('teams')
+    .select('id', { count: 'exact', head: true });
+
+  if (error) {
+    console.error('[db-supabase] Connection check failed:', error.message);
+    throw error;
+  }
+
+  console.log('[db-supabase] Connected to Supabase');
+  return true;
 }
 
 function getDb() {
@@ -55,51 +70,146 @@ function check(error, context) {
 
 // ─── Teams ────────────────────────────────────────────────────────────────────
 
+function normalizeTeamName(value) {
+  return String(value || '')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+function normalizeAgeGroup(value) {
+  if (!value) return null;
+  const raw = String(value).trim().toUpperCase();
+  const match = raw.match(/(\d{1,2})\s*U/);
+  return match ? `${match[1]}U` : raw;
+}
+
+function normalizeNullable(value) {
+  if (value === undefined || value === null) return null;
+  const trimmed = String(value).trim();
+  return trimmed ? trimmed : null;
+}
+
+function inferSeasonYear(input = {}) {
+  const direct = input.seasonYear || input.season_year;
+  if (direct !== undefined && direct !== null && String(direct).trim() !== '') {
+    const match = String(direct).match(/(20\d{2}|19\d{2})/);
+    const year = match ? Number(match[1]) : Number(direct);
+    if (Number.isFinite(year)) return year;
+  }
+
+  const dateCandidates = [input.gameDate, input.game_date, input.capturedAt, input.captured_at];
+  for (const candidate of dateCandidates) {
+    if (!candidate) continue;
+    const parsed = new Date(candidate);
+    if (!Number.isNaN(parsed.getTime())) return parsed.getFullYear();
+  }
+
+  return null;
+}
+
+function getProvidedBoolean(input, camelName, snakeName) {
+  if (Object.prototype.hasOwnProperty.call(input, camelName)) return Boolean(input[camelName]);
+  if (Object.prototype.hasOwnProperty.call(input, snakeName)) return Boolean(input[snakeName]);
+  return null;
+}
+
+async function findExistingTeam(sb, params) {
+  // Primary identity: team_name + age_group + season_year.
+  if (params.team_name && params.age_group && params.season_year) {
+    const { data, error } = await sb
+      .from('teams')
+      .select('id')
+      .ilike('team_name', params.team_name)
+      .eq('age_group', params.age_group)
+      .eq('season_year', params.season_year)
+      .order('updated_at', { ascending: false })
+      .order('id', { ascending: false })
+      .limit(1);
+    check(error, 'upsertTeam primary lookup');
+    if (data?.[0]) return data[0];
+  }
+
+  // Fallback identity: team_name + age_group across seasons.
+  if (params.team_name && params.age_group) {
+    const { data, error } = await sb
+      .from('teams')
+      .select('id')
+      .ilike('team_name', params.team_name)
+      .eq('age_group', params.age_group)
+      .order('season_year', { ascending: false })
+      .order('updated_at', { ascending: false })
+      .order('id', { ascending: false })
+      .limit(1);
+    check(error, 'upsertTeam fallback lookup');
+    if (data?.[0]) return data[0];
+  }
+
+  // Safety fallback for legacy rows/sheet imports that may not have age/year yet.
+  // This is deliberately exact-name only; GC/PG URLs are season pointers, not identity keys.
+  if (params.team_name && (!params.age_group || !params.season_year)) {
+    const { data, error } = await sb
+      .from('teams')
+      .select('id')
+      .ilike('team_name', params.team_name)
+      .order('season_year', { ascending: false })
+      .order('updated_at', { ascending: false })
+      .order('id', { ascending: false })
+      .limit(1);
+    check(error, 'upsertTeam legacy name lookup');
+    if (data?.[0]) return data[0];
+  }
+
+  // Do not fuzzy-write automatically. Fuzzy matches should be reviewed before identity merge.
+  return null;
+}
+
 async function upsertTeam(team) {
   const sb = getDb();
 
+  const isOurTeam = getProvidedBoolean(team, 'isOurTeam', 'is_our_team');
+
   const params = {
-    team_name:      team.teamName       || team.team_name       || '',
-    raw_team_name:  team.rawTeamName    || team.raw_team_name   || null,
-    gc_search_name: team.gcSearchName   || team.gc_search_name  || null,
-    gc_team_url:    team.gcTeamUrl      || team.gc_team_url     || null,
-    pg_team_url:    team.pgTeamUrl      || team.pg_team_url     || null,
-    classification: team.classification || null,
-    age_group:      team.age            || team.age_group       || null,
-    city:           team.city           || null,
-    state:          team.state          || null,
-    season_year:    team.seasonYear     || team.season_year     || null,
-    season_type:    team.seasonType     || team.season_type     || null,
-    is_our_team:    false,
+    team_name:      normalizeTeamName(team.teamName       || team.team_name       || ''),
+    raw_team_name:  normalizeNullable(team.rawTeamName    || team.raw_team_name),
+    gc_search_name: normalizeNullable(team.gcSearchName   || team.gc_search_name),
+    gc_team_url:    normalizeNullable(team.gcTeamUrl      || team.gc_team_url),
+    pg_team_url:    normalizeNullable(team.pgTeamUrl      || team.pg_team_url),
+    classification: normalizeNullable(team.classification),
+    age_group:      normalizeAgeGroup(team.age            || team.age_group),
+    city:           normalizeNullable(team.city),
+    state:          normalizeNullable(team.state),
+    season_year:    inferSeasonYear(team),
+    season_type:    normalizeNullable(team.seasonType     || team.season_type),
+    is_our_team:    isOurTeam,
   };
 
-  // Look up by gc_team_url first, then by name
-  let existing = null;
+  if (!params.team_name) {
+    throw new Error('upsertTeam requires teamName/team_name');
+  }
 
-  if (params.gc_team_url) {
-    const { data } = await sb.from('teams').select('id').eq('gc_team_url', params.gc_team_url).maybeSingle();
-    existing = data;
-  }
-  if (!existing && params.team_name) {
-    const { data } = await sb.from('teams').select('id')
-      .ilike('team_name', params.team_name.trim())
-      .maybeSingle();
-    existing = data;
-  }
+  const existing = await findExistingTeam(sb, params);
 
   if (existing) {
-    // Update — only overwrite nulls with new values (COALESCE behaviour)
-    const updates = {};
+    // Update — only send fields that have values. GC/PG URLs are refreshed as season pointers,
+    // but they are intentionally not used as identity keys.
+    const updates = { team_name: params.team_name, updated_at: new Date().toISOString() };
     for (const [k, v] of Object.entries(params)) {
-      if (v !== null && v !== undefined) updates[k] = v;
+      if (v !== null && v !== undefined && k !== 'team_name') updates[k] = v;
     }
+
     const { error } = await sb.from('teams').update(updates).eq('id', existing.id);
     check(error, 'upsertTeam update');
     return existing.id;
   }
 
-  // Insert new
-  const { data, error } = await sb.from('teams').insert(params).select('id').single();
+  // Insert new. Default target/scouted teams to false unless explicitly marked as Our Team.
+  const insertPayload = {
+    ...params,
+    is_our_team: params.is_our_team === null ? false : params.is_our_team,
+    updated_at: new Date().toISOString(),
+  };
+
+  const { data, error } = await sb.from('teams').insert(insertPayload).select('id').single();
   check(error, 'upsertTeam insert');
   return data.id;
 }
@@ -558,6 +668,7 @@ async function insertScoutingReport(report) {
 
 module.exports = {
   init,
+  verifyConnection,
   getDb,
   // Teams
   upsertTeam,

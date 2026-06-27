@@ -19,6 +19,10 @@ const path = require('path');
 
 let _db = null;  // module-level singleton
 
+function useSupabase() {
+  return String(process.env.USE_SUPABASE || '').toLowerCase() === 'true';
+}
+
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
 /**
@@ -29,7 +33,9 @@ function init(dbPath = './voodoo-scout.db') {
   // ── Supabase switch ──────────────────────────────────────────────────────
   // When USE_SUPABASE=true, transparently delegate everything to db-supabase.js.
   // All callers (pipeline.js, reingest-games.js, etc.) stay completely unchanged.
-  if (process.env.USE_SUPABASE === 'true') {
+  if (useSupabase()) {
+    console.log('[db] USE_SUPABASE = true');
+    console.log('[db] Loading Supabase DB layer');
     const sbDb = require('./db-supabase');
     sbDb.init();
     // Replace every export on this module with the async Supabase version.
@@ -37,6 +43,7 @@ function init(dbPath = './voodoo-scout.db') {
     Object.assign(module.exports, sbDb);
     return sbDb.getDb();
   }
+  console.log('[db] USE_SUPABASE = false');
   // ────────────────────────────────────────────────────────────────────────
 
   if (_db) return _db;
@@ -114,6 +121,84 @@ function getDb() {
 
 // ─── Teams ────────────────────────────────────────────────────────────────────
 
+function normalizeTeamName(value) {
+  return String(value || '')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+function normalizeAgeGroup(value) {
+  if (!value) return null;
+  const raw = String(value).trim().toUpperCase();
+  const match = raw.match(/(\d{1,2})\s*U/);
+  return match ? `${match[1]}U` : raw;
+}
+
+function normalizeNullable(value) {
+  if (value === undefined || value === null) return null;
+  const trimmed = String(value).trim();
+  return trimmed ? trimmed : null;
+}
+
+function inferSeasonYear(input = {}) {
+  const direct = input.seasonYear || input.season_year;
+  if (direct !== undefined && direct !== null && String(direct).trim() !== '') {
+    const match = String(direct).match(/(20\d{2}|19\d{2})/);
+    const year = match ? Number(match[1]) : Number(direct);
+    if (Number.isFinite(year)) return year;
+  }
+
+  const dateCandidates = [input.gameDate, input.game_date, input.capturedAt, input.captured_at];
+  for (const candidate of dateCandidates) {
+    if (!candidate) continue;
+    const parsed = new Date(candidate);
+    if (!Number.isNaN(parsed.getTime())) return parsed.getFullYear();
+  }
+
+  return null;
+}
+
+function findExistingTeamId(db, params) {
+  // Primary identity: team_name + age_group + season_year.
+  if (params.teamName && params.ageGroup && params.seasonYear) {
+    const row = db.prepare(`
+      SELECT id FROM teams
+      WHERE LOWER(TRIM(team_name)) = LOWER(TRIM(?))
+        AND LOWER(TRIM(COALESCE(age_group, ''))) = LOWER(TRIM(?))
+        AND season_year = ?
+      ORDER BY updated_at DESC, id DESC
+      LIMIT 1
+    `).get(params.teamName, params.ageGroup, params.seasonYear);
+    if (row) return row;
+  }
+
+  // Fallback identity: team_name + age_group across seasons.
+  if (params.teamName && params.ageGroup) {
+    const row = db.prepare(`
+      SELECT id FROM teams
+      WHERE LOWER(TRIM(team_name)) = LOWER(TRIM(?))
+        AND LOWER(TRIM(COALESCE(age_group, ''))) = LOWER(TRIM(?))
+      ORDER BY season_year DESC, updated_at DESC, id DESC
+      LIMIT 1
+    `).get(params.teamName, params.ageGroup);
+    if (row) return row;
+  }
+
+  // Safety fallback for legacy rows/sheet imports that may not have age/year yet.
+  // This is deliberately exact-name only; GC/PG URLs are season pointers, not identity keys.
+  if (params.teamName && (!params.ageGroup || !params.seasonYear)) {
+    const row = db.prepare(`
+      SELECT id FROM teams
+      WHERE LOWER(TRIM(team_name)) = LOWER(TRIM(?))
+      ORDER BY season_year DESC, updated_at DESC, id DESC
+      LIMIT 1
+    `).get(params.teamName);
+    if (row) return row;
+  }
+
+  return null;
+}
+
 /**
  * Insert or update a team. Returns the team's DB id.
  */
@@ -121,37 +206,32 @@ function upsertTeam(team) {
   const db = getDb();
 
   const params = {
-    teamName:       team.teamName       || team.team_name       || '',
-    rawTeamName:    team.rawTeamName    || team.raw_team_name   || null,
-    gcSearchName:   team.gcSearchName   || team.gc_search_name  || null,
-    gcTeamUrl:      team.gcTeamUrl      || team.gc_team_url     || null,
-    pgTeamUrl:      team.pgTeamUrl      || team.pg_team_url     || null,
-    classification: team.classification || null,
-    ageGroup:       team.age            || team.age_group       || null,
-    city:           team.city           || null,
-    state:          team.state          || null,
-    seasonYear:     team.seasonYear     || team.season_year     || null,
-    seasonType:     team.seasonType     || team.season_type     || null,
+    teamName:       normalizeTeamName(team.teamName || team.team_name || ''),
+    rawTeamName:    normalizeNullable(team.rawTeamName    || team.raw_team_name),
+    gcSearchName:   normalizeNullable(team.gcSearchName   || team.gc_search_name),
+    gcTeamUrl:      normalizeNullable(team.gcTeamUrl      || team.gc_team_url),
+    pgTeamUrl:      normalizeNullable(team.pgTeamUrl      || team.pg_team_url),
+    classification: normalizeNullable(team.classification),
+    ageGroup:       normalizeAgeGroup(team.age            || team.age_group),
+    city:           normalizeNullable(team.city),
+    state:          normalizeNullable(team.state),
+    seasonYear:     inferSeasonYear(team),
+    seasonType:     normalizeNullable(team.seasonType     || team.season_type),
   };
 
-  // Look up existing team by GC URL first, then by name
-  let existing = null;
-  if (params.gcTeamUrl) {
-    existing = db.prepare(`SELECT id FROM teams WHERE gc_team_url = ?`).get(params.gcTeamUrl);
-  }
-  if (!existing && params.teamName) {
-    existing = db.prepare(
-      `SELECT id FROM teams WHERE LOWER(TRIM(team_name)) = LOWER(TRIM(?))`
-    ).get(params.teamName);
+  if (!params.teamName) {
+    throw new Error('upsertTeam requires teamName/team_name');
   }
 
+  const existing = findExistingTeamId(db, params);
+
   if (existing) {
-    // Update existing record
+    // Update existing record. GC/PG URLs are refreshed as season pointers, but they are not identity keys.
     db.prepare(`
       UPDATE teams SET
         team_name      = @teamName,
-        raw_team_name  = @rawTeamName,
-        gc_search_name = @gcSearchName,
+        raw_team_name  = COALESCE(@rawTeamName, raw_team_name),
+        gc_search_name = COALESCE(@gcSearchName, gc_search_name),
         gc_team_url    = COALESCE(@gcTeamUrl, gc_team_url),
         pg_team_url    = COALESCE(@pgTeamUrl, pg_team_url),
         classification = COALESCE(@classification, classification),

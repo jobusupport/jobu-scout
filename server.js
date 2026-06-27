@@ -1,21 +1,48 @@
 'use strict';
 
 if (process.env.NODE_ENV !== 'production') {
-require('dotenv').config();
+  require('dotenv').config();
 }
+console.log('[env] Runtime config:', {
+  NODE_ENV: process.env.NODE_ENV,
+  USE_SUPABASE: process.env.USE_SUPABASE,
+  hasSupabaseUrl: !!process.env.SUPABASE_URL,
+  hasSupabaseAnonKey: !!process.env.SUPABASE_ANON_KEY,
+  hasSupabaseServiceRoleKey: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
+  hasAnthropicKey: !!process.env.ANTHROPIC_API_KEY,
+  DASHBOARD_PORT: process.env.DASHBOARD_PORT
+});
 
 const express   = require('express');
 const path      = require('path');
 const fs        = require('fs');
 const { spawn } = require('child_process');
-const Database  = require('better-sqlite3');
+let SQLiteDatabase = null;
 
 // ── Supabase ─────────────────────────────────────────────────────────────────
 const { createClient } = require('@supabase/supabase-js');
-const adminClient = createClient(
-  process.env.SUPABASE_URL,
+
+const USE_SUPABASE = String(process.env.USE_SUPABASE || '').toLowerCase() === 'true';
+const HAS_SUPABASE_CONFIG = Boolean(
+  process.env.SUPABASE_URL &&
+  process.env.SUPABASE_ANON_KEY &&
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
+
+const adminClient = HAS_SUPABASE_CONFIG
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
+  : null;
+
+let pipelineDb = null;
+if (USE_SUPABASE) {
+  pipelineDb = require('./src/db');
+  pipelineDb.init();
+  if (typeof pipelineDb.verifyConnection === 'function') {
+    pipelineDb.verifyConnection().catch(err => {
+      console.error('[startup] Supabase verification failed:', err.message);
+    });
+  }
+}
 
 const app  = express();
 const PORT = process.env.DASHBOARD_PORT || 3333;
@@ -77,9 +104,52 @@ function makeRunStep(id) {
 }
 
 // ── DB helpers ──────────────────────────────────────────────────────────────
-function getDb() { return new Database(DB_PATH, { readonly: true }); }
+function getSQLiteDatabase() {
+  if (!SQLiteDatabase) SQLiteDatabase = require('better-sqlite3');
+  return SQLiteDatabase;
+}
 
-function getTeams() {
+function getDb() {
+  if (USE_SUPABASE) {
+    throw new Error('SQLite access requested while USE_SUPABASE=true');
+  }
+  const Database = getSQLiteDatabase();
+  return new Database(DB_PATH, { readonly: true });
+}
+
+async function getTeams() {
+  if (USE_SUPABASE) {
+    const { data: teams, error } = await adminClient
+      .from('teams')
+      .select('*')
+      .order('team_name');
+
+    if (error) throw error;
+    if (!teams?.length) return [];
+
+    const ids = teams.map(t => t.id);
+    const { data: games, error: gamesError } = await adminClient
+      .from('games')
+      .select('id, team_id, game_date, result')
+      .in('team_id', ids);
+
+    if (gamesError) throw gamesError;
+
+    const gameMap = new Map();
+    for (const game of games || []) {
+      const row = gameMap.get(game.team_id) || { game_count: 0, last_game: null };
+      row.game_count += 1;
+      if (game.game_date && (!row.last_game || game.game_date > row.last_game)) row.last_game = game.game_date;
+      gameMap.set(game.team_id, row);
+    }
+
+    return teams.map(team => ({
+      ...team,
+      game_count: gameMap.get(team.id)?.game_count || 0,
+      last_game:  gameMap.get(team.id)?.last_game  || null,
+    }));
+  }
+
   try {
     const db    = getDb();
     const teams = db.prepare(`
@@ -92,7 +162,26 @@ function getTeams() {
   } catch { return []; }
 }
 
-function getTeamStats(teamId) {
+async function getTeamStats(teamId) {
+  if (USE_SUPABASE) {
+    const [{ data: games, error: gamesError }, { count: plays, error: playsError }, { data: batters, error: battersError }] = await Promise.all([
+      adminClient.from('games').select('result').eq('team_id', teamId),
+      adminClient.from('play_events').select('id', { count: 'exact', head: true }).eq('team_id', teamId),
+      adminClient.from('batting_lines').select('player_name').eq('team_id', teamId).eq('is_our_team', false),
+    ]);
+
+    if (gamesError) throw gamesError;
+    if (playsError) throw playsError;
+    if (battersError) throw battersError;
+
+    return {
+      wins:    (games || []).filter(g => g.result === 'W').length,
+      losses:  (games || []).filter(g => g.result === 'L').length,
+      plays:   plays || 0,
+      batters: new Set((batters || []).map(b => b.player_name).filter(Boolean)).size,
+    };
+  }
+
   try {
     const db      = getDb();
     const games   = db.prepare(`SELECT result FROM games WHERE team_id = ?`).all(teamId);
@@ -118,13 +207,62 @@ function hasPGData(teamName) {
   return fs.readdirSync(PG_ROOT).some(d => d.toLowerCase().includes(teamName.toLowerCase().split(' ')[0]));
 }
 
-function hasGameUrls(teamId) {
+async function hasGameUrls(teamId) {
+  if (USE_SUPABASE) {
+    const { count, error } = await adminClient
+      .from('team_game_urls')
+      .select('id', { count: 'exact', head: true })
+      .eq('team_id', teamId);
+    if (error) throw error;
+    return (count || 0) > 0;
+  }
+
   try {
     const db  = getDb();
     const row = db.prepare(`SELECT COUNT(*) as n FROM team_game_urls WHERE team_id = ?`).get(teamId);
     db.close();
     return row.n > 0;
   } catch { return false; }
+}
+
+async function getTeamGames(teamId) {
+  if (USE_SUPABASE) {
+    const { data, error } = await adminClient
+      .from('games')
+      .select('id, gc_game_id, gc_game_url, game_date, game_time, result, score_us, score_them, opponent_name, location, season_type')
+      .eq('team_id', teamId)
+      .order('game_date', { ascending: false });
+    if (error) throw error;
+    return data || [];
+  }
+
+  const db    = getDb();
+  const games = db.prepare(`
+    SELECT id, gc_game_id, gc_game_url, game_date, game_time,
+           result, score_us, score_them, opponent_name, location, season_type
+    FROM games
+    WHERE team_id = ?
+    ORDER BY game_date DESC
+  `).all(teamId);
+  db.close();
+  return games;
+}
+
+async function getTeamGameUrls(teamId) {
+  if (USE_SUPABASE) {
+    const { data, error } = await adminClient
+      .from('team_game_urls')
+      .select('*')
+      .eq('team_id', teamId)
+      .order('created_at');
+    if (error) throw error;
+    return data || [];
+  }
+
+  const db   = getDb();
+  const urls = db.prepare(`SELECT * FROM team_game_urls WHERE team_id = ? ORDER BY created_at`).all(teamId);
+  db.close();
+  return urls;
 }
 
 function cleanTeamName(name) {
@@ -138,6 +276,9 @@ async function requireAuth(req, res, next) {
     return res.status(401).json({ error: 'Missing or invalid Authorization header' });
   }
   const jwt = header.replace('Bearer ', '').trim();
+  if (!adminClient) {
+    return res.status(500).json({ error: 'Supabase auth is not configured on the server' });
+  }
   const { data, error } = await adminClient.auth.getUser(jwt);
   if (error || !data?.user) {
     return res.status(401).json({ error: 'Invalid or expired token' });
@@ -154,6 +295,9 @@ app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
     return res.status(400).json({ error: 'email and password are required' });
+  }
+  if (!HAS_SUPABASE_CONFIG) {
+    return res.status(500).json({ error: 'Supabase auth is not configured on the server' });
   }
   const anonClient = createClient(
     process.env.SUPABASE_URL,
@@ -185,6 +329,9 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
 app.post('/api/auth/refresh', async (req, res) => {
   const { refreshToken } = req.body;
   if (!refreshToken) return res.status(400).json({ error: 'refreshToken required' });
+  if (!HAS_SUPABASE_CONFIG) {
+    return res.status(500).json({ error: 'Supabase auth is not configured on the server' });
+  }
   const anonClient = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_ANON_KEY
@@ -200,15 +347,24 @@ app.post('/api/auth/refresh', async (req, res) => {
 
 // ── API ─────────────────────────────────────────────────────────────────────
 
-app.get('/api/teams', requireAuth, (req, res) => {
-  const teams = getTeams().map(t => ({
-    ...t,
-    hasGC:       !!t.gc_team_url || hasGameUrls(t.id),
-    hasPG:       hasPGData(t.team_name),
-    hasGameUrls: hasGameUrls(t.id),
-    stats:       getTeamStats(t.id),
-  }));
-  res.json(teams);
+app.get('/api/teams', requireAuth, async (req, res) => {
+  try {
+    const rawTeams = await getTeams();
+    const teams = await Promise.all(rawTeams.map(async t => {
+      const hasUrls = await hasGameUrls(t.id);
+      return {
+        ...t,
+        hasGC:       !!t.gc_team_url || hasUrls,
+        hasPG:       hasPGData(t.team_name),
+        hasGameUrls: hasUrls,
+        stats:       await getTeamStats(t.id),
+      };
+    }));
+    res.json(teams);
+  } catch (err) {
+    console.error('[api/teams]', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get('/api/reports', requireAuth, (req, res) => res.json(getReports()));
@@ -222,7 +378,7 @@ app.get('/api/jobs/:id', requireAuth, (req, res) => {
 app.get('/api/jobs/:id/stream', async (req, res) => {
   // EventSource can't send custom headers — accept token via query param
   const token = req.query.token;
-  if (token && process.env.SUPABASE_URL) {
+  if (token && adminClient) {
     const { data, error } = await adminClient.auth.getUser(token);
     if (error || !data?.user) return res.status(401).end();
   }
@@ -267,12 +423,12 @@ app.post('/api/jobs/:id/stop', (req, res) => {
 });
 
 // POST /api/run/gc-scraper
-app.post('/api/run/gc-scraper', (req, res) => {
-  const team = getTeams().find(t => t.id == req.body.teamId);
+app.post('/api/run/gc-scraper', async (req, res) => {
+  const team = (await getTeams()).find(t => t.id == req.body.teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
   const id = createJob(`GC Scraper — ${team.team_name}`);
   appendLog(id, `Starting GameChanger scraper for: ${team.team_name}`);
-  if (!team.gc_team_url && hasGameUrls(team.id)) {
+  if (!team.gc_team_url && await hasGameUrls(team.id)) {
     appendLog(id, `No team URL — scraping via individual game URLs`);
     spawnJob(id, 'node', ['src/scrape-game-urls.js', `"${cleanTeamName(team.team_name)}"`], ROOT);
   } else {
@@ -285,8 +441,8 @@ app.post('/api/run/gc-scraper', (req, res) => {
 });
 
 // POST /api/run/pg-scraper
-app.post('/api/run/pg-scraper', (req, res) => {
-  const team = getTeams().find(t => t.id == req.body.teamId);
+app.post('/api/run/pg-scraper', async (req, res) => {
+  const team = (await getTeams()).find(t => t.id == req.body.teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
   const id = createJob(`PG Scraper — ${team.team_name}`);
   appendLog(id, `Starting Perfect Game scraper for: ${team.team_name}`);
@@ -296,8 +452,8 @@ app.post('/api/run/pg-scraper', (req, res) => {
 });
 
 // POST /api/run/reingest
-app.post('/api/run/reingest', (req, res) => {
-  const team  = req.body.teamId ? getTeams().find(t => t.id == req.body.teamId) : null;
+app.post('/api/run/reingest', async (req, res) => {
+  const team  = req.body.teamId ? (await getTeams()).find(t => t.id == req.body.teamId) : null;
   const label = team ? `Reingest — ${team.team_name}` : 'Reingest — All Teams';
   const id    = createJob(label);
   appendLog(id, label);
@@ -306,9 +462,9 @@ app.post('/api/run/reingest', (req, res) => {
 });
 
 // POST /api/run/report  { teamId, gameLocation?, gameDate? }
-app.post('/api/run/report', (req, res) => {
+app.post('/api/run/report', async (req, res) => {
   const { teamId, gameLocation, gameDate } = req.body;
-  const team = getTeams().find(t => t.id == teamId);
+  const team = (await getTeams()).find(t => t.id == teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
   const id = createJob(`Report — ${team.team_name}`);
   appendLog(id, `Generating scouting report for: ${team.team_name}`);
@@ -321,13 +477,13 @@ app.post('/api/run/report', (req, res) => {
 });
 
 // POST /api/run/full-pipeline  { teamId, gameLocation?, gameDate? }
-app.post('/api/run/full-pipeline', (req, res) => {
+app.post('/api/run/full-pipeline', async (req, res) => {
   const { teamId, gameLocation, gameDate } = req.body;
-  const team = getTeams().find(t => t.id == teamId);
+  const team = (await getTeams()).find(t => t.id == teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
   const id      = createJob(`Full Pipeline — ${team.team_name}`);
   const pgRoot  = path.join(ROOT, '..', 'perfectgame-scraper');
-  const noGC    = !team.gc_team_url && hasGameUrls(team.id);
+  const noGC    = !team.gc_team_url && await hasGameUrls(team.id);
   const runStep = makeRunStep(id);
   appendLog(id, `Running full pipeline for: ${team.team_name}`);
   appendLog(id, `Steps: GC Scrape → PG Scrape → Reingest → Generate Report`);
@@ -362,8 +518,10 @@ app.post('/api/run/full-pipeline', (req, res) => {
 });
 
 // POST /api/run/all-gc — scrape all teams GC
-app.post('/api/run/all-gc', (req, res) => {
-  const teams   = getTeams().filter(t => t.gc_team_url || hasGameUrls(t.id));
+app.post('/api/run/all-gc', async (req, res) => {
+  const allTeams = await getTeams();
+  const teamsWithUrlFlags = await Promise.all(allTeams.map(async t => ({ ...t, _hasGameUrls: await hasGameUrls(t.id) })));
+  const teams   = teamsWithUrlFlags.filter(t => t.gc_team_url || t._hasGameUrls);
   if (!teams.length) return res.status(400).json({ error: 'No teams with GC URLs or game URLs' });
   const id      = createJob(`GC Scrape All (${teams.length} teams)`);
   const runStep = makeRunStep(id);
@@ -374,7 +532,7 @@ app.post('/api/run/all-gc', (req, res) => {
       if (jobs[id]?.status !== 'running') break;
       appendLog(id, `\n── [${done+failed+1}/${teams.length}] ${team.team_name} ──`);
       try {
-        if (!team.gc_team_url && hasGameUrls(team.id)) {
+        if (!team.gc_team_url && team._hasGameUrls) {
           await runStep('node', ['src/scrape-game-urls.js', `"${cleanTeamName(team.team_name)}"`], ROOT);
         } else {
           const env = {};
@@ -394,8 +552,8 @@ app.post('/api/run/all-gc', (req, res) => {
 });
 
 // POST /api/run/all-pg — scrape all teams PG
-app.post('/api/run/all-pg', (req, res) => {
-  const teams   = getTeams().filter(t => t.pg_team_url);
+app.post('/api/run/all-pg', async (req, res) => {
+  const teams   = (await getTeams()).filter(t => t.pg_team_url);
   if (!teams.length) return res.status(400).json({ error: 'No teams with PG URLs' });
   const id      = createJob(`PG Scrape All (${teams.length} teams)`);
   const pgRoot  = path.join(ROOT, '..', 'perfectgame-scraper');
@@ -420,8 +578,8 @@ app.post('/api/run/all-pg', (req, res) => {
 });
 
 // POST /api/run/all-reports — generate reports for all teams with games
-app.post('/api/run/all-reports', (req, res) => {
-  const teams   = getTeams().filter(t => t.game_count > 0);
+app.post('/api/run/all-reports', async (req, res) => {
+  const teams   = (await getTeams()).filter(t => t.game_count > 0);
   if (!teams.length) return res.status(400).json({ error: 'No teams with game data' });
   const id      = createJob(`Reports All (${teams.length} teams)`);
   const runStep = makeRunStep(id);
@@ -448,36 +606,34 @@ app.post('/api/run/all-reports', (req, res) => {
 app.get('/', (req, res) => res.sendFile(path.join(ROOT, 'dashboard', 'index.html')));
 
 // ── Team Games ───────────────────────────────────────────────────────────────
-app.get('/api/teams/:id/games', requireAuth, (req, res) => {
+app.get('/api/teams/:id/games', requireAuth, async (req, res) => {
   try {
-    const db    = getDb();
-    const games = db.prepare(`
-      SELECT id, gc_game_id, gc_game_url, game_date, game_time,
-             result, score_us, score_them, opponent_name, location, season_type
-      FROM games
-      WHERE team_id = ?
-      ORDER BY game_date DESC
-    `).all(req.params.id);
-    db.close();
-    res.json(games);
+    res.json(await getTeamGames(req.params.id));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── Team Game URLs ───────────────────────────────────────────────────────────
-app.get('/api/teams/:id/game-urls', requireAuth, (req, res) => {
+app.get('/api/teams/:id/game-urls', requireAuth, async (req, res) => {
   try {
-    const db   = getDb();
-    const urls = db.prepare(`SELECT * FROM team_game_urls WHERE team_id = ? ORDER BY created_at`).all(req.params.id);
-    db.close();
-    res.json(urls);
+    res.json(await getTeamGameUrls(req.params.id));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/teams/:id/game-urls', (req, res) => {
+app.post('/api/teams/:id/game-urls', async (req, res) => {
   const { gc_game_url, label = '', box_side = 'away' } = req.body;
   if (!['away','home'].includes(box_side)) return res.status(400).json({ error: 'box_side must be away or home' });
   try {
-    const db   = new Database(DB_PATH);
+    if (USE_SUPABASE) {
+      const { data, error } = await adminClient
+        .from('team_game_urls')
+        .insert({ team_id: req.params.id, gc_game_url: (gc_game_url || '').trim(), label: label.trim(), box_side })
+        .select('id')
+        .single();
+      if (error) throw error;
+      return res.json({ ok: true, id: data.id });
+    }
+
+    const db   = new (getSQLiteDatabase())(DB_PATH);
     const info = db.prepare(
       `INSERT INTO team_game_urls (team_id, gc_game_url, label, box_side) VALUES (?, ?, ?, ?)`
     ).run(req.params.id, (gc_game_url || '').trim(), label.trim(), box_side);
@@ -486,10 +642,24 @@ app.post('/api/teams/:id/game-urls', (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.put('/api/teams/:id/game-urls/:urlId', (req, res) => {
+app.put('/api/teams/:id/game-urls/:urlId', async (req, res) => {
   const { gc_game_url, label, box_side } = req.body;
   try {
-    const db = new Database(DB_PATH);
+    if (USE_SUPABASE) {
+      const updates = {};
+      if (gc_game_url !== undefined) updates.gc_game_url = gc_game_url;
+      if (label !== undefined)       updates.label       = label;
+      if (box_side !== undefined)    updates.box_side    = box_side;
+      const { error } = await adminClient
+        .from('team_game_urls')
+        .update(updates)
+        .eq('id', req.params.urlId)
+        .eq('team_id', req.params.id);
+      if (error) throw error;
+      return res.json({ ok: true });
+    }
+
+    const db = new (getSQLiteDatabase())(DB_PATH);
     db.prepare(`
       UPDATE team_game_urls SET
         gc_game_url = COALESCE(?, gc_game_url),
@@ -502,9 +672,19 @@ app.put('/api/teams/:id/game-urls/:urlId', (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete('/api/teams/:id/game-urls/:urlId', (req, res) => {
+app.delete('/api/teams/:id/game-urls/:urlId', async (req, res) => {
   try {
-    const db = new Database(DB_PATH);
+    if (USE_SUPABASE) {
+      const { error } = await adminClient
+        .from('team_game_urls')
+        .delete()
+        .eq('id', req.params.urlId)
+        .eq('team_id', req.params.id);
+      if (error) throw error;
+      return res.json({ ok: true });
+    }
+
+    const db = new (getSQLiteDatabase())(DB_PATH);
     db.prepare(`DELETE FROM team_game_urls WHERE id = ? AND team_id = ?`).run(req.params.urlId, req.params.id);
     db.close();
     res.json({ ok: true });
@@ -512,11 +692,29 @@ app.delete('/api/teams/:id/game-urls/:urlId', (req, res) => {
 });
 
 // ── Add Team ─────────────────────────────────────────────────────────────────
-app.post('/api/teams/add', (req, res) => {
+app.post('/api/teams/add', async (req, res) => {
   const { teamName, gcTeamUrl, pgTeamUrl } = req.body;
   if (!teamName) return res.status(400).json({ error: 'teamName is required' });
   try {
-    const db       = new Database(DB_PATH);
+    if (USE_SUPABASE) {
+      const { data: existing, error: findError } = await adminClient
+        .from('teams')
+        .select('id')
+        .ilike('team_name', teamName.trim())
+        .maybeSingle();
+      if (findError) throw findError;
+      if (existing) return res.status(409).json({ error: `"${teamName}" already exists (id ${existing.id})` });
+
+      const { data, error } = await adminClient
+        .from('teams')
+        .insert({ team_name: teamName.trim(), gc_team_url: gcTeamUrl || null, pg_team_url: pgTeamUrl || null, is_our_team: false })
+        .select('id')
+        .single();
+      if (error) throw error;
+      return res.json({ ok: true, id: data.id });
+    }
+
+    const db       = new (getSQLiteDatabase())(DB_PATH);
     const existing = db.prepare(`SELECT id FROM teams WHERE LOWER(TRIM(team_name)) = LOWER(TRIM(?))`).get(teamName);
     if (existing) { db.close(); return res.status(409).json({ error: `"${teamName}" already exists (id ${existing.id})` }); }
     const info = db.prepare(`INSERT INTO teams (team_name, gc_team_url, pg_team_url) VALUES (@teamName, @gcTeamUrl, @pgTeamUrl)`)
@@ -538,12 +736,14 @@ app.post('/api/settings/sheet', async (req, res) => {
     const csvText = await testFetch.text();
     if (!csvText || csvText.trim().startsWith('<!')) return res.status(400).json({ error: 'URL did not return CSV data.' });
 
-    const envPath = path.join(ROOT, '.env');
-    let envContent = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
-    envContent = envContent.includes('TEAMS_CSV_URL=')
-      ? envContent.replace(/TEAMS_CSV_URL=.*/g, `TEAMS_CSV_URL=${csvUrl}`)
-      : envContent + `\nTEAMS_CSV_URL=${csvUrl}`;
-    fs.writeFileSync(envPath, envContent);
+    if (process.env.NODE_ENV !== 'production') {
+      const envPath = path.join(ROOT, '.env');
+      let envContent = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
+      envContent = envContent.includes('TEAMS_CSV_URL=')
+        ? envContent.replace(/TEAMS_CSV_URL=.*/g, `TEAMS_CSV_URL=${csvUrl}`)
+        : envContent + `\nTEAMS_CSV_URL=${csvUrl}`;
+      fs.writeFileSync(envPath, envContent);
+    }
     process.env.TEAMS_CSV_URL = csvUrl;
 
     function parseCsvLine(line) {
@@ -582,7 +782,66 @@ app.post('/api/settings/sheet', async (req, res) => {
       return null;
     }
 
-    const db           = new Database(DB_PATH);
+    if (USE_SUPABASE) {
+      let added = 0, updated = 0, skipped = 0, removed = 0;
+
+      if (replace) {
+        const sheetNames = new Set();
+        for (let i = 1; i < rows.length; i++) {
+          const row  = rows[i];
+          const name = col(row, 'team_name', 'team name', 'team', 'name');
+          if (name && !name.startsWith('_')) sheetNames.add(name.toLowerCase().trim());
+        }
+        const { data: existingTeams, error: existingError } = await adminClient.from('teams').select('id, team_name');
+        if (existingError) throw existingError;
+        for (const t of existingTeams || []) {
+          if (!sheetNames.has(String(t.team_name || '').toLowerCase().trim())) {
+            const { error } = await adminClient.from('teams').delete().eq('id', t.id);
+            if (error) throw error;
+            removed++;
+          }
+        }
+      }
+
+      for (let i = 1; i < rows.length; i++) {
+        const row      = rows[i];
+        const teamName = col(row, 'team_name', 'team name', 'team', 'name');
+        if (!teamName || teamName.startsWith('_')) { skipped++; continue; }
+        const gcTeamUrl = col(row, 'gc_team_url', 'gc team url', 'gc_url', 'gamechanger_url', 'gamechanger team url', 'gamechanger url') || null;
+        const pgTeamUrl = col(row, 'pg_team_url', 'pg team url', 'pg_url', 'perfectgame_url', 'perfect game url', 'perfect_game_url', 'perfect_game_team_url', 'perfect game team url', 'team_page', 'team page') || null;
+        const { data: existing, error: findError } = await adminClient
+          .from('teams')
+          .select('id')
+          .ilike('team_name', teamName.trim())
+          .maybeSingle();
+        if (findError) throw findError;
+
+        if (existing) {
+          const updates = { updated_at: new Date().toISOString() };
+          if (gcTeamUrl) updates.gc_team_url = gcTeamUrl;
+          if (pgTeamUrl) updates.pg_team_url = pgTeamUrl;
+          const { error } = await adminClient.from('teams').update(updates).eq('id', existing.id);
+          if (error) throw error;
+          updated++;
+        } else {
+          const { error } = await adminClient.from('teams').insert({
+            team_name: teamName.trim(),
+            gc_team_url: gcTeamUrl,
+            pg_team_url: pgTeamUrl,
+            is_our_team: false,
+          });
+          if (error) throw error;
+          added++;
+        }
+      }
+
+      const msg = replace
+        ? `Synced ${added} new, ${updated} updated, ${removed} removed.`
+        : `Synced ${added} new, ${updated} updated from sheet.`;
+      return res.json({ ok: true, added, updated, removed, skipped, message: msg });
+    }
+
+    const db           = new (getSQLiteDatabase())(DB_PATH);
     const findExisting = db.prepare(`SELECT id FROM teams WHERE LOWER(TRIM(team_name)) = LOWER(TRIM(?))`);
     const insertTeam   = db.prepare(`INSERT INTO teams (team_name, gc_team_url, pg_team_url) VALUES (@teamName, @gcTeamUrl, @pgTeamUrl)`);
     const updateTeam   = db.prepare(`UPDATE teams SET gc_team_url = COALESCE(@gcTeamUrl, gc_team_url), pg_team_url = COALESCE(@pgTeamUrl, pg_team_url), updated_at = datetime('now') WHERE id = @id`);
