@@ -1791,8 +1791,27 @@ const browser = await chromium.launch({
 
   const page = await context.newPage();
 
-  try {
-    await processTeamsFromSpreadsheet(page);
+try {
+    // If server passed a specific team via env vars, skip the Google Sheet entirely
+    if (process.env.GC_TEST_TEAM_CONTAINS) {
+      const team = {
+        teamName:       process.env.GC_TEST_TEAM_CONTAINS,
+        rawTeamName:    process.env.GC_TEST_TEAM_CONTAINS,
+        gcSearchName:   process.env.GC_TEST_TEAM_CONTAINS,
+        gcTeamUrl:      process.env.GC_TEAM_URL || "",
+        pgTeamUrl:      "",
+        age:            String(process.env.GC_TEAM_AGE || "").replace(/\D/g, ""),
+        classification: process.env.GC_TEAM_AGE || "",
+        from:           process.env.GC_TEAM_CITY || "",
+        city:           process.env.GC_TEAM_CITY || "",
+        state:          process.env.GC_TEAM_STATE || "",
+        status:         "active"
+      };
+      const teamUrlCache = loadTeamUrlCache();
+      await processTeam(page, team, 1, 1, teamUrlCache);
+    } else {
+      await processTeamsFromSpreadsheet(page);
+    }
   } finally {
     await browser.close();
   }
@@ -1806,6 +1825,57 @@ main().catch((error) => {
   process.exit(1);
 });
 
+// ─── Entry Point: scrape a single team by DB record (no Google Sheet) ─────────
+async function scrapeTeamById(teamRecord) {
+  // teamRecord should have: { id, team_name, gc_team_url, age_group }
+  if (!fs.existsSync(STORAGE_STATE)) {
+    throw new Error(`Missing auth file: ${STORAGE_STATE}. Run npm run login first.`);
+  }
+
+  ensureDirectory(OUTPUT_DIR);
+  ensureDirectory(FAILED_MATCHES_DIR);
+
+  pipeline.init(DB_PATH);
+
+  const browser = await chromium.launch({
+    headless: process.env.NODE_ENV === 'production' ? true : false,
+    slowMo:   process.env.NODE_ENV === 'production' ? 0 : 75,
+  });
+
+  const context = await browser.newContext({
+    storageState: STORAGE_STATE,
+    viewport: { width: 1440, height: 1000 },
+    acceptDownloads: true
+  });
+
+  const page = await context.newPage();
+
+  // Build a team object that matches what processTeam() expects
+  const team = {
+    teamName:     teamRecord.team_name,
+    rawTeamName:  teamRecord.team_name,
+    gcSearchName: teamRecord.team_name,
+    gcTeamUrl:    teamRecord.gc_team_url || "",
+    pgTeamUrl:    teamRecord.pg_team_url || "",
+    age:          String(teamRecord.age_group || "").replace(/\D/g, ""),
+    classification: teamRecord.age_group || "",
+    from:         teamRecord.city || "",
+    city:         teamRecord.city || "",
+    state:        teamRecord.state || "",
+    status:       "active"
+  };
+
+  const teamUrlCache = loadTeamUrlCache();
+
+  try {
+    console.log(`Accepted GameChanger seasons: ${getAcceptedSeasonLabel()}`);
+    console.log(`Screenshot fallback: ${SCREENSHOT_FALLBACK ? "ON" : "OFF (structured extraction only)"}`);
+    await processTeam(page, team, 1, 1, teamUrlCache);
+  } finally {
+    await browser.close();
+  }
+}
+
 // ── Exports for scrape-game-urls.js ──────────────────────────────────────────
 if (require.main !== module) {
   module.exports = {
@@ -1815,5 +1885,6 @@ if (require.main !== module) {
     extractPlays,
     extractGameIdFromUrl,
     getTeamOutputDir,
+    scrapeTeamById,   // ← add this
   };
 }
