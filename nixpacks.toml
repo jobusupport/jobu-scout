@@ -1,0 +1,27 @@
+[phases.setup]
+nixPkgs = [
+  "glib",
+  "nss",
+  "nspr",
+  "atk",
+  "cups",
+  "dbus",
+  "expat",
+  "libdrm",
+  "libxcb",
+  "libxkbcommon",
+  "mesa",
+  "pango",
+  "cairo",
+  "alsa-lib",
+  "xorg.libX11",
+  "xorg.libXcomposite",
+  "xorg.libXdamage",
+  "xorg.libXext",
+  "xorg.libXfixes",
+  "xorg.libXrandr",
+  "xorg.libxshmfence"
+]
+
+[phases.build]
+cmds = ["npm install", "npx playwright install chromium"]
