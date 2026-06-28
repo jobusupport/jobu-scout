@@ -1838,10 +1838,13 @@ async function scrapeTeamById(teamRecord) {
 
   pipeline.init(DB_PATH);
 
-  const browser = await chromium.launch({
-    headless: process.env.NODE_ENV === 'production' ? true : false,
-    slowMo:   process.env.NODE_ENV === 'production' ? 0 : 75,
-  });
+console.log('[browser] Launching Chromium...');
+const browser = await chromium.launch({
+  headless: true,
+  slowMo: 0,
+  args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--single-process']
+});
+console.log('[browser] Chromium launched successfully.');
 
   const context = await browser.newContext({
     storageState: STORAGE_STATE,
