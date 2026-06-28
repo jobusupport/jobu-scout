@@ -4,6 +4,17 @@ if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
 }
 
+// Write GC auth session from environment variable on startup
+const gcAuthPath = '/app/storage/gamechanger-auth.json';
+if (process.env.GC_AUTH_JSON) {
+  try {
+    require('fs').mkdirSync('/app/storage', { recursive: true });
+    require('fs').writeFileSync(gcAuthPath, process.env.GC_AUTH_JSON, 'utf8');
+    console.log('[startup] GC auth written from env var');
+  } catch (e) {
+    console.error('[startup] Failed to write GC auth:', e.message);
+  }
+}
 // Railway should provide USE_SUPABASE=true, but production should still use
 // Supabase whenever the Supabase connection config is present. This prevents
 // an accidental production fallback to the local SQLite layer.
