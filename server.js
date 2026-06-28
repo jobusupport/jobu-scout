@@ -364,6 +364,19 @@ app.post('/api/auth/refresh', async (req, res) => {
 });
 
 // ── API ─────────────────────────────────────────────────────────────────────
+app.get('/api/debug/auth', (req, res) => {
+  const fs = require('fs');
+  const path = require('path');
+  const authPath = '/app/storage/gamechanger-auth.json';
+  const exists = fs.existsSync(authPath);
+  const cwd = process.cwd();
+  const storageContents = fs.existsSync('/app/storage') 
+    ? fs.readdirSync('/app/storage') 
+    : 'directory does not exist';
+  const appContents = fs.readdirSync('/app');
+  
+  res.json({ authPath, exists, cwd, storageContents, appContents });
+});
 
 app.get('/api/teams', requireAuth, async (req, res) => {
   try {
