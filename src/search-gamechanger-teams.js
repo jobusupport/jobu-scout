@@ -1821,6 +1821,7 @@ main().catch((error) => {
   console.error("");
   console.error("GameChanger team search failed:");
   console.error(error.message);
+  console.error(error.stack);
   console.error("");
   process.exit(1);
 });
