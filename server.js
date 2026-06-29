@@ -146,11 +146,14 @@ function getDb() {
   return new Database(DB_PATH, { readonly: true });
 }
 
-async function getTeams() {
+async function getTeams(req = null) {
   if (USE_SUPABASE) {
+    const orgId = await getRequestOrgId(req);
+
     const { data: teams, error } = await adminClient
       .from('teams')
       .select('*')
+      .eq('org_id', orgId)
       .order('team_name');
 
     if (error) throw error;
@@ -298,6 +301,154 @@ function cleanTeamName(name) {
   return (name || '').replace(/\([\d-]+ in \d{4}\)/g, '').trim();
 }
 
+function isMissingRelationError(err) {
+  const msg = String(err?.message || err || '').toLowerCase();
+  return (
+    msg.includes('relation') && msg.includes('does not exist') ||
+    msg.includes('could not find the table') ||
+    msg.includes('schema cache')
+  );
+}
+
+async function maybeSingleSafe(query) {
+  try {
+    const { data, error } = await query.maybeSingle();
+    if (error) {
+      if (isMissingRelationError(error)) return null;
+      throw error;
+    }
+    return data || null;
+  } catch (err) {
+    if (isMissingRelationError(err)) return null;
+    throw err;
+  }
+}
+
+async function selectSafe(query) {
+  try {
+    const { data, error } = await query;
+    if (error) {
+      if (isMissingRelationError(error)) return [];
+      throw error;
+    }
+    return data || [];
+  } catch (err) {
+    if (isMissingRelationError(err)) return [];
+    throw err;
+  }
+}
+
+async function getRequestOrgId(req) {
+  if (!USE_SUPABASE) return null;
+
+  if (req?._orgId) return req._orgId;
+
+  const user = req?.user || null;
+  const userId = user?.id || null;
+  const userEmail = user?.email || null;
+
+  const metadataOrgId =
+    user?.app_metadata?.org_id ||
+    user?.user_metadata?.org_id ||
+    user?.org_id ||
+    null;
+
+  if (metadataOrgId) {
+    req._orgId = metadataOrgId;
+    return metadataOrgId;
+  }
+
+  if (!userId && !userEmail) {
+    throw new Error('Unable to determine the current user. Please sign out and sign back in.');
+  }
+
+  // Common schema: profiles.id = auth.users.id, profiles.org_id
+  if (userId) {
+    const profileById = await maybeSingleSafe(
+      adminClient.from('profiles').select('org_id').eq('id', userId).limit(1)
+    );
+    if (profileById?.org_id) {
+      req._orgId = profileById.org_id;
+      return profileById.org_id;
+    }
+  }
+
+  if (userEmail) {
+    const profileByEmail = await maybeSingleSafe(
+      adminClient.from('profiles').select('org_id').ilike('email', userEmail).limit(1)
+    );
+    if (profileByEmail?.org_id) {
+      req._orgId = profileByEmail.org_id;
+      return profileByEmail.org_id;
+    }
+  }
+
+  // Common schema: org_members.user_id / org_members.email -> org_id
+  if (userId) {
+    const memberByUserId = await maybeSingleSafe(
+      adminClient.from('org_members').select('org_id').eq('user_id', userId).limit(1)
+    );
+    if (memberByUserId?.org_id) {
+      req._orgId = memberByUserId.org_id;
+      return memberByUserId.org_id;
+    }
+  }
+
+  if (userEmail) {
+    const memberByEmail = await maybeSingleSafe(
+      adminClient.from('org_members').select('org_id').ilike('email', userEmail).limit(1)
+    );
+    if (memberByEmail?.org_id) {
+      req._orgId = memberByEmail.org_id;
+      return memberByEmail.org_id;
+    }
+  }
+
+  // Alternate naming sometimes used by SaaS templates.
+  if (userId) {
+    const membershipByUserId = await maybeSingleSafe(
+      adminClient.from('memberships').select('org_id').eq('user_id', userId).limit(1)
+    );
+    if (membershipByUserId?.org_id) {
+      req._orgId = membershipByUserId.org_id;
+      return membershipByUserId.org_id;
+    }
+  }
+
+  // Safe customer-friendly fallback for single-org installs:
+  // no manual Railway variable, but we refuse to guess when more than one org exists.
+  const orgs = await selectSafe(adminClient.from('orgs').select('id').limit(2));
+  if (orgs.length === 1) {
+    req._orgId = orgs[0].id;
+    return orgs[0].id;
+  }
+
+  const organizations = await selectSafe(adminClient.from('organizations').select('id').limit(2));
+  if (organizations.length === 1) {
+    req._orgId = organizations[0].id;
+    return organizations[0].id;
+  }
+
+  throw new Error(
+    `No organization could be resolved for ${userEmail || userId}. ` +
+    'Create a profiles.org_id or org_members row for this user so teams can be assigned to the correct customer organization.'
+  );
+}
+
+async function assertTeamInRequestOrg(req, teamId) {
+  if (!USE_SUPABASE) return;
+  const orgId = await getRequestOrgId(req);
+  const { data, error } = await adminClient
+    .from('teams')
+    .select('id')
+    .eq('id', teamId)
+    .eq('org_id', orgId)
+    .maybeSingle();
+
+  if (error) throw error;
+  if (!data) throw new Error('Team not found for this organization.');
+}
+
 // ── Auth middleware ──────────────────────────────────────────────────────────
 async function requireAuth(req, res, next) {
   const header = req.headers.authorization;
@@ -391,7 +542,7 @@ app.get('/api/debug/auth', (req, res) => {
 
 app.get('/api/teams', requireAuth, async (req, res) => {
   try {
-    const rawTeams = await getTeams();
+    const rawTeams = await getTeams(req);
     const teams = await Promise.all(rawTeams.map(async t => {
       const hasUrls = await hasGameUrls(t.id);
       return {
@@ -465,8 +616,8 @@ app.post('/api/jobs/:id/stop', (req, res) => {
 });
 
 // POST /api/run/gc-scraper
-app.post('/api/run/gc-scraper', async (req, res) => {
-  const team = (await getTeams()).find(t => t.id == req.body.teamId);
+app.post('/api/run/gc-scraper', requireAuth, async (req, res) => {
+  const team = (await getTeams(req)).find(t => t.id == req.body.teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
   const id = createJob(`GC Scraper — ${team.team_name}`);
   appendLog(id, `Starting GameChanger scraper for: ${team.team_name}`);
@@ -483,8 +634,8 @@ app.post('/api/run/gc-scraper', async (req, res) => {
 });
 
 // POST /api/run/pg-scraper
-app.post('/api/run/pg-scraper', async (req, res) => {
-  const team = (await getTeams()).find(t => t.id == req.body.teamId);
+app.post('/api/run/pg-scraper', requireAuth, async (req, res) => {
+  const team = (await getTeams(req)).find(t => t.id == req.body.teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
   const id = createJob(`PG Scraper — ${team.team_name}`);
   appendLog(id, `Starting Perfect Game scraper for: ${team.team_name}`);
@@ -494,8 +645,8 @@ app.post('/api/run/pg-scraper', async (req, res) => {
 });
 
 // POST /api/run/reingest
-app.post('/api/run/reingest', async (req, res) => {
-  const team  = req.body.teamId ? (await getTeams()).find(t => t.id == req.body.teamId) : null;
+app.post('/api/run/reingest', requireAuth, async (req, res) => {
+  const team  = req.body.teamId ? (await getTeams(req)).find(t => t.id == req.body.teamId) : null;
   const label = team ? `Reingest — ${team.team_name}` : 'Reingest — All Teams';
   const id    = createJob(label);
   appendLog(id, label);
@@ -504,9 +655,9 @@ app.post('/api/run/reingest', async (req, res) => {
 });
 
 // POST /api/run/report  { teamId, gameLocation?, gameDate? }
-app.post('/api/run/report', async (req, res) => {
+app.post('/api/run/report', requireAuth, async (req, res) => {
   const { teamId, gameLocation, gameDate } = req.body;
-  const team = (await getTeams()).find(t => t.id == teamId);
+  const team = (await getTeams(req)).find(t => t.id == teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
   const id = createJob(`Report — ${team.team_name}`);
   appendLog(id, `Generating scouting report for: ${team.team_name}`);
@@ -519,9 +670,9 @@ app.post('/api/run/report', async (req, res) => {
 });
 
 // POST /api/run/full-pipeline  { teamId, gameLocation?, gameDate? }
-app.post('/api/run/full-pipeline', async (req, res) => {
+app.post('/api/run/full-pipeline', requireAuth, async (req, res) => {
   const { teamId, gameLocation, gameDate } = req.body;
-  const team = (await getTeams()).find(t => t.id == teamId);
+  const team = (await getTeams(req)).find(t => t.id == teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
   const id      = createJob(`Full Pipeline — ${team.team_name}`);
   const pgRoot  = path.join(ROOT, '..', 'perfectgame-scraper');
@@ -560,8 +711,8 @@ app.post('/api/run/full-pipeline', async (req, res) => {
 });
 
 // POST /api/run/all-gc — scrape all teams GC
-app.post('/api/run/all-gc', async (req, res) => {
-  const allTeams = await getTeams();
+app.post('/api/run/all-gc', requireAuth, async (req, res) => {
+  const allTeams = await getTeams(req);
   const teamsWithUrlFlags = await Promise.all(allTeams.map(async t => ({ ...t, _hasGameUrls: await hasGameUrls(t.id) })));
   const teams   = teamsWithUrlFlags.filter(t => t.gc_team_url || t._hasGameUrls);
   if (!teams.length) return res.status(400).json({ error: 'No teams with GC URLs or game URLs' });
@@ -594,8 +745,8 @@ app.post('/api/run/all-gc', async (req, res) => {
 });
 
 // POST /api/run/all-pg — scrape all teams PG
-app.post('/api/run/all-pg', async (req, res) => {
-  const teams   = (await getTeams()).filter(t => t.pg_team_url);
+app.post('/api/run/all-pg', requireAuth, async (req, res) => {
+  const teams   = (await getTeams(req)).filter(t => t.pg_team_url);
   if (!teams.length) return res.status(400).json({ error: 'No teams with PG URLs' });
   const id      = createJob(`PG Scrape All (${teams.length} teams)`);
   const pgRoot  = path.join(ROOT, '..', 'perfectgame-scraper');
@@ -620,8 +771,8 @@ app.post('/api/run/all-pg', async (req, res) => {
 });
 
 // POST /api/run/all-reports — generate reports for all teams with games
-app.post('/api/run/all-reports', async (req, res) => {
-  const teams   = (await getTeams()).filter(t => t.game_count > 0);
+app.post('/api/run/all-reports', requireAuth, async (req, res) => {
+  const teams   = (await getTeams(req)).filter(t => t.game_count > 0);
   if (!teams.length) return res.status(400).json({ error: 'No teams with game data' });
   const id      = createJob(`Reports All (${teams.length} teams)`);
   const runStep = makeRunStep(id);
@@ -661,11 +812,12 @@ app.get('/api/teams/:id/game-urls', requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/teams/:id/game-urls', async (req, res) => {
+app.post('/api/teams/:id/game-urls', requireAuth, async (req, res) => {
   const { gc_game_url, label = '', box_side = 'away' } = req.body;
   if (!['away','home'].includes(box_side)) return res.status(400).json({ error: 'box_side must be away or home' });
   try {
     if (USE_SUPABASE) {
+      await assertTeamInRequestOrg(req, req.params.id);
       const { data, error } = await adminClient
         .from('team_game_urls')
         .insert({ team_id: req.params.id, gc_game_url: (gc_game_url || '').trim(), label: label.trim(), box_side })
@@ -684,10 +836,11 @@ app.post('/api/teams/:id/game-urls', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.put('/api/teams/:id/game-urls/:urlId', async (req, res) => {
+app.put('/api/teams/:id/game-urls/:urlId', requireAuth, async (req, res) => {
   const { gc_game_url, label, box_side } = req.body;
   try {
     if (USE_SUPABASE) {
+      await assertTeamInRequestOrg(req, req.params.id);
       const updates = {};
       if (gc_game_url !== undefined) updates.gc_game_url = gc_game_url;
       if (label !== undefined)       updates.label       = label;
@@ -714,9 +867,10 @@ app.put('/api/teams/:id/game-urls/:urlId', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete('/api/teams/:id/game-urls/:urlId', async (req, res) => {
+app.delete('/api/teams/:id/game-urls/:urlId', requireAuth, async (req, res) => {
   try {
     if (USE_SUPABASE) {
+      await assertTeamInRequestOrg(req, req.params.id);
       const { error } = await adminClient
         .from('team_game_urls')
         .delete()
@@ -734,24 +888,40 @@ app.delete('/api/teams/:id/game-urls/:urlId', async (req, res) => {
 });
 
 // ── Add Team ─────────────────────────────────────────────────────────────────
-app.post('/api/teams/add', async (req, res) => {
+app.post('/api/teams/add', requireAuth, async (req, res) => {
   const { teamName, gcTeamUrl, pgTeamUrl } = req.body;
   if (!teamName) return res.status(400).json({ error: 'teamName is required' });
+
   try {
     if (USE_SUPABASE) {
+      const orgId = await getRequestOrgId(req);
+
       const { data: existing, error: findError } = await adminClient
         .from('teams')
         .select('id')
+        .eq('org_id', orgId)
         .ilike('team_name', teamName.trim())
         .maybeSingle();
+
       if (findError) throw findError;
-      if (existing) return res.status(409).json({ error: `"${teamName}" already exists (id ${existing.id})` });
+      if (existing) {
+        return res.status(409).json({
+          error: `"${teamName}" already exists in this organization (id ${existing.id})`,
+        });
+      }
 
       const { data, error } = await adminClient
         .from('teams')
-        .insert({ team_name: teamName.trim(), gc_team_url: gcTeamUrl || null, pg_team_url: pgTeamUrl || null, is_our_team: false })
+        .insert({
+          org_id: orgId,
+          team_name: teamName.trim(),
+          gc_team_url: gcTeamUrl || null,
+          pg_team_url: pgTeamUrl || null,
+          is_our_team: false,
+        })
         .select('id')
         .single();
+
       if (error) throw error;
       return res.json({ ok: true, id: data.id });
     }
@@ -763,11 +933,14 @@ app.post('/api/teams/add', async (req, res) => {
       .run({ teamName, gcTeamUrl: gcTeamUrl || null, pgTeamUrl: pgTeamUrl || null });
     db.close();
     res.json({ ok: true, id: info.lastInsertRowid });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    console.error('[api/teams/add]', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── Sync Google Sheet ────────────────────────────────────────────────────────
-app.post('/api/settings/sheet', async (req, res) => {
+app.post('/api/settings/sheet', requireAuth, async (req, res) => {
   const { csvUrl, replace = false } = req.body;
   if (!csvUrl || !csvUrl.includes('output=csv')) {
     return res.status(400).json({ error: 'Must be a published Google Sheet CSV URL (must contain output=csv)' });
@@ -825,62 +998,151 @@ app.post('/api/settings/sheet', async (req, res) => {
     }
 
     if (USE_SUPABASE) {
-      let added = 0, updated = 0, skipped = 0, removed = 0;
+      const orgId = await getRequestOrgId(req);
+
+      let added = 0;
+      let updated = 0;
+      let skipped = 0;
+      let removed = 0;
+      let keptWithGames = 0;
 
       if (replace) {
         const sheetNames = new Set();
+
         for (let i = 1; i < rows.length; i++) {
           const row  = rows[i];
           const name = col(row, 'team_name', 'team name', 'team', 'name');
-          if (name && !name.startsWith('_')) sheetNames.add(name.toLowerCase().trim());
-        }
-        const { data: existingTeams, error: existingError } = await adminClient.from('teams').select('id, team_name');
-        if (existingError) throw existingError;
-        for (const t of existingTeams || []) {
-          if (!sheetNames.has(String(t.team_name || '').toLowerCase().trim())) {
-            const { error } = await adminClient.from('teams').delete().eq('id', t.id);
-            if (error) throw error;
-            removed++;
+
+          if (name && !name.startsWith('_')) {
+            sheetNames.add(name.toLowerCase().trim());
           }
+        }
+
+        const { data: existingTeams, error: existingError } = await adminClient
+          .from('teams')
+          .select('id, team_name')
+          .eq('org_id', orgId);
+
+        if (existingError) throw existingError;
+
+        for (const t of existingTeams || []) {
+          const normalizedName = String(t.team_name || '').toLowerCase().trim();
+
+          if (sheetNames.has(normalizedName)) continue;
+
+          const { count: linkedGameCount, error: linkedGameError } = await adminClient
+            .from('games')
+            .select('id', { count: 'exact', head: true })
+            .eq('team_id', t.id);
+
+          if (linkedGameError) throw linkedGameError;
+
+          if ((linkedGameCount || 0) > 0) {
+            keptWithGames++;
+            console.log(`[sheet-sync] Keeping team with linked games: ${t.team_name}`);
+            continue;
+          }
+
+          const { error: deleteError } = await adminClient
+            .from('teams')
+            .delete()
+            .eq('id', t.id)
+            .eq('org_id', orgId);
+
+          if (deleteError) throw deleteError;
+          removed++;
         }
       }
 
       for (let i = 1; i < rows.length; i++) {
         const row      = rows[i];
         const teamName = col(row, 'team_name', 'team name', 'team', 'name');
-        if (!teamName || teamName.startsWith('_')) { skipped++; continue; }
-        const gcTeamUrl = col(row, 'gc_team_url', 'gc team url', 'gc_url', 'gamechanger_url', 'gamechanger team url', 'gamechanger url') || null;
-        const pgTeamUrl = col(row, 'pg_team_url', 'pg team url', 'pg_url', 'perfectgame_url', 'perfect game url', 'perfect_game_url', 'perfect_game_team_url', 'perfect game team url', 'team_page', 'team page') || null;
+
+        if (!teamName || teamName.startsWith('_')) {
+          skipped++;
+          continue;
+        }
+
+        const gcTeamUrl =
+          col(
+            row,
+            'gc_team_url',
+            'gc team url',
+            'gc_url',
+            'gamechanger_url',
+            'gamechanger team url',
+            'gamechanger url'
+          ) || null;
+
+        const pgTeamUrl =
+          col(
+            row,
+            'pg_team_url',
+            'pg team url',
+            'pg_url',
+            'perfectgame_url',
+            'perfect game url',
+            'perfect_game_url',
+            'perfect_game_team_url',
+            'perfect game team url',
+            'team_page',
+            'team page'
+          ) || null;
+
         const { data: existing, error: findError } = await adminClient
           .from('teams')
           .select('id')
+          .eq('org_id', orgId)
           .ilike('team_name', teamName.trim())
           .maybeSingle();
+
         if (findError) throw findError;
 
         if (existing) {
-          const updates = { updated_at: new Date().toISOString() };
+          const updates = {
+            updated_at: new Date().toISOString(),
+          };
+
           if (gcTeamUrl) updates.gc_team_url = gcTeamUrl;
           if (pgTeamUrl) updates.pg_team_url = pgTeamUrl;
-          const { error } = await adminClient.from('teams').update(updates).eq('id', existing.id);
+
+          const { error } = await adminClient
+            .from('teams')
+            .update(updates)
+            .eq('id', existing.id)
+            .eq('org_id', orgId);
+
           if (error) throw error;
           updated++;
         } else {
-          const { error } = await adminClient.from('teams').insert({
-            team_name: teamName.trim(),
-            gc_team_url: gcTeamUrl,
-            pg_team_url: pgTeamUrl,
-            is_our_team: false,
-          });
+          const { error } = await adminClient
+            .from('teams')
+            .insert({
+              org_id: orgId,
+              team_name: teamName.trim(),
+              gc_team_url: gcTeamUrl,
+              pg_team_url: pgTeamUrl,
+              is_our_team: false,
+            });
+
           if (error) throw error;
           added++;
         }
       }
 
       const msg = replace
-        ? `Synced ${added} new, ${updated} updated, ${removed} removed.`
+        ? `Synced ${added} new, ${updated} updated, ${removed} removed, ${keptWithGames} kept because they have games.`
         : `Synced ${added} new, ${updated} updated from sheet.`;
-      return res.json({ ok: true, added, updated, removed, skipped, message: msg });
+
+      return res.json({
+        ok: true,
+        added,
+        updated,
+        removed,
+        keptWithGames,
+        skipped,
+        message: msg,
+      });
     }
 
     const db           = new (getSQLiteDatabase())(DB_PATH);
