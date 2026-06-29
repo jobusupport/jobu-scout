@@ -1596,20 +1596,21 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId) {
       );
       if (!dbWriteResult || dbWriteResult.success === false) {
         console.warn(`[gc] DB write did not complete cleanly: ${dbWriteResult?.error || "unknown error"}`);
+        console.warn("[gc] Not marking this game as processed because the DB write failed.");
       } else {
         console.log("[gc] DB write complete.");
+
+        manifest.processedGames.push({
+          gameId,
+          gameUrl,
+          capturedAt:    new Date().toISOString(),
+          jsonFile:      captureResult.jsonFile      || "",
+          boxScoreFile:  captureResult.boxScoreFile  || ""
+        });
+
+        saveProcessedGames(manifest.manifestPath, manifest.processedGames);
+        console.log(`Updated processed-games manifest: ${manifest.manifestPath}`);
       }
-
-      manifest.processedGames.push({
-        gameId,
-        gameUrl,
-        capturedAt:    new Date().toISOString(),
-        jsonFile:      captureResult.jsonFile      || "",
-        boxScoreFile:  captureResult.boxScoreFile  || ""
-      });
-
-      saveProcessedGames(manifest.manifestPath, manifest.processedGames);
-      console.log(`Updated processed-games manifest: ${manifest.manifestPath}`);
     } else {
       console.log(`Capture failed for completed game #${gameIndex + 1}. Returning to schedule if possible.`);
     }

@@ -68,6 +68,95 @@ function check(error, context) {
   }
 }
 
+// ─── Org helpers ──────────────────────────────────────────────────────────────
+
+const _teamOrgCache = new Map();
+const _tableOrgColumnCache = new Map();
+
+function isMissingColumnError(error, columnName = 'org_id') {
+  if (!error) return false;
+  const message = String(error.message || '').toLowerCase();
+  return message.includes(`column ${columnName}`) && message.includes('does not exist');
+}
+
+async function tableHasOrgId(tableName) {
+  if (_tableOrgColumnCache.has(tableName)) return _tableOrgColumnCache.get(tableName);
+
+  const { error } = await getDb()
+    .from(tableName)
+    .select('org_id', { count: 'exact', head: true })
+    .limit(1);
+
+  if (isMissingColumnError(error, 'org_id')) {
+    _tableOrgColumnCache.set(tableName, false);
+    return false;
+  }
+
+  if (error) {
+    // Do not hide permissions or other real DB issues.
+    check(error, `${tableName} org_id capability check`);
+  }
+
+  _tableOrgColumnCache.set(tableName, true);
+  return true;
+}
+
+async function getOrgIdForTeam(teamId) {
+  const normalizedTeamId = Number(teamId);
+  const cacheKey = Number.isFinite(normalizedTeamId) ? String(normalizedTeamId) : String(teamId || '');
+
+  if (!cacheKey) throw new Error('getOrgIdForTeam requires teamId');
+  if (_teamOrgCache.has(cacheKey)) return _teamOrgCache.get(cacheKey);
+
+  const { data, error } = await getDb()
+    .from('teams')
+    .select('id, org_id')
+    .eq('id', teamId)
+    .maybeSingle();
+
+  check(error, 'getOrgIdForTeam');
+
+  if (!data) throw new Error(`Team ${teamId} not found while resolving org_id`);
+  if (!data.org_id) throw new Error(`Team ${teamId} does not have org_id`);
+
+  _teamOrgCache.set(cacheKey, data.org_id);
+  return data.org_id;
+}
+
+async function getSingleOrgIdFallback() {
+  for (const tableName of ['orgs', 'organizations']) {
+    try {
+      const { data, error } = await getDb().from(tableName).select('id').limit(2);
+      if (isMissingColumnError(error, 'id')) continue;
+      if (error) {
+        const msg = String(error.message || '').toLowerCase();
+        if (msg.includes('could not find the table') || msg.includes('does not exist')) continue;
+        check(error, `${tableName} single-org fallback`);
+      }
+      if (Array.isArray(data) && data.length === 1 && data[0]?.id) return data[0].id;
+    } catch (err) {
+      const msg = String(err.message || '').toLowerCase();
+      if (msg.includes('does not exist') || msg.includes('could not find the table')) continue;
+      throw err;
+    }
+  }
+  return null;
+}
+
+async function resolveOrgIdForTeamUpsert(team) {
+  const provided = normalizeNullable(team.orgId || team.org_id);
+  if (provided) return provided;
+  return await getSingleOrgIdFallback();
+}
+
+async function addOrgIdIfSupported(tableName, payload, orgId) {
+  if (!orgId) return payload;
+  if (tableName === 'games' || await tableHasOrgId(tableName)) {
+    return { org_id: orgId, ...payload };
+  }
+  return payload;
+}
+
 // ─── Teams ────────────────────────────────────────────────────────────────────
 
 function normalizeTeamName(value) {
@@ -113,14 +202,18 @@ function getProvidedBoolean(input, camelName, snakeName) {
   return null;
 }
 
+function applyOrgScope(query, params) {
+  return params.org_id ? query.eq('org_id', params.org_id) : query;
+}
+
 async function findExistingTeam(sb, params) {
   // Primary identity: team_name + age_group + season_year.
   if (params.team_name && params.age_group && params.season_year) {
-    const { data, error } = await sb
+    const { data, error } = await applyOrgScope(sb
       .from('teams')
       .select('id')
       .ilike('team_name', params.team_name)
-      .eq('age_group', params.age_group)
+      .eq('age_group', params.age_group), params)
       .eq('season_year', params.season_year)
       .order('updated_at', { ascending: false })
       .order('id', { ascending: false })
@@ -131,11 +224,11 @@ async function findExistingTeam(sb, params) {
 
   // Fallback identity: team_name + age_group across seasons.
   if (params.team_name && params.age_group) {
-    const { data, error } = await sb
+    const { data, error } = await applyOrgScope(sb
       .from('teams')
       .select('id')
       .ilike('team_name', params.team_name)
-      .eq('age_group', params.age_group)
+      .eq('age_group', params.age_group), params)
       .order('season_year', { ascending: false })
       .order('updated_at', { ascending: false })
       .order('id', { ascending: false })
@@ -147,10 +240,10 @@ async function findExistingTeam(sb, params) {
   // Safety fallback for legacy rows/sheet imports that may not have age/year yet.
   // This is deliberately exact-name only; GC/PG URLs are season pointers, not identity keys.
   if (params.team_name && (!params.age_group || !params.season_year)) {
-    const { data, error } = await sb
+    const { data, error } = await applyOrgScope(sb
       .from('teams')
       .select('id')
-      .ilike('team_name', params.team_name)
+      .ilike('team_name', params.team_name), params)
       .order('season_year', { ascending: false })
       .order('updated_at', { ascending: false })
       .order('id', { ascending: false })
@@ -165,10 +258,12 @@ async function findExistingTeam(sb, params) {
 
 async function upsertTeam(team) {
   const sb = getDb();
+  const resolvedOrgId = await resolveOrgIdForTeamUpsert(team);
 
   const isOurTeam = getProvidedBoolean(team, 'isOurTeam', 'is_our_team');
 
   const params = {
+    org_id:         resolvedOrgId,
     team_name:      normalizeTeamName(team.teamName       || team.team_name       || ''),
     raw_team_name:  normalizeNullable(team.rawTeamName    || team.raw_team_name),
     gc_search_name: normalizeNullable(team.gcSearchName   || team.gc_search_name),
@@ -230,17 +325,25 @@ async function getAllTeams() {
 
 async function insertGame(game) {
   const sb = getDb();
+  const orgId = normalizeNullable(game.orgId || game.org_id) || await getOrgIdForTeam(game.teamId);
 
-  // Dedup check
+  // Dedup check scoped to the team's org.
   if (game.gcGameId) {
-    const { data } = await sb.from('games').select('id').eq('gc_game_id', game.gcGameId).maybeSingle();
+    const { data, error } = await sb
+      .from('games')
+      .select('id')
+      .eq('org_id', orgId)
+      .eq('gc_game_id', game.gcGameId)
+      .maybeSingle();
+    check(error, 'insertGame dedup check');
     if (data) {
       console.log(`[db-supabase] Game already exists: ${game.gcGameId}`);
       return data.id;
     }
   }
 
-  const { data, error } = await sb.from('games').insert({
+  const payload = {
+    org_id:            orgId,
     team_id:           game.teamId,
     gc_game_id:        game.gcGameId        || null,
     gc_game_url:       game.gcGameUrl       || null,
@@ -256,14 +359,18 @@ async function insertGame(game) {
     json_file:         game.jsonFile        || null,
     screenshot_file:   game.screenshotFile  || null,
     captured_at:       game.capturedAt      || new Date().toISOString(),
-  }).select('id').single();
+  };
+
+  const { data, error } = await sb.from('games').insert(payload).select('id').single();
 
   check(error, 'insertGame');
   return data.id;
 }
 
 async function updateExistingGame(gameId, game) {
+  const orgId = normalizeNullable(game.orgId || game.org_id) || await getOrgIdForTeam(game.teamId);
   const { error } = await getDb().from('games').update({
+    org_id:            orgId,
     team_id:           game.teamId,
     gc_game_url:       game.gcGameUrl       || null,
     game_date:         game.gameDate        || null,
@@ -278,7 +385,7 @@ async function updateExistingGame(gameId, game) {
     json_file:         game.jsonFile        || null,
     screenshot_file:   game.screenshotFile  || null,
     captured_at:       game.capturedAt      || new Date().toISOString(),
-  }).eq('id', gameId);
+  }).eq('id', gameId).eq('org_id', orgId);
   check(error, 'updateExistingGame');
 }
 
@@ -300,33 +407,40 @@ async function getGameById(gameId) {
 async function insertBattingLines(lines, gameId) {
   if (!lines.length) return;
 
-  const rows = lines.map(row => ({
-    game_id:       gameId,
-    team_id:       row.teamId,
-    player_name:   row.playerName,
-    batting_order: row.battingOrder  ?? null,
-    is_our_team:   row.isOurTeam     ? true : false,
-    team_side:     row.teamSide      || null,
-    team_name_raw: row.teamNameRaw   || null,
-    position:      row.position      || null,
-    ab:            row.ab            ?? 0,
-    r:             row.r             ?? 0,
-    h:             row.h             ?? 0,
-    rbi:           row.rbi           ?? 0,
-    bb:            row.bb            ?? 0,
-    so:            row.so            ?? 0,
-    avg:           row.avg           ?? null,
-    obp:           row.obp           ?? null,
-    slg:           row.slg           ?? null,
-    doubles:       row.doubles       ?? 0,
-    triples:       row.triples       ?? 0,
-    hr:            row.hr            ?? 0,
-    sb:            row.sb            ?? 0,
-    hbp:           row.hbp           ?? 0,
-    sac:           row.sac           ?? 0,
-    lob:           row.lob           ?? 0,
-    raw_json:      row.rawJson       ? JSON.stringify(row.rawJson) : null,
-  }));
+  const orgId = normalizeNullable(lines[0].orgId || lines[0].org_id) || await getOrgIdForTeam(lines[0].teamId);
+  const includeOrgId = await tableHasOrgId('batting_lines');
+
+  const rows = lines.map(row => {
+    const payload = {
+      game_id:       gameId,
+      team_id:       row.teamId,
+      player_name:   row.playerName,
+      batting_order: row.battingOrder  ?? null,
+      is_our_team:   row.isOurTeam     ? true : false,
+      team_side:     row.teamSide      || null,
+      team_name_raw: row.teamNameRaw   || null,
+      position:      row.position      || null,
+      ab:            row.ab            ?? 0,
+      r:             row.r             ?? 0,
+      h:             row.h             ?? 0,
+      rbi:           row.rbi           ?? 0,
+      bb:            row.bb            ?? 0,
+      so:            row.so            ?? 0,
+      avg:           row.avg           ?? null,
+      obp:           row.obp           ?? null,
+      slg:           row.slg           ?? null,
+      doubles:       row.doubles       ?? 0,
+      triples:       row.triples       ?? 0,
+      hr:            row.hr            ?? 0,
+      sb:            row.sb            ?? 0,
+      hbp:           row.hbp           ?? 0,
+      sac:           row.sac           ?? 0,
+      lob:           row.lob           ?? 0,
+      raw_json:      row.rawJson       ? JSON.stringify(row.rawJson) : null,
+    };
+    if (includeOrgId) payload.org_id = orgId;
+    return payload;
+  });
 
   const { error } = await getDb().from('batting_lines').insert(rows);
   check(error, 'insertBattingLines');
@@ -338,28 +452,35 @@ async function insertBattingLines(lines, gameId) {
 async function insertPitchingLines(lines, gameId) {
   if (!lines.length) return;
 
-  const rows = lines.map(row => ({
-    game_id:       gameId,
-    team_id:       row.teamId,
-    player_name:   row.playerName,
-    is_our_team:   row.isOurTeam     ? true : false,
-    team_side:     row.teamSide      || null,
-    team_name_raw: row.teamNameRaw   || null,
-    ip:            row.ip            || null,
-    ip_decimal:    row.ipDecimal     ?? null,
-    bf:            row.bf            ?? 0,
-    pc:            row.pc            ?? 0,
-    strikes:       row.strikes       ?? 0,
-    h_allowed:     row.hAllowed      ?? 0,
-    r_allowed:     row.rAllowed      ?? 0,
-    er:            row.er            ?? 0,
-    bb:            row.bb            ?? 0,
-    so:            row.so            ?? 0,
-    hr_allowed:    row.hrAllowed     ?? 0,
-    era:           row.era           ?? null,
-    whip:          row.whip          ?? null,
-    raw_json:      row.rawJson       ? JSON.stringify(row.rawJson) : null,
-  }));
+  const orgId = normalizeNullable(lines[0].orgId || lines[0].org_id) || await getOrgIdForTeam(lines[0].teamId);
+  const includeOrgId = await tableHasOrgId('pitching_lines');
+
+  const rows = lines.map(row => {
+    const payload = {
+      game_id:       gameId,
+      team_id:       row.teamId,
+      player_name:   row.playerName,
+      is_our_team:   row.isOurTeam     ? true : false,
+      team_side:     row.teamSide      || null,
+      team_name_raw: row.teamNameRaw   || null,
+      ip:            row.ip            || null,
+      ip_decimal:    row.ipDecimal     ?? null,
+      bf:            row.bf            ?? 0,
+      pc:            row.pc            ?? 0,
+      strikes:       row.strikes       ?? 0,
+      h_allowed:     row.hAllowed      ?? 0,
+      r_allowed:     row.rAllowed      ?? 0,
+      er:            row.er            ?? 0,
+      bb:            row.bb            ?? 0,
+      so:            row.so            ?? 0,
+      hr_allowed:    row.hrAllowed     ?? 0,
+      era:           row.era           ?? null,
+      whip:          row.whip          ?? null,
+      raw_json:      row.rawJson       ? JSON.stringify(row.rawJson) : null,
+    };
+    if (includeOrgId) payload.org_id = orgId;
+    return payload;
+  });
 
   const { error } = await getDb().from('pitching_lines').insert(rows);
   check(error, 'insertPitchingLines');
@@ -371,22 +492,29 @@ async function insertPitchingLines(lines, gameId) {
 async function insertPlayEvents(events, gameId) {
   if (!events.length) return;
 
-  const rows = events.map(row => ({
-    game_id:        gameId,
-    team_id:        row.teamId,
-    sequence_num:   row.sequenceNum   ?? null,
-    inning:         row.inning        || null,
-    inning_num:     row.inningNum     ?? null,
-    inning_half:    row.inningHalf    || null,
-    event_type:     row.eventType     || null,
-    batter_name:    row.batterName    || null,
-    pitcher_name:   row.pitcherName   || null,
-    description:    row.description   || null,
-    runners_on:     row.runnersOn     || null,
-    outs_before:    row.outsBefore    ?? null,
-    result_rbi:     row.resultRbi     ?? 0,
-    is_scoring_play: row.isScoringPlay ? true : false,
-  }));
+  const orgId = normalizeNullable(events[0].orgId || events[0].org_id) || await getOrgIdForTeam(events[0].teamId);
+  const includeOrgId = await tableHasOrgId('play_events');
+
+  const rows = events.map(row => {
+    const payload = {
+      game_id:        gameId,
+      team_id:        row.teamId,
+      sequence_num:   row.sequenceNum   ?? null,
+      inning:         row.inning        || null,
+      inning_num:     row.inningNum     ?? null,
+      inning_half:    row.inningHalf    || null,
+      event_type:     row.eventType     || null,
+      batter_name:    row.batterName    || null,
+      pitcher_name:   row.pitcherName   || null,
+      description:    row.description   || null,
+      runners_on:     row.runnersOn     || null,
+      outs_before:    row.outsBefore    ?? null,
+      result_rbi:     row.resultRbi     ?? 0,
+      is_scoring_play: row.isScoringPlay ? true : false,
+    };
+    if (includeOrgId) payload.org_id = orgId;
+    return payload;
+  });
 
   const { error } = await getDb().from('play_events').insert(rows);
   check(error, 'insertPlayEvents');
@@ -406,24 +534,32 @@ async function clearGameDetailRows(gameId) {
 
 async function writeNormalizedGame(normalized) {
   const { game, battingLines, pitchingLines, playEvents } = normalized;
+  const orgId = normalizeNullable(game.orgId || game.org_id) || await getOrgIdForTeam(game.teamId);
+  const scopedGame = { ...game, orgId };
 
-  // Check for existing game
+  // Check for existing game, scoped to the team's org.
   let existing = null;
-  if (game.gcGameId) {
-    const { data } = await getDb().from('games').select('id').eq('gc_game_id', game.gcGameId).maybeSingle();
+  if (scopedGame.gcGameId) {
+    const { data, error } = await getDb()
+      .from('games')
+      .select('id')
+      .eq('org_id', orgId)
+      .eq('gc_game_id', scopedGame.gcGameId)
+      .maybeSingle();
+    check(error, 'writeNormalizedGame existing lookup');
     existing = data;
   }
 
-  const gameId = existing ? existing.id : await insertGame(game);
+  const gameId = existing ? existing.id : await insertGame(scopedGame);
 
   if (existing) {
-    await updateExistingGame(gameId, game);
+    await updateExistingGame(gameId, scopedGame);
     await clearGameDetailRows(gameId);
   }
 
-  const patchedBatting  = battingLines.map(r  => ({ ...r, gameId }));
-  const patchedPitching = pitchingLines.map(r => ({ ...r, gameId }));
-  const patchedPlays    = playEvents.map(r    => ({ ...r, gameId }));
+  const patchedBatting  = battingLines.map(r  => ({ ...r, gameId, orgId }));
+  const patchedPitching = pitchingLines.map(r => ({ ...r, gameId, orgId }));
+  const patchedPlays    = playEvents.map(r    => ({ ...r, gameId, orgId }));
 
   if (patchedBatting.length)  await insertBattingLines(patchedBatting, gameId);
   if (patchedPitching.length) await insertPitchingLines(patchedPitching, gameId);
@@ -583,8 +719,8 @@ async function getTeamAnalysisBundle(teamId) {
 async function upsertPlayerAdvancedStats(teamId, playerName, isOurTeam, stats) {
   const s  = stats;
   const sd = s.swingDecisions ? JSON.stringify(s.swingDecisions) : null;
-
-  const { error } = await getDb().from('player_advanced_stats').upsert({
+  const orgId = await getOrgIdForTeam(teamId);
+  const payload = {
     team_id:     teamId,
     player_name: playerName,
     is_our_team: isOurTeam ? true : false,
@@ -604,15 +740,18 @@ async function upsertPlayerAdvancedStats(teamId, playerName, isOurTeam, stats) {
     risp_ab: s.RISP_AB ?? 0, risp_h: s.RISP_H ?? 0, ba_risp: s.BA_RISP ?? null,
     swing_decisions: sd,
     k_pct: s.K_pct ?? null, bb_pct: s.BB_pct ?? null,
-  }, { onConflict: 'team_id,player_name,is_our_team' });
+  };
+  if (await tableHasOrgId('player_advanced_stats')) payload.org_id = orgId;
+
+  const { error } = await getDb().from('player_advanced_stats').upsert(payload, { onConflict: 'team_id,player_name,is_our_team' });
 
   check(error, 'upsertPlayerAdvancedStats');
 }
 
 async function upsertPitcherAdvancedStats(teamId, playerName, isOurTeam, stats) {
   const s = stats;
-
-  const { error } = await getDb().from('pitcher_advanced_stats').upsert({
+  const orgId = await getOrgIdForTeam(teamId);
+  const payload = {
     team_id:      teamId,
     player_name:  playerName,
     is_our_team:  isOurTeam ? true : false,
@@ -627,7 +766,10 @@ async function upsertPitcherAdvancedStats(teamId, playerName, isOurTeam, stats) 
     k_pct_bf: s.K_pct_BF ?? null, bb_pct_bf: s.BB_pct_BF ?? null,
     p_per_ip: s.P_per_IP ?? null,
     wp: s.WP ?? 0, bk: s.BK ?? 0, pik: s.PIK ?? 0,
-  }, { onConflict: 'team_id,player_name,is_our_team' });
+  };
+  if (await tableHasOrgId('pitcher_advanced_stats')) payload.org_id = orgId;
+
+  const { error } = await getDb().from('pitcher_advanced_stats').upsert(payload, { onConflict: 'team_id,player_name,is_our_team' });
 
   check(error, 'upsertPitcherAdvancedStats');
 }
@@ -651,14 +793,19 @@ async function getPitcherAdvancedStats(teamId, isOurTeam = null) {
 // ─── Scouting Reports ─────────────────────────────────────────────────────────
 
 async function insertScoutingReport(report) {
-  const { data, error } = await getDb().from('scouting_reports').insert({
+  const payload = {
     team_id:         report.teamId,
     report_type:     report.reportType     || 'full_scout',
     games_covered:   JSON.stringify(report.gamesCovered || []),
     file_path:       report.filePath       || null,
     file_format:     report.fileFormat     || 'pdf',
     recipient_email: report.recipientEmail || null,
-  }).select('id').single();
+  };
+  if (await tableHasOrgId('scouting_reports')) {
+    payload.org_id = normalizeNullable(report.orgId || report.org_id) || await getOrgIdForTeam(report.teamId);
+  }
+
+  const { data, error } = await getDb().from('scouting_reports').insert(payload).select('id').single();
 
   check(error, 'insertScoutingReport');
   return data.id;
