@@ -178,6 +178,24 @@ function normalizeNullable(value) {
   return trimmed ? trimmed : null;
 }
 
+function numericOrNull(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed || trimmed === '-' || trimmed.toUpperCase() === 'N/A') return null;
+    const cleaned = trimmed.replace(/,/g, '').replace(/%$/, '');
+    const n = Number(cleaned);
+    return Number.isFinite(n) ? n : null;
+  }
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function numericOrZero(value) {
+  const n = numericOrNull(value);
+  return n === null ? 0 : n;
+}
+
 function inferSeasonYear(input = {}) {
   const direct = input.seasonYear || input.season_year;
   if (direct !== undefined && direct !== null && String(direct).trim() !== '') {
@@ -423,27 +441,27 @@ async function insertBattingLines(lines, gameId) {
       game_id:       gameId,
       team_id:       row.teamId,
       player_name:   row.playerName,
-      batting_order: row.battingOrder  ?? null,
+      batting_order: numericOrNull(row.battingOrder),
       is_our_team:   row.isOurTeam     ? true : false,
       team_side:     row.teamSide      || null,
       team_name_raw: row.teamNameRaw   || null,
       position:      row.position      || null,
-      ab:            row.ab            ?? 0,
-      r:             row.r             ?? 0,
-      h:             row.h             ?? 0,
-      rbi:           row.rbi           ?? 0,
-      bb:            row.bb            ?? 0,
-      so:            row.so            ?? 0,
-      avg:           row.avg           ?? null,
-      obp:           row.obp           ?? null,
-      slg:           row.slg           ?? null,
-      doubles:       row.doubles       ?? 0,
-      triples:       row.triples       ?? 0,
-      hr:            row.hr            ?? 0,
-      sb:            row.sb            ?? 0,
-      hbp:           row.hbp           ?? 0,
-      sac:           row.sac           ?? 0,
-      lob:           row.lob           ?? 0,
+      ab:            numericOrZero(row.ab),
+      r:             numericOrZero(row.r),
+      h:             numericOrZero(row.h),
+      rbi:           numericOrZero(row.rbi),
+      bb:            numericOrZero(row.bb),
+      so:            numericOrZero(row.so),
+      avg:           numericOrNull(row.avg),
+      obp:           numericOrNull(row.obp),
+      slg:           numericOrNull(row.slg),
+      doubles:       numericOrZero(row.doubles),
+      triples:       numericOrZero(row.triples),
+      hr:            numericOrZero(row.hr),
+      sb:            numericOrZero(row.sb),
+      hbp:           numericOrZero(row.hbp),
+      sac:           numericOrZero(row.sac),
+      lob:           numericOrZero(row.lob),
       raw_json:      row.rawJson       ? JSON.stringify(row.rawJson) : null,
     };
     if (includeOrgId) payload.org_id = orgId;
@@ -472,18 +490,18 @@ async function insertPitchingLines(lines, gameId) {
       team_side:     row.teamSide      || null,
       team_name_raw: row.teamNameRaw   || null,
       ip:            row.ip            || null,
-      ip_decimal:    row.ipDecimal     ?? null,
-      bf:            row.bf            ?? 0,
-      pc:            row.pc            ?? 0,
-      strikes:       row.strikes       ?? 0,
-      h_allowed:     row.hAllowed      ?? 0,
-      r_allowed:     row.rAllowed      ?? 0,
-      er:            row.er            ?? 0,
-      bb:            row.bb            ?? 0,
-      so:            row.so            ?? 0,
-      hr_allowed:    row.hrAllowed     ?? 0,
-      era:           row.era           ?? null,
-      whip:          row.whip          ?? null,
+      ip_decimal:    numericOrNull(row.ipDecimal),
+      bf:            numericOrZero(row.bf),
+      pc:            numericOrZero(row.pc),
+      strikes:       numericOrZero(row.strikes),
+      h_allowed:     numericOrZero(row.hAllowed),
+      r_allowed:     numericOrZero(row.rAllowed),
+      er:            numericOrZero(row.er),
+      bb:            numericOrZero(row.bb),
+      so:            numericOrZero(row.so),
+      hr_allowed:    numericOrZero(row.hrAllowed),
+      era:           numericOrNull(row.era),
+      whip:          numericOrNull(row.whip),
       raw_json:      row.rawJson       ? JSON.stringify(row.rawJson) : null,
     };
     if (includeOrgId) payload.org_id = orgId;
@@ -507,17 +525,17 @@ async function insertPlayEvents(events, gameId) {
     const payload = {
       game_id:        gameId,
       team_id:        row.teamId,
-      sequence_num:   row.sequenceNum   ?? null,
+      sequence_num:   numericOrNull(row.sequenceNum),
       inning:         row.inning        || null,
-      inning_num:     row.inningNum     ?? null,
+      inning_num:     numericOrNull(row.inningNum),
       inning_half:    row.inningHalf    || null,
       event_type:     row.eventType     || null,
       batter_name:    row.batterName    || null,
       pitcher_name:   row.pitcherName   || null,
       description:    row.description   || null,
       runners_on:     row.runnersOn     || null,
-      outs_before:    row.outsBefore    ?? null,
-      result_rbi:     row.resultRbi     ?? 0,
+      outs_before:    numericOrNull(row.outsBefore),
+      result_rbi:     numericOrZero(row.resultRbi),
       is_scoring_play: row.isScoringPlay ? true : false,
     };
     if (includeOrgId) payload.org_id = orgId;
