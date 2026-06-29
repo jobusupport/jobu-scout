@@ -15,7 +15,9 @@
 
 const fs   = require('fs');
 const path = require('path');
+const { spawnSync } = require('child_process');
 const { getPGDataForTeam } = require('./pg-reader');
+const DESIGN = require('./design/jobu-design-system');
 
 // ─── Fan/Wedge Spray Chart SVG (Bob Jones style) ──────────────────────────────
 // Draws a baseball field fan with shaded wedges sized by zone percentage.
@@ -255,8 +257,7 @@ function confidenceBadge(level) {
 }
 
 function threatColor(level) {
-  const map = { high: 'C00000', medium: 'E36C09', low: '375623' };
-  return map[level] || '000000';
+  return DESIGN.colors.threat[level] || DESIGN.colors.threat.default;
 }
 
 // ─── docx Builders ────────────────────────────────────────────────────────────
@@ -292,17 +293,24 @@ async function buildDocx(analysis, outputPath) {
   const games      = a.reportMeta?.gamesAnalyzed ?? 0;
   const confidence = confidenceBadge(a.reportMeta?.dataConfidence);
 
-  // Color palette
-  const NAVY  = '1F3864';
-  const BLUE  = '2E75B6';
-  const WHITE = 'FFFFFF';
-  const BLACK = '000000';
-  const LGRAY = 'D9E2F3';
-  const MGRAY = 'BDD0EA';
-  const ALTROW = 'F5F8FC';
+  // Color palette — centralized JoBu Scout design system
+  const NAVY   = DESIGN.colors.navy;
+  const GOLD   = DESIGN.colors.gold;
+  const BLUE   = DESIGN.colors.gold; // alias kept for compatibility
+  const WHITE  = DESIGN.colors.white;
+  const BLACK  = DESIGN.colors.black;
+  const LGRAY  = DESIGN.colors.parchment;
+  const MGRAY  = DESIGN.colors.mutedGold;
+  const ALTROW = DESIGN.colors.altRow;
+  const BODY_FONT = DESIGN.fonts.docxBody;
+  const HEADING_FONT = DESIGN.fonts.docxHeading;
+
+  const logoBuffer = fs.existsSync(DESIGN.brand.logoPath)
+    ? fs.readFileSync(DESIGN.brand.logoPath)
+    : null;
 
   // Border helpers
-  const thinBorder = { style: BorderStyle.SINGLE, size: 1, color: 'CCCCCC' };
+  const thinBorder = { style: BorderStyle.SINGLE, size: DESIGN.docx.table.borderSize, color: DESIGN.colors.borderGold };
   const allBorders = { top: thinBorder, bottom: thinBorder, left: thinBorder, right: thinBorder };
   const noBorder   = { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' };
   const noBorders  = { top: noBorder, bottom: noBorder, left: noBorder, right: noBorder };
@@ -322,7 +330,7 @@ async function buildDocx(analysis, outputPath) {
       verticalAlign: VerticalAlign.CENTER,
       children: [new Paragraph({
         alignment: align,
-        children: [new TextRun({ text: String(text ?? '—'), bold, color, size, font: 'Arial' })],
+        children: [new TextRun({ text: String(text ?? '—'), bold, color, size, font: 'Calibri' })],
       })],
     };
     if (colspan) cellProps.columnSpan = colspan;
@@ -337,8 +345,8 @@ async function buildDocx(analysis, outputPath) {
     return new Paragraph({
       heading: HeadingLevel.HEADING_1,
       spacing: { before: 240, after: 100 },
-      border:  { bottom: { style: BorderStyle.SINGLE, size: 8, color: BLUE, space: 1 } },
-      children: [new TextRun({ text, bold: true, color: NAVY, size: 26, font: 'Arial' })],
+      border:  { bottom: { style: BorderStyle.SINGLE, size: 8, color: GOLD, space: 1 } },
+      children: [new TextRun({ text, bold: true, color: NAVY, size: 26, font: 'Calibri' })],
     });
   }
 
@@ -346,7 +354,7 @@ async function buildDocx(analysis, outputPath) {
     return new Paragraph({
       heading: HeadingLevel.HEADING_2,
       spacing: { before: 140, after: 60 },
-      children: [new TextRun({ text, bold: true, color: BLUE, size: 20, font: 'Arial' })],
+      children: [new TextRun({ text, bold: true, color: GOLD, size: 20, font: 'Calibri' })],
     });
   }
 
@@ -354,7 +362,7 @@ async function buildDocx(analysis, outputPath) {
     const { bold = false, color = BLACK, italic = false } = opts;
     return new Paragraph({
       spacing: { after: 100 },
-      children: [new TextRun({ text: String(text ?? ''), bold, color, italic, size: 18, font: 'Arial' })],
+      children: [new TextRun({ text: String(text ?? ''), bold, color, italic, size: 18, font: 'Calibri' })],
     });
   }
 
@@ -362,7 +370,7 @@ async function buildDocx(analysis, outputPath) {
     return new Paragraph({
       numbering: { reference: 'bullets', level: 0 },
       spacing:   { after: 50 },
-      children:  [new TextRun({ text: String(text ?? ''), size: 18, font: 'Arial' })],
+      children:  [new TextRun({ text: String(text ?? ''), size: 18, font: 'Calibri' })],
     });
   }
 
@@ -374,8 +382,8 @@ async function buildDocx(analysis, outputPath) {
     return new Paragraph({
       spacing: { after: 70 },
       children: [
-        new TextRun({ text: `${label}: `, bold: true, size: 18, font: 'Arial', color: NAVY }),
-        new TextRun({ text: String(value ?? '—'), size: 18, font: 'Arial' }),
+        new TextRun({ text: `${label}: `, bold: true, size: 18, font: 'Calibri', color: NAVY }),
+        new TextRun({ text: String(value ?? '—'), size: 18, font: 'Calibri' }),
       ],
     });
   }
@@ -426,15 +434,26 @@ async function buildDocx(analysis, outputPath) {
   // COVER PAGE
   // ─────────────────────────────────────────────────────────────────────────
   const coverBlock = [
+    ...(logoBuffer ? [new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { before: 0, after: 40 },
+      children: [new ImageRun({
+        data: logoBuffer,
+        transformation: {
+          width: DESIGN.docx.logo.coverWidth,
+          height: DESIGN.docx.logo.coverHeight,
+        },
+      })],
+    })] : []),
     new Paragraph({
       alignment: AlignmentType.CENTER,
-      spacing:   { before: 0, after: 60 },
-      children:  [new TextRun({ text: 'VOODOO SCOUT', bold: true, size: 48, color: NAVY, font: 'Arial' })],
+      spacing:   { before: 0, after: 40 },
+      children:  [new TextRun({ text: DESIGN.brand.name, bold: true, size: DESIGN.docx.headings.coverTitleSize, color: NAVY, font: HEADING_FONT })],
     }),
     new Paragraph({
       alignment: AlignmentType.CENTER,
       spacing:   { after: 60 },
-      children:  [new TextRun({ text: 'Intelligence Report', size: 26, color: BLUE, font: 'Arial' })],
+      children:  [new TextRun({ text: DESIGN.brand.subtitle, bold: true, size: DESIGN.docx.headings.coverSubtitleSize, color: GOLD, font: HEADING_FONT })],
     }),
     new Paragraph({
       alignment: AlignmentType.CENTER,
@@ -446,19 +465,19 @@ async function buildDocx(analysis, outputPath) {
     new Paragraph({
       alignment: AlignmentType.CENTER,
       spacing:   { after: 60 },
-      children:  [new TextRun({ text: 'Scouting Report', bold: true, size: 36, color: NAVY, font: 'Arial' })],
+      children:  [new TextRun({ text: 'Scouting Report', bold: true, size: 36, color: NAVY, font: 'Calibri' })],
     }),
     new Paragraph({
       alignment: AlignmentType.CENTER,
       spacing:   { after: 40 },
-      children:  [new TextRun({ text: teamName, size: 30, color: BLUE, font: 'Arial' })],
+      children:  [new TextRun({ text: teamName, size: 30, color: GOLD, font: 'Calibri' })],
     }),
     new Paragraph({
       alignment: AlignmentType.CENTER,
       spacing:   { after: 40 },
       children:  [new TextRun({
         text: `Record: ${a._record?.wins ?? '?'}-${a._record?.losses ?? '?'}`,
-        size: 22, color: '595959', font: 'Arial', italic: true,
+        size: 22, color: '595959', font: 'Calibri', italic: true,
       })],
     }),
     spacer(80),
@@ -1018,7 +1037,7 @@ async function buildDocx(analysis, outputPath) {
         pageBreakBefore: true,
         heading: HeadingLevel.HEADING_1,
         spacing: { before:0, after:120 },
-        children: [new TextRun({ text: playerLabel(player.name), bold:true, size:32, color:NAVY, font:'Arial' })],
+        children: [new TextRun({ text: playerLabel(player.name), bold:true, size:32, color:NAVY, font:'Calibri' })],
       });
     })();
 
@@ -1233,31 +1252,41 @@ async function buildDocx(analysis, outputPath) {
       }],
     },
     styles: {
-      default: { document: { run: { font:'Arial', size:18 } } },
+      default: { document: { run: { font:'Calibri', size:18 } } },
       paragraphStyles: [
         { id:'Heading1', name:'Heading 1', basedOn:'Normal', next:'Normal', quickFormat:true,
-          run:{ size:26, bold:true, font:'Arial', color:NAVY },
+          run:{ size:26, bold:true, font:'Calibri', color:NAVY },
           paragraph:{ spacing:{ before:240, after:100 }, outlineLevel:0 } },
         { id:'Heading2', name:'Heading 2', basedOn:'Normal', next:'Normal', quickFormat:true,
-          run:{ size:20, bold:true, font:'Arial', color:BLUE },
+          run:{ size:20, bold:true, font:'Calibri', color:GOLD },
           paragraph:{ spacing:{ before:140, after:60 }, outlineLevel:1 } },
       ],
     },
     sections: [{
       properties: {
         page: {
-          size:   { width:12240, height:15840 },
-          margin: { top:900, right:900, bottom:900, left:900 },
+          size:   { width:DESIGN.docx.page.width, height:DESIGN.docx.page.height },
+          margin: DESIGN.docx.page.margin,
         },
       },
       headers: {
         default: new Header({
           children: [new Paragraph({
             spacing: { after:50 },
-            border:  { bottom:{ style:BorderStyle.SINGLE, size:6, color:BLUE, space:1 } },
+            border:  { bottom:{ style:BorderStyle.SINGLE, size:DESIGN.docx.header.borderSize, color:GOLD, space:1 } },
             children: [
-              new TextRun({ text:`VOODOO SCOUT  |  ${teamName}`, bold:true, size:16, color:NAVY, font:'Arial' }),
-              new TextRun({ text:`\t${generated}`, size:16, color:'595959', font:'Arial' }),
+              ...(logoBuffer ? [
+                new ImageRun({
+                  data: logoBuffer,
+                  transformation: {
+                    width: DESIGN.docx.logo.headerWidth,
+                    height: DESIGN.docx.logo.headerHeight,
+                  },
+                }),
+                new TextRun({ text: '  ' }),
+              ] : []),
+              new TextRun({ text:`${DESIGN.brand.name}  |  ${teamName}`, bold:true, size:DESIGN.docx.header.fontSize, color:NAVY, font:HEADING_FONT }),
+              new TextRun({ text:`	${generated}`, size:DESIGN.docx.header.fontSize, color:DESIGN.colors.grayText, font:BODY_FONT }),
             ],
             tabStops: [{ type:TabStopType.RIGHT, position:TabStopPosition.MAX }],
           })],
@@ -1267,11 +1296,11 @@ async function buildDocx(analysis, outputPath) {
         default: new Footer({
           children: [new Paragraph({
             spacing: { before:50 },
-            border:  { top:{ style:BorderStyle.SINGLE, size:6, color:BLUE, space:1 } },
+            border:  { top:{ style:BorderStyle.SINGLE, size:6, color:GOLD, space:1 } },
             alignment: AlignmentType.CENTER,
             children: [
-              new TextRun({ text:'CONFIDENTIAL — For coaching staff use only  |  Page ', size:16, color:'595959', font:'Arial' }),
-              new TextRun({ children:[PageNumber.CURRENT], size:16, color:'595959', font:'Arial' }),
+              new TextRun({ text:`${DESIGN.docx.footer.text}  |  Page `, size:DESIGN.docx.footer.fontSize, color:DESIGN.colors.grayText, font:BODY_FONT }),
+              new TextRun({ children:[PageNumber.CURRENT], size:DESIGN.docx.footer.fontSize, color:DESIGN.colors.grayText, font:BODY_FONT }),
             ],
           })],
         }),
@@ -1364,8 +1393,8 @@ function buildReportHtml(analysis) {
     return j ? `#${j} ${name}` : name;
   }
   function threatBadge(level) {
-    const colors = { high:'#C00000', medium:'#E36C09', low:'#375623' };
-    return `<span style="background:${colors[level]||'#666'};color:white;padding:2px 8px;border-radius:3px;font-size:10px;font-weight:bold">${(level||'').toUpperCase()}</span>`;
+    const cls = { high:'threat-high', medium:'threat-medium', low:'threat-low' };
+    return `<span class="${cls[level]||'threat-low'}">${(level||'').toUpperCase()}</span>`;
   }
   function bullets(arr) {
     if (!arr || !arr.length) return '<p style="color:#888;font-style:italic">None identified.</p>';
@@ -1449,12 +1478,13 @@ function buildReportHtml(analysis) {
     `;
 
     const activeRosterHtml = activeSetH.size > 0
-      ? '<h4 class="sub">Active Roster — Last ' + arWindowH + '/' + arTotalH + ' Scouted Games</h4>' +
-        '<p class="note-italic">Players below appeared in at least 1 of the last ' + arWindowH + ' scouted games and are assumed to be active for your matchup. ' +
-        'Players <strong>not</strong> listed had zero appearances in that window and may be injured, inactive, or released.</p>' +
-        '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">' +
+      ? '<h4 class="sub">Active Roster (Last ' + arWindowH + '/' + arTotalH + ' Scouted Games)</h4>' +
+        '<p class="note-italic">Players below appeared in at least 1 of the last ' + arWindowH + ' scouted games. ' +
+        'Players <strong>not</strong> listed had zero appearances in that window and may be injured, inactive, or released. ' +
+        'Roster was filtered to ' + activeSetH.size + ' active players.</p>' +
+        '<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:8px;margin-bottom:8px">' +
           [...activeSetH].sort().map(name =>
-            '<span style="background:#1a3a5c;color:#fff;border-radius:4px;padding:3px 10px;font-size:0.85em;font-weight:600">' + esc(playerLabel(name)) + '</span>'
+            '<span class="roster-tag">' + esc(playerLabel(name)) + '</span>'
           ).join('') +
         '</div>'
       : '';
@@ -1511,9 +1541,9 @@ function buildReportHtml(analysis) {
       <td><strong>${playerLabel(p.name)}</strong></td>
       <td>${fmtH(bp.total_ip??p.ip,1)}</td>
       <td>${fmtH(bp.era??p.era,2)}</td>
-      <td>${fmtH(p.k_bb,2)}</td>
+      <td>${fmtH(bp.whip??p.whip,3)}</td>
       <td>${threatBadge(p.threat)}</td>
-      <td style="font-size:11px">${p.note||''}</td>
+      <td style="font-size:11px;text-align:left">${p.note||''}</td>
     </tr>`;
   }).join('');
 
@@ -1625,14 +1655,14 @@ function buildReportHtml(analysis) {
 
       <h4 class="sub">Swing Decisions</h4>
       <table style="width:100%">
-        <thead><tr><th>Count</th><th>Swing %</th><th>Take K %</th><th>n</th></tr></thead>
+        <thead><tr><th>Count</th><th>Swing %</th><th>Take K%</th><th>n</th></tr></thead>
         <tbody>${swingRows}</tbody>
       </table>
     </div>
   </div>
 
   <!-- Scout note full width -->
-  ${p.scoutingNote ? `<p style="margin-top:14px;line-height:1.6">${p.scoutingNote}</p>` : ''}
+  ${p.scoutingNote ? `<p style="margin-top:14px;line-height:1.6;font-family:'Inter',sans-serif">${p.scoutingNote}</p>` : ''}
 `;
   }).join('');
 
@@ -1640,44 +1670,208 @@ function buildReportHtml(analysis) {
 <html>
 <head>
 <meta charset="UTF-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Oswald:wght@400;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
+  /* ── Reset ── */
   * { margin:0; padding:0; box-sizing:border-box; }
-  body { font-family:Arial, sans-serif; font-size:12px; color:#222; background:white; }
-  .page { padding:36px 44px; }
-  h1.report-title { font-size:30px; color:#1F3864; text-align:center; letter-spacing:2px; }
-  h2.report-sub   { font-size:17px; color:#2E75B6; text-align:center; margin-bottom:6px; }
-  .team-name  { font-size:24px; font-weight:bold; color:#1F3864; text-align:center; margin:14px 0 4px; }
-  .meta-line  { text-align:center; color:#666; font-size:11px; margin-bottom:4px; }
-  hr.title-rule { border:none; border-top:3px solid #1F3864; margin:14px 0; }
-  h3.section  { font-size:15px; font-weight:bold; color:#1F3864; border-bottom:2px solid #2E75B6;
-                padding-bottom:3px; margin:24px 0 10px; text-transform:uppercase; letter-spacing:1px; }
-  h4.sub      { font-size:12px; font-weight:bold; color:#2E75B6; margin:12px 0 5px; }
-  p  { margin-bottom:7px; line-height:1.5; }
-  ul { margin:4px 0 9px 22px; }
-  li { margin-bottom:3px; line-height:1.5; }
-  table { width:100%; border-collapse:collapse; margin-bottom:14px; font-size:11px; }
-  th { background:#1F3864; color:white; padding:5px 6px; text-align:center; font-size:10px; }
-  td { padding:4px 6px; border-bottom:1px solid #e0e0e0; text-align:center; vertical-align:middle; }
-  td:first-child { text-align:left; }
-  tr:nth-child(even) td { background:#f5f8fc; }
-  .stat-grid { display:grid; grid-template-columns:repeat(5,1fr); gap:10px; margin-bottom:14px; }
-  .stat-box  { border:1px solid #ccc; border-radius:4px; padding:8px; text-align:center; }
-  .stat-val  { font-size:20px; font-weight:bold; color:#1F3864; }
-  .stat-lbl  { font-size:9px; color:#666; text-transform:uppercase; margin-top:2px; }
-  .note-italic { font-style:italic; color:#555; font-size:11px; }
-  .page-break { page-break-before:always; }
-  @media print { .page { padding:20px 28px; } body { font-size:11px; } }
+
+  /* ── Base ── */
+  body {
+    font-family: 'Inter', system-ui, sans-serif;
+    font-size: 12px;
+    color: #1a1a2e;
+    background: white;
+  }
+
+  .page { padding: 36px 44px; }
+
+  /* ── Cover ── */
+  .cover-logo {
+    text-align: center;
+    margin-bottom: 6px;
+  }
+  h1.report-title {
+    font-family: 'Bebas Neue', 'Impact', sans-serif;
+    font-size: 52px;
+    color: #0c121c;
+    text-align: center;
+    letter-spacing: 4px;
+    line-height: 1;
+    margin-bottom: 2px;
+  }
+  h1.report-title span {
+    color: #c79a45;
+  }
+  h2.report-sub {
+    font-family: 'Oswald', sans-serif;
+    font-size: 14px;
+    font-weight: 600;
+    color: #c79a45;
+    text-align: center;
+    letter-spacing: 4px;
+    text-transform: uppercase;
+    margin-bottom: 10px;
+  }
+  .team-name {
+    font-family: 'Oswald', sans-serif;
+    font-size: 26px;
+    font-weight: 700;
+    color: #0c121c;
+    text-align: center;
+    margin: 14px 0 4px;
+  }
+  .team-sub {
+    font-family: 'Oswald', sans-serif;
+    font-size: 20px;
+    font-weight: 400;
+    color: #c79a45;
+    text-align: center;
+    margin-bottom: 4px;
+  }
+  .meta-line {
+    text-align: center;
+    color: #555;
+    font-size: 11px;
+    font-family: 'Inter', sans-serif;
+    margin-bottom: 4px;
+  }
+  hr.title-rule {
+    border: none;
+    border-top: 2px solid #0c121c;
+    margin: 12px 0;
+  }
+  hr.gold-rule {
+    border: none;
+    border-top: 2px solid #c79a45;
+    margin: 8px 0;
+  }
+
+  /* ── Section headings ── */
+  h3.section {
+    font-family: 'Oswald', sans-serif;
+    font-size: 15px;
+    font-weight: 700;
+    color: #0c121c;
+    border-bottom: 2px solid #c79a45;
+    padding-bottom: 4px;
+    margin: 24px 0 12px;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+  }
+  h4.sub {
+    font-family: 'Oswald', sans-serif;
+    font-size: 12px;
+    font-weight: 600;
+    color: #c79a45;
+    margin: 14px 0 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+  }
+
+  /* ── Body text ── */
+  p  { margin-bottom: 7px; line-height: 1.55; font-family: 'Inter', sans-serif; }
+  ul { margin: 4px 0 9px 22px; }
+  li { margin-bottom: 4px; line-height: 1.55; font-family: 'Inter', sans-serif; }
+
+  /* ── Tables ── */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 14px;
+    font-size: 11px;
+    font-family: 'Inter', sans-serif;
+  }
+  th {
+    background: #0c121c;
+    color: #ece7da;
+    padding: 5px 7px;
+    text-align: center;
+    font-family: 'Oswald', sans-serif;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+  }
+  td {
+    padding: 4px 7px;
+    border-bottom: 1px solid #ddd8cc;
+    text-align: center;
+    vertical-align: middle;
+  }
+  td:first-child { text-align: left; }
+  tr:nth-child(even) td { background: #f5f2ec; }
+  tr.ps-detail-row td { background: transparent !important; }
+
+  /* ── Stat grid (overview boxes) ── */
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 10px;
+    margin-bottom: 14px;
+  }
+  .stat-box {
+    border: 1px solid #c4b89a;
+    border-radius: 4px;
+    padding: 10px 8px;
+    text-align: center;
+    background: #faf8f4;
+  }
+  .stat-val {
+    font-family: 'Oswald', sans-serif;
+    font-size: 22px;
+    font-weight: 700;
+    color: #0c121c;
+  }
+  .stat-lbl {
+    font-family: 'Inter', sans-serif;
+    font-size: 9px;
+    color: #7a7060;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-top: 2px;
+  }
+
+  /* ── Threat badge ── */
+  .threat-high   { background:#c00000; color:white; padding:2px 9px; border-radius:3px; font-size:10px; font-weight:700; font-family:'Oswald',sans-serif; letter-spacing:0.5px; }
+  .threat-medium { background:#e36c09; color:white; padding:2px 9px; border-radius:3px; font-size:10px; font-weight:700; font-family:'Oswald',sans-serif; letter-spacing:0.5px; }
+  .threat-low    { background:#375623; color:white; padding:2px 9px; border-radius:3px; font-size:10px; font-weight:700; font-family:'Oswald',sans-serif; letter-spacing:0.5px; }
+
+  /* ── Active roster tags ── */
+  .roster-tag {
+    display: inline-block;
+    background: #0c121c;
+    color: #ece7da;
+    border-radius: 3px;
+    padding: 3px 10px;
+    font-size: 0.85em;
+    font-weight: 600;
+    font-family: 'Inter', sans-serif;
+    margin: 2px;
+  }
+
+  /* ── Misc ── */
+  .note-italic { font-style: italic; color: #666; font-size: 11px; font-family: 'Inter', sans-serif; }
+  .page-break  { page-break-before: always; }
+  strong       { font-weight: 600; }
+
+  /* ── Print overrides ── */
+  @media print {
+    .page { padding: 20px 28px; }
+    body  { font-size: 11px; }
+  }
 </style>
 </head>
 <body>
 <div class="page">
 
 <!-- Cover -->
-<h1 class="report-title">VOODOO SCOUT</h1>
+<h1 class="report-title">JOBU <span>SCOUT</span></h1>
 <h2 class="report-sub">Intelligence Report</h2>
 <hr class="title-rule">
 <div class="team-name">Scouting Report</div>
-<div class="team-name" style="font-size:20px">${teamName}</div>
+<div class="team-sub">${teamName}</div>
 <div class="meta-line" style="font-style:italic">Record: ${a._record?.wins??'?'}-${a._record?.losses??'?'}</div>
 <div class="meta-line">Generated: ${generated} &nbsp;|&nbsp; ${games} game${games!==1?'s':''} analyzed &nbsp;|&nbsp; Confidence: ${confidence}</div>
 <hr class="title-rule">
@@ -1725,10 +1919,10 @@ ${conditionsHtml}
 ${bat.vulnerabilities?`<p class="note-italic">${bat.vulnerabilities}</p>`:''}
 <h4 class="sub">Hitters to Watch</h4>
 ${(bat.protectedHitters||[]).map(h=>`
-  <div style="display:flex;align-items:center;gap:10px;margin-bottom:7px;padding:7px;border:1px solid #ddd;border-radius:4px">
-    <div style="font-weight:bold;min-width:150px">${playerLabel(h.name)}</div>
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:7px;padding:8px 10px;border:1px solid #ddd8cc;border-radius:4px;background:#faf8f4">
+    <div style="font-weight:600;font-family:'Oswald',sans-serif;min-width:160px;color:#0c121c">${playerLabel(h.name)}</div>
     ${threatBadge(h.threat)}
-    <div style="font-size:12px;color:#333">${h.note}</div>
+    <div style="font-size:11px;color:#333;font-family:'Inter',sans-serif">${h.note}</div>
   </div>`).join('')||'<p style="color:#888;font-style:italic">None identified.</p>'}
 
 <!-- Pitching -->
@@ -1736,7 +1930,7 @@ ${(bat.protectedHitters||[]).map(h=>`
 <h3 class="section">Pitching Analysis</h3>
 <p>${pit.staffNotes||'Insufficient data.'}</p>
 <table>
-  <thead><tr><th style="text-align:left">Pitcher</th><th>IP</th><th>ERA</th><th>K/BB</th><th>Threat</th><th style="text-align:left">Scout Note</th></tr></thead>
+  <thead><tr><th style="text-align:left">Pitcher</th><th>IP</th><th>ERA</th><th>WHIP</th><th>Threat</th><th style="text-align:left">Scout Note</th></tr></thead>
   <tbody>${pitcherRows||'<tr><td colspan="6" style="color:#888;text-align:center">No pitching data</td></tr>'}</tbody>
 </table>
 <h4 class="sub">Fatigue / Overuse Risk</h4><p>${pit.fatigueRisk||'Unknown.'}</p>
@@ -1785,9 +1979,72 @@ ${playerDetailPages}
 </html>`;
 }
 
-// ─── buildPdf ─────────────────────────────────────────────────────────────────
+// ─── PDF from DOCX via LibreOffice ───────────────────────────────────────────
 
-async function buildPdf(analysis, outputPath) {
+function findSofficeCommand() {
+  const candidates = process.platform === 'win32'
+    ? [
+        process.env.LIBREOFFICE_PATH,
+        'soffice.exe',
+        'libreoffice.exe',
+        'C:\\Program Files\\LibreOffice\\program\\soffice.exe',
+        'C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe',
+      ].filter(Boolean)
+    : [
+        process.env.LIBREOFFICE_PATH,
+        'soffice',
+        'libreoffice',
+      ].filter(Boolean);
+
+  for (const cmd of candidates) {
+    const result = spawnSync(cmd, ['--version'], { encoding: 'utf8', windowsHide: true });
+    if (!result.error && result.status === 0) return cmd;
+  }
+  return null;
+}
+
+async function buildPdfFromDocx(docxPath, outputPath) {
+  if (!fs.existsSync(docxPath)) {
+    throw new Error(`DOCX file not found: ${docxPath}`);
+  }
+
+  const soffice = findSofficeCommand();
+  if (!soffice) {
+    throw new Error('LibreOffice/soffice was not found. Install LibreOffice or set LIBREOFFICE_PATH to the soffice executable.');
+  }
+
+  const outputDir = path.dirname(outputPath);
+  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+
+  const result = spawnSync(soffice, [
+    '--headless',
+    '--convert-to', 'pdf',
+    '--outdir', outputDir,
+    docxPath,
+  ], { encoding: 'utf8', windowsHide: true });
+
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(result.stderr || result.stdout || `LibreOffice exited with code ${result.status}`);
+  }
+
+  const convertedPath = path.join(outputDir, path.basename(docxPath, path.extname(docxPath)) + '.pdf');
+  if (!fs.existsSync(convertedPath)) {
+    throw new Error(`LibreOffice completed but PDF was not found at ${convertedPath}`);
+  }
+
+  if (convertedPath !== outputPath) {
+    if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+    fs.renameSync(convertedPath, outputPath);
+  }
+
+  console.log(`[report] PDF saved from DOCX: ${outputPath}`);
+  return outputPath;
+}
+
+// Legacy HTML/PDF builder retained for troubleshooting only. The production PDF
+// uses buildPdfFromDocx so the PDF matches the Word/desired format.
+async function buildHtmlPdf(analysis, outputPath) {
   const { chromium } = require('@playwright/test');
   const html = buildReportHtml(analysis);
   const browser = await chromium.launch({ headless: true });
@@ -1866,9 +2123,9 @@ async function generateReport(analysis, outputDir = './reports') {
     throw err;
   }
   try {
-    await buildPdf(analysis, pdfPath);
+    await buildPdfFromDocx(docxPath, pdfPath);
   } catch (err) {
-    console.error('[report] buildPdf failed:', err.message);
+    console.error('[report] buildPdfFromDocx failed:', err.message);
     throw err;
   }
 
@@ -1877,4 +2134,4 @@ async function generateReport(analysis, outputDir = './reports') {
 
 // ─── Exports ──────────────────────────────────────────────────────────────────
 
-module.exports = { generateReport, buildDocx, buildPdf, buildReportHtml };
+module.exports = { generateReport, buildDocx, buildPdfFromDocx, buildHtmlPdf, buildReportHtml };

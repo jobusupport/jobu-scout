@@ -323,7 +323,7 @@ function fmtNum(v, d = 2) {
 
 function buildAnalysisPrompt(bundle, options = {}) {
   const { team, games, tendencies, meta,
-          playerAdvanced, oppPitchers } = bundle;
+          playerAdvanced = [], oppPitchers = [] } = bundle;
 
   // Filter bundle.batting and bundle.pitching to opponent-only rows (is_our_team=0).
   // Without this filter, every player from every game appears in the report regardless
@@ -635,7 +635,7 @@ Return this EXACT JSON schema — fill every field, null if truly unknown:
 async function analyzeTeam(teamId, options = {}) {
   console.log(`\n[analyzer] Fetching bundle for team ${teamId}...`);
 
-  const bundle = pipeline.getTeamBundle(teamId);
+  const bundle = await pipeline.getTeamBundle(teamId);
   if (!bundle || !bundle.team) throw new Error(`No team found with id: ${teamId}`);
 
   console.log(`[analyzer] Team: ${bundle.team.team_name}`);

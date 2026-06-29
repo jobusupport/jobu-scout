@@ -72,7 +72,13 @@ async function runForTeam(team) {
   console.log(`Generating report: ${team.team_name}`);
   console.log('='.repeat(60));
   const analysis = await analyzer.analyzeTeam(team.id, analyzerOptions);
-  const paths    = await report.generateReport(analysis, REPORTS_DIR);
+  let paths;
+try {
+  paths = await report.generateReport(analysis, REPORTS_DIR);
+} catch (err) {
+  console.error('[report] FULL ERROR:', err);
+  throw err;
+}
   console.log(`\n✓ Report complete for: ${team.team_name}`);
   console.log(`  Word: ${paths.docx}`);
   console.log(`  PDF:  ${paths.pdf}`);
@@ -117,6 +123,6 @@ async function main() {
 
 main().catch(err => {
   console.error('\nReport generation failed:');
-  console.error(err.message);
+  console.error(err.stack || err);
   process.exit(1);
 });

@@ -445,22 +445,37 @@ function recalculateTeamStats(teamId, options = {}) {
  * Get everything the AI layer needs for a team.
  * Returns a rich JSON bundle ready to feed into Claude.
  */
-function getTeamBundle(teamId) {
-  const bundle = runSync(() => Promise.resolve(db.getTeamAnalysisBundle(teamId)));
+async function getTeamBundle(teamId) {
+  const bundle = await Promise.resolve(db.getTeamAnalysisBundle(teamId)) || {};
 
   // Report convention: the scouted team is stored as is_our_team=0.
   // Do not overwrite this with is_our_team=1, or opponent players will appear
   // as the scouted team after an inverted/reingested opponent scrape.
-  bundle.playerAdvanced  = runSync(() => Promise.resolve(db.getPlayerAdvancedStats(teamId, 0)));
-  bundle.opponentBatters = runSync(() => Promise.resolve(db.getPlayerAdvancedStats(teamId, 1)));
-  bundle.ourPitchers     = runSync(() => Promise.resolve(db.getPitcherAdvancedStats(teamId, 0)));
-  bundle.oppPitchers     = runSync(() => Promise.resolve(db.getPitcherAdvancedStats(teamId, 1)));
+  const [
+    playerAdvanced,
+    opponentBatters,
+    ourPitchers,
+    oppPitchers,
+  ] = await Promise.all([
+    Promise.resolve(db.getPlayerAdvancedStats(teamId, 0)),
+    Promise.resolve(db.getPlayerAdvancedStats(teamId, 1)),
+    Promise.resolve(db.getPitcherAdvancedStats(teamId, 0)),
+    Promise.resolve(db.getPitcherAdvancedStats(teamId, 1)),
+  ]);
+
+  bundle.playerAdvanced  = Array.isArray(playerAdvanced)  ? playerAdvanced  : [];
+  bundle.opponentBatters = Array.isArray(opponentBatters) ? opponentBatters : [];
+  bundle.ourPitchers     = Array.isArray(ourPitchers)     ? ourPitchers     : [];
+  bundle.oppPitchers     = Array.isArray(oppPitchers)     ? oppPitchers     : [];
 
   // Parse swing_decisions JSON for each player
-  for (const p of [...(bundle.playerAdvanced || []), ...(bundle.opponentBatters || [])]) {
+  for (const p of [...bundle.playerAdvanced, ...bundle.opponentBatters]) {
     if (p.swing_decisions) {
-      try { p.swingDecisions = JSON.parse(p.swing_decisions); }
-      catch { p.swingDecisions = null; }
+      try {
+        p.swingDecisions = JSON.parse(p.swing_decisions);
+      } catch {
+        p.swingDecisions = null;
+      }
     }
   }
 
