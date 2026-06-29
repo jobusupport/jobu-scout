@@ -303,9 +303,21 @@ function cleanTeamName(name) {
 
 function isMissingRelationError(err) {
   const msg = String(err?.message || err || '').toLowerCase();
+  const code = String(err?.code || '').toUpperCase();
+
   return (
-    msg.includes('relation') && msg.includes('does not exist') ||
+    // Missing table/relation
+    (msg.includes('relation') && msg.includes('does not exist')) ||
     msg.includes('could not find the table') ||
+
+    // Missing column in Supabase/PostgREST schema cache. This lets optional
+    // customer schemas work without requiring profiles.org_id specifically.
+    (msg.includes('column') && msg.includes('does not exist')) ||
+    msg.includes('could not find') && msg.includes('column') ||
+    code === '42703' ||
+    code === 'PGRST204' ||
+
+    // Generic PostgREST schema cache miss
     msg.includes('schema cache')
   );
 }
