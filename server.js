@@ -103,17 +103,55 @@ function finishJob(id, success, exitCode) {
   jobs[id].exitCode   = exitCode;
   jobs[id].finishedAt = Date.now();
   jobs[id].proc       = null;
+  jobs[id].pid        = null;
 }
-function spawnJob(id, cmd, args, cwd, env = {}) {
-  const proc = spawn(cmd, args, {
-    cwd, env: { ...process.env, ...env }, shell: false,
-  });
+
+function attachJobProcess(id, proc) {
+  if (!jobs[id]) return;
   jobs[id].pid  = proc.pid;
   jobs[id].proc = proc;
+}
+
+function stopJobProcess(job) {
+  if (!job || !job.proc || !job.pid) return false;
+
+  if (process.platform === 'win32') {
+    spawn('taskkill', ['/pid', String(job.pid), '/f', '/t'], { shell: true });
+    return true;
+  }
+
+  // Child processes are spawned detached on Linux so this kills the whole
+  // Playwright/Node process group, not just the parent node process.
+  try {
+    process.kill(-job.pid, 'SIGTERM');
+  } catch {
+    try { process.kill(job.pid, 'SIGTERM'); } catch {}
+  }
+
+  setTimeout(() => {
+    if (job.status === 'running' && job.pid) {
+      try { process.kill(-job.pid, 'SIGKILL'); } catch { try { process.kill(job.pid, 'SIGKILL'); } catch {} }
+    }
+  }, 5000).unref?.();
+
+  return true;
+}
+
+function spawnJob(id, cmd, args, cwd, env = {}) {
+  const proc = spawn(cmd, args, {
+    cwd,
+    env: { ...process.env, ...env },
+    shell: false,
+    detached: process.platform !== 'win32',
+  });
+  attachJobProcess(id, proc);
   const onData = chunk => String(chunk).split('\n').filter(Boolean).forEach(l => appendLog(id, l));
   proc.stdout.on('data', onData);
   proc.stderr.on('data', onData);
-  proc.on('close', code => finishJob(id, code === 0, code));
+  proc.on('close', code => {
+    if (jobs[id]?.stopping) return finishJob(id, false, -1);
+    finishJob(id, code === 0, code);
+  });
   return proc;
 }
 
@@ -121,13 +159,24 @@ function spawnJob(id, cmd, args, cwd, env = {}) {
 function makeRunStep(id) {
   return function runStep(cmd, args, cwd, env = {}) {
     return new Promise((resolve, reject) => {
+      if (jobs[id]?.stopping) return reject(new Error('Job stopped by user'));
+
       const proc = spawn(cmd, args, {
-        cwd, shell: false, env: { ...process.env, ...env },
+        cwd,
+        shell: false,
+        env: { ...process.env, ...env },
+        detached: process.platform !== 'win32',
       });
+      attachJobProcess(id, proc);
       const onData = chunk => String(chunk).split('\n').filter(Boolean).forEach(l => appendLog(id, l));
       proc.stdout.on('data', onData);
       proc.stderr.on('data', onData);
-      proc.on('close', code => code === 0 ? resolve() : reject(new Error(`Exit ${code}`)));
+      proc.on('close', code => {
+        if (jobs[id]?.stopping) return reject(new Error('Job stopped by user'));
+        jobs[id].proc = null;
+        jobs[id].pid  = null;
+        return code === 0 ? resolve() : reject(new Error(`Exit ${code}`));
+      });
     });
   };
 }
@@ -607,24 +656,24 @@ app.get('/api/jobs/:id/stream', async (req, res) => {
 });
 
 // POST /api/jobs/:id/stop
-app.post('/api/jobs/:id/stop', (req, res) => {
+app.post('/api/jobs/:id/stop', requireAuth, (req, res) => {
   const job = jobs[req.params.id];
   if (!job) return res.status(404).json({ error: 'Job not found' });
   if (job.status !== 'running') return res.json({ ok: true, message: 'Job already finished' });
+
+  job.stopping = true;
+  appendLog(req.params.id, '✗ Stop requested by user');
+
   try {
-    if (job.proc && job.pid) {
-      if (process.platform === 'win32') {
-        spawn('taskkill', ['/pid', String(job.pid), '/f', '/t'], { shell: true });
-      } else {
-        process.kill(-job.proc.pid, 'SIGTERM');
-      }
-    }
-    appendLog(req.params.id, '✗ Job stopped by user');
+    const stopped = stopJobProcess(job);
+    if (!stopped) appendLog(req.params.id, 'No active child process was attached to this job.');
     finishJob(req.params.id, false, -1);
-  } catch {
+    return res.json({ ok: true, stopped });
+  } catch (err) {
+    appendLog(req.params.id, `Stop failed: ${err.message}`);
     finishJob(req.params.id, false, -1);
+    return res.status(500).json({ error: err.message });
   }
-  res.json({ ok: true });
 });
 
 // POST /api/run/gc-scraper
@@ -948,6 +997,105 @@ app.post('/api/teams/add', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('[api/teams/add]', err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ── Edit / Remove Team ───────────────────────────────────────────────────────
+app.put('/api/teams/:id', requireAuth, async (req, res) => {
+  const { teamName, gcTeamUrl, pgTeamUrl } = req.body;
+  const teamId = req.params.id;
+
+  if (!teamName || !String(teamName).trim()) {
+    return res.status(400).json({ error: 'teamName is required' });
+  }
+
+  try {
+    if (USE_SUPABASE) {
+      const orgId = await getRequestOrgId(req);
+      await assertTeamInRequestOrg(req, teamId);
+
+      const { data: existingName, error: nameError } = await adminClient
+        .from('teams')
+        .select('id')
+        .eq('org_id', orgId)
+        .ilike('team_name', String(teamName).trim())
+        .neq('id', teamId)
+        .maybeSingle();
+
+      if (nameError) throw nameError;
+      if (existingName) {
+        return res.status(409).json({ error: `Another opponent already uses the name "${teamName}".` });
+      }
+
+      const { error } = await adminClient
+        .from('teams')
+        .update({
+          team_name: String(teamName).trim(),
+          gc_team_url: gcTeamUrl ? String(gcTeamUrl).trim() : null,
+          pg_team_url: pgTeamUrl ? String(pgTeamUrl).trim() : null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', teamId)
+        .eq('org_id', orgId);
+
+      if (error) throw error;
+      return res.json({ ok: true });
+    }
+
+    const db = new (getSQLiteDatabase())(DB_PATH);
+    const existing = db.prepare(`SELECT id FROM teams WHERE LOWER(TRIM(team_name)) = LOWER(TRIM(?)) AND id <> ?`).get(teamName, teamId);
+    if (existing) { db.close(); return res.status(409).json({ error: `Another opponent already uses the name "${teamName}".` }); }
+    db.prepare(`UPDATE teams SET team_name = ?, gc_team_url = ?, pg_team_url = ?, updated_at = datetime('now') WHERE id = ?`)
+      .run(String(teamName).trim(), gcTeamUrl || null, pgTeamUrl || null, teamId);
+    db.close();
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('[api/teams/:id PUT]', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/teams/:id', requireAuth, async (req, res) => {
+  const teamId = req.params.id;
+
+  try {
+    if (USE_SUPABASE) {
+      const orgId = await getRequestOrgId(req);
+      await assertTeamInRequestOrg(req, teamId);
+
+      const { count: gameCount, error: gamesError } = await adminClient
+        .from('games')
+        .select('id', { count: 'exact', head: true })
+        .eq('team_id', teamId);
+      if (gamesError) throw gamesError;
+
+      if ((gameCount || 0) > 0) {
+        return res.status(409).json({
+          error: `This opponent has ${gameCount} game(s) attached. Remove is blocked to protect scouting history.`,
+        });
+      }
+
+      await adminClient.from('team_game_urls').delete().eq('team_id', teamId);
+      const { error } = await adminClient
+        .from('teams')
+        .delete()
+        .eq('id', teamId)
+        .eq('org_id', orgId);
+      if (error) throw error;
+      return res.json({ ok: true });
+    }
+
+    const db = new (getSQLiteDatabase())(DB_PATH);
+    const gameCount = db.prepare(`SELECT COUNT(*) AS n FROM games WHERE team_id = ?`).get(teamId)?.n || 0;
+    if (gameCount > 0) { db.close(); return res.status(409).json({ error: `This opponent has ${gameCount} game(s) attached. Remove is blocked to protect scouting history.` }); }
+    db.prepare(`DELETE FROM team_game_urls WHERE team_id = ?`).run(teamId);
+    db.prepare(`DELETE FROM teams WHERE id = ?`).run(teamId);
+    db.close();
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('[api/teams/:id DELETE]', err);
+    return res.status(500).json({ error: err.message });
   }
 });
 
