@@ -326,6 +326,7 @@ async function getAllTeams() {
 async function insertGame(game) {
   const sb = getDb();
   const orgId = normalizeNullable(game.orgId || game.org_id) || await getOrgIdForTeam(game.teamId);
+  const ourTeamId = game.ourTeamId || game.our_team_id || game.teamId;
 
   // Dedup check scoped to the team's org.
   if (game.gcGameId) {
@@ -345,6 +346,7 @@ async function insertGame(game) {
   const payload = {
     org_id:            orgId,
     team_id:           game.teamId,
+    our_team_id:       ourTeamId,
     gc_game_id:        game.gcGameId        || null,
     gc_game_url:       game.gcGameUrl       || null,
     game_date:         game.gameDate        || null,
@@ -369,9 +371,11 @@ async function insertGame(game) {
 
 async function updateExistingGame(gameId, game) {
   const orgId = normalizeNullable(game.orgId || game.org_id) || await getOrgIdForTeam(game.teamId);
+  const ourTeamId = game.ourTeamId || game.our_team_id || game.teamId;
   const { error } = await getDb().from('games').update({
     org_id:            orgId,
     team_id:           game.teamId,
+    our_team_id:       ourTeamId,
     gc_game_url:       game.gcGameUrl       || null,
     game_date:         game.gameDate        || null,
     game_time:         game.gameTime        || null,

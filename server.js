@@ -656,7 +656,7 @@ app.get('/api/jobs/:id/stream', async (req, res) => {
 });
 
 // POST /api/jobs/:id/stop
-app.post('/api/jobs/:id/stop', requireAuth, (req, res) => {
+app.post('/api/jobs/:id/stop', (req, res) => {
   const job = jobs[req.params.id];
   if (!job) return res.status(404).json({ error: 'Job not found' });
   if (job.status !== 'running') return res.json({ ok: true, message: 'Job already finished' });
