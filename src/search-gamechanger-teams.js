@@ -152,6 +152,20 @@ function ensureDirectory(dirPath) {
   if (!fs.existsSync(dirPath)) fs.mkdirSync(dirPath, { recursive: true });
 }
 
+
+async function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+
+  try {
+    return await Promise.race([Promise.resolve(promise), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function uniqueFilePath(filePath) {
   if (!fs.existsSync(filePath)) return filePath;
   const parsed = path.parse(filePath);
@@ -1573,8 +1587,18 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId) {
 
     if (captureResult && captureResult.success) {
 
-      // ── NEW: write to SQLite via pipeline ──
-      pipeline.processExtractResult(captureResult, teamId);
+      // ── NEW: write to Supabase/SQLite via pipeline ──
+      console.log("[gc] Writing extracted game to DB...");
+      const dbWriteResult = await withTimeout(
+        pipeline.processExtractResult(captureResult, teamId),
+        60000,
+        "pipeline.processExtractResult"
+      );
+      if (!dbWriteResult || dbWriteResult.success === false) {
+        console.warn(`[gc] DB write did not complete cleanly: ${dbWriteResult?.error || "unknown error"}`);
+      } else {
+        console.log("[gc] DB write complete.");
+      }
 
       manifest.processedGames.push({
         gameId,
@@ -1666,7 +1690,13 @@ async function processTeam(page, team, teamNumber, totalTeams, teamUrlCache) {
   console.log("################################################################################");
 
   // ── NEW: register/fetch team in DB ──
-  const teamId = pipeline.ensureTeam(team);
+  console.log("[gc] Ensuring team exists in DB...");
+  const teamId = await withTimeout(
+    pipeline.ensureTeam(team),
+    30000,
+    "pipeline.ensureTeam"
+  );
+  console.log(`[gc] DB team id: ${teamId}`);
 
   const knownTeamUrl = getKnownTeamUrl(team, teamUrlCache);
 
@@ -1778,10 +1808,13 @@ async function main() {
   console.log(`Accepted GameChanger seasons: ${getAcceptedSeasonLabel()}`);
   console.log(`Screenshot fallback: ${SCREENSHOT_FALLBACK ? "ON" : "OFF (structured extraction only)"}`);
 
+console.log('[browser] Launching Chromium...');
 const browser = await chromium.launch({
   headless: process.env.NODE_ENV === 'production' ? true : false,
   slowMo:   process.env.NODE_ENV === 'production' ? 0 : 75,
+  args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
 });
+console.log('[browser] Chromium launched successfully.');
 
   const context = await browser.newContext({
     storageState: STORAGE_STATE,

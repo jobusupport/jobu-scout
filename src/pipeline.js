@@ -80,8 +80,8 @@ function init(dbPath = './voodoo-scout.db') {
  * Ensure a team exists in the DB. Returns teamId.
  * Pass the same team object from read-teams-from-sheet.js.
  */
-function ensureTeam(team) {
-  const teamId = runSync(() => Promise.resolve(db.upsertTeam(team)));
+async function ensureTeam(team) {
+  const teamId = await Promise.resolve(db.upsertTeam(team));
   console.log(`[pipeline] Team ID ${teamId}: ${team.teamName}`);
   return teamId;
 }
@@ -97,7 +97,7 @@ function ensureTeam(team) {
  * @param {boolean} [options.isOpponentTeam=false] - See module docstring
  * @returns {{ success, gameId, summary }}
  */
-function processGameJson(jsonFilePath, teamId, options = {}) {
+async function processGameJson(jsonFilePath, teamId, options = {}) {
   console.log(`\n[pipeline] Processing: ${path.basename(jsonFilePath)}`);
 
   if (!fs.existsSync(jsonFilePath)) {
@@ -132,7 +132,7 @@ function processGameJson(jsonFilePath, teamId, options = {}) {
 
   let result;
   try {
-    result = runSync(() => Promise.resolve(db.writeNormalizedGame(normalized)));
+    result = await Promise.resolve(db.writeNormalizedGame(normalized));
   } catch (err) {
     // Duplicate game is non-fatal
     if (err.message && err.message.includes('UNIQUE constraint')) {
@@ -164,12 +164,12 @@ function processGameJson(jsonFilePath, teamId, options = {}) {
  * @param {boolean} [options.isOpponentTeam=false] - See module docstring
  * @returns {{ processed, skipped, failed }}
  */
-function processTeamOutputDir(teamOutputDir, team, options = {}) {
+async function processTeamOutputDir(teamOutputDir, team, options = {}) {
   if (!fs.existsSync(teamOutputDir)) {
     throw new Error(`Team output directory not found: ${teamOutputDir}`);
   }
 
-  const teamId = ensureTeam(team);
+  const teamId = await ensureTeam(team);
 
   const jsonFiles = fs.readdirSync(teamOutputDir)
     .filter(f => f.endsWith('.json') && f.startsWith('game-') && f !== 'processed-games.json')
@@ -180,7 +180,7 @@ function processTeamOutputDir(teamOutputDir, team, options = {}) {
   const stats = { processed: 0, skipped: 0, failed: 0 };
 
   for (const jsonFile of jsonFiles) {
-    const result = processGameJson(jsonFile, teamId, options);
+    const result = await processGameJson(jsonFile, teamId, options);
     if (result.success && result.skipped) stats.skipped++;
     else if (result.success)              stats.processed++;
     else                                  stats.failed++;
@@ -201,7 +201,7 @@ function processTeamOutputDir(teamOutputDir, team, options = {}) {
  * @param {object} [options]
  * @param {boolean} [options.isOpponentTeam=false] - See module docstring
  */
-function processAllOutputDirs(outputDir, teams, options = {}) {
+async function processAllOutputDirs(outputDir, teams, options = {}) {
   const teamsByName = new Map(
     teams.map(t => [
       String(t.teamName || t.rawTeamName || '').toLowerCase().trim(),
@@ -231,7 +231,7 @@ function processAllOutputDirs(outputDir, teams, options = {}) {
     }
 
     const dirPath = path.join(outputDir, dirName);
-    const stats = processTeamOutputDir(dirPath, team, options);
+    const stats = await processTeamOutputDir(dirPath, team, options);
     totals.processed += stats.processed;
     totals.skipped   += stats.skipped;
     totals.failed    += stats.failed;
@@ -254,7 +254,7 @@ function processAllOutputDirs(outputDir, teams, options = {}) {
  * team's own GC page (reingest path). Leave unset/false for Birmingham Stars'
  * own live scrape so that is_our_team flags are preserved as-is.
  */
-function processExtractResult(extractResult, teamId) {
+async function processExtractResult(extractResult, teamId) {
   if (!extractResult || !extractResult.success) {
     console.warn('[pipeline] Extraction result was not successful — skipping DB write.');
     return { success: false };
@@ -279,7 +279,7 @@ function processExtractResult(extractResult, teamId) {
 
   let gameId = null;
   try {
-    const result = runSync(() => Promise.resolve(db.writeNormalizedGame(normalized)));
+    const result = await Promise.resolve(db.writeNormalizedGame(normalized));
     gameId = result.gameId;
     console.log(`[pipeline] Saved game ${gameId}`);
   } catch (err) {
@@ -293,7 +293,7 @@ function processExtractResult(extractResult, teamId) {
 
   // ── Run stats engine and store advanced stats ──────────────────────────────
   try {
-    _updateAdvancedStats(teamId, extractResult.gameData, invertTeamSide);
+    await _updateAdvancedStats(teamId, extractResult.gameData, invertTeamSide);
   } catch (err) {
     // Non-fatal — log and continue
     console.warn(`[pipeline] Advanced stats error: ${err.message}`);
@@ -308,10 +308,12 @@ function processExtractResult(extractResult, teamId) {
  *
  * @param {boolean} invertTeamSide - If true, swap our/opponent buckets before writing.
  */
-function _updateAdvancedStats(teamId, singleGameData, invertTeamSide = false) {
+async function _updateAdvancedStats(teamId, singleGameData, invertTeamSide = false) {
   if (!singleGameData) return;
 
   const statsResult = processGames([singleGameData]);
+
+  const writes = [];
 
   if (invertTeamSide) {
     // Scouted opponent team: their players are in statsResult.players (ourSide in
@@ -319,32 +321,34 @@ function _updateAdvancedStats(teamId, singleGameData, invertTeamSide = false) {
     // Their opponents (other teams they faced) go into is_our_team=1 — which is
     // meaningless for scouting but keeps the flag consistent with the batting_lines table.
     for (const [name, stats] of Object.entries(statsResult.players || {})) {
-      runSync(() => Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 0, stats)));
+      writes.push(Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 0, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.opponentBatters || {})) {
-      runSync(() => Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 1, stats)));
+      writes.push(Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 1, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.ourPitchers || {})) {
-      runSync(() => Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 0, stats)));
+      writes.push(Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 0, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.pitchers || {})) {
-      runSync(() => Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 1, stats)));
+      writes.push(Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 1, stats)));
     }
   } else {
     // Normal path: Birmingham Stars' own games
     for (const [name, stats] of Object.entries(statsResult.players || {})) {
-      runSync(() => Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 1, stats)));
+      writes.push(Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 1, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.opponentBatters || {})) {
-      runSync(() => Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 0, stats)));
+      writes.push(Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 0, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.ourPitchers || {})) {
-      runSync(() => Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 1, stats)));
+      writes.push(Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 1, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.pitchers || {})) {
-      runSync(() => Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 0, stats)));
+      writes.push(Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 0, stats)));
     }
   }
+
+  await Promise.all(writes);
 
   const playerCount  = Object.keys(statsResult.players || {}).length;
   const pitcherCount = Object.keys(statsResult.pitchers || {}).length;
@@ -364,13 +368,13 @@ function _updateAdvancedStats(teamId, singleGameData, invertTeamSide = false) {
  * @param {object} [options]
  * @param {boolean} [options.invertTeamSide=false] - See module docstring
  */
-function recalculateTeamStats(teamId, options = {}) {
+async function recalculateTeamStats(teamId, options = {}) {
   const d = db.getDb();
   const invertTeamSide = options.invertTeamSide === true;
 
   // Get all game JSON file paths stored during ingest
   const games = process.env.USE_SUPABASE === 'true'
-    ? runSync(() => db.getGamesByTeam(teamId))
+    ? await Promise.resolve(db.getGamesByTeam(teamId))
     : d.prepare(
         "SELECT json_file, gc_game_id FROM games WHERE team_id = ? AND json_file IS NOT NULL ORDER BY game_date"
       ).all(teamId);
@@ -401,40 +405,44 @@ function recalculateTeamStats(teamId, options = {}) {
 
   // Wipe existing advanced stats for this team and rewrite from scratch
   if (process.env.USE_SUPABASE === 'true') {
-    runSync(() => db.getDb().from('player_advanced_stats').delete().eq('team_id', teamId).then(r => r));
-    runSync(() => db.getDb().from('pitcher_advanced_stats').delete().eq('team_id', teamId).then(r => r));
+    await Promise.resolve(db.getDb().from('player_advanced_stats').delete().eq('team_id', teamId).then(r => r));
+    await Promise.resolve(db.getDb().from('pitcher_advanced_stats').delete().eq('team_id', teamId).then(r => r));
   } else {
     d.prepare("DELETE FROM player_advanced_stats WHERE team_id = ?").run(teamId);
     d.prepare("DELETE FROM pitcher_advanced_stats WHERE team_id = ?").run(teamId);
   }
 
+  const writes = [];
+
   if (invertTeamSide) {
     for (const [name, stats] of Object.entries(statsResult.players || {})) {
-      runSync(() => Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 0, stats)));
+      writes.push(Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 0, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.opponentBatters || {})) {
-      runSync(() => Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 1, stats)));
+      writes.push(Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 1, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.ourPitchers || {})) {
-      runSync(() => Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 0, stats)));
+      writes.push(Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 0, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.pitchers || {})) {
-      runSync(() => Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 1, stats)));
+      writes.push(Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 1, stats)));
     }
   } else {
     for (const [name, stats] of Object.entries(statsResult.players || {})) {
-      runSync(() => Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 1, stats)));
+      writes.push(Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 1, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.opponentBatters || {})) {
-      runSync(() => Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 0, stats)));
+      writes.push(Promise.resolve(db.upsertPlayerAdvancedStats(teamId, name, 0, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.ourPitchers || {})) {
-      runSync(() => Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 1, stats)));
+      writes.push(Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 1, stats)));
     }
     for (const [name, stats] of Object.entries(statsResult.pitchers || {})) {
-      runSync(() => Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 0, stats)));
+      writes.push(Promise.resolve(db.upsertPitcherAdvancedStats(teamId, name, 0, stats)));
     }
   }
+
+  await Promise.all(writes);
 
   console.log(`[pipeline] Stats recalculated: ${Object.keys(statsResult.players || {}).length} our batters, ${Object.keys(statsResult.opponentBatters || {}).length} opp batters, ${Object.keys(statsResult.ourPitchers || {}).length} our pitchers, ${Object.keys(statsResult.pitchers || {}).length} opp pitchers`);
 }
