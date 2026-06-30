@@ -410,8 +410,12 @@ async function buildDocx(analysis, outputPath) {
   // All batters/pitchers on the scouted team (opponent only, is_our_team=0).
   // bundle.batting/pitching may include all sides; filter explicitly to prevent
   // our own players or players from other teams appearing in the report.
-  const allOppBatters  = (a._bundle?.batting  || []).filter(b => b.is_our_team === 0);
-  const allOppPitchers = (a._bundle?.pitching || []).filter(p => p.is_our_team === 0);
+  // NOTE: is_our_team is a real boolean in Supabase (true/false), not 0/1 —
+  // SQLite stores it as an integer, which is why `=== 0` worked in local dev
+  // but silently filtered out every row once the DB switched to Supabase.
+  // Use a falsy check instead of strict numeric equality so it works for both.
+  const allOppBatters  = (a._bundle?.batting  || []).filter(b => !b.is_our_team);
+  const allOppPitchers = (a._bundle?.pitching || []).filter(p => !p.is_our_team);
   // Pitcher advanced stats (opponent)
   const pitAdvMap = {};
   for (const p of (a._ourPitchers || [])) pitAdvMap[p.player_name] = p;
