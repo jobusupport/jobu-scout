@@ -1639,14 +1639,31 @@ async function chooseIncrementalStartIndex(page, teamId, completedGameCount, kno
   console.log(`[gc] Complete games in DB for this team: ${dbCompleteCount}`);
   console.log(`[gc] Completed games visible on GameChanger: ${completedGameCount}`);
 
+  // Reliability-first default:
+  // Counts alone are not safe because the DB can contain a non-contiguous set of games
+  // after earlier failed/interrupted scraper runs. Example: DB has 14 complete games,
+  // but GameChanger game #14 is not one of them. In that situation, starting at #15
+  // would skip missing earlier games. So by default we reconcile from game #1 and skip
+  // every game already complete in the DB by GameChanger game id.
+  if (process.env.GC_INCREMENTAL_FAST_START !== 'true') {
+    if (dbCompleteCount === 0) {
+      console.log('[gc] No completed games found in DB. Starting at GameChanger completed game #1.');
+    } else {
+      console.log('[gc] Safe reconciliation mode: scanning from GameChanger game #1 and skipping games already complete in DB.');
+      console.log('[gc] To re-enable count-based fast start, set GC_INCREMENTAL_FAST_START=true.');
+    }
+    return 0;
+  }
+
+  console.log('[gc] GC_INCREMENTAL_FAST_START=true. Attempting count-based boundary check.');
+
   if (dbCompleteCount === 0) {
     console.log('[gc] No completed games found in DB. Starting at GameChanger completed game #1.');
     return 0;
   }
 
   if (completedGameCount <= dbCompleteCount) {
-    console.log('[gc] DB already has at least as many complete games as GameChanger shows. No new games to scrape.');
-    return completedGameCount;
+    console.log('[gc] DB has at least as many complete games as GameChanger shows, but fast-start mode still verifies the boundary.');
   }
 
   const verifyIndex = Math.min(dbCompleteCount - 1, completedGameCount - 1);
@@ -1671,13 +1688,18 @@ async function chooseIncrementalStartIndex(page, teamId, completedGameCount, kno
     return 0;
   }
 
-  if (matchesDb) {
+  if (matchesDb && completedGameCount > dbCompleteCount) {
     const startIndex = dbCompleteCount;
     console.log(`[gc] Incremental scrape confirmed. Starting with new GameChanger game #${startIndex + 1}.`);
     return startIndex;
   }
 
-  console.log('[gc] DB boundary did not match the GameChanger schedule. Falling back to a full scan with DB duplicate checks.');
+  if (matchesDb && completedGameCount <= dbCompleteCount) {
+    console.log('[gc] Boundary matched, but counts suggest there may be no new games. Running a full duplicate-check scan to verify no gaps.');
+    return 0;
+  }
+
+  console.log('[gc] DB boundary did not match the GameChanger schedule. The DB set is non-contiguous. Falling back to a full scan with DB duplicate checks.');
   return 0;
 }
 
@@ -1790,8 +1812,7 @@ async function processOneCompletedGame(page, team, teamId, gameIndex, manifest, 
   );
 
   if (!gameOpened) {
-    console.log(`[gc] Could not open completed game #${gameIndex + 1}. Skipping this game and continuing.`);
-    return { status: 'open_failed' };
+    throw new Error(`Could not open completed game #${gameIndex + 1}.`);
   }
 
   const gameUrl = page.url();
@@ -1805,9 +1826,13 @@ async function processOneCompletedGame(page, team, teamId, gameIndex, manifest, 
   }
 
   phase = 'manifest-duplicate-check';
-  if (isGameAlreadyProcessed(manifest.processedGames, gameId)) {
-    console.log(`Skipping already processed game: ${gameId || gameUrl}`);
+  if (process.env.GC_TRUST_PROCESSED_MANIFEST === 'true' && isGameAlreadyProcessed(manifest.processedGames, gameId)) {
+    console.log(`Skipping already processed game from manifest: ${gameId || gameUrl}`);
     return { status: 'skipped_manifest', gameId, gameUrl };
+  }
+
+  if (isGameAlreadyProcessed(manifest.processedGames, gameId)) {
+    console.log(`[gc] Manifest contains this game, but DB does not show it as complete. Re-scraping: ${gameId || gameUrl}`);
   }
 
   phase = 'extract-game-data';
@@ -1818,8 +1843,7 @@ async function processOneCompletedGame(page, team, teamId, gameIndex, manifest, 
   );
 
   if (!captureResult || !captureResult.success) {
-    console.log(`[gc] Capture failed for completed game #${gameIndex + 1}.`);
-    return { status: 'capture_failed', gameId, gameUrl };
+    throw new Error(`Capture failed for completed game #${gameIndex + 1}.`);
   }
 
   phase = 'db-write';
@@ -1834,7 +1858,7 @@ async function processOneCompletedGame(page, team, teamId, gameIndex, manifest, 
     const error = dbWriteResult?.error || 'unknown error';
     console.warn(`[gc] DB write did not complete cleanly: ${error}`);
     console.warn('[gc] Not marking this game as processed because the DB write failed.');
-    return { status: 'db_failed', gameId, gameUrl, error };
+    throw new Error(`DB write failed for completed game #${gameIndex + 1}: ${error}`);
   }
 
   console.log('[gc] DB write complete.');
