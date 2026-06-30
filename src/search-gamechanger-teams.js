@@ -725,6 +725,53 @@ async function chooseBestTeamResult(page, team, searchTerm, debugInfo) {
 
 // ─── Navigation Helpers ───────────────────────────────────────────────────────
 
+function toAbsoluteUrl(value, baseUrl) {
+  try {
+    return new URL(String(value || ''), baseUrl || 'https://web.gc.com').toString();
+  } catch {
+    return '';
+  }
+}
+
+async function findScheduleUrlOnCurrentPage(page) {
+  const currentUrl = page.url();
+  if (/\/schedule(?:[/?#]|$)/i.test(currentUrl)) return currentUrl;
+
+  const hrefs = await page.locator('a[href*="/schedule"]').evaluateAll((links) =>
+    links.map((link) => link.getAttribute('href')).filter(Boolean)
+  ).catch(() => []);
+
+  for (const href of hrefs) {
+    const absolute = toAbsoluteUrl(href, currentUrl);
+    if (/\/teams\/[^/]+\/[^/]+\/schedule(?:[/?#]|$)/i.test(absolute)) return absolute;
+  }
+
+  return '';
+}
+
+async function openSchedulePage(page, label = 'team page') {
+  console.log(`Looking for Schedule page from ${label}...`);
+  await dismissDontMissOutPopup(page);
+
+  const directScheduleUrl = await findScheduleUrlOnCurrentPage(page);
+  if (directScheduleUrl) {
+    console.log(`[gc] Opening schedule URL directly: ${directScheduleUrl}`);
+    await page.goto(directScheduleUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    try {
+      await page.waitForLoadState('networkidle', { timeout: 15000 });
+    } catch {
+      // GameChanger may keep background requests open.
+    }
+    await page.waitForTimeout(2000);
+    await dismissDontMissOutPopup(page);
+    console.log(`Schedule URL/page: ${page.url()}`);
+    return true;
+  }
+
+  console.log('[gc] No direct schedule href found. Falling back to clicking the Schedule tab.');
+  return await clickScheduleTab(page);
+}
+
 async function clickScheduleTab(page) {
   console.log("Looking for Schedule tab...");
 
@@ -1637,15 +1684,18 @@ async function chooseIncrementalStartIndex(page, teamId, completedGameCount, kno
 function wirePageDiagnostics(page) {
   if (!page || page.__jobuDiagnosticsAttached) return;
   page.__jobuDiagnosticsAttached = true;
+  const verboseBrowserLogs = process.env.GC_VERBOSE_BROWSER_LOGS === 'true';
   page.on('crash', () => console.error('[browser] Page crashed.'));
   page.on('pageerror', (error) => console.error(`[browser] Page error: ${error.message}`));
   page.on('console', (msg) => {
+    if (!verboseBrowserLogs) return;
     const type = msg.type();
     if (type === 'error' || type === 'warning') {
       console.log(`[browser console:${type}] ${msg.text().slice(0, 500)}`);
     }
   });
   page.on('requestfailed', (request) => {
+    if (!verboseBrowserLogs) return;
     const failure = request.failure();
     const url = request.url();
     if (/web\.gc\.com|gc\.com|gamechanger/i.test(url)) {
@@ -1940,7 +1990,7 @@ async function clickBestTeamResult(page, team, teamId, searchTerm, debugInfo, te
   console.log(`Opened URL: ${currentUrl}`);
   rememberTeamUrl(team, currentUrl, teamUrlCache);
 
-  const scheduleClicked = await clickScheduleTab(page);
+  const scheduleClicked = await openSchedulePage(page, 'selected team result');
   if (!scheduleClicked) return false;
 
   return await captureAllCompletedGamesFromSchedule(page, team, teamId);
@@ -1967,9 +2017,9 @@ async function processTeamFromKnownUrl(page, team, teamId, knownTeamUrl, teamUrl
   await dismissDontMissOutPopup(page);
   rememberTeamUrl(team, page.url(), teamUrlCache);
 
-  const scheduleClicked = await clickScheduleTab(page);
+  const scheduleClicked = await openSchedulePage(page, 'known team URL');
   if (!scheduleClicked) {
-    console.log("Could not click Schedule tab from known URL. Falling back to search.");
+    console.log("Could not open Schedule page from known URL. Falling back to search.");
     return false;
   }
 
