@@ -13,6 +13,10 @@ const STORAGE_STATE = path.join(__dirname, "..", "storage", "gamechanger-auth.js
 const TEST_TEAM_CONTAINS = process.env.GC_TEST_TEAM_CONTAINS || "";
 const OUTPUT_DIR = path.join(__dirname, "..", "output");
 const FAILED_MATCHES_DIR = path.join(OUTPUT_DIR, "_failed-team-matches");
+const FAILED_GAME_CAPTURES_DIR = path.join(OUTPUT_DIR, "_failed-game-captures");
+const GC_GAME_MAX_ATTEMPTS = Math.max(1, Number(process.env.GC_GAME_MAX_ATTEMPTS || 3));
+const GC_GAME_EXTRACTION_TIMEOUT_MS = Math.max(30000, Number(process.env.GC_GAME_EXTRACTION_TIMEOUT_MS || 180000));
+const GC_GAME_DB_WRITE_TIMEOUT_MS = Math.max(30000, Number(process.env.GC_GAME_DB_WRITE_TIMEOUT_MS || 90000));
 const TEAM_URLS_FILE = path.join(OUTPUT_DIR, "Team URLs.txt");
 const DB_PATH = path.join(__dirname, "..", "voodoo-scout.db");
 
@@ -1630,102 +1634,283 @@ async function chooseIncrementalStartIndex(page, teamId, completedGameCount, kno
   return 0;
 }
 
+function wirePageDiagnostics(page) {
+  if (!page || page.__jobuDiagnosticsAttached) return;
+  page.__jobuDiagnosticsAttached = true;
+  page.on('crash', () => console.error('[browser] Page crashed.'));
+  page.on('pageerror', (error) => console.error(`[browser] Page error: ${error.message}`));
+  page.on('console', (msg) => {
+    const type = msg.type();
+    if (type === 'error' || type === 'warning') {
+      console.log(`[browser console:${type}] ${msg.text().slice(0, 500)}`);
+    }
+  });
+  page.on('requestfailed', (request) => {
+    const failure = request.failure();
+    const url = request.url();
+    if (/web\.gc\.com|gc\.com|gamechanger/i.test(url)) {
+      console.log(`[browser request failed] ${request.method()} ${url.slice(0, 300)} :: ${failure?.errorText || 'unknown'}`);
+    }
+  });
+}
+
+function getErrorMessage(error) {
+  if (!error) return 'Unknown error';
+  return error.stack || error.message || String(error);
+}
+
+async function writeFailedGameCaptureReport(page, team, gameIndex, phase, error, extra = {}) {
+  try {
+    ensureDirectory(FAILED_GAME_CAPTURES_DIR);
+    const teamName = sanitizeFileNameCompact(team.teamName || team.rawTeamName || 'unknown-team');
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const base = `${teamName}-game-${gameIndex + 1}-${phase}-${stamp}`;
+    const txtPath = path.join(FAILED_GAME_CAPTURES_DIR, `${base}.txt`);
+    const pngPath = path.join(FAILED_GAME_CAPTURES_DIR, `${base}.png`);
+
+    const lines = [];
+    lines.push('GameChanger Game Capture Failure');
+    lines.push('================================');
+    lines.push(`Generated: ${new Date().toISOString()}`);
+    lines.push(`Team: ${team.teamName || team.rawTeamName || ''}`);
+    lines.push(`Game index: ${gameIndex + 1}`);
+    lines.push(`Phase: ${phase}`);
+    lines.push(`Current URL: ${page?.url ? page.url() : ''}`);
+    for (const [key, value] of Object.entries(extra || {})) {
+      lines.push(`${key}: ${value}`);
+    }
+    lines.push('');
+    lines.push('Error');
+    lines.push('-----');
+    lines.push(getErrorMessage(error));
+    fs.writeFileSync(txtPath, lines.join('\n'), 'utf8');
+    console.log(`[gc] Wrote failed game report: ${txtPath}`);
+
+    try {
+      if (page && !page.isClosed()) {
+        await page.screenshot({ path: pngPath, fullPage: true, timeout: 15000 });
+        console.log(`[gc] Wrote failed game screenshot: ${pngPath}`);
+      }
+    } catch (screenshotError) {
+      console.log(`[gc] Could not capture failure screenshot: ${screenshotError.message}`);
+    }
+  } catch (reportError) {
+    console.log(`[gc] Could not write failed game report: ${reportError.message}`);
+  }
+}
+
+async function returnToScheduleSafely(page, scheduleUrl, label = 'return to schedule') {
+  if (!page || page.isClosed()) return false;
+
+  try {
+    if (/\/schedule\/?(?:[?#].*)?$/i.test(page.url())) return true;
+  } catch {
+    // Continue to return attempts.
+  }
+
+  try {
+    const returned = await clickBackToSchedule(page);
+    if (returned) return true;
+  } catch (error) {
+    console.log(`[gc] Back-to-schedule click failed during ${label}: ${error.message}`);
+  }
+
+  if (scheduleUrl) {
+    try {
+      console.log(`[gc] Reloading schedule URL after ${label}: ${scheduleUrl}`);
+      await page.goto(scheduleUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      try { await page.waitForLoadState('networkidle', { timeout: 15000 }); } catch {}
+      await page.waitForTimeout(1500);
+      await dismissDontMissOutPopup(page);
+      return true;
+    } catch (error) {
+      console.log(`[gc] Schedule reload failed during ${label}: ${error.message}`);
+    }
+  }
+
+  return false;
+}
+
+async function processOneCompletedGame(page, team, teamId, gameIndex, manifest, knownDbGames, scheduleUrl) {
+  let phase = 'open-game';
+  const gameOpened = await withTimeout(
+    clickCompletedGameFromScheduleByIndex(page, gameIndex),
+    90000,
+    `open completed game #${gameIndex + 1}`
+  );
+
+  if (!gameOpened) {
+    console.log(`[gc] Could not open completed game #${gameIndex + 1}. Skipping this game and continuing.`);
+    return { status: 'open_failed' };
+  }
+
+  const gameUrl = page.url();
+  const gameId  = extractGameIdFromUrl(gameUrl);
+  console.log(`[gc] Opened GameChanger game #${gameIndex + 1}: ${gameId || gameUrl}`);
+
+  phase = 'db-duplicate-check';
+  if (dbGameMatchesPageGame(knownDbGames, gameId, gameUrl)) {
+    console.log(`[gc] Skipping game already complete in DB: ${gameId || gameUrl}`);
+    return { status: 'skipped_db', gameId, gameUrl };
+  }
+
+  phase = 'manifest-duplicate-check';
+  if (isGameAlreadyProcessed(manifest.processedGames, gameId)) {
+    console.log(`Skipping already processed game: ${gameId || gameUrl}`);
+    return { status: 'skipped_manifest', gameId, gameUrl };
+  }
+
+  phase = 'extract-game-data';
+  const captureResult = await withTimeout(
+    extractGameData(page, team),
+    GC_GAME_EXTRACTION_TIMEOUT_MS,
+    `extractGameData game #${gameIndex + 1}`
+  );
+
+  if (!captureResult || !captureResult.success) {
+    console.log(`[gc] Capture failed for completed game #${gameIndex + 1}.`);
+    return { status: 'capture_failed', gameId, gameUrl };
+  }
+
+  phase = 'db-write';
+  console.log('[gc] Writing extracted game to DB...');
+  const dbWriteResult = await withTimeout(
+    pipeline.processExtractResult(captureResult, teamId),
+    GC_GAME_DB_WRITE_TIMEOUT_MS,
+    `pipeline.processExtractResult game #${gameIndex + 1}`
+  );
+
+  if (!dbWriteResult || dbWriteResult.success === false) {
+    const error = dbWriteResult?.error || 'unknown error';
+    console.warn(`[gc] DB write did not complete cleanly: ${error}`);
+    console.warn('[gc] Not marking this game as processed because the DB write failed.');
+    return { status: 'db_failed', gameId, gameUrl, error };
+  }
+
+  console.log('[gc] DB write complete.');
+
+  phase = 'manifest-update';
+  manifest.processedGames.push({
+    gameId,
+    gameUrl,
+    capturedAt:    new Date().toISOString(),
+    jsonFile:      captureResult.jsonFile      || '',
+    boxScoreFile:  captureResult.boxScoreFile  || ''
+  });
+
+  saveProcessedGames(manifest.manifestPath, manifest.processedGames);
+  console.log(`Updated processed-games manifest: ${manifest.manifestPath}`);
+
+  knownDbGames.push({
+    gcGameId: gameId || extractGameIdFromUrl(gameUrl) || '',
+    gcGameUrl: gameUrl || '',
+  });
+
+  return { status: 'processed', gameId, gameUrl };
+}
+
 async function captureAllCompletedGamesFromSchedule(page, team, teamId) {
-  console.log("");
-  console.log("Starting completed-game capture loop...");
+  console.log('');
+  console.log('Starting completed-game capture loop...');
+  console.log(`[gc] Per-game retry limit: ${GC_GAME_MAX_ATTEMPTS}`);
+  console.log(`[gc] Extraction timeout: ${GC_GAME_EXTRACTION_TIMEOUT_MS}ms`);
+  console.log(`[gc] DB write timeout: ${GC_GAME_DB_WRITE_TIMEOUT_MS}ms`);
 
   const teamDir = getTeamOutputDir(team);
   const manifest = loadProcessedGames(teamDir);
   let knownDbGames = await loadKnownCompleteDbGames(teamId);
   let gameIndex = null;
+  let scheduleUrl = page.url();
+  const failures = [];
+  const processed = [];
+  const skipped = [];
 
   while (true) {
-    await dismissDontMissOutPopup(page);
+    try {
+      await dismissDontMissOutPopup(page);
+    } catch (error) {
+      console.log(`[gc] Popup dismissal failed but continuing: ${error.message}`);
+    }
 
-    const completedGameCount = await getVisibleCompletedGameCount(page);
+    let completedGameCount = 0;
+    try {
+      completedGameCount = await withTimeout(
+        getVisibleCompletedGameCount(page),
+        45000,
+        'getVisibleCompletedGameCount'
+      );
+    } catch (error) {
+      console.error(`[gc] Could not count completed games on schedule: ${error.message}`);
+      await writeFailedGameCaptureReport(page, team, gameIndex || 0, 'count-completed-games', error, { scheduleUrl });
+      const recovered = await returnToScheduleSafely(page, scheduleUrl, 'count completed games recovery');
+      if (!recovered) throw error;
+      completedGameCount = await getVisibleCompletedGameCount(page);
+    }
+
     console.log(`Visible completed games on schedule: ${completedGameCount}`);
 
     if (completedGameCount === 0) {
-      console.log("No completed games found. Moving on.");
+      console.log('No completed games found. Moving on.');
       return true;
     }
 
     if (gameIndex === null) {
       gameIndex = await chooseIncrementalStartIndex(page, teamId, completedGameCount, knownDbGames);
+      await returnToScheduleSafely(page, scheduleUrl, 'after incremental boundary check');
+      scheduleUrl = page.url().includes('/schedule') ? page.url() : scheduleUrl;
     }
 
     if (gameIndex >= completedGameCount) {
-      console.log("No more completed games to process for this team.");
-      return true;
-    }
-
-    const gameOpened = await clickCompletedGameFromScheduleByIndex(page, gameIndex);
-    if (!gameOpened) {
-      console.log(`Could not open completed game #${gameIndex + 1}. Moving on.`);
-      return true;
-    }
-
-    const gameUrl = page.url();
-    const gameId  = extractGameIdFromUrl(gameUrl);
-
-    if (dbGameMatchesPageGame(knownDbGames, gameId, gameUrl)) {
-      console.log(`[gc] Skipping game already complete in DB: ${gameId || gameUrl}`);
-      const returned = await clickBackToSchedule(page);
-      if (!returned) { console.log("Could not return to schedule after skipping DB duplicate game."); return false; }
-      gameIndex++;
-      continue;
-    }
-
-    if (isGameAlreadyProcessed(manifest.processedGames, gameId)) {
-      console.log(`Skipping already processed game: ${gameId || gameUrl}`);
-      const returned = await clickBackToSchedule(page);
-      if (!returned) { console.log("Could not return to schedule after skipping duplicate game."); return false; }
-      gameIndex++;
-      continue;
-    }
-
-    // ── NEW: structured extraction replaces screenshot capture ──
-    const captureResult = await extractGameData(page, team);
-
-    if (captureResult && captureResult.success) {
-
-      // ── NEW: write to Supabase/SQLite via pipeline ──
-      console.log("[gc] Writing extracted game to DB...");
-      const dbWriteResult = await withTimeout(
-        pipeline.processExtractResult(captureResult, teamId),
-        60000,
-        "pipeline.processExtractResult"
-      );
-      if (!dbWriteResult || dbWriteResult.success === false) {
-        console.warn(`[gc] DB write did not complete cleanly: ${dbWriteResult?.error || "unknown error"}`);
-        console.warn("[gc] Not marking this game as processed because the DB write failed.");
-      } else {
-        console.log("[gc] DB write complete.");
-
-        manifest.processedGames.push({
-          gameId,
-          gameUrl,
-          capturedAt:    new Date().toISOString(),
-          jsonFile:      captureResult.jsonFile      || "",
-          boxScoreFile:  captureResult.boxScoreFile  || ""
-        });
-
-        saveProcessedGames(manifest.manifestPath, manifest.processedGames);
-        console.log(`Updated processed-games manifest: ${manifest.manifestPath}`);
-
-        knownDbGames.push({
-          gcGameId: gameId || extractGameIdFromUrl(gameUrl) || '',
-          gcGameUrl: gameUrl || '',
-        });
+      console.log('No more completed games to process for this team.');
+      if (failures.length) {
+        console.warn(`[gc] Completed schedule scan with ${failures.length} failed game(s). Failed games were not marked processed and will be retried on the next run.`);
+        for (const f of failures) console.warn(`[gc] Failed game #${f.gameNumber}: ${f.status || f.error}`);
       }
-    } else {
-      console.log(`Capture failed for completed game #${gameIndex + 1}. Returning to schedule if possible.`);
+      console.log(`[gc] Summary: processed=${processed.length}, skipped=${skipped.length}, failed=${failures.length}`);
+      return true;
     }
 
-    const returned = await clickBackToSchedule(page);
-    if (!returned) {
-      console.log("Could not return to schedule. Stopping completed-game loop.");
-      return false;
+    let attempt = 1;
+    let finishedThisIndex = false;
+    let lastStatus = null;
+
+    while (attempt <= GC_GAME_MAX_ATTEMPTS && !finishedThisIndex) {
+      console.log('');
+      console.log(`[gc] Processing completed game #${gameIndex + 1} of ${completedGameCount} (attempt ${attempt}/${GC_GAME_MAX_ATTEMPTS})...`);
+      try {
+        const result = await processOneCompletedGame(page, team, teamId, gameIndex, manifest, knownDbGames, scheduleUrl);
+        lastStatus = result.status;
+
+        if (result.status === 'processed') processed.push(result);
+        else if (result.status && result.status.startsWith('skipped')) skipped.push(result);
+        else failures.push({ gameNumber: gameIndex + 1, ...result });
+
+        finishedThisIndex = true;
+      } catch (error) {
+        lastStatus = error.message;
+        console.error(`[gc] Error processing completed game #${gameIndex + 1} attempt ${attempt}: ${error.message}`);
+        console.error(getErrorMessage(error));
+        await writeFailedGameCaptureReport(page, team, gameIndex, `attempt-${attempt}`, error, { scheduleUrl });
+
+        if (attempt >= GC_GAME_MAX_ATTEMPTS) {
+          failures.push({ gameNumber: gameIndex + 1, error: error.message });
+          console.warn(`[gc] Giving up on completed game #${gameIndex + 1} after ${GC_GAME_MAX_ATTEMPTS} attempt(s). Continuing to the next game.`);
+          finishedThisIndex = true;
+        }
+      } finally {
+        const returned = await returnToScheduleSafely(page, scheduleUrl, `game #${gameIndex + 1} attempt ${attempt}`);
+        if (!returned) {
+          const err = new Error(`Could not return to schedule after game #${gameIndex + 1} attempt ${attempt}. Last status: ${lastStatus || 'unknown'}`);
+          console.error(`[gc] ${err.message}`);
+          await writeFailedGameCaptureReport(page, team, gameIndex, `return-to-schedule-attempt-${attempt}`, err, { scheduleUrl });
+          if (attempt >= GC_GAME_MAX_ATTEMPTS) {
+            failures.push({ gameNumber: gameIndex + 1, error: err.message });
+            finishedThisIndex = true;
+          }
+        }
+      }
+
+      attempt++;
     }
 
     gameIndex++;
@@ -1909,6 +2094,7 @@ async function main() {
 
   ensureDirectory(OUTPUT_DIR);
   ensureDirectory(FAILED_MATCHES_DIR);
+  ensureDirectory(FAILED_GAME_CAPTURES_DIR);
 
   // ── NEW: initialize pipeline / database ──
   pipeline.init(DB_PATH);
@@ -1931,6 +2117,7 @@ console.log('[browser] Chromium launched successfully.');
   });
 
   const page = await context.newPage();
+  wirePageDiagnostics(page);
 
 try {
     // If server passed a specific team via env vars, skip the Google Sheet entirely
@@ -1976,6 +2163,7 @@ async function scrapeTeamById(teamRecord) {
 
   ensureDirectory(OUTPUT_DIR);
   ensureDirectory(FAILED_MATCHES_DIR);
+  ensureDirectory(FAILED_GAME_CAPTURES_DIR);
 
   pipeline.init(DB_PATH);
 
@@ -1994,6 +2182,7 @@ console.log('[browser] Chromium launched successfully.');
   });
 
   const page = await context.newPage();
+  wirePageDiagnostics(page);
 
   // Build a team object that matches what processTeam() expects
   const team = {
