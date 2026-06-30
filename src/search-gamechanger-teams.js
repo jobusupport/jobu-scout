@@ -938,7 +938,7 @@ function normalizeScheduleDateText(value, fallbackYear = TARGET_SEASON_YEAR) {
   };
 
   const patterns = [
-    /\b(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:day)?\.?,?\s*)?(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2})(?:,?\s+(20\d{2}|19\d{2}))?\b/i,
+    /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\.?,?\s*(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2})(?:,?\s+(20\d{2}|19\d{2}))?\b/i,
     /\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\b/,
   ];
 
@@ -1015,7 +1015,7 @@ async function getVisibleCompletedGameEntries(page) {
       const entry = await item.evaluate((element) => {
         function clean(value) { return String(value || '').replace(/\s+/g, ' ').trim(); }
         function looksLikeDate(value) {
-          return /\b(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:day)?\.?[,]?\s*)?(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}(?:,?\s+(?:20\d{2}|19\d{2}))?\b/i.test(value) ||
+          return /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\.?[,]?\s*(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}(?:,?\s+(?:20\d{2}|19\d{2}))?\b/i.test(value) ||
             /\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/.test(value);
         }
 
@@ -1112,7 +1112,7 @@ async function clickCompletedGameFromScheduleByIndex(page, targetIndex) {
       const scheduleMetaRaw = await item.evaluate((element) => {
         function clean(value) { return String(value || '').replace(/\s+/g, ' ').trim(); }
         function looksLikeDate(value) {
-          return /\b(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:day)?\.?[,]?\s*)?(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}(?:,?\s+(?:20\d{2}|19\d{2}))?\b/i.test(value) ||
+          return /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\.?[,]?\s*(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}(?:,?\s+(?:20\d{2}|19\d{2}))?\b/i.test(value) ||
             /\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/.test(value);
         }
 
@@ -1457,62 +1457,23 @@ async function extractGameHeader(page) {
   return await page.evaluate(() => {
     const bodyText = document.body.innerText;
 
-    function clean(value) {
-      return String(value || '').replace(/\s+/g, ' ').trim();
-    }
+    const dateMatch = bodyText.match(
+      /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+[A-Z][a-z]+\s+\d{1,2},\s+\d{1,2}:\d{2}\s+[AP]M\s*[-–—]\s*\d{1,2}:\d{2}\s+[AP]M\s+[A-Z]{2}\b/i
+    );
 
-    // GameChanger can show the game date in different places depending on page:
-    // recap may show a full date/time range, while box-score often shows a
-    // simpler date line just above the box score. Capture both formats.
-    const datePatterns = [
-      /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:day)?\s+[A-Z][a-z]+\s+\d{1,2},\s+\d{1,2}:\d{2}\s+[AP]M\s*[-–—]\s*\d{1,2}:\d{2}\s+[AP]M\s+[A-Z]{2}\b/i,
-      /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:day)?\.?,?\s+[A-Z][a-z]+\s+\d{1,2},?\s+(?:20\d{2}|19\d{2})(?:,?\s+\d{1,2}:\d{2}\s+[AP]M(?:\s*[-–—]\s*\d{1,2}:\d{2}\s+[AP]M)?\s*(?:[A-Z]{2})?)?\b/i,
-      /\b[A-Z][a-z]+\s+\d{1,2},?\s+(?:20\d{2}|19\d{2})(?:,?\s+\d{1,2}:\d{2}\s+[AP]M(?:\s*[-–—]\s*\d{1,2}:\d{2}\s+[AP]M)?\s*(?:[A-Z]{2})?)?\b/i,
-      /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:day)?\.?,?\s+[A-Z][a-z]+\s+\d{1,2}\b/i,
-      /\b[A-Z][a-z]+\s+\d{1,2}\b/i,
-      /\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/i,
-    ];
-
-    const dateCandidates = [];
-    const lines = bodyText
-      .split(/\r?\n/)
-      .map(clean)
-      .filter(Boolean);
-
-    for (const line of lines.slice(0, 80)) {
-      if (/^(recap|box score|plays|videos|info|lineup|schedule)$/i.test(line)) continue;
-      for (const pattern of datePatterns) {
-        const match = line.match(pattern);
-        if (match) {
-          dateCandidates.push(match[0]);
-          break;
-        }
-      }
-    }
-
-    if (!dateCandidates.length) {
-      for (const pattern of datePatterns) {
-        const match = bodyText.match(pattern);
-        if (match) {
-          dateCandidates.push(match[0]);
-          break;
-        }
-      }
-    }
-
-    const dateTime = dateCandidates[0] || null;
     const scoreMatch = bodyText.match(/\b([WL])\s*(\d+)\s*[-–—]\s*(\d+)\b/i);
 
     const teamCandidates = [];
     for (const el of document.querySelectorAll('h1, h2, h3, [class*="team"], [class*="Team"]')) {
-      const text = clean(el.innerText || '');
+      const text = String(el.innerText || "").replace(/\s+/g, " ").trim();
       if (text && text.length < 200) teamCandidates.push(text);
     }
+
+    const dateTime = dateMatch ? dateMatch[0] : null;
 
     return {
       dateTime,
       gameDatetimeRaw: dateTime,
-      dateCandidates,
       result:         scoreMatch ? scoreMatch[1] : null,
       scoreUs:        scoreMatch ? scoreMatch[2] : null,
       scoreThem:      scoreMatch ? scoreMatch[3] : null,
@@ -1520,6 +1481,58 @@ async function extractGameHeader(page) {
       pageUrl:        window.location.href
     };
   });
+}
+
+
+async function extractGameDateFromCurrentPage(page, label = 'current page') {
+  try {
+    const candidates = await page.evaluate(() => {
+      function clean(value) { return String(value || '').replace(/\s+/g, ' ').trim(); }
+      function looksLikeDate(value) {
+        return /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\.?[,]?\s*(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}(?:,?\s+(?:20\d{2}|19\d{2}))?\b/i.test(value) ||
+          /\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/.test(value);
+      }
+      function scoreText(value) {
+        const text = clean(value);
+        let score = 0;
+        if (!looksLikeDate(text)) return -999;
+        if (/\b\d{1,2}:\d{2}\s*(?:AM|PM)\b/i.test(text)) score += 40;
+        if (/\b(?:FINAL|Box Score|Recap|Plays|Videos|Info)\b/i.test(text)) score += 10;
+        if (/\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)/i.test(text)) score += 30;
+        if (/\b20\d{2}\b/.test(text)) score += 10;
+        if (text.length <= 120) score += 20;
+        if (text.length > 260) score -= 35;
+        return score;
+      }
+
+      const rows = [];
+      for (const el of document.querySelectorAll('body *')) {
+        const text = clean(el.innerText || el.textContent || '');
+        if (!text || text.length > 500 || !looksLikeDate(text)) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        if (rect.top < -20 || rect.top > 900) continue;
+        const score = scoreText(text) - Math.max(0, rect.top / 100);
+        rows.push({ text, top: rect.top, score });
+      }
+      rows.sort((a, b) => b.score - a.score || a.top - b.top || a.text.length - b.text.length);
+      return rows.slice(0, 10);
+    });
+
+    for (const candidate of candidates || []) {
+      const normalized = normalizeScheduleDateText(candidate.text);
+      if (normalized) {
+        console.log(`[gc] Date candidate from ${label}: ${normalized} | ${candidate.text}`);
+        return { gameDate: normalized, dateText: candidate.text };
+      }
+    }
+
+    console.warn(`[gc] No usable date found on ${label}.`);
+    return { gameDate: null, dateText: '' };
+  } catch (error) {
+    console.warn(`[gc] Could not extract date from ${label}: ${error.message}`);
+    return { gameDate: null, dateText: '' };
+  }
 }
 
 async function extractBoxScore(page) {
@@ -1899,43 +1912,31 @@ async function extractGameData(page, team, scheduleMeta = null) {
   console.log("Starting structured data extraction (HTML, no OCR)...");
 
   const scheduleGameMeta = scheduleMeta || page.__jobuCurrentGameScheduleMeta || {};
-
-  // Capture header info on recap first, then again after navigating to Box Score.
-  // GC frequently puts the reliable game date at the top of the box-score page,
-  // just above the table, not on the schedule card or recap page.
-  const recapHeader = await extractGameHeader(page);
+  const header   = await extractGameHeader(page);
+  const recapPageDate = await extractGameDateFromCurrentPage(page, 'recap page');
   const boxScore = await extractBoxScore(page);
-  const boxScoreHeader = await extractGameHeader(page);
+  const boxScorePageDate = await extractGameDateFromCurrentPage(page, 'box score page');
 
-  const header = {
-    ...recapHeader,
-    dateTime: boxScoreHeader.dateTime || recapHeader.dateTime || null,
-    gameDatetimeRaw: boxScoreHeader.gameDatetimeRaw || recapHeader.gameDatetimeRaw || null,
-    dateCandidates: [
-      ...(boxScoreHeader.dateCandidates || []),
-      ...(recapHeader.dateCandidates || []),
-    ],
-    result: recapHeader.result || boxScoreHeader.result || null,
-    scoreUs: recapHeader.scoreUs || boxScoreHeader.scoreUs || null,
-    scoreThem: recapHeader.scoreThem || boxScoreHeader.scoreThem || null,
-    teamCandidates: Array.from(new Set([
-      ...(recapHeader.teamCandidates || []),
-      ...(boxScoreHeader.teamCandidates || []),
-    ])),
-    pageUrl: boxScoreHeader.pageUrl || recapHeader.pageUrl || page.url(),
-  };
+  const parsedHeaderGameDate = parseGameDateFromHeaderDateTime(header.dateTime || header.gameDatetimeRaw);
+  const resolvedGameDate =
+    scheduleGameMeta.gameDate ||
+    boxScorePageDate.gameDate ||
+    recapPageDate.gameDate ||
+    parsedHeaderGameDate ||
+    null;
 
-  const plays = await extractPlays(page);
-
-  const parsedBoxScoreGameDate = parseGameDateFromHeaderDateTime(boxScoreHeader.dateTime || boxScoreHeader.gameDatetimeRaw);
-  const parsedRecapGameDate = parseGameDateFromHeaderDateTime(recapHeader.dateTime || recapHeader.gameDatetimeRaw);
-  const parsedHeaderGameDate = parsedBoxScoreGameDate || parsedRecapGameDate;
-  const resolvedGameDate = scheduleGameMeta.gameDate || parsedHeaderGameDate || null;
+  let resolvedGameDateSource = 'unresolved';
   if (resolvedGameDate) {
-    console.log(`[gc] Resolved game date: ${resolvedGameDate}${scheduleGameMeta.gameDate ? ' (schedule card)' : (parsedBoxScoreGameDate ? ' (box score header)' : ' (recap/header)')}`);
+    if (scheduleGameMeta.gameDate) resolvedGameDateSource = 'schedule card';
+    else if (boxScorePageDate.gameDate) resolvedGameDateSource = 'box score page';
+    else if (recapPageDate.gameDate) resolvedGameDateSource = 'recap page';
+    else resolvedGameDateSource = 'game header';
+    console.log(`[gc] Resolved game date: ${resolvedGameDate} (${resolvedGameDateSource})`);
   } else {
     console.warn(`[gc] Could not resolve game date for ${gameId || gameUrl}`);
   }
+
+  const plays    = await extractPlays(page);
 
   // Play reconstruction fallback if AG Grid was empty
   if (boxScore.source === "plays" || (!boxScore.batting.length && !boxScore.pitching.length)) {
@@ -1998,7 +1999,10 @@ async function extractGameData(page, team, scheduleMeta = null) {
       scheduleDateText: scheduleGameMeta.dateText || "",
       scheduleCardText: scheduleGameMeta.cardText || "",
       scheduleScoreText: scheduleGameMeta.scoreText || "",
-      gameDatetimeRaw: header.gameDatetimeRaw || header.dateTime || scheduleGameMeta.dateText || "",
+      boxScoreDateText: boxScorePageDate.dateText || "",
+      recapDateText: recapPageDate.dateText || "",
+      gameDateSource: resolvedGameDateSource,
+      gameDatetimeRaw: header.gameDatetimeRaw || header.dateTime || boxScorePageDate.dateText || recapPageDate.dateText || scheduleGameMeta.dateText || "",
       capturedAt:  new Date().toISOString(),
       ...header,
       gameDate:    resolvedGameDate,
