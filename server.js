@@ -4,7 +4,7 @@ if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
 }
 
-// Write GC auth session from environment variable on startup
+// Writes GC auth session from environment variable on startup
 const gcAuthPath = '/app/storage/gamechanger-auth.json';
 if (process.env.GC_AUTH_JSON) {
   try {
