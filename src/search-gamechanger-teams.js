@@ -27,7 +27,7 @@ const TARGET_SEASON_WORDS = (process.env.GC_ACCEPTED_SEASONS || "spring,summer")
   .filter(Boolean);
 
 // Screenshot fallback: set GC_SCREENSHOT_FALLBACK=true in .env to also
-// capture a box score PNG in addition to structured JSON extraction.
+// capture a box score PNG screenshot in addition to structured JSON extraction.
 const SCREENSHOT_FALLBACK = process.env.GC_SCREENSHOT_FALLBACK === "true";
 
 // ─── Utility Functions ────────────────────────────────────────────────────────
