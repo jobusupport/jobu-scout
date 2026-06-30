@@ -17,6 +17,8 @@ const FAILED_GAME_CAPTURES_DIR = path.join(OUTPUT_DIR, "_failed-game-captures");
 const GC_GAME_MAX_ATTEMPTS = Math.max(1, Number(process.env.GC_GAME_MAX_ATTEMPTS || 3));
 const GC_GAME_EXTRACTION_TIMEOUT_MS = Math.max(30000, Number(process.env.GC_GAME_EXTRACTION_TIMEOUT_MS || 180000));
 const GC_GAME_DB_WRITE_TIMEOUT_MS = Math.max(30000, Number(process.env.GC_GAME_DB_WRITE_TIMEOUT_MS || 90000));
+const GC_PLAYS_EXTRACTION_TIMEOUT_MS = Math.max(15000, Number(process.env.GC_PLAYS_EXTRACTION_TIMEOUT_MS || 60000));
+const GC_SKIP_PLAYS = process.env.GC_SKIP_PLAYS === 'true';
 const TEAM_URLS_FILE = path.join(OUTPUT_DIR, "Team URLs.txt");
 const DB_PATH = path.join(__dirname, "..", "voodoo-scout.db");
 
@@ -27,7 +29,7 @@ const TARGET_SEASON_WORDS = (process.env.GC_ACCEPTED_SEASONS || "spring,summer")
   .filter(Boolean);
 
 // Screenshot fallback: set GC_SCREENSHOT_FALLBACK=true in .env to also
-// capture a box score PNG screenshot in addition to structured JSON extraction.
+// capture a box score PNG in addition to structured JSON extraction.
 const SCREENSHOT_FALLBACK = process.env.GC_SCREENSHOT_FALLBACK === "true";
 
 // ─── Utility Functions ────────────────────────────────────────────────────────
@@ -1862,43 +1864,84 @@ async function autoScrollToLoadAll(page, maxScrolls = 30) {
 async function extractPlays(page) {
   console.log("Extracting play-by-play from DOM...");
 
-  await clickTabByName(page, "Plays");
-  await page.waitForTimeout(1500);
-  await selectChronologicalPlaysOrder(page);
-  await page.waitForTimeout(1500);
-  await autoScrollToLoadAll(page);
+  if (GC_SKIP_PLAYS) {
+    console.warn('[gc] GC_SKIP_PLAYS=true — skipping play-by-play extraction for this repair run.');
+    return [];
+  }
 
-  const plays = await page.evaluate(() => {
-    const results = [];
-    const seen = new Set();
-    const playSelectors = ['[class*="play"]','[class*="Play"]','[class*="event"]','[data-testid*="play"]',"li"];
+  // Direct URL navigation is more reliable than clicking the tab from the box-score page.
+  try {
+    const currentUrl = page.url();
+    const playsUrl = currentUrl
+      .replace(/\/box-score\/?$/, "/plays")
+      .replace(/\/recap\/?$/, "/plays")
+      .replace(/\/videos\/?$/, "/plays")
+      .replace(/\/info\/?$/, "/plays")
+      .replace(/\/lineup\/?$/, "/plays");
 
-    for (const selector of playSelectors) {
-      for (const el of document.querySelectorAll(selector)) {
-        const text = String(el.innerText || "").replace(/\s+/g, " ").trim();
-        const looksLikePlay = /\b(single|double|triple|home run|strikeout|walk|fly out|ground out|pop out|line out|hit by pitch|stolen base|wild pitch|passed ball|balk|error|fielder.s choice|sacrifice|inning)\b/i.test(text);
-        if (!looksLikePlay || text.length < 5 || text.length > 500 || seen.has(text)) continue;
-        seen.add(text);
-
-        let inning = null;
-        let node = el.parentElement;
-        for (let depth = 0; depth < 8 && node; depth++) {
-          const parentText = String(node.innerText || "");
-          const inningMatch = parentText.match(/\b(Top|Bottom|Mid|End)\s+(\d+)\b/i);
-          if (inningMatch) { inning = `${inningMatch[1]} ${inningMatch[2]}`; break; }
-          node = node.parentElement;
-        }
-
-        results.push({ inning, text });
-      }
-      if (results.length > 20) break;
+    if (playsUrl !== currentUrl) {
+      console.log(`[gc] Navigating directly to plays URL: ${playsUrl}`);
+      await page.goto(playsUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+      try { await page.waitForLoadState("networkidle", { timeout: 10000 }); } catch {}
+      await page.waitForTimeout(1500);
+      await dismissDontMissOutPopup(page);
+    } else {
+      await clickTabByName(page, "Plays");
     }
+  } catch (error) {
+    console.warn(`[gc] Could not open Plays page. Continuing without play-by-play: ${error.message}`);
+    return [];
+  }
 
-    return results;
-  });
+  try {
+    await withTimeout(selectChronologicalPlaysOrder(page), 12000, 'selectChronologicalPlaysOrder');
+  } catch (error) {
+    console.warn(`[gc] Could not switch Plays order. Continuing with visible order: ${error.message}`);
+  }
 
-  console.log(`  Extracted ${plays.length} play-by-play events`);
-  return plays;
+  try {
+    await page.waitForTimeout(1000);
+    await withTimeout(autoScrollToLoadAll(page, 12), 20000, 'autoScrollToLoadAll plays');
+  } catch (error) {
+    console.warn(`[gc] Could not fully scroll/load Plays. Continuing with visible plays: ${error.message}`);
+  }
+
+  try {
+    const plays = await withTimeout(page.evaluate(() => {
+      const results = [];
+      const seen = new Set();
+      const playSelectors = ['[class*="play"]','[class*="Play"]','[class*="event"]','[data-testid*="play"]',"li"];
+
+      for (const selector of playSelectors) {
+        for (const el of document.querySelectorAll(selector)) {
+          const text = String(el.innerText || "").replace(/\s+/g, " ").trim();
+          const looksLikePlay = /\b(single|double|triple|home run|strikeout|walk|fly out|ground out|pop out|line out|hit by pitch|stolen base|wild pitch|passed ball|balk|error|fielder.s choice|sacrifice|inning)\b/i.test(text);
+          if (!looksLikePlay || text.length < 5 || text.length > 500 || seen.has(text)) continue;
+          seen.add(text);
+
+          let inning = null;
+          let node = el.parentElement;
+          for (let depth = 0; depth < 8 && node; depth++) {
+            const parentText = String(node.innerText || "");
+            const inningMatch = parentText.match(/\b(Top|Bottom|Mid|End)\s+(\d+)\b/i);
+            if (inningMatch) { inning = `${inningMatch[1]} ${inningMatch[2]}`; break; }
+            node = node.parentElement;
+          }
+
+          results.push({ inning, text });
+        }
+        if (results.length > 20) break;
+      }
+
+      return results;
+    }), 15000, 'evaluate plays DOM');
+
+    console.log(`  Extracted ${plays.length} play-by-play events`);
+    return plays;
+  } catch (error) {
+    console.warn(`[gc] Play extraction failed. Continuing without play-by-play: ${error.message}`);
+    return [];
+  }
 }
 
 // ─── Main Game Extraction (replaces captureBoxScoreAndPlays) ─────────────────
@@ -1936,7 +1979,17 @@ async function extractGameData(page, team, scheduleMeta = null) {
     console.warn(`[gc] Could not resolve game date for ${gameId || gameUrl}`);
   }
 
-  const plays    = await extractPlays(page);
+  let plays = [];
+  try {
+    plays = await withTimeout(
+      extractPlays(page),
+      GC_PLAYS_EXTRACTION_TIMEOUT_MS,
+      'extractPlays'
+    );
+  } catch (error) {
+    console.warn(`[gc] Play extraction timed out/failed. Continuing with box score only: ${error.message}`);
+    plays = [];
+  }
 
   // Play reconstruction fallback if AG Grid was empty
   if (boxScore.source === "plays" || (!boxScore.batting.length && !boxScore.pitching.length)) {
@@ -2426,6 +2479,7 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId) {
   console.log(`[gc] Per-game retry limit: ${GC_GAME_MAX_ATTEMPTS}`);
   console.log(`[gc] Extraction timeout: ${GC_GAME_EXTRACTION_TIMEOUT_MS}ms`);
   console.log(`[gc] DB write timeout: ${GC_GAME_DB_WRITE_TIMEOUT_MS}ms`);
+  console.log(`[gc] Plays extraction timeout: ${GC_PLAYS_EXTRACTION_TIMEOUT_MS}ms${GC_SKIP_PLAYS ? ' (GC_SKIP_PLAYS=true)' : ''}`);
 
   const teamDir = getTeamOutputDir(team);
   const manifest = loadProcessedGames(teamDir);
