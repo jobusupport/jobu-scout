@@ -2432,6 +2432,17 @@ async function processOneCompletedGame(page, team, teamId, gameIndex, manifest, 
     throw new Error(`Capture failed for completed game #${gameIndex + 1}.`);
   }
 
+  // Dashboard teams in the Single Opponent Scout workflow are opponent/scouted-team pages.
+  // Store the scraped team's own players as is_our_team=false so report queries
+  // analyze the selected team, not the collection of opponents they played.
+  // Set GC_INGEST_AS_SCOUTED_OPPONENT=false only for true self-scout/our-team scrapes.
+  const ingestAsScoutedOpponent = process.env.GC_INGEST_AS_SCOUTED_OPPONENT !== 'false';
+  captureResult.isOpponentTeam = ingestAsScoutedOpponent;
+  if (captureResult.gameData && captureResult.gameData.meta) {
+    captureResult.gameData.meta.isOpponentTeam = ingestAsScoutedOpponent;
+  }
+  console.log(`[gc] Ingest side mode: ${ingestAsScoutedOpponent ? 'scouted opponent/team stored as is_our_team=0' : 'self-scout/our team stored as is_our_team=1'}`);
+
   phase = 'db-write';
   console.log('[gc] Writing extracted game to DB...');
   const dbWriteResult = await withTimeout(
