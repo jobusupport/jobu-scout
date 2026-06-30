@@ -1541,13 +1541,103 @@ async function extractGameData(page, team) {
 
 // ─── Game Loop ────────────────────────────────────────────────────────────────
 
+function normalizeGcGameIdentity(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const extracted = extractGameIdFromUrl(raw);
+  return extracted || raw;
+}
+
+function dbGameMatchesPageGame(dbGames, gameId, gameUrl) {
+  const normalizedGameId = normalizeGcGameIdentity(gameId);
+  const normalizedUrlGameId = normalizeGcGameIdentity(gameUrl);
+  const normalizedUrl = String(gameUrl || '').trim();
+
+  return (dbGames || []).some((game) => {
+    const dbGameId = normalizeGcGameIdentity(game.gcGameId || game.gc_game_id || '');
+    const dbUrl = String(game.gcGameUrl || game.gc_game_url || '').trim();
+    const dbUrlGameId = normalizeGcGameIdentity(dbUrl);
+
+    return (
+      (normalizedGameId && dbGameId && normalizedGameId === dbGameId) ||
+      (normalizedGameId && dbUrlGameId && normalizedGameId === dbUrlGameId) ||
+      (normalizedUrlGameId && dbGameId && normalizedUrlGameId === dbGameId) ||
+      (normalizedUrl && dbUrl && normalizedUrl === dbUrl)
+    );
+  });
+}
+
+async function loadKnownCompleteDbGames(teamId) {
+  if (!pipeline.getKnownCompleteGamesForTeam) {
+    console.log('[gc] DB completed-game lookup is not available. Falling back to schedule scan.');
+    return [];
+  }
+
+  const games = await withTimeout(
+    pipeline.getKnownCompleteGamesForTeam(teamId),
+    30000,
+    'pipeline.getKnownCompleteGamesForTeam'
+  );
+
+  return Array.isArray(games) ? games : [];
+}
+
+async function chooseIncrementalStartIndex(page, teamId, completedGameCount, knownDbGames) {
+  const dbCompleteCount = knownDbGames.length;
+
+  console.log(`[gc] Complete games in DB for this team: ${dbCompleteCount}`);
+  console.log(`[gc] Completed games visible on GameChanger: ${completedGameCount}`);
+
+  if (dbCompleteCount === 0) {
+    console.log('[gc] No completed games found in DB. Starting at GameChanger completed game #1.');
+    return 0;
+  }
+
+  if (completedGameCount <= dbCompleteCount) {
+    console.log('[gc] DB already has at least as many complete games as GameChanger shows. No new games to scrape.');
+    return completedGameCount;
+  }
+
+  const verifyIndex = Math.min(dbCompleteCount - 1, completedGameCount - 1);
+  console.log(`[gc] Incremental scrape check: verifying GameChanger game #${verifyIndex + 1} is already in DB...`);
+
+  const opened = await clickCompletedGameFromScheduleByIndex(page, verifyIndex);
+  if (!opened) {
+    console.log('[gc] Could not open the DB boundary game. Falling back to a full schedule scan.');
+    return 0;
+  }
+
+  const verifyUrl = page.url();
+  const verifyGameId = extractGameIdFromUrl(verifyUrl);
+  const matchesDb = dbGameMatchesPageGame(knownDbGames, verifyGameId, verifyUrl);
+
+  console.log(`[gc] Boundary GameChanger game id: ${verifyGameId || '(none)'}`);
+  console.log(`[gc] Boundary game is in DB: ${matchesDb ? 'YES' : 'NO'}`);
+
+  const returned = await clickBackToSchedule(page);
+  if (!returned) {
+    console.log('[gc] Could not return to schedule after DB boundary check. Falling back to current page handling.');
+    return 0;
+  }
+
+  if (matchesDb) {
+    const startIndex = dbCompleteCount;
+    console.log(`[gc] Incremental scrape confirmed. Starting with new GameChanger game #${startIndex + 1}.`);
+    return startIndex;
+  }
+
+  console.log('[gc] DB boundary did not match the GameChanger schedule. Falling back to a full scan with DB duplicate checks.');
+  return 0;
+}
+
 async function captureAllCompletedGamesFromSchedule(page, team, teamId) {
   console.log("");
   console.log("Starting completed-game capture loop...");
 
   const teamDir = getTeamOutputDir(team);
   const manifest = loadProcessedGames(teamDir);
-  let gameIndex = 0;
+  let knownDbGames = await loadKnownCompleteDbGames(teamId);
+  let gameIndex = null;
 
   while (true) {
     await dismissDontMissOutPopup(page);
@@ -1558,6 +1648,10 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId) {
     if (completedGameCount === 0) {
       console.log("No completed games found. Moving on.");
       return true;
+    }
+
+    if (gameIndex === null) {
+      gameIndex = await chooseIncrementalStartIndex(page, teamId, completedGameCount, knownDbGames);
     }
 
     if (gameIndex >= completedGameCount) {
@@ -1573,6 +1667,14 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId) {
 
     const gameUrl = page.url();
     const gameId  = extractGameIdFromUrl(gameUrl);
+
+    if (dbGameMatchesPageGame(knownDbGames, gameId, gameUrl)) {
+      console.log(`[gc] Skipping game already complete in DB: ${gameId || gameUrl}`);
+      const returned = await clickBackToSchedule(page);
+      if (!returned) { console.log("Could not return to schedule after skipping DB duplicate game."); return false; }
+      gameIndex++;
+      continue;
+    }
 
     if (isGameAlreadyProcessed(manifest.processedGames, gameId)) {
       console.log(`Skipping already processed game: ${gameId || gameUrl}`);
@@ -1610,6 +1712,11 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId) {
 
         saveProcessedGames(manifest.manifestPath, manifest.processedGames);
         console.log(`Updated processed-games manifest: ${manifest.manifestPath}`);
+
+        knownDbGames.push({
+          gcGameId: gameId || extractGameIdFromUrl(gameUrl) || '',
+          gcGameUrl: gameUrl || '',
+        });
       }
     } else {
       console.log(`Capture failed for completed game #${gameIndex + 1}. Returning to schedule if possible.`);

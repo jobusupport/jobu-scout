@@ -86,6 +86,21 @@ async function ensureTeam(team) {
   return teamId;
 }
 
+async function getKnownCompleteGamesForTeam(teamId) {
+  const getter = typeof db.getCompleteGamesByTeam === 'function'
+    ? db.getCompleteGamesByTeam
+    : db.getGamesByTeam;
+
+  const games = await Promise.resolve(getter(teamId)) || [];
+  return games.map((game) => ({
+    id: game.id,
+    gcGameId: game.gc_game_id || game.gcGameId || '',
+    gcGameUrl: game.gc_game_url || game.gcGameUrl || '',
+    gameDate: game.game_date || game.gameDate || null,
+    opponentName: game.opponent_name || game.opponentName || '',
+  }));
+}
+
 // ─── Single Game Processing ───────────────────────────────────────────────────
 
 /**
@@ -495,6 +510,7 @@ async function getTeamBundle(teamId) {
 module.exports = {
   init,
   ensureTeam,
+  getKnownCompleteGamesForTeam,
   processGameJson,
   processTeamOutputDir,
   processAllOutputDirs,

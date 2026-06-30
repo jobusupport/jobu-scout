@@ -422,6 +422,44 @@ async function getGamesByTeam(teamId) {
   return data || [];
 }
 
+async function getCompleteGamesByTeam(teamId) {
+  const sb = getDb();
+
+  const { data: games, error: gamesError } = await sb
+    .from('games')
+    .select('id, gc_game_id, gc_game_url, game_date, game_time, captured_at, opponent_name')
+    .eq('team_id', teamId)
+    .order('game_date', { ascending: true })
+    .order('captured_at', { ascending: true });
+  check(gamesError, 'getCompleteGamesByTeam games');
+
+  if (!games || games.length === 0) return [];
+
+  const gameIds = games.map((game) => game.id);
+
+  const [battingRes, pitchingRes, playsRes] = await Promise.all([
+    sb.from('batting_lines').select('game_id').in('game_id', gameIds),
+    sb.from('pitching_lines').select('game_id').in('game_id', gameIds),
+    sb.from('play_events').select('game_id').in('game_id', gameIds),
+  ]);
+
+  check(battingRes.error, 'getCompleteGamesByTeam batting_lines');
+  check(pitchingRes.error, 'getCompleteGamesByTeam pitching_lines');
+  check(playsRes.error, 'getCompleteGamesByTeam play_events');
+
+  const battingGameIds = new Set((battingRes.data || []).map((row) => row.game_id));
+  const pitchingGameIds = new Set((pitchingRes.data || []).map((row) => row.game_id));
+  const playGameIds = new Set((playsRes.data || []).map((row) => row.game_id));
+
+  return games
+    .filter((game) => battingGameIds.has(game.id) && pitchingGameIds.has(game.id) && playGameIds.has(game.id))
+    .map((game) => ({
+      ...game,
+      gcGameId: game.gc_game_id || '',
+      gcGameUrl: game.gc_game_url || '',
+    }));
+}
+
 async function getGameById(gameId) {
   const { data, error } = await getDb().from('games').select('*').eq('id', gameId).maybeSingle();
   check(error, 'getGameById');
@@ -850,6 +888,7 @@ module.exports = {
   // Games
   insertGame,
   getGamesByTeam,
+  getCompleteGamesByTeam,
   getGameById,
   // Stats
   insertBattingLines,
