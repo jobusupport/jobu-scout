@@ -244,33 +244,7 @@ async function getTeams(req = null) {
 }
 
 async function getTeamStats(teamId) {
-  if (USE_SUPABASE) {
-    const [{ data: games, error: gamesError }, { count: plays, error: playsError }, { data: batters, error: battersError }] = await Promise.all([
-      adminClient.from('games').select('result').eq('team_id', teamId),
-      adminClient.from('play_events').select('id', { count: 'exact', head: true }).eq('team_id', teamId),
-      adminClient.from('batting_lines').select('player_name').eq('team_id', teamId).eq('is_our_team', false),
-    ]);
-
-    if (gamesError) throw gamesError;
-    if (playsError) throw playsError;
-    if (battersError) throw battersError;
-
-    return {
-      wins:    (games || []).filter(g => g.result === 'W').length,
-      losses:  (games || []).filter(g => g.result === 'L').length,
-      plays:   plays || 0,
-      batters: new Set((batters || []).map(b => b.player_name).filter(Boolean)).size,
-    };
-  }
-
-  try {
-    const db      = getDb();
-    const games   = db.prepare(`SELECT result FROM games WHERE team_id = ?`).all(teamId);
-    const plays   = db.prepare(`SELECT COUNT(*) as n FROM play_events WHERE team_id = ?`).get(teamId);
-    const batters = db.prepare(`SELECT COUNT(DISTINCT player_name) as n FROM batting_lines WHERE team_id = ? AND is_our_team = 0`).get(teamId);
-    db.close();
-    return { wins: games.filter(g=>g.result==='W').length, losses: games.filter(g=>g.result==='L').length, plays: plays.n, batters: batters.n };
-  } catch { return {}; }
+  return await getTeamSummary(teamId);
 }
 
 function getReports() {
@@ -858,6 +832,16 @@ app.post('/api/run/all-reports', requireAuth, async (req, res) => {
 
 // ── Serve dashboard ─────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.sendFile(path.join(ROOT, 'dashboard', 'index.html')));
+
+// ── Team Summary ─────────────────────────────────────────────────────────────
+app.get('/api/teams/:id/summary', requireAuth, async (req, res) => {
+  try {
+    res.json(await getTeamSummary(req.params.id, req));
+  } catch (err) {
+    console.error('[api/teams/:id/summary]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ── Team Games ───────────────────────────────────────────────────────────────
 app.get('/api/teams/:id/games', requireAuth, async (req, res) => {
