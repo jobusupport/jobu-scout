@@ -4,7 +4,7 @@ if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
 }
 
-// Writes GC auth session from environment variable on startup
+// Write GC auth session from environment variable on startup
 const gcAuthPath = '/app/storage/gamechanger-auth.json';
 if (process.env.GC_AUTH_JSON) {
   try {
@@ -244,7 +244,96 @@ async function getTeams(req = null) {
 }
 
 async function getTeamStats(teamId) {
-  return await getTeamSummary(teamId);
+  if (USE_SUPABASE) {
+    const [{ data: games, error: gamesError }, { count: plays, error: playsError }, { data: batters, error: battersError }] = await Promise.all([
+      adminClient.from('games').select('result').eq('team_id', teamId),
+      adminClient.from('play_events').select('id', { count: 'exact', head: true }).eq('team_id', teamId),
+      adminClient.from('batting_lines').select('player_name').eq('team_id', teamId).eq('is_our_team', false),
+    ]);
+
+    if (gamesError) throw gamesError;
+    if (playsError) throw playsError;
+    if (battersError) throw battersError;
+
+    return {
+      wins:    (games || []).filter(g => g.result === 'W').length,
+      losses:  (games || []).filter(g => g.result === 'L').length,
+      plays:   plays || 0,
+      batters: new Set((batters || []).map(b => b.player_name).filter(Boolean)).size,
+    };
+  }
+
+  try {
+    const db      = getDb();
+    const games   = db.prepare(`SELECT result FROM games WHERE team_id = ?`).all(teamId);
+    const plays   = db.prepare(`SELECT COUNT(*) as n FROM play_events WHERE team_id = ?`).get(teamId);
+    const batters = db.prepare(`SELECT COUNT(DISTINCT player_name) as n FROM batting_lines WHERE team_id = ? AND is_our_team = 0`).get(teamId);
+    db.close();
+    return { wins: games.filter(g=>g.result==='W').length, losses: games.filter(g=>g.result==='L').length, plays: plays.n, batters: batters.n };
+  } catch { return {}; }
+}
+
+
+async function getTeamSummary(teamId) {
+  if (USE_SUPABASE) {
+    const [gamesRes, playsRes, battersRes] = await Promise.all([
+      adminClient
+        .from('games')
+        .select('id, game_date, result')
+        .eq('team_id', teamId),
+      adminClient
+        .from('play_events')
+        .select('id', { count: 'exact', head: true })
+        .eq('team_id', teamId),
+      adminClient
+        .from('batting_lines')
+        .select('player_name')
+        .eq('team_id', teamId)
+        .eq('is_our_team', false),
+    ]);
+
+    if (gamesRes.error) throw gamesRes.error;
+    if (playsRes.error) throw playsRes.error;
+    if (battersRes.error) throw battersRes.error;
+
+    const games = gamesRes.data || [];
+    const normalizedResult = value => String(value || '').trim().toUpperCase();
+    const lastGame = games
+      .map(g => g.game_date)
+      .filter(Boolean)
+      .sort()
+      .pop() || null;
+
+    return {
+      games: games.length,
+      game_count: games.length,
+      wins: games.filter(g => normalizedResult(g.result) === 'W').length,
+      losses: games.filter(g => normalizedResult(g.result) === 'L').length,
+      ties: games.filter(g => normalizedResult(g.result) === 'T').length,
+      last_game: lastGame,
+      plays: playsRes.count || 0,
+      batters: new Set((battersRes.data || []).map(b => b.player_name).filter(Boolean)).size,
+    };
+  }
+
+  const db = getDb();
+  const games = db.prepare(`SELECT game_date, result FROM games WHERE team_id = ?`).all(teamId);
+  const plays = db.prepare(`SELECT COUNT(*) AS n FROM play_events WHERE team_id = ?`).get(teamId)?.n || 0;
+  const batters = db.prepare(`SELECT COUNT(DISTINCT player_name) AS n FROM batting_lines WHERE team_id = ? AND is_our_team = 0`).get(teamId)?.n || 0;
+  db.close();
+
+  const normalizedResult = value => String(value || '').trim().toUpperCase();
+  const lastGame = games.map(g => g.game_date).filter(Boolean).sort().pop() || null;
+  return {
+    games: games.length,
+    game_count: games.length,
+    wins: games.filter(g => normalizedResult(g.result) === 'W').length,
+    losses: games.filter(g => normalizedResult(g.result) === 'L').length,
+    ties: games.filter(g => normalizedResult(g.result) === 'T').length,
+    last_game: lastGame,
+    plays,
+    batters,
+  };
 }
 
 function getReports() {
@@ -579,13 +668,27 @@ app.get('/api/teams', requireAuth, async (req, res) => {
   try {
     const rawTeams = await getTeams(req);
     const teams = await Promise.all(rawTeams.map(async t => {
-      const hasUrls = await hasGameUrls(t.id);
+      let hasUrls = false;
+      let stats = { wins: 0, losses: 0, ties: 0, plays: 0, batters: 0 };
+
+      try {
+        hasUrls = await hasGameUrls(t.id);
+      } catch (err) {
+        console.warn(`[api/teams] hasGameUrls failed for ${t.team_name || t.id}: ${err.message}`);
+      }
+
+      try {
+        stats = await getTeamStats(t.id);
+      } catch (err) {
+        console.warn(`[api/teams] getTeamStats failed for ${t.team_name || t.id}: ${err.message}`);
+      }
+
       return {
         ...t,
         hasGC:       !!t.gc_team_url || hasUrls,
         hasPG:       hasPGData(t.team_name),
         hasGameUrls: hasUrls,
-        stats:       await getTeamStats(t.id),
+        stats,
       };
     }));
     res.json(teams);
@@ -833,10 +936,12 @@ app.post('/api/run/all-reports', requireAuth, async (req, res) => {
 // ── Serve dashboard ─────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.sendFile(path.join(ROOT, 'dashboard', 'index.html')));
 
-// ── Team Summary ─────────────────────────────────────────────────────────────
+
+// ── Live Team Summary ───────────────────────────────────────────────────────
 app.get('/api/teams/:id/summary', requireAuth, async (req, res) => {
   try {
-    res.json(await getTeamSummary(req.params.id, req));
+    await assertTeamInRequestOrg(req, req.params.id);
+    res.json(await getTeamSummary(req.params.id));
   } catch (err) {
     console.error('[api/teams/:id/summary]', err);
     res.status(500).json({ error: err.message });
