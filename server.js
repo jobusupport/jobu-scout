@@ -297,7 +297,7 @@ async function getTeamSummary(teamId) {
     if (battersRes.error) throw battersRes.error;
 
     const games = gamesRes.data || [];
-    const normalizedResult = value => String(value || '').trim().toUpperCase();
+    const normResult = value => String(value || '').trim().toUpperCase();
     const lastGame = games
       .map(g => g.game_date)
       .filter(Boolean)
@@ -306,10 +306,9 @@ async function getTeamSummary(teamId) {
 
     return {
       games: games.length,
-      game_count: games.length,
-      wins: games.filter(g => normalizedResult(g.result) === 'W').length,
-      losses: games.filter(g => normalizedResult(g.result) === 'L').length,
-      ties: games.filter(g => normalizedResult(g.result) === 'T').length,
+      wins: games.filter(g => normResult(g.result) === 'W').length,
+      losses: games.filter(g => normResult(g.result) === 'L').length,
+      ties: games.filter(g => normResult(g.result) === 'T').length,
       last_game: lastGame,
       plays: playsRes.count || 0,
       batters: new Set((battersRes.data || []).map(b => b.player_name).filter(Boolean)).size,
@@ -317,23 +316,24 @@ async function getTeamSummary(teamId) {
   }
 
   const db = getDb();
-  const games = db.prepare(`SELECT game_date, result FROM games WHERE team_id = ?`).all(teamId);
-  const plays = db.prepare(`SELECT COUNT(*) AS n FROM play_events WHERE team_id = ?`).get(teamId)?.n || 0;
-  const batters = db.prepare(`SELECT COUNT(DISTINCT player_name) AS n FROM batting_lines WHERE team_id = ? AND is_our_team = 0`).get(teamId)?.n || 0;
-  db.close();
-
-  const normalizedResult = value => String(value || '').trim().toUpperCase();
-  const lastGame = games.map(g => g.game_date).filter(Boolean).sort().pop() || null;
-  return {
-    games: games.length,
-    game_count: games.length,
-    wins: games.filter(g => normalizedResult(g.result) === 'W').length,
-    losses: games.filter(g => normalizedResult(g.result) === 'L').length,
-    ties: games.filter(g => normalizedResult(g.result) === 'T').length,
-    last_game: lastGame,
-    plays,
-    batters,
-  };
+  try {
+    const games = db.prepare(`SELECT game_date, result FROM games WHERE team_id = ?`).all(teamId);
+    const plays = db.prepare(`SELECT COUNT(*) as n FROM play_events WHERE team_id = ?`).get(teamId)?.n || 0;
+    const batters = db.prepare(`SELECT COUNT(DISTINCT player_name) as n FROM batting_lines WHERE team_id = ? AND is_our_team = 0`).get(teamId)?.n || 0;
+    const normResult = value => String(value || '').trim().toUpperCase();
+    const lastGame = games.map(g => g.game_date).filter(Boolean).sort().pop() || null;
+    return {
+      games: games.length,
+      wins: games.filter(g => normResult(g.result) === 'W').length,
+      losses: games.filter(g => normResult(g.result) === 'L').length,
+      ties: games.filter(g => normResult(g.result) === 'T').length,
+      last_game: lastGame,
+      plays,
+      batters,
+    };
+  } finally {
+    db.close();
+  }
 }
 
 function getReports() {
@@ -668,32 +668,29 @@ app.get('/api/teams', requireAuth, async (req, res) => {
   try {
     const rawTeams = await getTeams(req);
     const teams = await Promise.all(rawTeams.map(async t => {
-      let hasUrls = false;
-      let stats = { wins: 0, losses: 0, ties: 0, plays: 0, batters: 0 };
-
-      try {
-        hasUrls = await hasGameUrls(t.id);
-      } catch (err) {
-        console.warn(`[api/teams] hasGameUrls failed for ${t.team_name || t.id}: ${err.message}`);
-      }
-
-      try {
-        stats = await getTeamStats(t.id);
-      } catch (err) {
-        console.warn(`[api/teams] getTeamStats failed for ${t.team_name || t.id}: ${err.message}`);
-      }
-
+      const hasUrls = await hasGameUrls(t.id);
       return {
         ...t,
         hasGC:       !!t.gc_team_url || hasUrls,
         hasPG:       hasPGData(t.team_name),
         hasGameUrls: hasUrls,
-        stats,
+        stats:       await getTeamStats(t.id),
       };
     }));
     res.json(teams);
   } catch (err) {
     console.error('[api/teams]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+app.get('/api/teams/:id/summary', requireAuth, async (req, res) => {
+  try {
+    if (USE_SUPABASE) await assertTeamInRequestOrg(req, req.params.id);
+    res.json(await getTeamSummary(req.params.id));
+  } catch (err) {
+    console.error('[api/teams/:id/summary]', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -935,18 +932,6 @@ app.post('/api/run/all-reports', requireAuth, async (req, res) => {
 
 // ── Serve dashboard ─────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.sendFile(path.join(ROOT, 'dashboard', 'index.html')));
-
-
-// ── Live Team Summary ───────────────────────────────────────────────────────
-app.get('/api/teams/:id/summary', requireAuth, async (req, res) => {
-  try {
-    await assertTeamInRequestOrg(req, req.params.id);
-    res.json(await getTeamSummary(req.params.id));
-  } catch (err) {
-    console.error('[api/teams/:id/summary]', err);
-    res.status(500).json({ error: err.message });
-  }
-});
 
 // ── Team Games ───────────────────────────────────────────────────────────────
 app.get('/api/teams/:id/games', requireAuth, async (req, res) => {
