@@ -940,6 +940,63 @@ function isGameAlreadyProcessed(processedGames, gameId) {
   return processedGames.some((game) => game.gameId === gameId);
 }
 
+
+async function getVisibleCompletedGameEntries(page) {
+  await dismissDontMissOutPopup(page);
+  const completedGameRegex = /\b[WL]\s*\d+\s*[-–—]\s*\d+\b/i;
+  const scoreLocator = page.getByText(completedGameRegex);
+  const count = await scoreLocator.count();
+  const entries = [];
+
+  for (let i = 0; i < count; i++) {
+    const item = scoreLocator.nth(i);
+    try {
+      const box = await item.boundingBox();
+      if (!box || box.width <= 0 || box.height <= 0) continue;
+
+      const entry = await item.evaluate((element) => {
+        const text = (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim();
+        let node = element;
+        let href = '';
+        for (let depth = 0; depth < 12 && node; depth++) {
+          if (node.href) { href = node.href; break; }
+          if (node.getAttribute) {
+            href = node.getAttribute('href') || node.getAttribute('data-href') || '';
+            if (href) break;
+          }
+          const anchor = node.querySelector && node.querySelector('a[href*="/schedule/"]');
+          if (anchor && anchor.href) { href = anchor.href; break; }
+          node = node.parentElement;
+        }
+        return { text, href };
+      });
+
+      const href = entry.href ? new URL(entry.href, window.location.origin).href : '';
+      entries.push({
+        visibleIndex: entries.length,
+        scoreText: entry.text || '',
+        href,
+        gameId: href ? extractGameIdFromUrl(href) : '',
+      });
+    } catch {
+      // Ignore stale rows.
+    }
+  }
+
+  return entries;
+}
+
+function buildResumeOrderedScheduleIndexes(completedGameCount) {
+  const newestFirst = process.env.GC_SCHEDULE_NEWEST_FIRST !== 'false';
+  const indexes = [];
+  if (newestFirst) {
+    for (let i = completedGameCount - 1; i >= 0; i--) indexes.push(i);
+  } else {
+    for (let i = 0; i < completedGameCount; i++) indexes.push(i);
+  }
+  return indexes;
+}
+
 async function clickCompletedGameFromScheduleByIndex(page, targetIndex) {
   console.log("");
   console.log(`Looking for completed game #${targetIndex + 1} with W/L and score...`);
@@ -1893,56 +1950,43 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId) {
   const teamDir = getTeamOutputDir(team);
   const manifest = loadProcessedGames(teamDir);
   let knownDbGames = await loadKnownCompleteDbGames(teamId);
-  let gameIndex = null;
   let scheduleUrl = page.url();
   const failures = [];
   const processed = [];
   const skipped = [];
 
-  while (true) {
-    try {
-      await dismissDontMissOutPopup(page);
-    } catch (error) {
-      console.log(`[gc] Popup dismissal failed but continuing: ${error.message}`);
-    }
+  let completedGameCount = 0;
+  try {
+    completedGameCount = await withTimeout(
+      getVisibleCompletedGameCount(page),
+      45000,
+      'getVisibleCompletedGameCount'
+    );
+  } catch (error) {
+    console.error(`[gc] Could not count completed games on schedule: ${error.message}`);
+    await writeFailedGameCaptureReport(page, team, 0, 'count-completed-games', error, { scheduleUrl });
+    const recovered = await returnToScheduleSafely(page, scheduleUrl, 'count completed games recovery');
+    if (!recovered) throw error;
+    completedGameCount = await getVisibleCompletedGameCount(page);
+  }
 
-    let completedGameCount = 0;
-    try {
-      completedGameCount = await withTimeout(
-        getVisibleCompletedGameCount(page),
-        45000,
-        'getVisibleCompletedGameCount'
-      );
-    } catch (error) {
-      console.error(`[gc] Could not count completed games on schedule: ${error.message}`);
-      await writeFailedGameCaptureReport(page, team, gameIndex || 0, 'count-completed-games', error, { scheduleUrl });
-      const recovered = await returnToScheduleSafely(page, scheduleUrl, 'count completed games recovery');
-      if (!recovered) throw error;
-      completedGameCount = await getVisibleCompletedGameCount(page);
-    }
+  console.log(`Visible completed games on schedule: ${completedGameCount}`);
+  console.log(`[gc] Complete games in DB for this team: ${knownDbGames.length}`);
 
-    console.log(`Visible completed games on schedule: ${completedGameCount}`);
+  if (completedGameCount === 0) {
+    console.log('No completed games found. Moving on.');
+    return true;
+  }
 
-    if (completedGameCount === 0) {
-      console.log('No completed games found. Moving on.');
-      return true;
-    }
+  console.log('[gc] Resume mode: starting at the end of the GameChanger schedule and walking forward.');
+  console.log('[gc] Each game is skipped only when that exact GameChanger game id is already complete in the DB.');
+  console.log('[gc] This avoids rescraping early games and still fills any true gaps.');
 
-    if (gameIndex === null) {
-      gameIndex = await chooseIncrementalStartIndex(page, teamId, completedGameCount, knownDbGames);
-      await returnToScheduleSafely(page, scheduleUrl, 'after incremental boundary check');
-      scheduleUrl = page.url().includes('/schedule') ? page.url() : scheduleUrl;
-    }
+  const scheduleIndexes = buildResumeOrderedScheduleIndexes(completedGameCount);
 
-    if (gameIndex >= completedGameCount) {
-      console.log('No more completed games to process for this team.');
-      if (failures.length) {
-        console.warn(`[gc] Completed schedule scan with ${failures.length} failed game(s). Failed games were not marked processed and will be retried on the next run.`);
-        for (const f of failures) console.warn(`[gc] Failed game #${f.gameNumber}: ${f.status || f.error}`);
-      }
-      console.log(`[gc] Summary: processed=${processed.length}, skipped=${skipped.length}, failed=${failures.length}`);
-      return true;
-    }
+  for (const gameIndex of scheduleIndexes) {
+    await returnToScheduleSafely(page, scheduleUrl, `before game #${gameIndex + 1}`);
+    scheduleUrl = page.url().includes('/schedule') ? page.url() : scheduleUrl;
 
     let attempt = 1;
     let finishedThisIndex = false;
@@ -1986,9 +2030,15 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId) {
 
       attempt++;
     }
-
-    gameIndex++;
   }
+
+  console.log('No more completed games to process for this team.');
+  if (failures.length) {
+    console.warn(`[gc] Completed schedule scan with ${failures.length} failed game(s). Failed games were not marked processed and will be retried on the next run.`);
+    for (const f of failures) console.warn(`[gc] Failed game #${f.gameNumber}: ${f.status || f.error}`);
+  }
+  console.log(`[gc] Summary: processed=${processed.length}, skipped=${skipped.length}, failed=${failures.length}`);
+  return true;
 }
 
 // ─── Team Processing ──────────────────────────────────────────────────────────

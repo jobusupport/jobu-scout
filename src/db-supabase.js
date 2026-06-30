@@ -196,6 +196,45 @@ function numericOrZero(value) {
   return n === null ? 0 : n;
 }
 
+
+function extractGcGameIdFromUrl(value) {
+  const match = String(value || '').match(/\/schedule\/([^/?#]+)/i);
+  return match ? match[1] : '';
+}
+
+function normalizeGcGameIdFromGame(game) {
+  return normalizeNullable(game.gcGameId || game.gc_game_id) || extractGcGameIdFromUrl(game.gcGameUrl || game.gc_game_url) || null;
+}
+
+async function findExistingGameByGcIdentity(sb, orgId, game) {
+  const gcGameId = normalizeGcGameIdFromGame(game);
+  const gcGameUrl = normalizeNullable(game.gcGameUrl || game.gc_game_url);
+
+  if (gcGameId) {
+    const { data, error } = await sb
+      .from('games')
+      .select('id')
+      .eq('org_id', orgId)
+      .eq('gc_game_id', gcGameId)
+      .maybeSingle();
+    check(error, 'findExistingGameByGcIdentity gc_game_id');
+    if (data) return data;
+  }
+
+  if (gcGameUrl) {
+    const { data, error } = await sb
+      .from('games')
+      .select('id')
+      .eq('org_id', orgId)
+      .eq('gc_game_url', gcGameUrl)
+      .maybeSingle();
+    check(error, 'findExistingGameByGcIdentity gc_game_url');
+    if (data) return data;
+  }
+
+  return null;
+}
+
 function inferSeasonYear(input = {}) {
   const direct = input.seasonYear || input.season_year;
   if (direct !== undefined && direct !== null && String(direct).trim() !== '') {
@@ -346,20 +385,15 @@ async function insertGame(game) {
   const orgId = normalizeNullable(game.orgId || game.org_id) || await getOrgIdForTeam(game.teamId);
   const ourTeamId = game.ourTeamId || game.our_team_id || game.teamId;
   const opponentId = game.opponentId || game.opponent_id || game.teamId;
+  const gcGameId = normalizeGcGameIdFromGame(game);
 
-  // Dedup check scoped to the team's org.
-  if (game.gcGameId) {
-    const { data, error } = await sb
-      .from('games')
-      .select('id')
-      .eq('org_id', orgId)
-      .eq('gc_game_id', game.gcGameId)
-      .maybeSingle();
-    check(error, 'insertGame dedup check');
-    if (data) {
-      console.log(`[db-supabase] Game already exists: ${game.gcGameId}`);
-      return data.id;
-    }
+  // Dedup check scoped to the team's org. This protects against duplicate rows
+  // even when an older write had only gc_game_url or the normalized object
+  // did not carry gcGameId cleanly.
+  const existing = await findExistingGameByGcIdentity(sb, orgId, { ...game, gcGameId });
+  if (existing) {
+    console.log(`[db-supabase] Game already exists: ${gcGameId || game.gcGameUrl || existing.id}`);
+    return existing.id;
   }
 
   const payload = {
@@ -367,7 +401,7 @@ async function insertGame(game) {
     team_id:           game.teamId,
     our_team_id:       ourTeamId,
     opponent_id:       opponentId,
-    gc_game_id:        game.gcGameId        || null,
+    gc_game_id:        gcGameId             || null,
     gc_game_url:       game.gcGameUrl       || null,
     game_date:         game.gameDate        || null,
     game_time:         game.gameTime        || null,
@@ -393,11 +427,13 @@ async function updateExistingGame(gameId, game) {
   const orgId = normalizeNullable(game.orgId || game.org_id) || await getOrgIdForTeam(game.teamId);
   const ourTeamId = game.ourTeamId || game.our_team_id || game.teamId;
   const opponentId = game.opponentId || game.opponent_id || game.teamId;
+  const gcGameId = normalizeGcGameIdFromGame(game);
   const { error } = await getDb().from('games').update({
     org_id:            orgId,
     team_id:           game.teamId,
     our_team_id:       ourTeamId,
     opponent_id:       opponentId,
+    gc_game_id:        gcGameId             || null,
     gc_game_url:       game.gcGameUrl       || null,
     game_date:         game.gameDate        || null,
     game_time:         game.gameTime        || null,
@@ -602,17 +638,9 @@ async function writeNormalizedGame(normalized) {
   const scopedGame = { ...game, orgId };
 
   // Check for existing game, scoped to the team's org.
-  let existing = null;
-  if (scopedGame.gcGameId) {
-    const { data, error } = await getDb()
-      .from('games')
-      .select('id')
-      .eq('org_id', orgId)
-      .eq('gc_game_id', scopedGame.gcGameId)
-      .maybeSingle();
-    check(error, 'writeNormalizedGame existing lookup');
-    existing = data;
-  }
+  const normalizedGcGameId = normalizeGcGameIdFromGame(scopedGame);
+  if (normalizedGcGameId) scopedGame.gcGameId = normalizedGcGameId;
+  const existing = await findExistingGameByGcIdentity(getDb(), orgId, scopedGame);
 
   const gameId = existing ? existing.id : await insertGame(scopedGame);
 
