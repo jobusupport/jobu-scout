@@ -918,6 +918,64 @@ function extractGameIdFromUrl(url) {
   return match ? match[1] : "";
 }
 
+function normalizeScheduleDateText(value, fallbackYear = TARGET_SEASON_YEAR) {
+  const raw = String(value || "").replace(/\s+/g, " ").trim();
+  if (!raw) return null;
+
+  const monthMap = {
+    jan: 1, january: 1,
+    feb: 2, february: 2,
+    mar: 3, march: 3,
+    apr: 4, april: 4,
+    may: 5,
+    jun: 6, june: 6,
+    jul: 7, july: 7,
+    aug: 8, august: 8,
+    sep: 9, sept: 9, september: 9,
+    oct: 10, october: 10,
+    nov: 11, november: 11,
+    dec: 12, december: 12,
+  };
+
+  const patterns = [
+    /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\.?,?\s*(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2})(?:,?\s+(20\d{2}|19\d{2}))?\b/i,
+    /\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\b/,
+  ];
+
+  const monthNameMatch = raw.match(patterns[0]);
+  if (monthNameMatch) {
+    const month = monthMap[String(monthNameMatch[1]).toLowerCase().replace(/\.$/, "")];
+    const day = Number(monthNameMatch[2]);
+    const year = Number(monthNameMatch[3] || fallbackYear);
+    if (month && day >= 1 && day <= 31 && Number.isFinite(year)) {
+      return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    }
+  }
+
+  const slashMatch = raw.match(patterns[1]);
+  if (slashMatch) {
+    const month = Number(slashMatch[1]);
+    const day = Number(slashMatch[2]);
+    let year = slashMatch[3] ? Number(slashMatch[3]) : Number(fallbackYear);
+    if (year < 100) year += 2000;
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31 && Number.isFinite(year)) {
+      return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    }
+  }
+
+  return null;
+}
+
+function parseScoreText(value) {
+  const match = String(value || "").match(/\b([WL])\s*(\d+)\s*[-–—]\s*(\d+)\b/i);
+  if (!match) return { result: null, scoreUs: null, scoreThem: null };
+  return {
+    result: match[1].toUpperCase(),
+    scoreUs: Number(match[2]),
+    scoreThem: Number(match[3]),
+  };
+}
+
 function loadProcessedGames(teamDir) {
   const manifestPath = path.join(teamDir, "processed-games.json");
   if (!fs.existsSync(manifestPath)) return { manifestPath, processedGames: [] };
@@ -955,10 +1013,21 @@ async function getVisibleCompletedGameEntries(page) {
       if (!box || box.width <= 0 || box.height <= 0) continue;
 
       const entry = await item.evaluate((element) => {
-        const text = (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim();
+        function clean(value) { return String(value || '').replace(/\s+/g, ' ').trim(); }
+        function looksLikeDate(value) {
+          return /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\.?[,]?\s*(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}(?:,?\s+(?:20\d{2}|19\d{2}))?\b/i.test(value) ||
+            /\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/.test(value);
+        }
+
+        const scoreText = clean(element.innerText || element.textContent || '');
         let node = element;
         let href = '';
+        let cardText = scoreText;
+
         for (let depth = 0; depth < 12 && node; depth++) {
+          const text = clean(node.innerText || node.textContent || '');
+          if (text && text.length >= cardText.length && text.length < 1200) cardText = text;
+
           if (node.href) { href = node.href; break; }
           if (node.getAttribute) {
             href = node.getAttribute('href') || node.getAttribute('data-href') || '';
@@ -968,13 +1037,37 @@ async function getVisibleCompletedGameEntries(page) {
           if (anchor && anchor.href) { href = anchor.href; break; }
           node = node.parentElement;
         }
-        return { text, href };
+
+        const scoreRect = element.getBoundingClientRect();
+        const dateCandidates = [];
+        for (const candidate of Array.from(document.querySelectorAll('body *'))) {
+          const text = clean(candidate.innerText || candidate.textContent || '');
+          if (!text || text.length > 300 || !looksLikeDate(text)) continue;
+          const rect = candidate.getBoundingClientRect();
+          if (rect.width <= 0 || rect.height <= 0) continue;
+          const distance = Math.abs(rect.top - scoreRect.top);
+          const abovePenalty = rect.top <= scoreRect.top + 20 ? 0 : 10000;
+          dateCandidates.push({ text, distance: distance + abovePenalty, top: rect.top });
+        }
+
+        dateCandidates.sort((a, b) => a.distance - b.distance || b.top - a.top);
+        const dateText = dateCandidates[0]?.text || '';
+
+        return { scoreText, cardText, dateText, href };
       });
 
-      const href = entry.href ? new URL(entry.href, window.location.origin).href : '';
+      const href = entry.href ? new URL(entry.href, page.url()).href : '';
+      const scoreParts = parseScoreText(entry.scoreText || entry.cardText || '');
+      const gameDate = normalizeScheduleDateText(`${entry.cardText || ''} ${entry.dateText || ''}`);
       entries.push({
         visibleIndex: entries.length,
-        scoreText: entry.text || '',
+        scoreText: entry.scoreText || '',
+        cardText: entry.cardText || '',
+        dateText: entry.dateText || '',
+        gameDate,
+        result: scoreParts.result,
+        scoreUs: scoreParts.scoreUs,
+        scoreThem: scoreParts.scoreThem,
         href,
         gameId: href ? extractGameIdFromUrl(href) : '',
       });
@@ -1016,7 +1109,80 @@ async function clickCompletedGameFromScheduleByIndex(page, targetIndex) {
       const scoreText = await item.innerText().catch(() => "");
       if (visibleIndex !== targetIndex) { visibleIndex++; continue; }
 
-      console.log(`Found completed game #${targetIndex + 1}: ${scoreText}`);
+      const scheduleMetaRaw = await item.evaluate((element) => {
+        function clean(value) { return String(value || '').replace(/\s+/g, ' ').trim(); }
+        function looksLikeDate(value) {
+          return /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\.?[,]?\s*(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}(?:,?\s+(?:20\d{2}|19\d{2}))?\b/i.test(value) ||
+            /\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/.test(value);
+        }
+
+        const scoreText = clean(element.innerText || element.textContent || '');
+        let node = element;
+        let href = '';
+        let cardText = scoreText;
+        let clickableFound = false;
+
+        for (let depth = 0; depth < 12 && node; depth++) {
+          const text = clean(node.innerText || node.textContent || '');
+          if (text && text.length >= cardText.length && text.length < 1200) cardText = text;
+
+          if (node.href) { href = node.href; clickableFound = true; break; }
+          if (node.getAttribute) {
+            href = node.getAttribute('href') || node.getAttribute('data-href') || '';
+            if (href) { clickableFound = true; break; }
+          }
+          const anchor = node.querySelector && node.querySelector('a[href*="/schedule/"]');
+          if (anchor && anchor.href) { href = anchor.href; clickableFound = true; break; }
+          node = node.parentElement;
+        }
+
+        const scoreRect = element.getBoundingClientRect();
+        const dateCandidates = [];
+        for (const candidate of Array.from(document.querySelectorAll('body *'))) {
+          const text = clean(candidate.innerText || candidate.textContent || '');
+          if (!text || text.length > 300 || !looksLikeDate(text)) continue;
+          const rect = candidate.getBoundingClientRect();
+          if (rect.width <= 0 || rect.height <= 0) continue;
+          const distance = Math.abs(rect.top - scoreRect.top);
+          const abovePenalty = rect.top <= scoreRect.top + 20 ? 0 : 10000;
+          dateCandidates.push({ text, distance: distance + abovePenalty, top: rect.top });
+        }
+        dateCandidates.sort((a, b) => a.distance - b.distance || b.top - a.top);
+
+        return {
+          scoreText,
+          cardText,
+          dateText: dateCandidates[0]?.text || '',
+          href,
+          clickableFound,
+        };
+      });
+
+      const scheduleMeta = {
+        visibleIndex: targetIndex,
+        scoreText: scheduleMetaRaw.scoreText || scoreText || '',
+        cardText: scheduleMetaRaw.cardText || '',
+        dateText: scheduleMetaRaw.dateText || '',
+        gameDate: normalizeScheduleDateText(`${scheduleMetaRaw.cardText || ''} ${scheduleMetaRaw.dateText || ''}`),
+        ...parseScoreText(`${scheduleMetaRaw.scoreText || ''} ${scheduleMetaRaw.cardText || ''}`),
+      };
+
+      if (scheduleMetaRaw.href) {
+        try {
+          scheduleMeta.href = new URL(scheduleMetaRaw.href, page.url()).href;
+          scheduleMeta.gameId = extractGameIdFromUrl(scheduleMeta.href);
+        } catch {
+          scheduleMeta.href = scheduleMetaRaw.href;
+          scheduleMeta.gameId = extractGameIdFromUrl(scheduleMetaRaw.href);
+        }
+      }
+
+      console.log(`Found completed game #${targetIndex + 1}: ${scheduleMeta.scoreText || scoreText}`);
+      if (scheduleMeta.gameDate) {
+        console.log(`[gc] Schedule date captured for game #${targetIndex + 1}: ${scheduleMeta.gameDate}`);
+      } else {
+        console.warn(`[gc] Could not capture schedule date for game #${targetIndex + 1}. Card text: ${scheduleMeta.cardText || '(none)'}`);
+      }
 
       try {
         await item.click();
@@ -1045,15 +1211,18 @@ async function clickCompletedGameFromScheduleByIndex(page, targetIndex) {
 
       await page.waitForTimeout(3000);
       await dismissDontMissOutPopup(page);
+      scheduleMeta.openedUrl = page.url();
+      scheduleMeta.openedGameId = extractGameIdFromUrl(page.url());
+      page.__jobuCurrentGameScheduleMeta = scheduleMeta;
       console.log(`Opened completed game page: ${page.url()}`);
-      return true;
+      return scheduleMeta;
     } catch {
       // Try next item.
     }
   }
 
   console.log(`No completed game found at index ${targetIndex}.`);
-  return false;
+  return null;
 }
 
 // ─── Page / DOM Helpers (kept for screenshot fallback) ────────────────────────
@@ -1280,6 +1449,10 @@ async function extractTableData(page, tableLocator) {
   });
 }
 
+function parseGameDateFromHeaderDateTime(value) {
+  return normalizeScheduleDateText(value);
+}
+
 async function extractGameHeader(page) {
   return await page.evaluate(() => {
     const bodyText = document.body.innerText;
@@ -1296,8 +1469,11 @@ async function extractGameHeader(page) {
       if (text && text.length < 200) teamCandidates.push(text);
     }
 
+    const dateTime = dateMatch ? dateMatch[0] : null;
+
     return {
-      dateTime:       dateMatch ? dateMatch[0] : null,
+      dateTime,
+      gameDatetimeRaw: dateTime,
       result:         scoreMatch ? scoreMatch[1] : null,
       scoreUs:        scoreMatch ? scoreMatch[2] : null,
       scoreThem:      scoreMatch ? scoreMatch[3] : null,
@@ -1382,6 +1558,130 @@ async function extractBoxScore(page) {
       return stats;
     }
 
+    function normalizeStatKey(value) {
+      return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    }
+
+    function toInt(value) {
+      const match = String(value || '').replace(/,/g, '').match(/-?\d+/);
+      return match ? Number(match[0]) : null;
+    }
+
+    function playerNameMatches(entryText, playerName) {
+      const entry = String(entryText || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+      const player = String(playerName || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+      if (!entry || !player) return false;
+      if (entry.includes(player)) return true;
+      const parts = player.split(' ').filter(Boolean);
+      if (parts.length >= 2) return entry.includes(parts[0]) && entry.includes(parts[parts.length - 1]);
+      return false;
+    }
+
+    function applyPitchingAliases(row) {
+      const keyMap = {};
+      for (const [key, value] of Object.entries(row || {})) keyMap[normalizeStatKey(key)] = value;
+
+      const pitchCountKeys = ['pc', 'p', 'pitches', 'pitchcount', 'pit', 'np'];
+      for (const key of pitchCountKeys) {
+        const value = keyMap[normalizeStatKey(key)];
+        const parsed = toInt(value);
+        if (parsed !== null) {
+          row.PC = parsed;
+          row.pc = parsed;
+          row.P = parsed;
+          row.Pitches = parsed;
+          break;
+        }
+      }
+
+      const strikeKeys = ['s', 'strikes', 'strike'];
+      for (const key of strikeKeys) {
+        const value = keyMap[normalizeStatKey(key)];
+        const parsed = toInt(value);
+        if (parsed !== null) {
+          row.Strikes = parsed;
+          row.strikes = parsed;
+          row.S = parsed;
+          break;
+        }
+      }
+
+      for (const [key, value] of Object.entries(row || {})) {
+        const text = String(value || '').trim();
+        const ps = text.match(/^(\d+)\s*[-–—]\s*(\d+)$/);
+        if (ps && /p|pitch|strike|ps/i.test(key)) {
+          row['P-S'] = text;
+          row.PitchesStrikes = text;
+          row.PC = Number(ps[1]);
+          row.pc = Number(ps[1]);
+          row.P = Number(ps[1]);
+          row.Pitches = Number(ps[1]);
+          row.Strikes = Number(ps[2]);
+          row.strikes = Number(ps[2]);
+          row.S = Number(ps[2]);
+          break;
+        }
+      }
+
+      return row;
+    }
+
+    function mergePitchingExtraIntoRows(rows, extraStats) {
+      const pitchingRows = Array.isArray(rows) ? rows : [];
+      const extras = extraStats || {};
+
+      for (const row of pitchingRows) applyPitchingAliases(row);
+
+      for (const [label, values] of Object.entries(extras)) {
+        const normalizedLabel = normalizeStatKey(label);
+        const list = Array.isArray(values) ? values : [];
+        const isPitchStrike = /pitch.*strike|pitchesstrikes|ps/.test(normalizedLabel);
+        const isPitchOnly = /^(p|pc|pitches|pitchcount|pit)$/.test(normalizedLabel);
+        const isStrikeOnly = /^(s|strikes)$/.test(normalizedLabel);
+
+        for (let index = 0; index < pitchingRows.length; index++) {
+          const row = pitchingRows[index];
+          let entry = list.find(v => playerNameMatches(v, row.Player));
+          if (!entry && list.length === pitchingRows.length) entry = list[index];
+          if (!entry) continue;
+
+          row[`Extra_${label}`] = entry;
+
+          if (isPitchStrike) {
+            const ps = String(entry).match(/(\d+)\s*[-–—]\s*(\d+)/);
+            if (ps) {
+              row['P-S'] = `${ps[1]}-${ps[2]}`;
+              row.PitchesStrikes = `${ps[1]}-${ps[2]}`;
+              row.PC = Number(ps[1]);
+              row.pc = Number(ps[1]);
+              row.P = Number(ps[1]);
+              row.Pitches = Number(ps[1]);
+              row.Strikes = Number(ps[2]);
+              row.strikes = Number(ps[2]);
+              row.S = Number(ps[2]);
+            }
+          } else if (isPitchOnly) {
+            const pc = toInt(entry);
+            if (pc !== null) {
+              row.PC = pc;
+              row.pc = pc;
+              row.P = pc;
+              row.Pitches = pc;
+            }
+          } else if (isStrikeOnly) {
+            const strikes = toInt(entry);
+            if (strikes !== null) {
+              row.Strikes = strikes;
+              row.strikes = strikes;
+              row.S = strikes;
+            }
+          }
+        }
+      }
+
+      return pitchingRows;
+    }
+
     // GC DOM layout (confirmed from live inspection):
     //   .BoxScore__awayTeamName   → away team label
     //   .BoxScore__awayLineup     → contains away batting AG Grid
@@ -1442,6 +1742,9 @@ async function extractBoxScore(page) {
 
     const homePitchingExtra = document.querySelector(".BoxScore__homePitchingExtra");
     result.home.pitchingExtra = extractExtraStats(homePitchingExtra);
+
+    result.away.pitching = mergePitchingExtraIntoRows(result.away.pitching, result.away.pitchingExtra);
+    result.home.pitching = mergePitchingExtraIntoRows(result.home.pitching, result.home.pitchingExtra);
 
     return result;
   });
@@ -1548,7 +1851,7 @@ async function extractPlays(page) {
 
 // ─── Main Game Extraction (replaces captureBoxScoreAndPlays) ─────────────────
 
-async function extractGameData(page, team) {
+async function extractGameData(page, team, scheduleMeta = null) {
   const teamDir = getTeamOutputDir(team);
   const gameUrl = page.url();
   const gameId  = extractGameIdFromUrl(gameUrl);
@@ -1556,9 +1859,18 @@ async function extractGameData(page, team) {
   console.log("");
   console.log("Starting structured data extraction (HTML, no OCR)...");
 
+  const scheduleGameMeta = scheduleMeta || page.__jobuCurrentGameScheduleMeta || {};
   const header   = await extractGameHeader(page);
   const boxScore = await extractBoxScore(page);
   const plays    = await extractPlays(page);
+
+  const parsedHeaderGameDate = parseGameDateFromHeaderDateTime(header.dateTime || header.gameDatetimeRaw);
+  const resolvedGameDate = scheduleGameMeta.gameDate || parsedHeaderGameDate || null;
+  if (resolvedGameDate) {
+    console.log(`[gc] Resolved game date: ${resolvedGameDate}${scheduleGameMeta.gameDate ? ' (schedule card)' : ' (game header)'}`);
+  } else {
+    console.warn(`[gc] Could not resolve game date for ${gameId || gameUrl}`);
+  }
 
   // Play reconstruction fallback if AG Grid was empty
   if (boxScore.source === "plays" || (!boxScore.batting.length && !boxScore.pitching.length)) {
@@ -1616,8 +1928,16 @@ async function extractGameData(page, team) {
       opponentName,
       awayTeam:    boxScore.awayTeam || "",
       homeTeam:    boxScore.homeTeam || "",
+      gameDate:    resolvedGameDate,
+      game_date:   resolvedGameDate,
+      scheduleDateText: scheduleGameMeta.dateText || "",
+      scheduleCardText: scheduleGameMeta.cardText || "",
+      scheduleScoreText: scheduleGameMeta.scoreText || "",
+      gameDatetimeRaw: header.gameDatetimeRaw || header.dateTime || scheduleGameMeta.dateText || "",
       capturedAt:  new Date().toISOString(),
-      ...header
+      ...header,
+      gameDate:    resolvedGameDate,
+      game_date:   resolvedGameDate
     },
     boxScore,
     plays
@@ -1666,13 +1986,54 @@ function dbGameMatchesPageGame(dbGames, gameId, gameUrl) {
     const dbUrl = String(game.gcGameUrl || game.gc_game_url || '').trim();
     const dbUrlGameId = normalizeGcGameIdentity(dbUrl);
 
+    const matched = (
+      (normalizedGameId && dbGameId && normalizedGameId === dbGameId) ||
+      (normalizedGameId && dbUrlGameId && normalizedGameId === dbUrlGameId) ||
+      (normalizedUrlGameId && dbGameId && normalizedUrlGameId === dbGameId) ||
+      (normalizedUrl && dbUrl && normalizedUrl === dbUrl)
+    );
+
+    if (!matched) return false;
+
+    if (process.env.GC_REPROCESS_ALL_COMPLETED_GAMES === 'true') {
+      console.log(`[gc] Repair mode active. Reprocessing existing DB game: ${dbGameId || dbUrlGameId || dbUrl}`);
+      return false;
+    }
+
+    const dbGameDate = game.gameDate || game.game_date || null;
+    if (!dbGameDate && process.env.GC_REPAIR_MISSING_GAME_DATES !== 'false') {
+      console.log(`[gc] Existing DB game is missing game_date. Reprocessing to repair: ${dbGameId || dbUrlGameId || dbUrl}`);
+      return false;
+    }
+
+    return true;
+  });
+}
+
+
+function findMatchingDbGame(dbGames, gameId, gameUrl) {
+  const normalizedGameId = normalizeGcGameIdentity(gameId);
+  const normalizedUrlGameId = normalizeGcGameIdentity(gameUrl);
+  const normalizedUrl = String(gameUrl || '').trim();
+
+  return (dbGames || []).find((game) => {
+    const dbGameId = normalizeGcGameIdentity(game.gcGameId || game.gc_game_id || '');
+    const dbUrl = String(game.gcGameUrl || game.gc_game_url || '').trim();
+    const dbUrlGameId = normalizeGcGameIdentity(dbUrl);
+
     return (
       (normalizedGameId && dbGameId && normalizedGameId === dbGameId) ||
       (normalizedGameId && dbUrlGameId && normalizedGameId === dbUrlGameId) ||
       (normalizedUrlGameId && dbGameId && normalizedUrlGameId === dbGameId) ||
       (normalizedUrl && dbUrl && normalizedUrl === dbUrl)
     );
-  });
+  }) || null;
+}
+
+function shouldForceReprocessDbGame(dbGame) {
+  if (process.env.GC_REPROCESS_ALL_COMPLETED_GAMES === 'true') return true;
+  if (dbGame && !dbGame.gameDate && !dbGame.game_date && process.env.GC_REPAIR_MISSING_GAME_DATES !== 'false') return true;
+  return false;
 }
 
 async function loadKnownCompleteDbGames(teamId) {
@@ -1860,26 +2221,72 @@ async function returnToScheduleSafely(page, scheduleUrl, label = 'return to sche
   return false;
 }
 
-async function processOneCompletedGame(page, team, teamId, gameIndex, manifest, knownDbGames, scheduleUrl) {
+async function processOneCompletedGame(page, team, teamId, gameIndex, manifest, knownDbGames, scheduleUrl, scheduleEntry = null) {
   let phase = 'open-game';
-  const gameOpened = await withTimeout(
-    clickCompletedGameFromScheduleByIndex(page, gameIndex),
-    90000,
-    `open completed game #${gameIndex + 1}`
-  );
+  let gameUrl = '';
+  let gameId = '';
+  let gameScheduleMeta = null;
 
-  if (!gameOpened) {
-    throw new Error(`Could not open completed game #${gameIndex + 1}.`);
+  const entryHref = scheduleEntry?.href || '';
+  const entryGameId = scheduleEntry?.gameId || extractGameIdFromUrl(entryHref);
+
+  // Fast skip before opening the page. This prevents skip-only games from getting
+  // stuck on recap pages and avoids relying on the fragile "Back to Schedule" link.
+  const preOpenDbMatch = findMatchingDbGame(knownDbGames, entryGameId, entryHref);
+  if (preOpenDbMatch && !shouldForceReprocessDbGame(preOpenDbMatch)) {
+    console.log(`[gc] Skipping game already complete in DB without opening page: ${entryGameId || entryHref}`);
+    return { status: 'skipped_db', gameId: entryGameId, gameUrl: entryHref };
   }
 
-  const gameUrl = page.url();
-  const gameId  = extractGameIdFromUrl(gameUrl);
+  if (entryHref) {
+    gameScheduleMeta = {
+      ...scheduleEntry,
+      openedUrl: entryHref,
+      openedGameId: entryGameId,
+    };
+
+    console.log('');
+    console.log(`Opening completed game #${gameIndex + 1} directly from captured schedule URL...`);
+    console.log(`[gc] Schedule card: ${scheduleEntry?.scoreText || ''} | ${scheduleEntry?.gameDate || 'NO DATE'} | ${entryGameId || entryHref}`);
+
+    await withTimeout(
+      page.goto(entryHref, { waitUntil: 'domcontentloaded', timeout: 60000 }),
+      70000,
+      `navigate directly to completed game #${gameIndex + 1}`
+    );
+    try { await page.waitForLoadState('networkidle', { timeout: 15000 }); } catch {}
+    await page.waitForTimeout(2000);
+    await dismissDontMissOutPopup(page);
+
+    gameUrl = page.url();
+    gameId = extractGameIdFromUrl(gameUrl) || entryGameId;
+  } else {
+    const openedMeta = await withTimeout(
+      clickCompletedGameFromScheduleByIndex(page, gameIndex),
+      90000,
+      `open completed game #${gameIndex + 1}`
+    );
+
+    if (!openedMeta) {
+      throw new Error(`Could not open completed game #${gameIndex + 1}.`);
+    }
+
+    gameUrl = page.url();
+    gameId  = extractGameIdFromUrl(gameUrl);
+    gameScheduleMeta = { ...openedMeta, openedUrl: gameUrl, openedGameId: gameId };
+  }
+
   console.log(`[gc] Opened GameChanger game #${gameIndex + 1}: ${gameId || gameUrl}`);
 
   phase = 'db-duplicate-check';
-  if (dbGameMatchesPageGame(knownDbGames, gameId, gameUrl)) {
+  const dbMatch = findMatchingDbGame(knownDbGames, gameId, gameUrl);
+  if (dbMatch && !shouldForceReprocessDbGame(dbMatch)) {
     console.log(`[gc] Skipping game already complete in DB: ${gameId || gameUrl}`);
     return { status: 'skipped_db', gameId, gameUrl };
+  }
+
+  if (dbMatch && shouldForceReprocessDbGame(dbMatch)) {
+    console.log(`[gc] Reprocessing existing DB game because it is incomplete or repair mode is enabled: ${gameId || gameUrl}`);
   }
 
   phase = 'manifest-duplicate-check';
@@ -1894,7 +2301,7 @@ async function processOneCompletedGame(page, team, teamId, gameIndex, manifest, 
 
   phase = 'extract-game-data';
   const captureResult = await withTimeout(
-    extractGameData(page, team),
+    extractGameData(page, team, gameScheduleMeta),
     GC_GAME_EXTRACTION_TIMEOUT_MS,
     `extractGameData game #${gameIndex + 1}`
   );
@@ -1921,20 +2328,24 @@ async function processOneCompletedGame(page, team, teamId, gameIndex, manifest, 
   console.log('[gc] DB write complete.');
 
   phase = 'manifest-update';
-  manifest.processedGames.push({
-    gameId,
-    gameUrl,
-    capturedAt:    new Date().toISOString(),
-    jsonFile:      captureResult.jsonFile      || '',
-    boxScoreFile:  captureResult.boxScoreFile  || ''
-  });
+  if (!isGameAlreadyProcessed(manifest.processedGames, gameId)) {
+    manifest.processedGames.push({
+      gameId,
+      gameUrl,
+      capturedAt:    new Date().toISOString(),
+      jsonFile:      captureResult.jsonFile      || '',
+      boxScoreFile:  captureResult.boxScoreFile  || '',
+      gameDate:      captureResult.gameData?.meta?.gameDate || gameScheduleMeta?.gameDate || ''
+    });
 
-  saveProcessedGames(manifest.manifestPath, manifest.processedGames);
-  console.log(`Updated processed-games manifest: ${manifest.manifestPath}`);
+    saveProcessedGames(manifest.manifestPath, manifest.processedGames);
+    console.log(`Updated processed-games manifest: ${manifest.manifestPath}`);
+  }
 
   knownDbGames.push({
     gcGameId: gameId || extractGameIdFromUrl(gameUrl) || '',
     gcGameUrl: gameUrl || '',
+    gameDate: captureResult.gameData?.meta?.gameDate || gameScheduleMeta?.gameDate || null,
   });
 
   return { status: 'processed', gameId, gameUrl };
@@ -1973,6 +2384,26 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId) {
   console.log(`Visible completed games on schedule: ${completedGameCount}`);
   console.log(`[gc] Complete games in DB for this team: ${knownDbGames.length}`);
 
+  let scheduleEntries = [];
+  try {
+    scheduleEntries = await withTimeout(
+      getVisibleCompletedGameEntries(page),
+      45000,
+      'getVisibleCompletedGameEntries'
+    );
+  } catch (error) {
+    console.warn(`[gc] Could not capture schedule entries up front: ${error.message}`);
+    scheduleEntries = [];
+  }
+
+  const directEntries = scheduleEntries.filter((entry) => entry.href || entry.gameId);
+  if (directEntries.length) {
+    completedGameCount = directEntries.length;
+    console.log(`[gc] Captured ${directEntries.length} completed schedule entries with direct game URLs.`);
+  } else {
+    console.warn('[gc] Could not capture direct game URLs from the schedule. Falling back to click-by-index mode.');
+  }
+
   if (completedGameCount === 0) {
     console.log('No completed games found. Moving on.');
     return true;
@@ -1980,13 +2411,16 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId) {
 
   console.log('[gc] Resume mode: starting at the end of the GameChanger schedule and walking forward.');
   console.log('[gc] Each game is skipped only when that exact GameChanger game id is already complete in the DB.');
-  console.log('[gc] This avoids rescraping early games and still fills any true gaps.');
+  console.log('[gc] Direct URL mode avoids fragile Back-to-Schedule navigation after skipped games.');
 
   const scheduleIndexes = buildResumeOrderedScheduleIndexes(completedGameCount);
 
   for (const gameIndex of scheduleIndexes) {
-    await returnToScheduleSafely(page, scheduleUrl, `before game #${gameIndex + 1}`);
-    scheduleUrl = page.url().includes('/schedule') ? page.url() : scheduleUrl;
+    const scheduleEntry = directEntries.length ? directEntries[gameIndex] : null;
+    if (!scheduleEntry) {
+      await returnToScheduleSafely(page, scheduleUrl, `before game #${gameIndex + 1}`);
+      scheduleUrl = page.url().includes('/schedule') ? page.url() : scheduleUrl;
+    }
 
     let attempt = 1;
     let finishedThisIndex = false;
@@ -1996,7 +2430,7 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId) {
       console.log('');
       console.log(`[gc] Processing completed game #${gameIndex + 1} of ${completedGameCount} (attempt ${attempt}/${GC_GAME_MAX_ATTEMPTS})...`);
       try {
-        const result = await processOneCompletedGame(page, team, teamId, gameIndex, manifest, knownDbGames, scheduleUrl);
+        const result = await processOneCompletedGame(page, team, teamId, gameIndex, manifest, knownDbGames, scheduleUrl, scheduleEntry);
         lastStatus = result.status;
 
         if (result.status === 'processed') processed.push(result);
@@ -2016,14 +2450,16 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId) {
           finishedThisIndex = true;
         }
       } finally {
-        const returned = await returnToScheduleSafely(page, scheduleUrl, `game #${gameIndex + 1} attempt ${attempt}`);
-        if (!returned) {
-          const err = new Error(`Could not return to schedule after game #${gameIndex + 1} attempt ${attempt}. Last status: ${lastStatus || 'unknown'}`);
-          console.error(`[gc] ${err.message}`);
-          await writeFailedGameCaptureReport(page, team, gameIndex, `return-to-schedule-attempt-${attempt}`, err, { scheduleUrl });
-          if (attempt >= GC_GAME_MAX_ATTEMPTS) {
-            failures.push({ gameNumber: gameIndex + 1, error: err.message });
-            finishedThisIndex = true;
+        if (!scheduleEntry) {
+          const returned = await returnToScheduleSafely(page, scheduleUrl, `game #${gameIndex + 1} attempt ${attempt}`);
+          if (!returned) {
+            const err = new Error(`Could not return to schedule after game #${gameIndex + 1} attempt ${attempt}. Last status: ${lastStatus || 'unknown'}`);
+            console.error(`[gc] ${err.message}`);
+            await writeFailedGameCaptureReport(page, team, gameIndex, `return-to-schedule-attempt-${attempt}`, err, { scheduleUrl });
+            if (attempt >= GC_GAME_MAX_ATTEMPTS) {
+              failures.push({ gameNumber: gameIndex + 1, error: err.message });
+              finishedThisIndex = true;
+            }
           }
         }
       }

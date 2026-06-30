@@ -118,6 +118,48 @@ function ipToDecimal(ip) {
   return parseFloat((innings + outs / 3).toFixed(4));
 }
 
+
+/**
+ * Normalize explicit dates carried from the GameChanger schedule card.
+ * Preferred input is YYYY-MM-DD. Also accepts ISO timestamps and common
+ * MM/DD/YYYY / Month Day, Year strings.
+ */
+function normalizeDateCandidate(value) {
+  if (value === undefined || value === null) return null;
+  const raw = String(value).trim();
+  if (!raw) return null;
+
+  const isoDate = raw.match(/\b(20\d{2}|19\d{2})-(\d{2})-(\d{2})\b/);
+  if (isoDate) return `${isoDate[1]}-${isoDate[2]}-${isoDate[3]}`;
+
+  const slashDate = raw.match(/\b(\d{1,2})[\/.-](\d{1,2})[\/.-]((?:20|19)\d{2})\b/);
+  if (slashDate) {
+    const month = String(slashDate[1]).padStart(2, '0');
+    const day = String(slashDate[2]).padStart(2, '0');
+    return `${slashDate[3]}-${month}-${day}`;
+  }
+
+  const MONTHS = {
+    jan: '01', january: '01', feb: '02', february: '02', mar: '03', march: '03',
+    apr: '04', april: '04', may: '05', jun: '06', june: '06', jul: '07', july: '07',
+    aug: '08', august: '08', sep: '09', sept: '09', september: '09', oct: '10', october: '10',
+    nov: '11', november: '11', dec: '12', december: '12'
+  };
+
+  const monthName = raw.match(/\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2})(?:,?\s*((?:20|19)\d{2}))?/i);
+  if (monthName) {
+    const month = MONTHS[monthName[1].toLowerCase().replace('.', '')];
+    const day = String(monthName[2]).padStart(2, '0');
+    const year = monthName[3] || new Date().getFullYear();
+    if (month) return `${year}-${month}-${day}`;
+  }
+
+  const parsed = new Date(raw);
+  if (!Number.isNaN(parsed.getTime())) return parsed.toISOString().slice(0, 10);
+
+  return null;
+}
+
 /**
  * Parse a raw date/time string from GC into ISO date + time parts.
  * Input: "Sat April 12, 2:00 PM - 4:30 PM CT"
@@ -346,7 +388,17 @@ function normalizePlayEvent(raw, gameId, teamId, sequenceNum) {
  * Normalize the game-level meta from extractGameHeader() output.
  */
 function normalizeGameMeta(meta, teamId) {
-  const dateTime = parseDateTimeRaw(meta.gameDateTime || meta.dateTime || '');
+  const rawDateTime = meta.gameDateTime || meta.gameDatetimeRaw || meta.game_datetime_raw || meta.dateTime || '';
+  const explicitGameDate = normalizeDateCandidate(
+    meta.gameDate ||
+    meta.game_date ||
+    meta.scheduleGameDate ||
+    meta.schedule_game_date ||
+    meta.scheduleDate ||
+    meta.schedule_date ||
+    meta.date
+  );
+  const dateTime = parseDateTimeRaw(rawDateTime);
 
   // Extract opponent name from teamCandidates
   // GC header typically has both team names; the opponent is the one that
@@ -429,9 +481,9 @@ function normalizeGameMeta(meta, teamId) {
     teamId,
     gcGameId:        meta.gameId || null,
     gcGameUrl:       meta.gameUrl || meta.pageUrl || null,
-    gameDate:        dateTime.date,
-    gameTime:        dateTime.time,
-    gameDatetimeRaw: dateTime.raw || meta.dateTime || null,
+    gameDate:        explicitGameDate || dateTime.date,
+    gameTime:        meta.gameTime || meta.game_time || dateTime.time,
+    gameDatetimeRaw: dateTime.raw || rawDateTime || explicitGameDate || null,
     result,
     scoreUs,
     scoreThem,
@@ -678,6 +730,7 @@ module.exports = {
   normalizeEventType,
   ipToDecimal,
   parseDateTimeRaw,
+  normalizeDateCandidate,
   // Expose for testing
-  _internals: { clean, toInt, toFloat, toAvg, parseInning, extractPlayerFromPlay }
+  _internals: { clean, toInt, toFloat, toAvg, parseInning, extractPlayerFromPlay, normalizeDateCandidate }
 };
