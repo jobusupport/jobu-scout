@@ -278,7 +278,7 @@ async function buildDocx(analysis, outputPath) {
     Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
     HeadingLevel, AlignmentType, BorderStyle, WidthType, ShadingType,
     VerticalAlign, PageNumber, PageBreak, LevelFormat, Header, Footer,
-    TabStopType, TabStopPosition, ImageRun,
+    TabStopType, TabStopPosition, ImageRun, TableLayoutType,
   } = require('docx');
 
   const a         = analysis;
@@ -320,13 +320,14 @@ async function buildDocx(analysis, outputPath) {
     const {
       width = 2340, bold = false, color = BLACK, bg = WHITE,
       align = AlignmentType.LEFT, size = 18, colspan, isAlt = false,
+      margins = { top: 50, bottom: 50, left: 100, right: 100 },
     } = opts;
     const fill = isAlt ? ALTROW : bg;
     const cellProps = {
       borders: allBorders,
       width:   { size: width, type: WidthType.DXA },
       shading: { fill, type: ShadingType.CLEAR },
-      margins: { top: 50, bottom: 50, left: 100, right: 100 },
+      margins,
       verticalAlign: VerticalAlign.CENTER,
       children: [new Paragraph({
         alignment: align,
@@ -337,8 +338,8 @@ async function buildDocx(analysis, outputPath) {
     return new TableCell(cellProps);
   }
 
-  function hCell(text, width = 2340) {
-    return cell(text, { width, bold: true, color: WHITE, bg: NAVY, size: 17, align: AlignmentType.CENTER });
+  function hCell(text, width = 2340, opts = {}) {
+    return cell(text, { width, bold: true, color: WHITE, bg: NAVY, size: 17, align: AlignmentType.CENTER, ...opts });
   }
 
   function sectionHeading(text) {
@@ -542,6 +543,7 @@ async function buildDocx(analysis, outputPath) {
     return [
       sectionHeading('PITCHING SUMMARY'),
       new Table({
+        layout: TableLayoutType.FIXED,
         width: { size: 9900, type: WidthType.DXA },
         columnWidths: [2200, 500, 700, 700, 700, 700, 700, 700],
         rows: [
@@ -562,6 +564,14 @@ async function buildDocx(analysis, outputPath) {
   // HITTING SUMMARY TABLE (Bob Jones format — all batters)
   // ─────────────────────────────────────────────────────────────────────────
   function buildHittingSummaryBlock() {
+    // Tighter padding + smaller font than the shared defaults — this table has
+    // 18 columns, so every DXA of cell margin matters. Combined with
+    // layout: TableLayoutType.FIXED on the Table itself, these widths are now
+    // actually honored by the renderer instead of being recalculated.
+    const TIGHT_MARGINS = { top: 40, bottom: 40, left: 40, right: 40 };
+    const DATA_SIZE = 14;
+    const HEAD_SIZE = 14;
+
     const batters = [...allOppBatters].sort((a, b) => (b.total_ab || 0) - (a.total_ab || 0));
 
     const rows = batters.map((b, i) => {
@@ -571,24 +581,24 @@ async function buildDocx(analysis, outputPath) {
       const jersey = jerseyFor(b.player_name) ? `#${jerseyFor(b.player_name)} ` : '';
 
       return new TableRow({ children: [
-        cell(`${jersey}${b.player_name}`, { width: 1600, bold: true, size: 16, isAlt }),
-        cell(String(m.pa || '—'),            { width: 460, align: AlignmentType.CENTER, size: 16, isAlt }),
-        cell(String(b.total_ab ?? '—'),    { width: 420, align: AlignmentType.CENTER, size: 16, isAlt }),
-        cell(String(b.total_h ?? '—'),     { width: 420, align: AlignmentType.CENTER, size: 16, isAlt }),
-        cell(String(b.total_so ?? '—'),    { width: 420, align: AlignmentType.CENTER, size: 16, isAlt }),
-        cell(String(b.total_bb ?? '—'),    { width: 420, align: AlignmentType.CENTER, size: 16, isAlt }),
-        cell(String(b.total_hbp ?? '—'),   { width: 480, align: AlignmentType.CENTER, size: 16, isAlt }),
-        cell(String(b.total_hr ?? '—'),    { width: 420, align: AlignmentType.CENTER, size: 16, isAlt }),
-        cell(String(m.xbh || '—'),           { width: 480, align: AlignmentType.CENTER, size: 16, isAlt }),
-        cell(String(b.total_sb ?? '—'),    { width: 480, align: AlignmentType.CENTER, size: 16, isAlt }),
-        cell(fmtAvg(m.avg),        { width: 460, align: AlignmentType.CENTER, size: 16, isAlt }),
-        cell(fmtAvg(m.obp),        { width: 480, align: AlignmentType.CENTER, size: 16, isAlt }),
-        cell(fmtAvg(m.slg),        { width: 480, align: AlignmentType.CENTER, size: 16, isAlt }),
-        cell(fmtAvg(m.ops),        { width: 500, align: AlignmentType.CENTER, size: 16, isAlt }),
-        cell(m.kPct != null ? m.kPct.toFixed(1)+'%' : '—', { width: 460, align: AlignmentType.CENTER, size: 16, isAlt }),
-        cell(m.bbPct != null ? m.bbPct.toFixed(1)+'%' : '—', { width: 500, align: AlignmentType.CENTER, size: 16, isAlt }),
-        cell(m.gbPct != null ? m.gbPct.toFixed(1)+'%' : '—', { width: 520, align: AlignmentType.CENTER, size: 16, isAlt }),
-        cell(m.bunts != null ? String(m.bunts) : '—',                { width: 600, align: AlignmentType.CENTER, size: 16, isAlt }),
+        cell(`${jersey}${b.player_name}`, { width: 1600, bold: true, size: DATA_SIZE, isAlt, margins: TIGHT_MARGINS }),
+        cell(String(m.pa || '—'),            { width: 460, align: AlignmentType.CENTER, size: DATA_SIZE, isAlt, margins: TIGHT_MARGINS }),
+        cell(String(b.total_ab ?? '—'),    { width: 420, align: AlignmentType.CENTER, size: DATA_SIZE, isAlt, margins: TIGHT_MARGINS }),
+        cell(String(b.total_h ?? '—'),     { width: 420, align: AlignmentType.CENTER, size: DATA_SIZE, isAlt, margins: TIGHT_MARGINS }),
+        cell(String(b.total_so ?? '—'),    { width: 420, align: AlignmentType.CENTER, size: DATA_SIZE, isAlt, margins: TIGHT_MARGINS }),
+        cell(String(b.total_bb ?? '—'),    { width: 420, align: AlignmentType.CENTER, size: DATA_SIZE, isAlt, margins: TIGHT_MARGINS }),
+        cell(String(b.total_hbp ?? '—'),   { width: 480, align: AlignmentType.CENTER, size: DATA_SIZE, isAlt, margins: TIGHT_MARGINS }),
+        cell(String(b.total_hr ?? '—'),    { width: 420, align: AlignmentType.CENTER, size: DATA_SIZE, isAlt, margins: TIGHT_MARGINS }),
+        cell(String(m.xbh || '—'),           { width: 480, align: AlignmentType.CENTER, size: DATA_SIZE, isAlt, margins: TIGHT_MARGINS }),
+        cell(String(b.total_sb ?? '—'),    { width: 480, align: AlignmentType.CENTER, size: DATA_SIZE, isAlt, margins: TIGHT_MARGINS }),
+        cell(fmtAvg(m.avg),        { width: 460, align: AlignmentType.CENTER, size: DATA_SIZE, isAlt, margins: TIGHT_MARGINS }),
+        cell(fmtAvg(m.obp),        { width: 480, align: AlignmentType.CENTER, size: DATA_SIZE, isAlt, margins: TIGHT_MARGINS }),
+        cell(fmtAvg(m.slg),        { width: 480, align: AlignmentType.CENTER, size: DATA_SIZE, isAlt, margins: TIGHT_MARGINS }),
+        cell(fmtAvg(m.ops),        { width: 500, align: AlignmentType.CENTER, size: DATA_SIZE, isAlt, margins: TIGHT_MARGINS }),
+        cell(m.kPct != null ? m.kPct.toFixed(1)+'%' : '—', { width: 460, align: AlignmentType.CENTER, size: DATA_SIZE, isAlt, margins: TIGHT_MARGINS }),
+        cell(m.bbPct != null ? m.bbPct.toFixed(1)+'%' : '—', { width: 500, align: AlignmentType.CENTER, size: DATA_SIZE, isAlt, margins: TIGHT_MARGINS }),
+        cell(m.gbPct != null ? m.gbPct.toFixed(1)+'%' : '—', { width: 520, align: AlignmentType.CENTER, size: DATA_SIZE, isAlt, margins: TIGHT_MARGINS }),
+        cell(m.bunts != null ? String(m.bunts) : '—',                { width: 600, align: AlignmentType.CENTER, size: DATA_SIZE, isAlt, margins: TIGHT_MARGINS }),
       ]});
     });
 
@@ -613,39 +623,41 @@ async function buildDocx(analysis, outputPath) {
     const teamGBpct = totals.battedBalls > 0 ? totals.gb / totals.battedBalls * 100 : null;
 
     const totRow = new TableRow({ children: [
-      cell('TEAM TOTALS', { width: 1600, bold: true, bg: LGRAY, size: 16 }),
-      cell(String(totPA),  { width: 460, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: 16 }),
-      cell(String(totAB),  { width: 420, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: 16 }),
-      cell(String(totH),   { width: 420, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: 16 }),
-      cell(String(totSO),  { width: 420, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: 16 }),
-      cell(String(totBB),  { width: 420, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: 16 }),
-      cell(String(totHBP), { width: 480, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: 16 }),
-      cell(String(totHR),  { width: 420, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: 16 }),
-      cell(String(totXBH), { width: 480, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: 16 }),
-      cell(String(totSB),  { width: 480, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: 16 }),
-      cell(teamAVG != null ? fmtAvg(teamAVG) : '—', { width: 460, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: 16 }),
-      cell(teamOBP != null ? fmtAvg(teamOBP) : '—', { width: 480, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: 16 }),
-      cell(teamSLG != null ? fmtAvg(teamSLG) : '—', { width: 480, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: 16 }),
-      cell(teamOPS != null ? fmtAvg(teamOPS) : '—', { width: 500, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: 16 }),
-      cell(teamKpct  != null ? teamKpct.toFixed(1)+'%'  : '—', { width: 460, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: 16 }),
-      cell(teamBBpct != null ? teamBBpct.toFixed(1)+'%' : '—', { width: 500, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: 16 }),
-      cell(teamGBpct != null ? teamGBpct.toFixed(1)+'%' : '—', { width: 520, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: 16 }),
-      cell(String(totals.sac || '—'), { width: 600, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: 16 }),
+      cell('TEAM TOTALS', { width: 1600, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
+      cell(String(totPA),  { width: 460, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
+      cell(String(totAB),  { width: 420, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
+      cell(String(totH),   { width: 420, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
+      cell(String(totSO),  { width: 420, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
+      cell(String(totBB),  { width: 420, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
+      cell(String(totHBP), { width: 480, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
+      cell(String(totHR),  { width: 420, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
+      cell(String(totXBH), { width: 480, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
+      cell(String(totSB),  { width: 480, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
+      cell(teamAVG != null ? fmtAvg(teamAVG) : '—', { width: 460, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
+      cell(teamOBP != null ? fmtAvg(teamOBP) : '—', { width: 480, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
+      cell(teamSLG != null ? fmtAvg(teamSLG) : '—', { width: 480, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
+      cell(teamOPS != null ? fmtAvg(teamOPS) : '—', { width: 500, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
+      cell(teamKpct  != null ? teamKpct.toFixed(1)+'%'  : '—', { width: 460, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
+      cell(teamBBpct != null ? teamBBpct.toFixed(1)+'%' : '—', { width: 500, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
+      cell(teamGBpct != null ? teamGBpct.toFixed(1)+'%' : '—', { width: 520, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
+      cell(String(totals.sac || '—'), { width: 600, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
     ]});
 
     const colWidths = [1600,460,420,420,420,420,480,420,480,480,460,480,480,500,460,500,520,600];
+    const tableWidth = colWidths.reduce((a, b) => a + b, 0); // keep Table width in sync with columnWidths under FIXED layout
     return [
       sectionHeading('HITTING SUMMARY'),
       new Table({
-        width: { size: 9900, type: WidthType.DXA },
+        layout: TableLayoutType.FIXED,
+        width: { size: tableWidth, type: WidthType.DXA },
         columnWidths: colWidths,
         rows: [
           new TableRow({ children: [
-            hCell('Player',1600), hCell('PA',460),  hCell('AB',420),  hCell('H',420),
-            hCell('K',420),       hCell('BB',420),  hCell('HBP',480), hCell('HR',420),
-            hCell('XBH',480),     hCell('SBA',480), hCell('BA',460),  hCell('OBP',480),
-            hCell('SLG',480),     hCell('OPS',500), hCell('K%',460),  hCell('BB%',500),
-            hCell('GB%',520),     hCell('Bunts',600),
+            hCell('Player',1600,{size:HEAD_SIZE,margins:TIGHT_MARGINS}), hCell('PA',460,{size:HEAD_SIZE,margins:TIGHT_MARGINS}),  hCell('AB',420,{size:HEAD_SIZE,margins:TIGHT_MARGINS}),  hCell('H',420,{size:HEAD_SIZE,margins:TIGHT_MARGINS}),
+            hCell('K',420,{size:HEAD_SIZE,margins:TIGHT_MARGINS}),       hCell('BB',420,{size:HEAD_SIZE,margins:TIGHT_MARGINS}),  hCell('HBP',480,{size:HEAD_SIZE,margins:TIGHT_MARGINS}), hCell('HR',420,{size:HEAD_SIZE,margins:TIGHT_MARGINS}),
+            hCell('XBH',480,{size:HEAD_SIZE,margins:TIGHT_MARGINS}),     hCell('SBA',480,{size:HEAD_SIZE,margins:TIGHT_MARGINS}), hCell('BA',460,{size:HEAD_SIZE,margins:TIGHT_MARGINS}),  hCell('OBP',480,{size:HEAD_SIZE,margins:TIGHT_MARGINS}),
+            hCell('SLG',480,{size:HEAD_SIZE,margins:TIGHT_MARGINS}),     hCell('OPS',500,{size:HEAD_SIZE,margins:TIGHT_MARGINS}), hCell('K%',460,{size:HEAD_SIZE,margins:TIGHT_MARGINS}),  hCell('BB%',500,{size:HEAD_SIZE,margins:TIGHT_MARGINS}),
+            hCell('GB%',520,{size:HEAD_SIZE,margins:TIGHT_MARGINS}),     hCell('Bunts',600,{size:HEAD_SIZE,margins:TIGHT_MARGINS}),
           ]}),
           ...rows,
           totRow,
@@ -710,6 +722,7 @@ async function buildDocx(analysis, outputPath) {
     return [
       sectionHeading('FIELDING SUMMARY'),
       new Table({
+        layout: TableLayoutType.FIXED,
         width: { size: 9900, type: WidthType.DXA },
         columnWidths: [2400, 600, 6900],
         rows: [
@@ -736,6 +749,7 @@ async function buildDocx(analysis, outputPath) {
     bodyPara(a.overallSummary || 'No summary available.'),
     spacer(80),
     new Table({
+        layout: TableLayoutType.FIXED,
       width: { size: 9900, type: WidthType.DXA },
       columnWidths: [2475, 2475, 2475, 2475],
       rows: [
@@ -756,6 +770,7 @@ async function buildDocx(analysis, outputPath) {
   const battingBlock = [
     sectionHeading('BATTING ANALYSIS'),
     new Table({
+        layout: TableLayoutType.FIXED,
       width: { size: 9900, type: WidthType.DXA },
       columnWidths: [4950, 4950],
       rows: [
@@ -779,6 +794,7 @@ async function buildDocx(analysis, outputPath) {
     spacer(60),
     subHeading('Hitters to Watch'),
     ...((bat.protectedHitters || []).map(h => new Table({
+        layout: TableLayoutType.FIXED,
       width: { size: 9900, type: WidthType.DXA },
       columnWidths: [3300, 1500, 5100],
       rows: [new TableRow({ children: [
@@ -816,6 +832,7 @@ async function buildDocx(analysis, outputPath) {
     spacer(60),
     subHeading('Pitching Staff'),
     ...(pitchRows.length ? [new Table({
+        layout: TableLayoutType.FIXED,
       width: { size: 9900, type: WidthType.DXA },
       columnWidths: [2000,500,600,600,600,600,600,700,1600],
       rows: [
@@ -841,6 +858,7 @@ async function buildDocx(analysis, outputPath) {
   const tendencyBlock = [
     sectionHeading('TENDENCIES'),
     new Table({
+        layout: TableLayoutType.FIXED,
       width: { size: 9900, type: WidthType.DXA },
       columnWidths: [1980,1980,1980,1980,1980],
       rows: [
@@ -897,6 +915,7 @@ async function buildDocx(analysis, outputPath) {
   const playerSummaryBlock = [
     sectionHeading('PLAYER BREAKDOWNS'),
     ...(playerSummaryRows.length ? [new Table({
+        layout: TableLayoutType.FIXED,
       width: { size: 9900, type: WidthType.DXA },
       columnWidths: [2200,700,700,560,560,700,4480],
       rows: [
@@ -929,6 +948,7 @@ async function buildDocx(analysis, outputPath) {
       ]});
     });
     return [new Table({
+        layout: TableLayoutType.FIXED,
       width: { size: 3000, type: WidthType.DXA },
       columnWidths: [600,900,900,600],
       rows: [
@@ -957,6 +977,7 @@ async function buildDocx(analysis, outputPath) {
     const W5 = 900, W4 = 1125;
     return [
       new Table({
+        layout: TableLayoutType.FIXED,
         width: { size: 4500, type: WidthType.DXA },
         columnWidths: [W5,W5,W5,W5,W5],
         rows: [
@@ -966,6 +987,7 @@ async function buildDocx(analysis, outputPath) {
       }),
       spacer(40),
       new Table({
+        layout: TableLayoutType.FIXED,
         width: { size: 4500, type: WidthType.DXA },
         columnWidths: [W4,W4,W4,W4],
         rows: [
@@ -976,6 +998,7 @@ async function buildDocx(analysis, outputPath) {
       spacer(40),
       // BA / OBP / SLG / OPS
       new Table({
+        layout: TableLayoutType.FIXED,
         width: { size: 4500, type: WidthType.DXA },
         columnWidths: [1125,1125,1125,1125],
         rows: [
@@ -991,6 +1014,7 @@ async function buildDocx(analysis, outputPath) {
       spacer(40),
       // K% / BB% / GB%
       new Table({
+        layout: TableLayoutType.FIXED,
         width: { size: 4500, type: WidthType.DXA },
         columnWidths: [1500,1500,1500],
         rows: [
@@ -1070,6 +1094,7 @@ async function buildDocx(analysis, outputPath) {
         sprayPct['3B'], sprayPct.SS, sprayPct['2B'], sprayPct['1B'], sprayPct.P,
       ];
       leftContent.push(new Table({
+        layout: TableLayoutType.FIXED,
         width: { size: LEFT-200, type: WidthType.DXA },
         columnWidths: Array(8).fill(Math.floor((LEFT-200)/8)),
         rows: [
@@ -1100,6 +1125,7 @@ async function buildDocx(analysis, outputPath) {
     }
 
     const twoColTable = new Table({
+        layout: TableLayoutType.FIXED,
       width:        { size: 9900, type: WidthType.DXA },
       columnWidths: [LEFT, RIGHT],
       rows: [new TableRow({ children: [
@@ -1140,6 +1166,7 @@ async function buildDocx(analysis, outputPath) {
       const forecast = Array.isArray(wx?.forecast) ? wx.forecast : [];
       if (forecast.length) {
         out.push(new Table({
+        layout: TableLayoutType.FIXED,
           width: { size: 9900, type: WidthType.DXA },
           columnWidths: [1700,1200,1200,4200,1600],
           rows: [
@@ -1209,6 +1236,7 @@ async function buildDocx(analysis, outputPath) {
         });
       });
       out.push(new Table({
+        layout: TableLayoutType.FIXED,
         width: { size: 9900, type: WidthType.DXA },
         columnWidths: [2000,2800,1800,1600,1700],
         rows: [
