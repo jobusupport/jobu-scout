@@ -564,6 +564,19 @@ function getTeamBattingAggregates(teamId) {
     ORDER BY total_ab DESC
   `).all(teamId);
 }
+
+// Per-game batting_lines rows (player_name + position only) for the scouted
+// team, used to build the Fielding Summary's position breakdown. Not
+// aggregated like the function above — each row is one game's line, since a
+// player's position can vary game to game.
+function getRawBattingLines(teamId) {
+  return getDb().prepare(`
+    SELECT player_name, position
+    FROM batting_lines
+    WHERE team_id = ?
+      AND is_our_team = 0
+  `).all(teamId);
+}
 /**
  * Aggregate pitching stats for a team across all stored games.
  */
@@ -772,6 +785,7 @@ function getTeamAnalysisBundle(teamId) {
   const facedBattersAdv   = getPlayerAdvancedStats(teamId, 1);
   const scoutedPitchersAdv = getPitcherAdvancedStats(teamId, 0);
   const facedPitchersAdv   = getPitcherAdvancedStats(teamId, 1);
+  const rawBattingLines    = getRawBattingLines(teamId);
 
   return {
     team,
@@ -786,6 +800,7 @@ function getTeamAnalysisBundle(teamId) {
     ourPitchers:     scoutedPitchersAdv, // advanced pitching for scouted team
     oppPitchers:     facedPitchersAdv,   // pitchers from teams the scouted team faced
     opponentBatters: facedBattersAdv,    // alias used by report.js oppBatMap
+    rawBattingLines,                     // per-game position data for Fielding Summary
     meta: {
       gamesAnalyzed: games.length,
       generatedAt:   new Date().toISOString(),
@@ -970,6 +985,7 @@ function getPitcherAdvancedStats(teamId, isOurTeam = null) {
 module.exports = {
   init,
   getDb,
+  getRawBattingLines,
   // Teams
   upsertTeam,
   getTeamByUrl,

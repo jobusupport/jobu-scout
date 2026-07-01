@@ -674,6 +674,19 @@ async function getTeamBattingAggregates(teamId) {
   return data || [];
 }
 
+// Per-game batting_lines rows (player_name + position only) for the scouted
+// team, used to build the Fielding Summary's position breakdown. Not
+// aggregated like the function above — each row is one game's line, since a
+// player's position can vary game to game.
+async function getRawBattingLines(teamId) {
+  const { data, error } = await getDb().from('batting_lines')
+    .select('player_name, position')
+    .eq('team_id', teamId)
+    .eq('is_our_team', false);
+  check(error, 'getRawBattingLines');
+  return data || [];
+}
+
 async function getTeamPitchingAggregates(teamId) {
   const { data, error } = await getDb().rpc('get_team_pitching_aggregates', { p_team_id: teamId });
   check(error, 'getTeamPitchingAggregates');
@@ -771,6 +784,7 @@ async function getTeamAnalysisBundle(teamId) {
     teamRes, games, batting, pitching, tendencies,
     recentPitchingLines, jerseyMap, activeRoster,
     scoutedBattersAdv, facedBattersAdv, scoutedPitchersAdv, facedPitchersAdv,
+    rawBattingLines,
   ] = await Promise.all([
     sb.from('teams').select('*').eq('id', teamId).maybeSingle(),
     getTeamGameResults(teamId),
@@ -784,6 +798,7 @@ async function getTeamAnalysisBundle(teamId) {
     getPlayerAdvancedStats(teamId, 1),
     getPitcherAdvancedStats(teamId, 0),
     getPitcherAdvancedStats(teamId, 1),
+    getRawBattingLines(teamId),
   ]);
 
   return {
@@ -799,6 +814,7 @@ async function getTeamAnalysisBundle(teamId) {
     ourPitchers:        scoutedPitchersAdv,
     oppPitchers:        facedPitchersAdv,
     opponentBatters:    facedBattersAdv,
+    rawBattingLines,
     meta: {
       gamesAnalyzed: games.length,
       generatedAt:   new Date().toISOString(),
@@ -909,6 +925,7 @@ module.exports = {
   init,
   verifyConnection,
   getDb,
+  getRawBattingLines,
   // Teams
   upsertTeam,
   getTeamByUrl,

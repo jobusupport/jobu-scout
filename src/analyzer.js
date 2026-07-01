@@ -113,14 +113,19 @@ function computePitchSmartEligibility(bundle, options = {}) {
   const allPitchLines = bundle.recentPitchingLines || [];
 
   // ── Determine which is_our_team flag belongs to the scouted team ───────────
-  // Pre-reingest rows have is_our_team=1; post-reingest rows have is_our_team=0.
   // Whichever value has more distinct player names is the scouted team's side.
-  const countByFlag = { 0: new Set(), 1: new Set() };
+  // NOTE: is_our_team is a real boolean in Supabase (true/false), not 0/1.
+  // The old `=== 1` check never matched a boolean, so countByFlag[1] was always
+  // empty and the final filter silently passed through every line regardless
+  // of side — this only avoided visible breakage because recentPitchingLines
+  // happens to already be pre-filtered upstream. Using real booleans below
+  // removes that hidden dependency.
+  const countByFlag = { true: new Set(), false: new Set() };
   for (const line of allPitchLines) {
-    countByFlag[line.is_our_team === 1 ? 1 : 0].add(line.player_name);
+    countByFlag[String(!!line.is_our_team)].add(line.player_name);
   }
-  const scoutedIsOurTeam = countByFlag[1].size >= countByFlag[0].size ? 1 : 0;
-  const scoutedLines = allPitchLines.filter(l => (l.is_our_team === 1 ? 1 : 0) === scoutedIsOurTeam);
+  const scoutedIsOurTeam = countByFlag.true.size >= countByFlag.false.size;
+  const scoutedLines = allPitchLines.filter(l => !!l.is_our_team === scoutedIsOurTeam);
 
   // ── Find the most recent game dates this team played (up to their last 2 dates) ──
   // We use the most recent game dates in the data, NOT a fixed calendar window,
@@ -325,11 +330,14 @@ function buildAnalysisPrompt(bundle, options = {}) {
   const { team, games, tendencies, meta,
           playerAdvanced = [], oppPitchers = [] } = bundle;
 
-  // Filter bundle.batting and bundle.pitching to opponent-only rows (is_our_team=0).
+  // Filter bundle.batting and bundle.pitching to opponent-only rows (is_our_team=false).
   // Without this filter, every player from every game appears in the report regardless
   // of which team they played for.
-  const batting  = (bundle.batting  || []).filter(b => b.is_our_team === 0);
-  const pitching = (bundle.pitching || []).filter(p => p.is_our_team === 0);
+  // NOTE: is_our_team is a real boolean in Supabase (true/false), not 0/1 — a strict
+  // `=== 0` check never matches a boolean and silently zeroes out this entire dataset,
+  // starving the Claude prompt of real batting/pitching data.
+  const batting  = (bundle.batting  || []).filter(b => !b.is_our_team);
+  const pitching = (bundle.pitching || []).filter(p => !p.is_our_team);
 
   const { gameLocation = null, gameDate = null } = options;
 
@@ -679,7 +687,8 @@ async function analyzeTeam(teamId, options = {}) {
     winPct: withResult > 0 ? parseFloat((wins / withResult).toFixed(3)) : null,
   };
 
-  const bat      = (bundle.batting || []).filter(b => b.is_our_team === 0);
+  // NOTE: is_our_team is a real boolean in Supabase — see comment in buildAnalysisPrompt.
+  const bat      = (bundle.batting || []).filter(b => !b.is_our_team);
   const totalH   = bat.reduce((s, b) => s + (b.total_h   || 0), 0);
   const totalBB  = bat.reduce((s, b) => s + (b.total_bb  || 0), 0);
   const totalHBP = bat.reduce((s, b) => s + (b.total_hbp || 0), 0);
