@@ -384,33 +384,39 @@ async function _updateAdvancedStats(teamId, singleGameData, invertTeamSide = fal
  * @param {boolean} [options.invertTeamSide=false] - See module docstring
  */
 async function recalculateTeamStats(teamId, options = {}) {
-  const d = db.getDb();
   const invertTeamSide = options.invertTeamSide === true;
 
-  // Get all game JSON file paths stored during ingest
-  const games = process.env.USE_SUPABASE === 'true'
-    ? await Promise.resolve(db.getGamesByTeam(teamId))
-    : d.prepare(
-        "SELECT json_file, gc_game_id FROM games WHERE team_id = ? AND json_file IS NOT NULL ORDER BY game_date"
-      ).all(teamId);
+  let allGameData;
 
-  const fs   = require('fs');
-  const path = require('path');
+  if (process.env.USE_SUPABASE === 'true') {
+    // Supabase-native: reconstruct game objects directly from
+    // batting_lines/pitching_lines.raw_json + play_events, with no
+    // dependency on local JSON files ever having existed on disk (or on
+    // whichever machine originally ran the scrape). See
+    // db-supabase.js:getGameDataForStatsEngine for how this is assembled.
+    allGameData = await Promise.resolve(db.getGameDataForStatsEngine(teamId));
+  } else {
+    // SQLite/local-dev fallback: local game JSON files by stored path.
+    const d  = db.getDb();
+    const fs = require('fs');
+    const games = d.prepare(
+      "SELECT json_file, gc_game_id FROM games WHERE team_id = ? AND json_file IS NOT NULL ORDER BY game_date"
+    ).all(teamId);
 
-  const allGameData = [];
-
-  for (const game of games) {
-    if (!game.json_file || !fs.existsSync(game.json_file)) continue;
-    try {
-      const raw = JSON.parse(fs.readFileSync(game.json_file, 'utf8'));
-      allGameData.push(raw);
-    } catch (e) {
-      console.warn(`[pipeline] Could not read ${game.json_file}: ${e.message}`);
+    allGameData = [];
+    for (const game of games) {
+      if (!game.json_file || !fs.existsSync(game.json_file)) continue;
+      try {
+        const raw = JSON.parse(fs.readFileSync(game.json_file, 'utf8'));
+        allGameData.push(raw);
+      } catch (e) {
+        console.warn(`[pipeline] Could not read ${game.json_file}: ${e.message}`);
+      }
     }
   }
 
   if (!allGameData.length) {
-    console.warn(`[pipeline] recalculateTeamStats: no game JSON files found for team ${teamId}`);
+    console.warn(`[pipeline] recalculateTeamStats: no game data found for team ${teamId}`);
     return;
   }
 
@@ -418,11 +424,16 @@ async function recalculateTeamStats(teamId, options = {}) {
 
   const statsResult = processGames(allGameData);
 
+  if (statsResult.unattributedErrors && (statsResult.unattributedErrors.ourSide || statsResult.unattributedErrors.opponentSide)) {
+    console.log(`[pipeline] Unattributed errors (no name in play text, or name didn't match a roster): our side ${statsResult.unattributedErrors.ourSide}, opponent side ${statsResult.unattributedErrors.opponentSide}`);
+  }
+
   // Wipe existing advanced stats for this team and rewrite from scratch
   if (process.env.USE_SUPABASE === 'true') {
     await Promise.resolve(db.getDb().from('player_advanced_stats').delete().eq('team_id', teamId).then(r => r));
     await Promise.resolve(db.getDb().from('pitcher_advanced_stats').delete().eq('team_id', teamId).then(r => r));
   } else {
+    const d = db.getDb();
     d.prepare("DELETE FROM player_advanced_stats WHERE team_id = ?").run(teamId);
     d.prepare("DELETE FROM pitcher_advanced_stats WHERE team_id = ?").run(teamId);
   }

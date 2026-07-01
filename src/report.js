@@ -671,12 +671,14 @@ async function buildDocx(analysis, outputPath) {
   // FIELDING SUMMARY TABLE
   // ─────────────────────────────────────────────────────────────────────────
   function buildFieldingSummaryBlock() {
-    // Build fielding data from batting_lines raw_json position field
-    // and from errors tracked in play events (if available)
-    // We use position field from DB batting lines + game count
+    // Position data comes from rawBattingLines (per-game position field,
+    // wired up in pipeline.js/db-supabase.js's getTeamAnalysisBundle).
+    // Error counts come from the advanced-stats `errors` column, populated
+    // by stats-engine.js's fielder-attribution parsing (see processGames) —
+    // batting_lines itself has no errors column, so this must NOT read
+    // b.errors from rawBattingLines; that field never existed there.
     const fieldingMap = {}; // name → { errors, positions: {pos → count} }
 
-    // Pull from bundle batting raw (opponent batters from DB)
     for (const b of (a._bundle?.rawBattingLines || [])) {
       if (!b.player_name) continue;
       if (!fieldingMap[b.player_name]) {
@@ -688,17 +690,36 @@ async function buildDocx(analysis, outputPath) {
         fieldingMap[b.player_name].positions[posKey] =
           (fieldingMap[b.player_name].positions[posKey] || 0) + 1;
       }
-      fieldingMap[b.player_name].errors += b.errors || 0;
     }
 
-    // If rawBattingLines not available, fall back to bundle.batting positions
+    // If rawBattingLines wasn't available for some reason, fall back to
+    // bundle.batting so the table still has rows (positions just won't be
+    // as precise — this mirrors the old fallback but no longer invents a
+    // fake "N/A" position key).
     if (Object.keys(fieldingMap).length === 0) {
       for (const b of allOppBatters) {
         if (!b.player_name) continue;
-        fieldingMap[b.player_name] = {
-          errors: 0,
-          positions: { [b.primary_position || 'N/A']: b.games || 1 },
-        };
+        fieldingMap[b.player_name] = { errors: 0, positions: {} };
+      }
+    }
+
+    // Fill in real error counts from advanced stats. A player's errors land
+    // in exactly one of these two sources (stats-engine.js's fielder
+    // matching checks the batting roster before the pitching roster), so
+    // simple addition here can't double-count.
+    for (const name of Object.keys(fieldingMap)) {
+      const adv = getAdv(name);
+      if (adv && adv.errors) fieldingMap[name].errors += adv.errors;
+      const pitAdv = pitAdvMap[name];
+      if (pitAdv && pitAdv.errors) fieldingMap[name].errors += pitAdv.errors;
+    }
+    // A pitcher who committed an error (e.g. "error by pitcher X") may not
+    // appear in rawBattingLines at all if they never batted — add them here
+    // so their error still shows up rather than being silently dropped.
+    for (const p of Object.values(pitAdvMap)) {
+      if (!p.player_name || !p.errors) continue;
+      if (!fieldingMap[p.player_name]) {
+        fieldingMap[p.player_name] = { errors: p.errors, positions: { P: 1 } };
       }
     }
 
@@ -719,6 +740,11 @@ async function buildDocx(analysis, outputPath) {
 
     if (rows.length === 0) return [];
 
+    const unattributed = toNum(a._bundle?.team?.unattributed_errors_opponent_side);
+    const unattributedNote = unattributed > 0
+      ? [bodyPara(`Note: ${unattributed} additional error(s) were logged in the play-by-play without a named fielder (e.g. "error by shortstop" with no player specified) and could not be attributed to a specific player above.`)]
+      : [];
+
     return [
       sectionHeading('FIELDING SUMMARY'),
       new Table({
@@ -732,6 +758,7 @@ async function buildDocx(analysis, outputPath) {
           ...rows,
         ],
       }),
+      ...unattributedNote,
       spacer(120),
     ];
   }

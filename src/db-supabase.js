@@ -458,6 +458,88 @@ async function getGamesByTeam(teamId) {
   return data || [];
 }
 
+/**
+ * Reconstruct game objects in the exact shape stats-engine.js's
+ * processGames() expects — { meta: { gameId }, boxScore: { batting,
+ * pitching }, plays: [{ inning, text }] } — directly from Supabase, with no
+ * dependency on local JSON files ever having existed on disk.
+ *
+ * This works because:
+ *  - batting_lines/pitching_lines.raw_json stores the box score row exactly
+ *    as scraped (including isOurTeam/TeamSide), so JSON.parse(raw_json)
+ *    reproduces the original row verbatim.
+ *  - play_events.description/.inning are the same text/inning fields
+ *    normalizePlayEvent() derived from the original play.text/play.inning,
+ *    so { inning, text: description } reconstructs the original plays[] shape.
+ *
+ * Used by pipeline.js's recalculateTeamStats() so full-season stat
+ * recalculation (swing decisions, spray%, RISP, errors, etc.) works
+ * regardless of which machine originally ran the scrape.
+ */
+async function getGameDataForStatsEngine(teamId) {
+  const sb = getDb();
+
+  const { data: games, error: gamesError } = await sb.from('games')
+    .select('id, game_date')
+    .eq('team_id', teamId);
+  check(gamesError, 'getGameDataForStatsEngine games');
+  if (!games || !games.length) return [];
+
+  const gameIds = games.map(g => g.id);
+
+  const [battingRes, pitchingRes, playsRes] = await Promise.all([
+    sb.from('batting_lines').select('game_id, raw_json').in('game_id', gameIds),
+    sb.from('pitching_lines').select('game_id, raw_json').in('game_id', gameIds),
+    sb.from('play_events').select('game_id, inning, description, sequence_num').in('game_id', gameIds),
+  ]);
+  check(battingRes.error, 'getGameDataForStatsEngine batting_lines');
+  check(pitchingRes.error, 'getGameDataForStatsEngine pitching_lines');
+  check(playsRes.error, 'getGameDataForStatsEngine play_events');
+
+  function parseRawJson(str) {
+    if (!str) return null;
+    try { return JSON.parse(str); } catch { return null; }
+  }
+
+  const battingByGame = {};
+  for (const row of battingRes.data || []) {
+    const parsed = parseRawJson(row.raw_json);
+    if (!parsed) continue;
+    if (!battingByGame[row.game_id]) battingByGame[row.game_id] = [];
+    battingByGame[row.game_id].push(parsed);
+  }
+
+  const pitchingByGame = {};
+  for (const row of pitchingRes.data || []) {
+    const parsed = parseRawJson(row.raw_json);
+    if (!parsed) continue;
+    if (!pitchingByGame[row.game_id]) pitchingByGame[row.game_id] = [];
+    pitchingByGame[row.game_id].push(parsed);
+  }
+
+  // Group plays by game, then sort each game's plays by sequence_num — do
+  // NOT rely on Supabase's row order across an .in() query spanning multiple
+  // games, since sequence_num resets per game and a flat order-by would
+  // interleave games incorrectly.
+  const playsByGame = {};
+  for (const row of playsRes.data || []) {
+    if (!playsByGame[row.game_id]) playsByGame[row.game_id] = [];
+    playsByGame[row.game_id].push(row);
+  }
+  for (const gameId of Object.keys(playsByGame)) {
+    playsByGame[gameId].sort((a, b) => (a.sequence_num ?? 0) - (b.sequence_num ?? 0));
+  }
+
+  return games.map(g => ({
+    meta: { gameId: g.id },
+    boxScore: {
+      batting:  battingByGame[g.id]  || [],
+      pitching: pitchingByGame[g.id] || [],
+    },
+    plays: (playsByGame[g.id] || []).map(row => ({ inning: row.inning, text: row.description })),
+  }));
+}
+
 async function getCompleteGamesByTeam(teamId) {
   const sb = getDb();
 
@@ -926,6 +1008,7 @@ module.exports = {
   verifyConnection,
   getDb,
   getRawBattingLines,
+  getGameDataForStatsEngine,
   // Teams
   upsertTeam,
   getTeamByUrl,

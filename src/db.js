@@ -855,7 +855,7 @@ function upsertPlayerAdvancedStats(teamId, playerName, isOurTeam, stats) {
       spray_lf_pct, spray_cf_pct, spray_rf_pct, spray_3b_pct,
       spray_ss_pct, spray_2b_pct, spray_1b_pct, spray_pc_pct,
       risp_ab, risp_h, ba_risp,
-      swing_decisions, k_pct, bb_pct
+      swing_decisions, k_pct, bb_pct, errors
     ) VALUES (
       @teamId, @playerName, @isOurTeam,
       @games, @totalPitches,
@@ -864,7 +864,7 @@ function upsertPlayerAdvancedStats(teamId, playerName, isOurTeam, stats) {
       @sprayLfPct, @sprayCfPct, @sprayRfPct, @spray3bPct,
       @spraySsPct, @spray2bPct, @spray1bPct, @sprayPcPct,
       @rispAb, @rispH, @baRisp,
-      @swingDecisions, @kPct, @bbPct
+      @swingDecisions, @kPct, @bbPct, @errors
     )
     ON CONFLICT(team_id, player_name, is_our_team) DO UPDATE SET
       games         = excluded.games,
@@ -883,6 +883,7 @@ function upsertPlayerAdvancedStats(teamId, playerName, isOurTeam, stats) {
       risp_ab = excluded.risp_ab, risp_h = excluded.risp_h, ba_risp = excluded.ba_risp,
       swing_decisions = excluded.swing_decisions,
       k_pct = excluded.k_pct, bb_pct = excluded.bb_pct,
+      errors = excluded.errors,
       generated_at = datetime('now')
   `).run({
     teamId, playerName, isOurTeam: isOurTeam ? 1 : 0,
@@ -902,6 +903,7 @@ function upsertPlayerAdvancedStats(teamId, playerName, isOurTeam, stats) {
     rispAb: s.RISP_AB ?? 0, rispH: s.RISP_H ?? 0, baRisp: s.BA_RISP ?? null,
     swingDecisions: sd,
     kPct: s.K_pct ?? null, bbPct: s.BB_pct ?? null,
+    errors: s.E ?? 0,
   });
 }
 
@@ -915,13 +917,13 @@ function upsertPitcherAdvancedStats(teamId, playerName, isOurTeam, stats) {
       games, total_pitches, strikes, s_pct,
       gb, fb, ld, gb_pct, fb_pct, ld_pct, go_ao,
       so_per7, bb_per7, k_pct_bf, bb_pct_bf, p_per_ip,
-      wp, bk, pik
+      wp, bk, pik, errors
     ) VALUES (
       @teamId, @playerName, @isOurTeam,
       @games, @totalPitches, @strikes, @sPct,
       @gb, @fb, @ld, @gbPct, @fbPct, @ldPct, @goAo,
       @soPer7, @bbPer7, @kPctBf, @bbPctBf, @pPerIp,
-      @wp, @bk, @pik
+      @wp, @bk, @pik, @errors
     )
     ON CONFLICT(team_id, player_name, is_our_team) DO UPDATE SET
       games = excluded.games, total_pitches = excluded.total_pitches,
@@ -933,6 +935,7 @@ function upsertPitcherAdvancedStats(teamId, playerName, isOurTeam, stats) {
       k_pct_bf = excluded.k_pct_bf, bb_pct_bf = excluded.bb_pct_bf,
       p_per_ip = excluded.p_per_ip,
       wp = excluded.wp, bk = excluded.bk, pik = excluded.pik,
+      errors = excluded.errors,
       generated_at = datetime('now')
   `).run({
     teamId, playerName, isOurTeam: isOurTeam ? 1 : 0,
@@ -947,6 +950,7 @@ function upsertPitcherAdvancedStats(teamId, playerName, isOurTeam, stats) {
     kPctBf:  s.K_pct_BF ?? null, bbPctBf: s.BB_pct_BF ?? null,
     pPerIp:  s.P_per_IP ?? null,
     wp: s.WP ?? 0, bk: s.BK ?? 0, pik: s.PIK ?? 0,
+    errors: s.E ?? 0,
   });
 }
 

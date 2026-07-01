@@ -11,12 +11,19 @@
  * Requires USE_SUPABASE=true in your environment (or .env, loaded by db.js).
  */
 
-const pipeline = require('./pipeline');
+const path = require('path');
 const db = require('./db');
+const pipeline = require('./pipeline'); // safe to require before db.init() executes — db.js's exports get mutated in place when init() runs below, and pipeline.js shares that same module reference
 
 const TEAM_ID = '6cd35c46-9996-4f83-8048-92e9f0ff9058'; // Tennessee Yard 14U
 
 async function main() {
+  // Required even in Supabase mode — init() is what delegates db.js's exports
+  // over to db-supabase.js when USE_SUPABASE=true. The path arg is ignored
+  // in that case, but the call itself is mandatory before any db/pipeline
+  // function will work.
+  db.init(path.join(__dirname, '..', 'voodoo-scout.db'));
+
   console.log(`[fix] Recalculating advanced stats for team ${TEAM_ID}...`);
 
   // invertTeamSide: false because Tennessee Yard was scraped as the scouted

@@ -154,6 +154,13 @@ function parsePA(rawText) {
   const battedBall = extractBattedBall(narrativePart);
   const sprayZone  = extractSprayZone(narrativePart);
 
+  // Extract every fielder responsible for an error mentioned anywhere in this
+  // play's text — not gated to eventType==='Error' (see extractFielders doc),
+  // and scanning the full text rather than just narrativePart in case the
+  // pitch-sequence/narrative split above didn't find a clean ". [Capital]"
+  // boundary for this particular description.
+  const fielders = extractFielders(text);
+
   // Extract baserunning events from the full text
   const sbCount  = (text.match(/\bsteals\b/gi) || []).length;
   const csCount  = (text.match(/\bcaught stealing\b/gi) || []).length;
@@ -177,6 +184,7 @@ function parsePA(rawText) {
     pitches,
     battedBall,
     sprayZone,
+    fielders,
     sbCount,
     csCount,
     wpCount,
@@ -285,14 +293,29 @@ function extractBatter(narrative, eventType) {
     'Foul Out':        'is out on foul',
     "Fielder's Choice":'grounds into',
     'Sacrifice':       'sacrifice|bunts',
-    'Error':           'reaches on error|on error',
+    'Error':           'reaches on (?:an )?error|on (?:an )?error',
   };
 
   const verbPattern = verbs[eventType] || '[a-z]+';
+  // NOTE: deliberately no /i flag — GC narrative verbs are consistently
+  // lowercase, and an /i flag here makes [A-Z] match lowercase too, which
+  // let filler words (e.g. "ground ball and") masquerade as a false-positive
+  // "name" immediately before a verb phrase. Case-sensitive is strictly more
+  // correct for extracting an actual Title-Case player name.
   const m = narrative.match(
-    new RegExp(`([A-Z][a-z]+(?:\\s+[A-Z][a-z]+){1,2})\\s+(?:${verbPattern})`, 'i')
+    new RegExp(`([A-Z][a-z]+(?:\\s+[A-Z][a-z]+){1,2})\\s+(?:${verbPattern})`)
   );
-  return m ? m[1].trim() : null;
+  if (m) return m[1].trim();
+
+  // Fallback: some phrasings put the batter's name at the very start of the
+  // narrative with descriptive text between it and the verb — e.g. "Grayson
+  // Bentley hits a ground ball and reaches on an error by pitcher..." — the
+  // primary pattern above requires the name immediately before the verb, so
+  // it never matches here even though the batter is unambiguous. Only used
+  // when the primary match fails, so this can't regress any case that
+  // already resolves correctly.
+  const leading = narrative.match(/^([A-Z][a-zA-Z'-]+(?:\s+[A-Z][a-zA-Z'-]+){0,2})\s+[a-z]/);
+  return leading ? leading[1].trim() : null;
 }
 
 function extractPitcher(narrative) {
@@ -334,6 +357,52 @@ function extractSprayZone(narrative) {
   return null;
 }
 
+const FIELDER_POSITION_MAP = {
+  'left fielder':   'LF',
+  'center fielder': 'CF',
+  'right fielder':  'RF',
+  'third baseman':  '3B',
+  'shortstop':      'SS',
+  'second baseman': '2B',
+  'first baseman':  '1B',
+  'pitcher':        'P',
+  'catcher':        'C',
+};
+
+/**
+ * Extract every fielder responsible for an error mentioned in play text.
+ * GC play text usually reads "...reaches on an error by shortstop" (position
+ * only) or "...error by third baseman Shumake" (position + name). A player's
+ * name is present in most (but not all) cases — when absent, this returns
+ * { position, name: null } so the caller can decide how to attribute it
+ * rather than guessing.
+ *
+ * Deliberately NOT limited to plays whose primary eventType is 'Error' — a
+ * play can be a Ground Out at the primary level while still crediting a
+ * runner-advancing error mid-sentence (e.g. "...scores on error by first
+ * baseman..."), and some plays contain more than one error mention. This
+ * matches globally so both cases are captured.
+ *
+ * Examples matched:
+ *   "reaches on an error by pitcher Graham Rickard."
+ *   "reaches on an error by shortstop."
+ *   "advances to 2nd on error by right fielder ."  (name sometimes blank)
+ *   "...error by second baseman , ...advances to 2nd on error by right fielder ."  (two errors, one play)
+ */
+function extractFielders(narrative) {
+  if (!narrative) return [];
+  const re = /error by (left fielder|center fielder|right fielder|third baseman|shortstop|second baseman|first baseman|pitcher|catcher)\s*([A-Z][a-zA-Z'-]+(?:\s+[A-Z][a-zA-Z'-]+){0,2})?/gi;
+  const results = [];
+  let m;
+  while ((m = re.exec(narrative)) !== null) {
+    results.push({
+      position: FIELDER_POSITION_MAP[m[1].toLowerCase()] || null,
+      name: m[2] ? m[2].trim() : null,
+    });
+  }
+  return results;
+}
+
 function boxRowsForSide(game, type) {
   const box = game.boxScore || {};
   const combined = Array.isArray(box[type]) ? box[type] : [];
@@ -365,6 +434,7 @@ function emptyPlayerStats(name) {
     BB: 0, SO: 0, HBP: 0, SF: 0, SAC: 0,
     singles: 0, doubles: 0, triples: 0, HR: 0,
     SB: 0, CS: 0, PIK: 0,
+    E: 0, // fielding errors committed (attributed via extractFielder on Error plays)
     // Batted ball
     GB: 0, FB: 0, LD: 0, battedBalls: 0,
     // Spray zones
@@ -390,6 +460,7 @@ function emptyPitcherStats(name) {
     H: 0, R: 0, ER: 0,
     BB: 0, SO: 0, HBP: 0,
     WP: 0, BK: 0, PIK: 0,
+    E: 0, // fielding errors committed as a defender (e.g. "error by pitcher")
     GB: 0, FB: 0, LD: 0,
     // Pitch totals
     totalPitches: 0, strikes: 0,
@@ -426,6 +497,11 @@ function processGames(games) {
   const pitchers = {};  // opponent pitchers (who pitched against us)
   const opponentBatters = {}; // opponent batters
   const ourPitchers = {};     // our pitchers
+  // Errors whose fielder couldn't be matched to a named roster player (no
+  // name in the play text, or the name didn't match either roster) — tallied
+  // by which side committed them rather than silently dropped or misattributed.
+  let unattributedErrorsOurSide = 0;
+  let unattributedErrorsOpponentSide = 0;
 
   for (const game of games) {
     const gameId   = game.meta?.gameId || 'unknown';
@@ -440,6 +516,12 @@ function processGames(games) {
     );
     const ourPitcherNames = new Set(
       pitching.filter(p => p.isOurTeam).map(p => p.Player)
+    );
+    const oppBatterNames = new Set(
+      batting.filter(b => !b.isOurTeam).map(b => b.Player)
+    );
+    const oppPitcherNames = new Set(
+      pitching.filter(p => !p.isOurTeam).map(p => p.Player)
     );
 
     // Process each play
@@ -459,7 +541,56 @@ function processGames(games) {
       }
 
       const pa = parsePA(text);
-      if (!pa || !pa.batter) continue;
+      if (!pa) continue;
+
+      // ── Attribute each error mention to the fielder who committed it ──
+      // Deliberately independent of pa.batter resolving successfully — a
+      // batter-extraction miss (e.g. an unexpected phrasing variant) should
+      // not also silently drop error data for an unrelated defensive player.
+      // Match the fielder's name directly against all four rosters to
+      // determine which side committed it, rather than deriving it from
+      // isOurBatter (which requires a resolved batter). If no name was
+      // captured, or it doesn't match a known roster player, tally it as
+      // unattributed for now — position-only fallback would risk crediting
+      // the wrong player, since a player's position can change mid-game.
+      for (const fielderInfo of pa.fielders) {
+        const fielderName = fielderInfo.name;
+        let attributed = false;
+
+        if (fielderName) {
+          if (ourBatterNames.has(fielderName)) {
+            if (!players[fielderName]) players[fielderName] = emptyPlayerStats(fielderName);
+            players[fielderName].E++;
+            attributed = true;
+          } else if (ourPitcherNames.has(fielderName)) {
+            if (!ourPitchers[fielderName]) ourPitchers[fielderName] = emptyPitcherStats(fielderName);
+            ourPitchers[fielderName].E++;
+            attributed = true;
+          } else if (oppBatterNames.has(fielderName)) {
+            if (!opponentBatters[fielderName]) opponentBatters[fielderName] = emptyPlayerStats(fielderName);
+            opponentBatters[fielderName].E++;
+            attributed = true;
+          } else if (oppPitcherNames.has(fielderName)) {
+            if (!pitchers[fielderName]) pitchers[fielderName] = emptyPitcherStats(fielderName);
+            pitchers[fielderName].E++;
+            attributed = true;
+          }
+        }
+
+        if (!attributed) {
+          // Best-effort side guess for the unattributed tally only (not used
+          // for player-level credit): if we know the batter and their side,
+          // the fielder is the opposite side; otherwise default to opponent
+          // since that's who a scouting report cares about most.
+          const fielderIsOurSide = pa.batter && ourBatterNames.size > 0
+            ? !ourBatterNames.has(pa.batter)
+            : false;
+          if (fielderIsOurSide) unattributedErrorsOurSide++;
+          else unattributedErrorsOpponentSide++;
+        }
+      }
+
+      if (!pa.batter) continue;
 
       const isOurBatter = ourBatterNames.size > 0
         ? ourBatterNames.has(pa.batter)
@@ -569,6 +700,10 @@ function processGames(games) {
     ourPitchers:     finalizeStats(ourPitchers),
     opponentBatters: finalizeStats(opponentBatters),
     pitchers:        finalizeStats(pitchers),
+    unattributedErrors: {
+      ourSide:      unattributedErrorsOurSide,
+      opponentSide: unattributedErrorsOpponentSide,
+    },
   };
 }
 
@@ -670,5 +805,5 @@ module.exports = {
   parsePitchSequence,
   detectEventType,
   // Exposed for testing
-  _internals: { extractBatter, extractPitcher, extractBattedBall, extractSprayZone, normalizePitchToken }
+  _internals: { extractBatter, extractPitcher, extractBattedBall, extractSprayZone, extractFielders, normalizePitchToken }
 };
