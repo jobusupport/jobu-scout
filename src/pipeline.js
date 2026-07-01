@@ -422,10 +422,45 @@ async function recalculateTeamStats(teamId, options = {}) {
 
   console.log(`[pipeline] Recalculating stats from ${allGameData.length} game(s) for team ${teamId}${invertTeamSide ? ' (inverted)' : ''}...`);
 
+  // ── Diagnostic logging ──────────────────────────────────────────────────
+  // Temporary instrumentation to pin down a real/synthetic-test discrepancy:
+  // a hand-built single-game test proves processGames() classifies isOurTeam
+  // correctly, but production output doesn't match. Log the actual shape of
+  // what got fetched for the first few games so we can see where it diverges.
+  for (const g of allGameData.slice(0, 3)) {
+    const bat = g.boxScore?.batting || [];
+    const pit = g.boxScore?.pitching || [];
+    const trueBat = bat.filter(b => b.isOurTeam === true).length;
+    const falseBat = bat.filter(b => b.isOurTeam === false).length;
+    console.log(`[pipeline][diag] game ${g.meta?.gameId}: batting=${bat.length} (isOurTeam true=${trueBat} false=${falseBat}), pitching=${pit.length}, plays=${(g.plays || []).length}`);
+    if (bat.length) {
+      console.log(`[pipeline][diag]   sample batting row:`, JSON.stringify(bat[0]));
+    }
+  }
+  console.log(`[pipeline][diag] total games with 0 batting rows: ${allGameData.filter(g => !(g.boxScore?.batting || []).length).length} / ${allGameData.length}`);
+  console.log(`[pipeline][diag] total games with 0 plays: ${allGameData.filter(g => !(g.plays || []).length).length} / ${allGameData.length}`);
+  // ── End diagnostic logging ──────────────────────────────────────────────
+
   const statsResult = processGames(allGameData);
 
   if (statsResult.unattributedErrors && (statsResult.unattributedErrors.ourSide || statsResult.unattributedErrors.opponentSide)) {
     console.log(`[pipeline] Unattributed errors (no name in play text, or name didn't match a roster): our side ${statsResult.unattributedErrors.ourSide}, opponent side ${statsResult.unattributedErrors.opponentSide}`);
+  }
+
+  // Persist unattributed error counts on the team row so report.js can
+  // surface a transparency note in the Fielding Summary — these are errors
+  // whose fielder couldn't be matched to a named roster player, not errors
+  // to silently drop.
+  const ue = statsResult.unattributedErrors || { ourSide: 0, opponentSide: 0 };
+  if (process.env.USE_SUPABASE === 'true') {
+    await Promise.resolve(db.getDb().from('teams').update({
+      unattributed_errors_our_side: ue.ourSide || 0,
+      unattributed_errors_opponent_side: ue.opponentSide || 0,
+    }).eq('id', teamId).then(r => r));
+  } else {
+    db.getDb().prepare(
+      "UPDATE teams SET unattributed_errors_our_side = ?, unattributed_errors_opponent_side = ? WHERE id = ?"
+    ).run(ue.ourSide || 0, ue.opponentSide || 0, teamId);
   }
 
   // Wipe existing advanced stats for this team and rewrite from scratch
