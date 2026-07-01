@@ -196,6 +196,12 @@ function numericOrZero(value) {
   return n === null ? 0 : n;
 }
 
+function serializeRawJsonForTextColumn(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'string') return value.trim() || null;
+  try { return JSON.stringify(value); } catch { return String(value); }
+}
+
 
 function extractGcGameIdFromUrl(value) {
   const match = String(value || '').match(/\/schedule\/([^/?#]+)/i);
@@ -488,33 +494,57 @@ async function getGameDataForStatsEngine(teamId) {
   const gameIds = games.map(g => g.id);
 
   const [battingRes, pitchingRes, playsRes] = await Promise.all([
-    sb.from('batting_lines').select('game_id, raw_json').in('game_id', gameIds),
-    sb.from('pitching_lines').select('game_id, raw_json').in('game_id', gameIds),
+    sb.from('batting_lines')
+      .select('game_id, player_name, team_name_raw, team_side, is_our_team, raw_json')
+      .in('game_id', gameIds),
+    sb.from('pitching_lines')
+      .select('game_id, player_name, team_name_raw, team_side, is_our_team, raw_json')
+      .in('game_id', gameIds),
     sb.from('play_events').select('game_id, inning, description, sequence_num').in('game_id', gameIds),
   ]);
   check(battingRes.error, 'getGameDataForStatsEngine batting_lines');
   check(pitchingRes.error, 'getGameDataForStatsEngine pitching_lines');
   check(playsRes.error, 'getGameDataForStatsEngine play_events');
 
-  function parseRawJson(str) {
-    if (!str) return null;
-    try { return JSON.parse(str); } catch { return null; }
+  function parseRawJson(value) {
+    if (!value) return null;
+
+    // Older Supabase rows were written to a TEXT column as JSON.stringify(row.rawJson)
+    // even though row.rawJson was already a JSON string. That produces values like:
+    //   "{\"Player\":\"Smith\", ...}"
+    // Parse repeatedly until we reach the actual object. This keeps old rows usable.
+    let parsed = value;
+    for (let i = 0; i < 3 && typeof parsed === 'string'; i++) {
+      const trimmed = parsed.trim();
+      if (!trimmed) return null;
+      try { parsed = JSON.parse(trimmed); } catch { return null; }
+    }
+
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  }
+
+  function rowForStatsEngine(row) {
+    const parsed = parseRawJson(row.raw_json) || {};
+    return {
+      ...parsed,
+      Player:     parsed.Player || parsed.Name || row.player_name,
+      Name:       parsed.Name || parsed.Player || row.player_name,
+      TeamName:   parsed.TeamName || parsed.teamName || row.team_name_raw || null,
+      TeamSide:   parsed.TeamSide || parsed.teamSide || row.team_side || null,
+      isOurTeam:  row.is_our_team === true,
+    };
   }
 
   const battingByGame = {};
   for (const row of battingRes.data || []) {
-    const parsed = parseRawJson(row.raw_json);
-    if (!parsed) continue;
     if (!battingByGame[row.game_id]) battingByGame[row.game_id] = [];
-    battingByGame[row.game_id].push(parsed);
+    battingByGame[row.game_id].push(rowForStatsEngine(row));
   }
 
   const pitchingByGame = {};
   for (const row of pitchingRes.data || []) {
-    const parsed = parseRawJson(row.raw_json);
-    if (!parsed) continue;
     if (!pitchingByGame[row.game_id]) pitchingByGame[row.game_id] = [];
-    pitchingByGame[row.game_id].push(parsed);
+    pitchingByGame[row.game_id].push(rowForStatsEngine(row));
   }
 
   // Group plays by game, then sort each game's plays by sequence_num — do
@@ -618,7 +648,7 @@ async function insertBattingLines(lines, gameId) {
       hbp:           numericOrZero(row.hbp),
       sac:           numericOrZero(row.sac),
       lob:           numericOrZero(row.lob),
-      raw_json:      row.rawJson       ? JSON.stringify(row.rawJson) : null,
+      raw_json:      serializeRawJsonForTextColumn(row.rawJson),
     };
     if (includeOrgId) payload.org_id = orgId;
     return payload;
@@ -658,7 +688,7 @@ async function insertPitchingLines(lines, gameId) {
       hr_allowed:    numericOrZero(row.hrAllowed),
       era:           numericOrNull(row.era),
       whip:          numericOrNull(row.whip),
-      raw_json:      row.rawJson       ? JSON.stringify(row.rawJson) : null,
+      raw_json:      serializeRawJsonForTextColumn(row.rawJson),
     };
     if (includeOrgId) payload.org_id = orgId;
     return payload;
