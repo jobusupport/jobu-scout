@@ -493,18 +493,45 @@ async function getGameDataForStatsEngine(teamId) {
 
   const gameIds = games.map(g => g.id);
 
-  const [battingRes, pitchingRes, playsRes] = await Promise.all([
-    sb.from('batting_lines')
-      .select('game_id, player_name, team_name_raw, team_side, is_our_team, raw_json')
-      .in('game_id', gameIds),
-    sb.from('pitching_lines')
-      .select('game_id, player_name, team_name_raw, team_side, is_our_team, raw_json')
-      .in('game_id', gameIds),
-    sb.from('play_events').select('game_id, inning, description, sequence_num').in('game_id', gameIds),
+  async function fetchAllRows(makeQuery, context, pageSize = 1000) {
+    const rows = [];
+    let from = 0;
+
+    while (true) {
+      const to = from + pageSize - 1;
+      const { data, error } = await makeQuery().range(from, to);
+      check(error, context);
+
+      const batch = data || [];
+      rows.push(...batch);
+
+      if (batch.length < pageSize) break;
+      from += pageSize;
+    }
+
+    return rows;
+  }
+
+  const [battingRows, pitchingRows, playRows] = await Promise.all([
+    fetchAllRows(
+      () => sb.from('batting_lines')
+        .select('game_id, player_name, team_name_raw, team_side, is_our_team, raw_json')
+        .in('game_id', gameIds),
+      'getGameDataForStatsEngine batting_lines'
+    ),
+    fetchAllRows(
+      () => sb.from('pitching_lines')
+        .select('game_id, player_name, team_name_raw, team_side, is_our_team, raw_json')
+        .in('game_id', gameIds),
+      'getGameDataForStatsEngine pitching_lines'
+    ),
+    fetchAllRows(
+      () => sb.from('play_events')
+        .select('game_id, inning, description, sequence_num')
+        .in('game_id', gameIds),
+      'getGameDataForStatsEngine play_events'
+    ),
   ]);
-  check(battingRes.error, 'getGameDataForStatsEngine batting_lines');
-  check(pitchingRes.error, 'getGameDataForStatsEngine pitching_lines');
-  check(playsRes.error, 'getGameDataForStatsEngine play_events');
 
   function parseRawJson(value) {
     if (!value) return null;
@@ -536,13 +563,13 @@ async function getGameDataForStatsEngine(teamId) {
   }
 
   const battingByGame = {};
-  for (const row of battingRes.data || []) {
+  for (const row of battingRows || []) {
     if (!battingByGame[row.game_id]) battingByGame[row.game_id] = [];
     battingByGame[row.game_id].push(rowForStatsEngine(row));
   }
 
   const pitchingByGame = {};
-  for (const row of pitchingRes.data || []) {
+  for (const row of pitchingRows || []) {
     if (!pitchingByGame[row.game_id]) pitchingByGame[row.game_id] = [];
     pitchingByGame[row.game_id].push(rowForStatsEngine(row));
   }
@@ -552,7 +579,7 @@ async function getGameDataForStatsEngine(teamId) {
   // games, since sequence_num resets per game and a flat order-by would
   // interleave games incorrectly.
   const playsByGame = {};
-  for (const row of playsRes.data || []) {
+  for (const row of playRows || []) {
     if (!playsByGame[row.game_id]) playsByGame[row.game_id] = [];
     playsByGame[row.game_id].push(row);
   }
