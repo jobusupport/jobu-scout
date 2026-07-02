@@ -486,7 +486,7 @@ async function getGameDataForStatsEngine(teamId) {
   const sb = getDb();
 
   const { data: games, error: gamesError } = await sb.from('games')
-    .select('id, game_date')
+    .select('id, game_date, opponent_name, result, score_us, score_them, gc_game_url')
     .eq('team_id', teamId);
   check(gamesError, 'getGameDataForStatsEngine games');
   if (!games || !games.length) return [];
@@ -588,7 +588,15 @@ async function getGameDataForStatsEngine(teamId) {
   }
 
   return games.map(g => ({
-    meta: { gameId: g.id },
+    meta: {
+      gameId: g.id,
+      gameDate: g.game_date || null,
+      opponentName: g.opponent_name || null,
+      result: g.result || null,
+      scoreUs: g.score_us ?? null,
+      scoreThem: g.score_them ?? null,
+      gcGameUrl: g.gc_game_url || null,
+    },
     boxScore: {
       batting:  battingByGame[g.id]  || [],
       pitching: pitchingByGame[g.id] || [],
@@ -891,6 +899,30 @@ async function getTeamPlayTendencies(teamId) {
   return data || [];
 }
 
+async function getLatestVerifiedTeamTotals(teamId) {
+  try {
+    const { data, error } = await getDb()
+      .from('derived_team_verified_totals')
+      .select('*')
+      .eq('team_id', teamId)
+      .maybeSingle();
+
+    // The migration may not exist yet on a fresh environment. Do not break
+    // report generation; analyzer.js will fall back to box-score aggregates.
+    if (error) {
+      const msg = String(error.message || '').toLowerCase();
+      if (msg.includes('does not exist') || msg.includes('could not find the table')) return null;
+      check(error, 'getLatestVerifiedTeamTotals');
+    }
+
+    return data || null;
+  } catch (err) {
+    const msg = String(err.message || '').toLowerCase();
+    if (msg.includes('does not exist') || msg.includes('could not find the table')) return null;
+    throw err;
+  }
+}
+
 async function getTeamGameResults(teamId) {
   const { data, error } = await getDb().from('games')
     .select('id, game_date, opponent_name, result, score_us, score_them, gc_game_url')
@@ -923,7 +955,7 @@ async function getTeamAnalysisBundle(teamId) {
     teamRes, games, batting, pitching, tendencies,
     recentPitchingLines, jerseyMap, activeRoster,
     scoutedBattersAdv, facedBattersAdv, scoutedPitchersAdv, facedPitchersAdv,
-    rawBattingLines,
+    rawBattingLines, verifiedTotals,
   ] = await Promise.all([
     sb.from('teams').select('*').eq('id', teamId).maybeSingle(),
     getTeamGameResults(teamId),
@@ -938,6 +970,7 @@ async function getTeamAnalysisBundle(teamId) {
     getPitcherAdvancedStats(teamId, 0),
     getPitcherAdvancedStats(teamId, 1),
     getRawBattingLines(teamId),
+    getLatestVerifiedTeamTotals(teamId),
   ]);
 
   return {
@@ -954,6 +987,7 @@ async function getTeamAnalysisBundle(teamId) {
     oppPitchers:        facedPitchersAdv,
     opponentBatters:    facedBattersAdv,
     rawBattingLines,
+    verifiedTotals,
     meta: {
       gamesAnalyzed: games.length,
       generatedAt:   new Date().toISOString(),

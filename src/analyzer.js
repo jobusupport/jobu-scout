@@ -326,6 +326,92 @@ function fmtNum(v, d = 2) {
   return isNaN(n) ? 'N/A' : n.toFixed(d);
 }
 
+function safeJson(value, fallback = null) {
+  if (value === null || value === undefined) return fallback;
+  if (typeof value === 'object') return value;
+  try { return JSON.parse(value); } catch { return fallback; }
+}
+
+function officialTeamTotalsFromBox(batting = [], pitching = [], gamesAnalyzed = 0) {
+  const officialBatting = batting.reduce((t, b) => {
+    t.pa += (b.total_ab || 0) + (b.total_bb || 0) + (b.total_hbp || 0) + (b.total_sac || 0);
+    t.ab += b.total_ab || 0;
+    t.h += b.total_h || 0;
+    t.bb += b.total_bb || 0;
+    t.so += b.total_so || 0;
+    t.hbp += b.total_hbp || 0;
+    t.doubles += b.total_2b || 0;
+    t.triples += b.total_3b || 0;
+    t.hr += b.total_hr || 0;
+    t.rbi += b.total_rbi || 0;
+    t.sb += b.total_sb || 0;
+    t.sac += b.total_sac || 0;
+    return t;
+  }, { games: gamesAnalyzed, pa: 0, ab: 0, h: 0, bb: 0, so: 0, hbp: 0, doubles: 0, triples: 0, hr: 0, rbi: 0, sb: 0, sac: 0 });
+
+  const officialPitching = pitching.reduce((t, p) => {
+    t.ip += Number(p.total_ip || 0);
+    t.bf += p.total_bf || 0;
+    t.pc += p.total_pc || p.total_pitches || 0;
+    t.h += p.total_h || 0;
+    t.r += p.total_r || 0;
+    t.er += p.total_er || 0;
+    t.bb += p.total_bb || 0;
+    t.so += p.total_so || 0;
+    t.hr += p.total_hr || 0;
+    return t;
+  }, { games: gamesAnalyzed, ip: 0, bf: 0, pc: 0, h: 0, r: 0, er: 0, bb: 0, so: 0, hr: 0 });
+
+  return { officialBatting, officialPitching };
+}
+
+function buildVerifiedFactsBlock(bundle, batting, pitching) {
+  const verified = bundle.verifiedTotals || null;
+  const gamesAnalyzed = bundle.meta?.gamesAnalyzed || 0;
+  const fallback = officialTeamTotalsFromBox(batting, pitching, gamesAnalyzed);
+  const officialBatting = safeJson(verified?.batting_official, fallback.officialBatting) || fallback.officialBatting;
+  const officialPitching = safeJson(verified?.pitching_official, fallback.officialPitching) || fallback.officialPitching;
+  const tendencies = safeJson(verified?.tendencies, {}) || {};
+  const warnings = safeJson(verified?.warnings, []) || [];
+
+  const totalBases = ((officialBatting.h || 0) - (officialBatting.doubles || 0) - (officialBatting.triples || 0) - (officialBatting.hr || 0))
+    + 2 * (officialBatting.doubles || 0) + 3 * (officialBatting.triples || 0) + 4 * (officialBatting.hr || 0);
+  const obpDen = (officialBatting.ab || 0) + (officialBatting.bb || 0) + (officialBatting.hbp || 0) + (officialBatting.sac || 0);
+  const avg = officialBatting.ab > 0 ? officialBatting.h / officialBatting.ab : null;
+  const obp = obpDen > 0 ? ((officialBatting.h || 0) + (officialBatting.bb || 0) + (officialBatting.hbp || 0)) / obpDen : null;
+  const slg = officialBatting.ab > 0 ? totalBases / officialBatting.ab : null;
+  const ops = obp !== null && slg !== null ? obp + slg : null;
+
+  const validationLine = verified
+    ? `Validation: ${verified.validated_games || 0}/${verified.play_by_play_games || 0} play-by-play games matched box score within tolerance; confidence=${verified.confidence || 'low'}; mismatches=${verified.mismatch_games || 0}.`
+    : 'Validation: no stored play-by-play validation run found yet; official totals below are box-score aggregates.';
+
+  const sideTendencyLines = [];
+  const scoutedBatting = tendencies.scoutedBatting || {};
+  const scoutedPitchingDefense = tendencies.scoutedPitchingDefense || {};
+  if (Object.keys(scoutedBatting).length) {
+    sideTendencyLines.push(`Scouted batting side-specific PBP: groundOuts=${scoutedBatting.groundOutsValidatedPbp ?? 'N/A'}, flyOuts=${scoutedBatting.flyOutsValidatedPbp ?? 'N/A'}, lineOuts=${scoutedBatting.lineOutsValidatedPbp ?? 'N/A'} (${scoutedBatting.note || 'side-attributed play-by-play only'}).`);
+  }
+  if (Object.keys(scoutedPitchingDefense).length) {
+    sideTendencyLines.push(`Scouted pitching/defense side-specific PBP: WP=${scoutedPitchingDefense.wildPitchesFromSideAttributedPbp ?? 'N/A'}, PB=${scoutedPitchingDefense.passedBallsFromSideAttributedPbp ?? 'N/A'}, pickoffs=${scoutedPitchingDefense.pickoffsFromSideAttributedPbp ?? 'N/A'} (${scoutedPitchingDefense.note || 'side-attributed play-by-play only'}).`);
+  }
+
+  return `=== VERIFIED TEAM FACTS — USE THESE NUMBERS FOR ALL NUMERIC CLAIMS ===
+${validationLine}
+Games analyzed: ${gamesAnalyzed}
+Official batting totals from box score: PA ${officialBatting.pa || 0}, AB ${officialBatting.ab || 0}, H ${officialBatting.h || 0}, BB ${officialBatting.bb || 0}, SO ${officialBatting.so || 0}, HBP ${officialBatting.hbp || 0}, 2B ${officialBatting.doubles || 0}, 3B ${officialBatting.triples || 0}, HR ${officialBatting.hr || 0}, RBI ${officialBatting.rbi || 0}, SB ${officialBatting.sb || 0}.
+Official slash line from box score: AVG ${avg === null ? 'N/A' : fmtAvg(avg)}, OBP ${obp === null ? 'N/A' : fmtAvg(obp)}, SLG ${slg === null ? 'N/A' : fmtAvg(slg)}, OPS ${ops === null ? 'N/A' : fmtAvg(ops)}.
+Official pitching totals from box score: IP ${fmtNum(officialPitching.ip, 1)}, BF ${officialPitching.bf || 0}, PC ${officialPitching.pc || 0}, H ${officialPitching.h || 0}, R ${officialPitching.r || 0}, ER ${officialPitching.er || 0}, BB ${officialPitching.bb || 0}, SO ${officialPitching.so || 0}, HR ${officialPitching.hr || 0}.
+${sideTendencyLines.length ? sideTendencyLines.join('\n') : 'Side-specific play-by-play tendencies are unavailable or have not been validated; do not cite raw event-distribution totals.'}
+${warnings.length ? `Validation warnings: ${warnings.join(' | ')}` : 'Validation warnings: none.'}
+
+HARD RULES:
+- Do NOT use raw all-game event distribution counts for HBP, BB, SO, GB, FB, LD, WP, PB, pickoffs, or catcher/pitcher claims.
+- Do NOT report any number that conflicts with the official box-score totals above.
+- If a side-specific tendency is unavailable, say it is unavailable instead of inventing or using raw event counts.
+- Claude explains verified facts; Claude does not calculate new season totals.`;
+}
+
 function buildAnalysisPrompt(bundle, options = {}) {
   const { team, games, tendencies, meta,
           playerAdvanced = [], oppPitchers = [] } = bundle;
@@ -404,9 +490,7 @@ function buildAnalysisPrompt(bundle, options = {}) {
     `GB%:${fmtNum(p.gb_pct,1)} ERA:${fmtNum(p.era)} WHIP:${fmtNum(p.whip,3)}`
   ).join('\n');
 
-  const tendencyStr = tendencies.map(t =>
-    `${t.event_type}: ${t.count} (${t.pct}%)`
-  ).join('\n');
+  const verifiedFactsBlock = buildVerifiedFactsBlock(bundle, batting, pitching);
 
   // ── PitchSmart Analysis ──────────────────────────────────────────────────
   const pitchSmart = computePitchSmartEligibility(bundle, options);
@@ -456,6 +540,9 @@ Use your knowledge of the location and typical conditions to provide the best fo
 
   return `Analyze this baseball team and return a complete JSON scouting report.
 
+CRITICAL STAT ACCURACY REQUIREMENT:
+Use VERIFIED TEAM FACTS as the source of truth for all season totals. Do not cite raw play-event counts or all-game event distributions as team stats. If a side-specific tendency is not validated, say it is unavailable.
+
 TEAM: ${team.team_name}
 CLASSIFICATION: ${team.classification || 'Unknown'} | AGE: ${team.age_group || '?'}U | LOCATION: ${team.city || ''} ${team.state || ''}
 GAMES ANALYZED: ${meta.gamesAnalyzed}
@@ -499,8 +586,7 @@ ${Object.keys(pitcherVelo).length > 0
       }).join('\n\n')
   : 'No PG velocity data available.'}
 
-=== PLAY-BY-PLAY EVENT DISTRIBUTION ===
-${tendencyStr || 'No play data'}
+${verifiedFactsBlock}
 
 ${pitchSmartStr}
 
