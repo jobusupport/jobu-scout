@@ -26,7 +26,23 @@ const REPORTS_DIR = process.env.REPORTS_DIR || path.join(__dirname, '..', 'repor
 const analyzerOptions = {
   gameLocation: process.env.GAME_LOCATION || null,
   gameDate:     process.env.GAME_DATE     || new Date().toISOString().slice(0, 10),
+  // Advanced stats (player_advanced_stats / pitcher_advanced_stats) are now
+  // recalculated automatically at the start of every report (see
+  // analyzer.js:analyzeTeam). Pass --skip-recalc on the CLI, or set
+  // ANALYZER_SKIP_RECALC=true, to bypass this when iterating quickly and
+  // you're confident advanced stats are already current.
+  skipRecalculate: process.argv.slice(2).includes('--skip-recalc'),
+  // Almost every team in this DB is a scouted opponent (is_our_team=false),
+  // which is why recalculate-all-teams.js has always used invertTeamSide:
+  // false. If you are ever generating a report for JoBu 14U itself (or any
+  // other team ingested in self-scout mode), pass GAME_INVERT_TEAM_SIDE=true
+  // so the recalculation direction matches how that team was ingested.
+  invertTeamSide: process.env.GAME_INVERT_TEAM_SIDE === 'true',
 };
+
+if (analyzerOptions.skipRecalculate) {
+  console.log('[report] Skipping automatic advanced-stats recalculation (--skip-recalc).');
+}
 
 if (analyzerOptions.gameLocation) {
   console.log(`[report] Game location: ${analyzerOptions.gameLocation}`);
@@ -130,7 +146,7 @@ async function runForTeam(team) {
 }
 
 async function main() {
-  const args = process.argv.slice(2);
+  const args = process.argv.slice(2).filter(a => a !== '--skip-recalc');
 
   if (args.includes('--list') || args.includes('-l')) {
     await listTeams();
