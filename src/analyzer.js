@@ -270,6 +270,34 @@ function computePitchSmartEligibility(bundle, options = {}) {
 
   const recentGames = [...lookbackDates].map(d => ({ game_date: d }));
 
+  // ── Data-quality guard: detect a collapsed game_date pattern ──────────────
+  // If the "last 2 dates" lookback only ever finds ONE distinct date, but that
+  // date carries outings against many different opponents, the scraper almost
+  // certainly failed to resolve distinct per-game dates (a known failure mode
+  // in the GameChanger schedule-page date extraction) and stamped every game
+  // with the same value. When that happens, PitchSmart's cumulative same-day
+  // pitch counts and "not eligible until +N days" projections are not
+  // trustworthy — they are built on a false premise (many games on one day).
+  // We do not attempt to guess correct dates here; we just refuse to present
+  // the result with unwarranted confidence.
+  const distinctOpponentsOnSingleDate = lookbackDates.size === 1
+    ? new Set(
+        scoutedLines
+          .filter(l => l.game_date && lookbackDates.has(l.game_date))
+          .map(l => l.opponent_name)
+          .filter(Boolean)
+      ).size
+    : 0;
+  const dateDataSuspect = lookbackDates.size === 1 && distinctOpponentsOnSingleDate > 2;
+  const dateDataWarning = dateDataSuspect
+    ? `PitchSmart data quality warning: every scouted outing in the lookback window shares the single ` +
+      `date ${[...lookbackDates][0]}, but spans ${distinctOpponentsOnSingleDate} different opponents. ` +
+      `A team cannot realistically play that many different opponents in one calendar day, so the ` +
+      `underlying game dates for this team are very likely wrong (a scraper date-resolution issue), and ` +
+      `the pitch counts/eligibility below should be treated as unreliable until this team is re-scraped ` +
+      `with corrected date extraction.`
+    : null;
+
   return {
     ageGroup,
     psGroup,
@@ -278,6 +306,8 @@ function computePitchSmartEligibility(bundle, options = {}) {
     lookbackDates: [...lookbackDates].sort(),
     recentGames,
     pitchers,
+    dateDataSuspect,
+    dateDataWarning,
   };
 }
 
@@ -576,7 +606,7 @@ PitchSmart Rest Requirements for ${psGroup}: ${JSON.stringify(psRules?.rest)}
 Max pitches allowed: ${psRules?.max}
 Game date / reference date: ${referenceDate}
 Games found in last 96 hours: ${recentGames.map(g => `${g.game_date} vs ${g.opponent_name}`).join(', ') || 'none'}
-
+${pitchSmart.dateDataSuspect ? `\n*** DATA QUALITY WARNING ***\n${pitchSmart.dateDataWarning}\nYou MUST open the pitching availability discussion with this caveat, in plain language, before stating any eligibility conclusions.\n` : ''}
 Per-pitcher recent activity:
 ${pitchSmartEligibility.map(p =>
   `${p.name}: ${p.pitches} pitches on ${p.mostRecentGameDate} vs ${p.mostRecentOpponent} → ` +
@@ -585,7 +615,7 @@ ${pitchSmartEligibility.map(p =>
     : `NOT ELIGIBLE — requires ${p.restNeeded} rest days → eligible again ${p.eligibleDate}`)
 ).join('\n')}
 
-IMPORTANT: Apply PitchSmart rules carefully in your pitchingAnalysis. List eligible pitchers separately from ineligible ones. For every pitcher who threw in the last 96 hours, state the date they pitched, pitch count, rest days required, and eligible date.`
+IMPORTANT: Apply PitchSmart rules carefully in your pitchingAnalysis. List eligible pitchers separately from ineligible ones. For every pitcher who threw in the last 96 hours, state the date they pitched, pitch count, rest days required, and eligible date.${pitchSmart.dateDataSuspect ? ' Because of the data quality warning above, present these as provisional/unverified rather than certain.' : ''}`
     : `=== PITCHSMART ELIGIBILITY ===
 No scouted-team pitcher activity found in the last 96 hours for ${team.team_name}.
 All pitchers presumed eligible based on available data.

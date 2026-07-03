@@ -1233,6 +1233,13 @@ async function buildDocx(analysis, outputPath) {
       ? 'PitchSmart — Last 2 Game Dates Scouted: ' + ps.lookbackDates.join(' & ')
       : 'PitchSmart — Pitcher Availability';
     out.push(subHeading(psHeadingLabel));
+    if (hasPitchSmart && ps.dateDataSuspect) {
+      out.push(bodyPara(
+        '⚠ DATA QUALITY WARNING: ' + (ps.dateDataWarning || 'Scouted game dates for this team could not be reliably resolved. Pitch counts and eligibility below should be treated as unverified until this team is re-scraped.'),
+        { bold: true, color: 'C00000' }
+      ));
+      out.push(spacer(60));
+    }
     if (hasPitchSmart) {
       out.push(labelValue('Your Game Date', ps.referenceDate || ctx.gameDate || '—'));
       out.push(labelValue('Age Group', `${ps.ageGroup || '14'}U (${ps.psGroup || '13-14'} PitchSmart group)`));
@@ -1527,11 +1534,18 @@ function buildReportHtml(analysis) {
         }).join('')
       : '';
 
+    const pitchSmartWarningHtml = (hasPitchSmart && ps.dateDataSuspect)
+      ? '<p style="background:#fdecec;border:1px solid #C00000;color:#C00000;padding:8px 10px;font-weight:bold;font-size:0.9em;margin:6px 0 10px">&#9888; DATA QUALITY WARNING: ' +
+        esc(ps.dateDataWarning || 'Scouted game dates for this team could not be reliably resolved. Pitch counts and eligibility below should be treated as unverified until this team is re-scraped.') +
+        '</p>'
+      : '';
+
     const pitchSmartHtml = `
       <h4 class="sub">${hasPitchSmart && ps.lookbackDates && ps.lookbackDates.length
         ? 'PitchSmart &mdash; Last 2 Game Dates: ' + esc(ps.lookbackDates.join(' &amp; '))
         : 'PitchSmart &mdash; Pitcher Availability'
       }</h4>
+      ${pitchSmartWarningHtml}
       ${hasPitchSmart ? '<p><strong>Reference Date:</strong> ' + esc(ps.referenceDate || ctx.gameDate || '—') + ' &nbsp; <strong>Age Group:</strong> ' + esc(ps.ageGroup || '14') + 'U (' + esc(ps.psGroup || '13-14') + ')</p><p style="font-size:0.82em;color:#555;margin:4px 0 8px"><strong>PitchSmart (13-14U):</strong> 1–20 pitches = 0 rest days &nbsp;|&nbsp; 21–35 = 1 day &nbsp;|&nbsp; 36–50 = 2 days &nbsp;|&nbsp; 51–65 = 3 days &nbsp;|&nbsp; 66+ = 4 days</p><table><thead><tr><th style="text-align:left">Pitcher</th><th>Last Pitched</th><th>Last Opponent</th><th>Total Pitches</th><th>Rest Req.</th><th>Eligible Date</th><th>Status</th></tr></thead><tbody>' + psRows + '</tbody></table>'
       : '<p class="note-italic">No pitching lines were found for this team in the database. All pitchers are presumed eligible based on available data.</p>'}
     `;

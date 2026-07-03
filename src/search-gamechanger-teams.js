@@ -1025,31 +1025,65 @@ async function getVisibleCompletedGameEntries(page) {
         let node = element;
         let href = '';
         let cardText = scoreText;
+        // rowContainer is the smallest ancestor that is actually clickable/linked
+        // to this specific game. Date search MUST be scoped to this element (plus
+        // its immediate previous sibling, to catch a date-group header that
+        // precedes a row rather than wrapping it) — never to the whole document.
+        // Searching the whole page previously caused every game on a schedule to
+        // resolve to the same date whenever a single date-like element (e.g. a
+        // group header several games away) happened to score as "closest."
+        let rowContainer = element;
+
+        // CARDTEXT_MAX_LEN caps how much text we're willing to fold into a single
+        // row's "cardText". Multi-game schedule lists routinely nest a single
+        // game's score inside large shared containers (virtualized list rows,
+        // date-grouped sections); without a tight cap, cardText silently absorbs
+        // neighboring games/date headers and date-parsing then locks onto
+        // whichever date happens to appear first in that merged blob for every
+        // row, collapsing the whole team's schedule onto one date.
+        const CARDTEXT_MAX_LEN = 260;
 
         for (let depth = 0; depth < 12 && node; depth++) {
           const text = clean(node.innerText || node.textContent || '');
-          if (text && text.length >= cardText.length && text.length < 1200) cardText = text;
+          if (text && text.length >= cardText.length && text.length <= CARDTEXT_MAX_LEN) {
+            cardText = text;
+            rowContainer = node;
+          }
 
-          if (node.href) { href = node.href; break; }
+          if (node.href) { href = node.href; rowContainer = node; break; }
           if (node.getAttribute) {
             href = node.getAttribute('href') || node.getAttribute('data-href') || '';
-            if (href) break;
+            if (href) { rowContainer = node; break; }
           }
           const anchor = node.querySelector && node.querySelector('a[href*="/schedule/"]');
-          if (anchor && anchor.href) { href = anchor.href; break; }
+          if (anchor && anchor.href) { href = anchor.href; rowContainer = node; break; }
           node = node.parentElement;
         }
 
+        // Scope the date search to this row's own subtree, plus its immediate
+        // previous sibling (common pattern: "Sat, Jul 2" header sits as a sibling
+        // just above a block of that day's games) — not the entire document.
+        const searchRoots = [rowContainer];
+        if (rowContainer.previousElementSibling) searchRoots.push(rowContainer.previousElementSibling);
+        const parentPrev = rowContainer.parentElement && rowContainer.parentElement.previousElementSibling;
+        if (parentPrev) searchRoots.push(parentPrev);
+
         const scoreRect = element.getBoundingClientRect();
         const dateCandidates = [];
-        for (const candidate of Array.from(document.querySelectorAll('body *'))) {
-          const text = clean(candidate.innerText || candidate.textContent || '');
-          if (!text || text.length > 300 || !looksLikeDate(text)) continue;
-          const rect = candidate.getBoundingClientRect();
-          if (rect.width <= 0 || rect.height <= 0) continue;
-          const distance = Math.abs(rect.top - scoreRect.top);
-          const abovePenalty = rect.top <= scoreRect.top + 20 ? 0 : 10000;
-          dateCandidates.push({ text, distance: distance + abovePenalty, top: rect.top });
+        const seenNodes = new Set();
+        for (const root of searchRoots) {
+          const nodes = [root, ...Array.from(root.querySelectorAll('*'))];
+          for (const candidate of nodes) {
+            if (seenNodes.has(candidate)) continue;
+            seenNodes.add(candidate);
+            const text = clean(candidate.innerText || candidate.textContent || '');
+            if (!text || text.length > 300 || !looksLikeDate(text)) continue;
+            const rect = candidate.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) continue;
+            const distance = Math.abs(rect.top - scoreRect.top);
+            const abovePenalty = rect.top <= scoreRect.top + 20 ? 0 : 10000;
+            dateCandidates.push({ text, distance: distance + abovePenalty, top: rect.top });
+          }
         }
 
         dateCandidates.sort((a, b) => a.distance - b.distance || b.top - a.top);
@@ -1123,31 +1157,65 @@ async function clickCompletedGameFromScheduleByIndex(page, targetIndex) {
         let href = '';
         let cardText = scoreText;
         let clickableFound = false;
+        // rowContainer is the smallest ancestor that is actually clickable/linked
+        // to this specific game. Date search MUST be scoped to this element (plus
+        // its immediate previous sibling, to catch a date-group header that
+        // precedes a row rather than wrapping it) — never to the whole document.
+        // Searching the whole page previously caused every game on a schedule to
+        // resolve to the same date whenever a single date-like element (e.g. a
+        // group header several games away) happened to score as "closest."
+        let rowContainer = element;
+
+        // CARDTEXT_MAX_LEN caps how much text we're willing to fold into a single
+        // row's "cardText". Multi-game schedule lists routinely nest a single
+        // game's score inside large shared containers (virtualized list rows,
+        // date-grouped sections); without a tight cap, cardText silently absorbs
+        // neighboring games/date headers and date-parsing then locks onto
+        // whichever date happens to appear first in that merged blob for every
+        // row, collapsing the whole team's schedule onto one date.
+        const CARDTEXT_MAX_LEN = 260;
 
         for (let depth = 0; depth < 12 && node; depth++) {
           const text = clean(node.innerText || node.textContent || '');
-          if (text && text.length >= cardText.length && text.length < 1200) cardText = text;
+          if (text && text.length >= cardText.length && text.length <= CARDTEXT_MAX_LEN) {
+            cardText = text;
+            rowContainer = node;
+          }
 
-          if (node.href) { href = node.href; clickableFound = true; break; }
+          if (node.href) { href = node.href; clickableFound = true; rowContainer = node; break; }
           if (node.getAttribute) {
             href = node.getAttribute('href') || node.getAttribute('data-href') || '';
-            if (href) { clickableFound = true; break; }
+            if (href) { clickableFound = true; rowContainer = node; break; }
           }
           const anchor = node.querySelector && node.querySelector('a[href*="/schedule/"]');
-          if (anchor && anchor.href) { href = anchor.href; clickableFound = true; break; }
+          if (anchor && anchor.href) { href = anchor.href; clickableFound = true; rowContainer = node; break; }
           node = node.parentElement;
         }
 
+        // Scope the date search to this row's own subtree, plus its immediate
+        // previous sibling (common pattern: "Sat, Jul 2" header sits as a sibling
+        // just above a block of that day's games) — not the entire document.
+        const searchRoots = [rowContainer];
+        if (rowContainer.previousElementSibling) searchRoots.push(rowContainer.previousElementSibling);
+        const parentPrev = rowContainer.parentElement && rowContainer.parentElement.previousElementSibling;
+        if (parentPrev) searchRoots.push(parentPrev);
+
         const scoreRect = element.getBoundingClientRect();
         const dateCandidates = [];
-        for (const candidate of Array.from(document.querySelectorAll('body *'))) {
-          const text = clean(candidate.innerText || candidate.textContent || '');
-          if (!text || text.length > 300 || !looksLikeDate(text)) continue;
-          const rect = candidate.getBoundingClientRect();
-          if (rect.width <= 0 || rect.height <= 0) continue;
-          const distance = Math.abs(rect.top - scoreRect.top);
-          const abovePenalty = rect.top <= scoreRect.top + 20 ? 0 : 10000;
-          dateCandidates.push({ text, distance: distance + abovePenalty, top: rect.top });
+        const seenNodes = new Set();
+        for (const root of searchRoots) {
+          const nodes = [root, ...Array.from(root.querySelectorAll('*'))];
+          for (const candidate of nodes) {
+            if (seenNodes.has(candidate)) continue;
+            seenNodes.add(candidate);
+            const text = clean(candidate.innerText || candidate.textContent || '');
+            if (!text || text.length > 300 || !looksLikeDate(text)) continue;
+            const rect = candidate.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) continue;
+            const distance = Math.abs(rect.top - scoreRect.top);
+            const abovePenalty = rect.top <= scoreRect.top + 20 ? 0 : 10000;
+            dateCandidates.push({ text, distance: distance + abovePenalty, top: rect.top });
+          }
         }
         dateCandidates.sort((a, b) => a.distance - b.distance || b.top - a.top);
 
@@ -1961,22 +2029,40 @@ async function extractGameData(page, team, scheduleMeta = null) {
   const boxScorePageDate = await extractGameDateFromCurrentPage(page, 'box score page');
 
   const parsedHeaderGameDate = parseGameDateFromHeaderDateTime(header.dateTime || header.gameDatetimeRaw);
+
+  // Preference order: box score page and recap page dates are captured after
+  // navigating to THIS specific game's own URL, so they are far less likely to
+  // collide with another game's date than the schedule-card date, which is
+  // resolved via a DOM-proximity heuristic on the shared schedule LIST page
+  // (see getVisibleCompletedGameEntries / clickCompletedGameFromScheduleByIndex).
+  // The schedule card date is still useful as a fallback and as a cross-check.
   const resolvedGameDate =
-    scheduleGameMeta.gameDate ||
     boxScorePageDate.gameDate ||
     recapPageDate.gameDate ||
+    scheduleGameMeta.gameDate ||
     parsedHeaderGameDate ||
     null;
 
   let resolvedGameDateSource = 'unresolved';
   if (resolvedGameDate) {
-    if (scheduleGameMeta.gameDate) resolvedGameDateSource = 'schedule card';
-    else if (boxScorePageDate.gameDate) resolvedGameDateSource = 'box score page';
+    if (boxScorePageDate.gameDate) resolvedGameDateSource = 'box score page';
     else if (recapPageDate.gameDate) resolvedGameDateSource = 'recap page';
+    else if (scheduleGameMeta.gameDate) resolvedGameDateSource = 'schedule card';
     else resolvedGameDateSource = 'game header';
     console.log(`[gc] Resolved game date: ${resolvedGameDate} (${resolvedGameDateSource})`);
   } else {
     console.warn(`[gc] Could not resolve game date for ${gameId || gameUrl}`);
+  }
+
+  // Cross-check: if the schedule card disagrees with the per-game page date,
+  // that is a strong signal the schedule-list proximity search latched onto
+  // the wrong element for this row. Log it loudly so it shows up in Railway
+  // logs even though we don't block on it.
+  const perGamePageDate = boxScorePageDate.gameDate || recapPageDate.gameDate || null;
+  if (perGamePageDate && scheduleGameMeta.gameDate && perGamePageDate !== scheduleGameMeta.gameDate) {
+    console.warn(`[gc] DATE MISMATCH for ${gameId || gameUrl}: schedule card said ${scheduleGameMeta.gameDate}, ` +
+      `per-game page said ${perGamePageDate}. Using ${perGamePageDate}. If this repeats across many games in one run, ` +
+      `the schedule-card date extraction is likely broken for this team's page layout.`);
   }
 
   let plays = [];
@@ -2481,7 +2567,13 @@ async function processOneCompletedGame(page, team, teamId, gameIndex, manifest, 
     gameDate: captureResult.gameData?.meta?.gameDate || gameScheduleMeta?.gameDate || null,
   });
 
-  return { status: 'processed', gameId, gameUrl };
+  return {
+    status: 'processed',
+    gameId,
+    gameUrl,
+    gameDate: captureResult.gameData?.meta?.gameDate || gameScheduleMeta?.gameDate || null,
+    opponentName: captureResult.gameData?.meta?.opponentName || null,
+  };
 }
 
 async function captureAllCompletedGamesFromSchedule(page, team, teamId) {
@@ -2608,6 +2700,33 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId) {
     for (const f of failures) console.warn(`[gc] Failed game #${f.gameNumber}: ${f.status || f.error}`);
   }
   console.log(`[gc] Summary: processed=${processed.length}, skipped=${skipped.length}, failed=${failures.length}`);
+
+  // ── Date-collapse integrity check ─────────────────────────────────────────
+  // If this run processed several games and they all landed on the same
+  // game_date (or a handful of dates far fewer than the number of distinct
+  // opponents), the date-resolution heuristics almost certainly failed for
+  // this team's page layout — same failure mode that previously silently
+  // corrupted PitchSmart data for entire teams. This never blocks the run
+  // (we still want the box score data), but it must be loud and unmissable.
+  const datedGames = processed.filter(p => p.gameDate);
+  if (datedGames.length >= 4) {
+    const distinctDates = new Set(datedGames.map(p => p.gameDate));
+    const distinctOpponents = new Set(datedGames.map(p => p.opponentName).filter(Boolean));
+    if (distinctDates.size === 1 && distinctOpponents.size > 2) {
+      console.warn('');
+      console.warn('##################################################################');
+      console.warn('[gc] DATE INTEGRITY WARNING: all ' + datedGames.length + ' games processed in this ' +
+        'run for "' + (team.teamName || 'this team') + '" resolved to the same game_date (' +
+        [...distinctDates][0] + ') against ' + distinctOpponents.size + ' different opponents.');
+      console.warn('[gc] This is almost certainly wrong (a team cannot realistically play that many ' +
+        'different opponents in one day) and will corrupt PitchSmart pitcher-availability data.');
+      console.warn('[gc] Do NOT trust this team\'s dates until re-scraped. See date-resolution logic in ' +
+        'extractGameData / getVisibleCompletedGameEntries / clickCompletedGameFromScheduleByIndex.');
+      console.warn('##################################################################');
+      console.warn('');
+    }
+  }
+
   return true;
 }
 
