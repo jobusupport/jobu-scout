@@ -829,8 +829,21 @@ Return this EXACT JSON schema — fill every field, null if truly unknown:
 // ─── Main ──────────────────────────────────────────────────────────────────────
 
 async function analyzeTeam(teamId, options = {}) {
-  console.log(`\n[analyzer] Fetching bundle for team ${teamId}...`);
+  console.log(`\n[analyzer] Preparing analysis for team ${teamId}...`);
 
+  // Rebuild advanced stats from stored game data before fetching the bundle.
+  // generate-report.js exposes --skip-recalc / ANALYZER_SKIP_RECALC, but the
+  // analyzer previously fetched stale player_advanced_stats rows first.
+  if (!options.skipRecalculate && typeof pipeline.recalculateTeamStats === 'function') {
+    console.log('[analyzer] Recalculating advanced stats before report bundle...');
+    await pipeline.recalculateTeamStats(teamId, {
+      invertTeamSide: options.invertTeamSide === true,
+    });
+  } else if (options.skipRecalculate) {
+    console.log('[analyzer] Advanced-stats recalculation skipped by option.');
+  }
+
+  console.log(`[analyzer] Fetching bundle for team ${teamId}...`);
   const bundle = await pipeline.getTeamBundle(teamId);
   if (!bundle || !bundle.team) throw new Error(`No team found with id: ${teamId}`);
 

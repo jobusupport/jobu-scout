@@ -417,9 +417,65 @@ async function buildDocx(analysis, outputPath) {
   // Use a falsy check instead of strict numeric equality so it works for both.
   const allOppBatters  = (a._bundle?.batting  || []).filter(b => !b.is_our_team);
   const allOppPitchers = (a._bundle?.pitching || []).filter(p => !p.is_our_team);
-  // Pitcher advanced stats (opponent)
+  // Pitcher advanced stats can be inconsistent by side for legacy rows,
+  // especially after opponent-team ingests. Build a tolerant lookup across both
+  // advanced pitcher buckets, then prefer box-score aggregates for SO/7 and BB/7.
   const pitAdvMap = {};
-  for (const p of (a._ourPitchers || [])) pitAdvMap[p.player_name] = p;
+  const pitAdvRows = [...(a._ourPitchers || []), ...(a._oppPitchers || [])];
+  for (const p of pitAdvRows) {
+    if (p?.player_name && !pitAdvMap[p.player_name]) pitAdvMap[p.player_name] = p;
+  }
+
+  function normPlayerName(name) {
+    return String(name || '').toLowerCase().replace(/[^a-z0-9]/g, '').trim();
+  }
+
+  function getPitcherAdv(name) {
+    if (!name) return {};
+    if (pitAdvMap[name]) return pitAdvMap[name];
+    const wanted = normPlayerName(name);
+    return pitAdvRows.find(p => normPlayerName(p.player_name) === wanted) || {};
+  }
+
+  const pitchLineAgg = {};
+  for (const line of (a._bundle?.recentPitchingLines || [])) {
+    // Scouted team rows are is_our_team=false in the box-score tables used by
+    // the report. Use those official GameChanger pitch/strike totals for S%.
+    if (!line?.player_name || line.is_our_team) continue;
+    const key = line.player_name;
+    if (!pitchLineAgg[key]) pitchLineAgg[key] = { pc: 0, strikes: 0 };
+    pitchLineAgg[key].pc += toNum(line.pc ?? line.pitch_count ?? line.total_pitches);
+    pitchLineAgg[key].strikes += toNum(line.strikes);
+  }
+
+  function pitcherSoPer7(p, adv = getPitcherAdv(p?.player_name || p?.name)) {
+    const ip = firstNum(p?.total_ip, p?.ip);
+    const so = firstNum(p?.total_so, p?.so);
+    const derived = ip && ip > 0 && so != null ? (so / ip * 7) : null;
+    return firstNum(derived, adv?.so_per7);
+  }
+
+  function pitcherBbPer7(p, adv = getPitcherAdv(p?.player_name || p?.name)) {
+    const ip = firstNum(p?.total_ip, p?.ip);
+    const bb = firstNum(p?.total_bb, p?.bb);
+    const derived = ip && ip > 0 && bb != null ? (bb / ip * 7) : null;
+    return firstNum(derived, adv?.bb_per7);
+  }
+
+  function pitcherStrikePct(p, adv = getPitcherAdv(p?.player_name || p?.name)) {
+    const name = p?.player_name || p?.name;
+    const agg = pitchLineAgg[name] || null;
+    if (agg && agg.pc > 0) return agg.strikes / agg.pc * 100;
+    const pitches = firstNum(p?.total_pitches, p?.pc, adv?.total_pitches);
+    const strikes = firstNum(p?.total_strikes, p?.strikes, adv?.strikes);
+    const derived = pitches && pitches > 0 && strikes != null ? (strikes / pitches * 100) : null;
+    return firstNum(derived, adv?.s_pct);
+  }
+
+  function fmtPitcherStrikePct(p, adv = getPitcherAdv(p?.player_name || p?.name)) {
+    const n = pitcherStrikePct(p, adv);
+    return n != null && Number.isFinite(Number(n)) ? Number(n).toFixed(1) + '%' : '—';
+  }
 
   function jerseyFor(name) {
     if (!name) return null;
@@ -506,9 +562,9 @@ async function buildDocx(analysis, outputPath) {
         cell(fmt(p.total_ip, 1),                  { width: 700,  align: AlignmentType.CENTER, isAlt }),
         cell(fmt(p.era, 2),                       { width: 700,  align: AlignmentType.CENTER, isAlt }),
         cell(fmt(p.whip, 2),                      { width: 700,  align: AlignmentType.CENTER, isAlt }),
-        cell(fmt(adv.so_per7, 2),                 { width: 700,  align: AlignmentType.CENTER, isAlt }),
-        cell(fmt(adv.bb_per7, 2),                 { width: 700,  align: AlignmentType.CENTER, isAlt }),
-        cell(adv.s_pct != null ? adv.s_pct.toFixed(1) + '%' : '—', { width: 700, align: AlignmentType.CENTER, isAlt }),
+        cell(fmt(pitcherSoPer7(p, adv), 2),       { width: 700,  align: AlignmentType.CENTER, isAlt }),
+        cell(fmt(pitcherBbPer7(p, adv), 2),       { width: 700,  align: AlignmentType.CENTER, isAlt }),
+        cell(fmtPitcherStrikePct(p, adv),         { width: 700, align: AlignmentType.CENTER, isAlt }),
       ]});
     });
 
@@ -523,9 +579,9 @@ async function buildDocx(analysis, outputPath) {
     const teamSO7   = totalIP > 0 ? (totalSO / totalIP * 7) : null;
     const teamBB7   = totalIP > 0 ? (totalBB / totalIP * 7) : null;
 
-    // Strike pct from all adv
-    const allStrikes = (a._oppPitchers || []).reduce((s, p) => s + (p.strikes || 0), 0);
-    const allPitches = (a._oppPitchers || []).reduce((s, p) => s + (p.total_pitches || 0), 0);
+    // Strike pct from official pitching lines where available.
+    const allStrikes = Object.values(pitchLineAgg).reduce((s, p) => s + (p.strikes || 0), 0);
+    const allPitches = Object.values(pitchLineAgg).reduce((s, p) => s + (p.pc || 0), 0);
     const teamSpct   = allPitches > 0 ? (allStrikes / allPitches * 100) : null;
     const totalApps  = allOppPitchers.reduce((s, p) => s + (p.games || 0), 0);
 
@@ -834,19 +890,17 @@ async function buildDocx(analysis, outputPath) {
   ];
 
   // Pitching analysis (AI narrative) + pitcher table (advanced stats)
-  const advPMap = {};
-  for (const p of (a._ourPitchers || [])) advPMap[p.player_name] = p;
-
   const pitchRows = (pit.pitchers || []).map(p => {
-    const adv = advPMap[p.name] || {};
+    const box = bundlePitMap[p.name] || { name: p.name, ip: p.ip, total_ip: p.ip };
+    const adv = getPitcherAdv(p.name);
     return new TableRow({ children: [
       cell(playerLabel(p.name), { width:2000, bold:true }),
       cell(fmt(p.ip,1),         { width:500,  align:AlignmentType.CENTER }),
       cell(fmt(p.era,2),        { width:600,  align:AlignmentType.CENTER }),
       cell(fmt(p.whip,3),       { width:600,  align:AlignmentType.CENTER }),
-      cell(fmt(p.so_per7 ?? adv.so_per7,2), { width:600, align:AlignmentType.CENTER }),
-      cell(fmt(p.bb_per7 ?? adv.bb_per7,2), { width:600, align:AlignmentType.CENTER }),
-      cell(adv.s_pct != null ? adv.s_pct.toFixed(1)+'%' : '—', { width:600, align:AlignmentType.CENTER }),
+      cell(fmt(firstNum(p.so_per7, pitcherSoPer7(box, adv)),2), { width:600, align:AlignmentType.CENTER }),
+      cell(fmt(firstNum(p.bb_per7, pitcherBbPer7(box, adv)),2), { width:600, align:AlignmentType.CENTER }),
+      cell(fmtPitcherStrikePct(box, adv), { width:600, align:AlignmentType.CENTER }),
       cell((p.threat||'').toUpperCase(), { width:700, bold:true, color:WHITE, bg:threatColor(p.threat), align:AlignmentType.CENTER }),
       cell(p.note, { width:1600 }),
     ]});
@@ -1443,7 +1497,59 @@ function buildReportHtml(analysis) {
   const allOppBatters  = (a._bundle?.batting  || []);
   const allOppPitchers = (a._bundle?.pitching || []);
   const pitAdvMap = {};
-  for (const p of (a._ourPitchers || [])) pitAdvMap[p.player_name] = p;
+  const pitAdvRows = [...(a._ourPitchers || []), ...(a._oppPitchers || [])];
+  for (const p of pitAdvRows) {
+    if (p?.player_name && !pitAdvMap[p.player_name]) pitAdvMap[p.player_name] = p;
+  }
+
+  function normPlayerName(name) {
+    return String(name || '').toLowerCase().replace(/[^a-z0-9]/g, '').trim();
+  }
+
+  function getPitcherAdv(name) {
+    if (!name) return {};
+    if (pitAdvMap[name]) return pitAdvMap[name];
+    const wanted = normPlayerName(name);
+    return pitAdvRows.find(p => normPlayerName(p.player_name) === wanted) || {};
+  }
+
+  const pitchLineAgg = {};
+  for (const line of (a._bundle?.recentPitchingLines || [])) {
+    if (!line?.player_name || line.is_our_team) continue;
+    const key = line.player_name;
+    if (!pitchLineAgg[key]) pitchLineAgg[key] = { pc: 0, strikes: 0 };
+    pitchLineAgg[key].pc += toNum(line.pc ?? line.pitch_count ?? line.total_pitches);
+    pitchLineAgg[key].strikes += toNum(line.strikes);
+  }
+
+  function pitcherSoPer7(p, adv = getPitcherAdv(p?.player_name || p?.name)) {
+    const ip = firstNum(p?.total_ip, p?.ip);
+    const so = firstNum(p?.total_so, p?.so);
+    const derived = ip && ip > 0 && so != null ? (so / ip * 7) : null;
+    return firstNum(derived, adv?.so_per7);
+  }
+
+  function pitcherBbPer7(p, adv = getPitcherAdv(p?.player_name || p?.name)) {
+    const ip = firstNum(p?.total_ip, p?.ip);
+    const bb = firstNum(p?.total_bb, p?.bb);
+    const derived = ip && ip > 0 && bb != null ? (bb / ip * 7) : null;
+    return firstNum(derived, adv?.bb_per7);
+  }
+
+  function pitcherStrikePct(p, adv = getPitcherAdv(p?.player_name || p?.name)) {
+    const name = p?.player_name || p?.name;
+    const agg = pitchLineAgg[name] || null;
+    if (agg && agg.pc > 0) return agg.strikes / agg.pc * 100;
+    const pitches = firstNum(p?.total_pitches, p?.pc, adv?.total_pitches);
+    const strikes = firstNum(p?.total_strikes, p?.strikes, adv?.strikes);
+    const derived = pitches && pitches > 0 && strikes != null ? (strikes / pitches * 100) : null;
+    return firstNum(derived, adv?.s_pct);
+  }
+
+  function fmtPitcherStrikePct(p, adv = getPitcherAdv(p?.player_name || p?.name)) {
+    const n = pitcherStrikePct(p, adv);
+    return n != null && Number.isFinite(Number(n)) ? Number(n).toFixed(1) + '%' : '—';
+  }
 
   function jerseyFor(name) {
     if (!name) return null;
@@ -1584,9 +1690,9 @@ function buildReportHtml(analysis) {
         <td>${fmtH(p.total_ip,1)}</td>
         <td>${fmtH(p.era,2)}</td>
         <td>${fmtH(p.whip,2)}</td>
-        <td>${fmtH(adv.so_per7,2)}</td>
-        <td>${fmtH(adv.bb_per7,2)}</td>
-        <td>${adv.s_pct!=null ? adv.s_pct.toFixed(1)+'%' : '—'}</td>
+        <td>${fmtH(pitcherSoPer7(p, adv),2)}</td>
+        <td>${fmtH(pitcherBbPer7(p, adv),2)}</td>
+        <td>${fmtPitcherStrikePct(p, adv)}</td>
       </tr>`;
     }).join('');
 
