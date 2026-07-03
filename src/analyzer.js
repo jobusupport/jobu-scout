@@ -21,12 +21,14 @@ const API_KEY      = process.env.ANTHROPIC_API_KEY || '';
 // Rest requirements based on pitches thrown in a single outing
 
 const PITCHSMART_RULES = {
-  '7-8':   { max: 50,  rest: { 1: 0, 20: 1, 35: 2, 50: 3 } },
-  '9-10':  { max: 75,  rest: { 1: 0, 26: 1, 51: 2, 66: 3 } },
-  '11-12': { max: 85,  rest: { 1: 0, 26: 1, 51: 2, 66: 3 } },
-  '13-14': { max: 95,  rest: { 1: 0, 36: 1, 61: 2, 76: 3 } },
-  '15-16': { max: 95,  rest: { 1: 0, 36: 1, 61: 2, 76: 3 } },
-  '17-18': { max: 105, rest: { 1: 0, 36: 1, 61: 2, 76: 3 } },
+  // USA Baseball Pitch Smart rest thresholds. Keys are minimum pitch counts.
+  // Example: 13-14U, 36 pitches means 2 full calendar days of rest.
+  '7-8':   { max: 50,  rest: { 1: 0, 21: 1, 36: 2, 51: 3 } },
+  '9-10':  { max: 75,  rest: { 1: 0, 21: 1, 36: 2, 51: 3, 66: 4 } },
+  '11-12': { max: 85,  rest: { 1: 0, 21: 1, 36: 2, 51: 3, 66: 4 } },
+  '13-14': { max: 95,  rest: { 1: 0, 21: 1, 36: 2, 51: 3, 66: 4 } },
+  '15-16': { max: 95,  rest: { 1: 0, 31: 1, 46: 2, 61: 3, 76: 4 } },
+  '17-18': { max: 105, rest: { 1: 0, 31: 1, 46: 2, 61: 3, 76: 4 } },
 };
 
 function getPitchSmartGroup(ageGroup) {
@@ -102,6 +104,73 @@ function addCalendarDays(dateStr, days) {
   return d.toISOString().slice(0, 10);
 }
 
+function numericOrNull(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  const cleaned = String(value).trim().replace(/,/g, '').replace(/%$/, '');
+  if (!cleaned || cleaned === '-' || cleaned.toUpperCase() === 'N/A') return null;
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : null;
+}
+
+function parseMaybeJson(value) {
+  if (!value) return null;
+  if (typeof value === 'object') return value;
+  try { return JSON.parse(value); } catch { return null; }
+}
+
+function getPitchCountFromLine(line = {}) {
+  const raw = parseMaybeJson(line.raw_json || line.rawJson) || {};
+  const candidates = [
+    line.pitch_count,
+    line.pitchCount,
+    line.pc,
+    line.PC,
+    line.pitches,
+    line.pitch_count_total,
+    line.total_pitches,
+    raw.PC,
+    raw.pc,
+    raw['#P'],
+    raw['Pitches'],
+    raw['Pitch Count'],
+    raw.NP,
+  ];
+
+  for (const candidate of candidates) {
+    const n = numericOrNull(candidate);
+    if (n !== null && n > 0) return Math.round(n);
+  }
+
+  // Last-resort estimate. GameChanger sometimes fails to expose PC but does
+  // expose BF/IP. This prevents impossible report rows like "0 pitches (5.1 IP)".
+  const bf = numericOrNull(line.bf || line.BF || raw.BF || raw['Batters Faced']);
+  if (bf !== null && bf > 0) return Math.max(1, Math.round(bf * 3.8));
+
+  const ipDec = numericOrNull(line.ip_decimal || line.ipDecimal);
+  if (ipDec !== null && ipDec > 0) return Math.max(1, Math.round(ipDec * 15));
+
+  return 0;
+}
+
+function isOurTeamValue(value) {
+  return value === true || value === 1 || value === '1' || String(value).toLowerCase() === 'true';
+}
+
+function getScoutedPitchingLines(allPitchLines = []) {
+  const valid = allPitchLines.filter(l => l && l.player_name);
+  const falseSide = valid.filter(l => !isOurTeamValue(l.is_our_team));
+  if (falseSide.length) return falseSide;
+
+  // Fallback for legacy data where side flags were not set consistently.
+  const countByFlag = { true: new Set(), false: new Set() };
+  for (const line of valid) {
+    countByFlag[String(isOurTeamValue(line.is_our_team))].add(line.player_name);
+  }
+  const scoutedIsOurTeam = countByFlag.true.size >= countByFlag.false.size;
+  return valid.filter(l => isOurTeamValue(l.is_our_team) === scoutedIsOurTeam);
+}
+
 function computePitchSmartEligibility(bundle, options = {}) {
   const team = bundle.team || {};
   const ageGroup = team.age_group || '14';
@@ -110,92 +179,95 @@ function computePitchSmartEligibility(bundle, options = {}) {
   const referenceDate = options.gameDate || new Date().toISOString().slice(0, 10);
   const referenceTs = dateAtNoon(referenceDate);
 
-  const allPitchLines = bundle.recentPitchingLines || [];
+  const scoutedLines = getScoutedPitchingLines(bundle.recentPitchingLines || []);
 
-  // ── Determine which is_our_team flag belongs to the scouted team ───────────
-  // Whichever value has more distinct player names is the scouted team's side.
-  // NOTE: is_our_team is a real boolean in Supabase (true/false), not 0/1.
-  // The old `=== 1` check never matched a boolean, so countByFlag[1] was always
-  // empty and the final filter silently passed through every line regardless
-  // of side — this only avoided visible breakage because recentPitchingLines
-  // happens to already be pre-filtered upstream. Using real booleans below
-  // removes that hidden dependency.
-  const countByFlag = { true: new Set(), false: new Set() };
-  for (const line of allPitchLines) {
-    countByFlag[String(!!line.is_our_team)].add(line.player_name);
-  }
-  const scoutedIsOurTeam = countByFlag.true.size >= countByFlag.false.size;
-  const scoutedLines = allPitchLines.filter(l => !!l.is_our_team === scoutedIsOurTeam);
-
-  // ── Find the most recent game dates this team played (up to their last 2 dates) ──
-  // We use the most recent game dates in the data, NOT a fixed calendar window,
-  // because scouted teams may not have played recently relative to the report date.
+  // Use the most recent game dates in the data, not a fixed calendar window.
+  // Reports can be generated weeks after a tournament, so a 96-hour window would
+  // hide the actual last outings.
   const allGameDates = [...new Set(
     scoutedLines.map(l => l.game_date).filter(Boolean)
-  )].sort((a, b) => dateAtNoon(b) - dateAtNoon(a)); // newest first
+  )].sort((a, b) => dateAtNoon(b) - dateAtNoon(a));
 
-  // Take pitching lines from the most recent 2 distinct game dates only.
-  // This is the correct PitchSmart lookback: what did they throw in their last
-  // 1-2 outings, and how many days rest do they need before our game?
   const lookbackDates = new Set(allGameDates.slice(0, 2));
 
-  const pitcherRecentPitches = {};
+  // PitchSmart is based on a pitcher's DAILY pitch total, not a cumulative
+  // two-date total. Group pitcher outings by date first, then evaluate each date.
+  const pitcherByDate = {};
   for (const line of scoutedLines) {
     if (!line.game_date || !lookbackDates.has(line.game_date)) continue;
 
-    if (!pitcherRecentPitches[line.player_name]) {
-      pitcherRecentPitches[line.player_name] = { pitches: 0, games: [] };
+    const name = line.player_name;
+    const date = line.game_date;
+    const pitches = getPitchCountFromLine(line);
+
+    if (!pitcherByDate[name]) pitcherByDate[name] = {};
+    if (!pitcherByDate[name][date]) {
+      pitcherByDate[name][date] = { date, pitches: 0, outings: [] };
     }
 
-    const pitches = Number(line.pitch_count) > 0
-      ? Number(line.pitch_count)
-      : Math.round((Number(line.bf) || 0) * 3.8);
-
-    pitcherRecentPitches[line.player_name].pitches += pitches;
-    pitcherRecentPitches[line.player_name].games.push({
-      date: line.game_date,
+    pitcherByDate[name][date].pitches += pitches;
+    pitcherByDate[name][date].outings.push({
+      date,
       pitches,
       opponent: line.opponent_name || 'Unknown',
       ip: line.ip || null,
+      bf: line.bf ?? null,
+      pc: line.pc ?? line.pitch_count ?? null,
     });
   }
 
-  const pitchers = Object.entries(pitcherRecentPitches).map(([name, data]) => {
-    const pitches = data.pitches;
-    const restNeeded = getRequiredRestDays(pitches, ageGroup);
-    const mostRecentGame = data.games
+  const pitchers = Object.entries(pitcherByDate).map(([name, byDate]) => {
+    const dailyGames = Object.values(byDate)
+      .sort((a, b) => dateAtNoon(b.date) - dateAtNoon(a.date))
+      .map(day => {
+        const restNeeded = getRequiredRestDays(day.pitches, ageGroup);
+        const eligibleDate = restNeeded === 0
+          ? day.date
+          : addCalendarDays(day.date, restNeeded + 1);
+        return {
+          date: day.date,
+          pitches: day.pitches,
+          restNeeded,
+          eligibleDate,
+          outings: day.outings,
+          opponent: day.outings.map(o => o.opponent).filter(Boolean).join(' / ') || 'Unknown',
+          ip: day.outings.map(o => o.ip).filter(Boolean).join(' + ') || null,
+        };
+      });
+
+    const mostRecentGame = dailyGames[0];
+    const limitingGame = dailyGames
       .slice()
-      .sort((a, b) => dateAtNoon(b.date) - dateAtNoon(a.date))[0];
+      .sort((a, b) => dateAtNoon(b.eligibleDate) - dateAtNoon(a.eligibleDate))[0] || mostRecentGame;
 
-    // Days of rest already accrued between their last outing and our game date
-    const lastPitchedTs = dateAtNoon(mostRecentGame.date);
-    const daysSince = Math.floor((referenceTs - lastPitchedTs) / (1000 * 60 * 60 * 24));
-
-    // Eligible date = last pitched date + required rest days + 1
-    const eligibleDate = restNeeded === 0
-      ? mostRecentGame.date
-      : addCalendarDays(mostRecentGame.date, restNeeded + 1);
-    const isEligible = dateAtNoon(eligibleDate) <= referenceTs;
+    const daysSince = Math.floor(
+      (referenceTs - dateAtNoon(mostRecentGame.date)) / (1000 * 60 * 60 * 24)
+    );
+    const isEligible = dateAtNoon(limitingGame.eligibleDate) <= referenceTs;
 
     return {
       name,
-      pitches,
-      restNeeded,
+      // Keep this as the most recent daily pitch total so the report does not
+      // imply PitchSmart rest was calculated from a two-day cumulative number.
+      pitches: mostRecentGame.pitches,
+      dailyPitches: mostRecentGame.pitches,
+      totalLookbackPitches: dailyGames.reduce((s, d) => s + d.pitches, 0),
+      restNeeded: limitingGame.restNeeded,
       daysSince,
       isEligible,
-      eligibleDate,
+      eligibleDate: limitingGame.eligibleDate,
       mostRecentGameDate: mostRecentGame.date,
       mostRecentOpponent: mostRecentGame.opponent,
-      games: data.games,
+      limitingGameDate: limitingGame.date,
+      games: dailyGames.flatMap(day => day.outings),
+      dailyGames,
     };
   }).sort((a, b) => {
-    // Not eligible first, then by most recent outing date, then by pitch count
     if (a.isEligible !== b.isEligible) return a.isEligible ? 1 : -1;
     return dateAtNoon(b.mostRecentGameDate) - dateAtNoon(a.mostRecentGameDate)
       || b.pitches - a.pitches;
   });
 
-  // The "recent games" context for the report header
   const recentGames = [...lookbackDates].map(d => ({ game_date: d }));
 
   return {
