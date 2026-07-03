@@ -160,16 +160,6 @@ async function processGameJson(jsonFilePath, teamId, options = {}) {
 
   console.log(`[pipeline] Saved game ${result.gameId}: ${result.batters} batters, ${result.pitchers} pitchers, ${result.plays} plays`);
 
-  // Keep advanced stats season-level, not last-game-level.
-  // processTeamOutputDir disables this and recalculates once at the end.
-  if (options.recalculateStats !== false) {
-    try {
-      await recalculateTeamStats(teamId, { invertTeamSide: options.isOpponentTeam === true });
-    } catch (err) {
-      console.warn(`[pipeline] Advanced stats recalculation error: ${err.message}`);
-    }
-  }
-
   return {
     success: true,
     gameId:  result.gameId,
@@ -205,20 +195,17 @@ async function processTeamOutputDir(teamOutputDir, team, options = {}) {
   const stats = { processed: 0, skipped: 0, failed: 0 };
 
   for (const jsonFile of jsonFiles) {
-    const result = await processGameJson(jsonFile, teamId, {
-      ...options,
-      recalculateStats: false,
-    });
+    const result = await processGameJson(jsonFile, teamId, options);
     if (result.success && result.skipped) stats.skipped++;
     else if (result.success)              stats.processed++;
     else                                  stats.failed++;
   }
 
-  if (stats.processed > 0 || options.forceRecalculateStats === true) {
+  if (stats.processed > 0) {
     try {
       await recalculateTeamStats(teamId, { invertTeamSide: options.isOpponentTeam === true });
     } catch (err) {
-      console.warn(`[pipeline] Advanced stats recalculation error: ${err.message}`);
+      console.warn(`[pipeline] Team advanced stats recalculation error: ${err.message}`);
     }
   }
 
@@ -327,11 +314,9 @@ async function processExtractResult(extractResult, teamId) {
     }
   }
 
-  // ── Recalculate full-season advanced stats ────────────────────────────────
-  // Do NOT upsert advanced stats from only this single game. That creates a
-  // last-game-wins bug where swing decisions, spray charts, GB/FB rates, and
-  // player advanced rows disappear whenever the latest processed game has
-  // incomplete play-by-play. Rebuild from every stored game instead.
+  // ── Rebuild advanced stats from the full stored season ───────────────────
+  // Permanent fix: do not upsert advanced stats from only the latest game.
+  // That made swing decisions depend on whichever game was processed last.
   try {
     await recalculateTeamStats(teamId, { invertTeamSide });
   } catch (err) {
@@ -546,10 +531,10 @@ async function getTeamBundle(teamId) {
   // Do not overwrite this with is_our_team=1, or opponent players will appear
   // as the scouted team after an inverted/reingested opponent scrape.
   const [
-    playerAdvanced0,
-    playerAdvanced1,
-    pitcherAdvanced0,
-    pitcherAdvanced1,
+    playerAdvanced,
+    opponentBatters,
+    ourPitchers,
+    oppPitchers,
   ] = await Promise.all([
     Promise.resolve(db.getPlayerAdvancedStats(teamId, 0)),
     Promise.resolve(db.getPlayerAdvancedStats(teamId, 1)),
@@ -557,28 +542,10 @@ async function getTeamBundle(teamId) {
     Promise.resolve(db.getPitcherAdvancedStats(teamId, 1)),
   ]);
 
-  // Report convention: the scouted team should be is_our_team=false.
-  // Fallback only protects legacy rows that were written before the side
-  // convention was stabilized. The normal path must remain side 0.
-  const p0 = Array.isArray(playerAdvanced0) ? playerAdvanced0 : [];
-  const p1 = Array.isArray(playerAdvanced1) ? playerAdvanced1 : [];
-  const r0 = Array.isArray(pitcherAdvanced0) ? pitcherAdvanced0 : [];
-  const r1 = Array.isArray(pitcherAdvanced1) ? pitcherAdvanced1 : [];
-
-  const useLegacySide1ForBatters = p0.length === 0 && p1.length > 0;
-  const useLegacySide1ForPitchers = r0.length === 0 && r1.length > 0;
-
-  if (useLegacySide1ForBatters) {
-    console.warn('[pipeline] No is_our_team=false player advanced rows found; using legacy is_our_team=true rows as fallback. Run recalculateTeamStats(..., { invertTeamSide: true }) to repair permanently.');
-  }
-  if (useLegacySide1ForPitchers) {
-    console.warn('[pipeline] No is_our_team=false pitcher advanced rows found; using legacy is_our_team=true rows as fallback. Run recalculateTeamStats(..., { invertTeamSide: true }) to repair permanently.');
-  }
-
-  bundle.playerAdvanced  = useLegacySide1ForBatters ? p1 : p0;
-  bundle.opponentBatters = useLegacySide1ForBatters ? p0 : p1;
-  bundle.ourPitchers     = useLegacySide1ForPitchers ? r1 : r0;
-  bundle.oppPitchers     = useLegacySide1ForPitchers ? r0 : r1;
+  bundle.playerAdvanced  = Array.isArray(playerAdvanced)  ? playerAdvanced  : [];
+  bundle.opponentBatters = Array.isArray(opponentBatters) ? opponentBatters : [];
+  bundle.ourPitchers     = Array.isArray(ourPitchers)     ? ourPitchers     : [];
+  bundle.oppPitchers     = Array.isArray(oppPitchers)     ? oppPitchers     : [];
 
   // Parse swing_decisions JSON for each player
   for (const p of [...bundle.playerAdvanced, ...bundle.opponentBatters]) {

@@ -482,6 +482,41 @@ function addCount(player, countBefore, pitchType) {
   if (isTakeK) c.take_k++;
 }
 
+
+function normalizeNameKey(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '').trim();
+}
+
+const INVALID_PLAYER_NAMES = new Set([
+  '', 'out', 'outs', 'run', 'runs', 'inning', 'top', 'bottom', 'home', 'away',
+  'courtesyrunner', 'ball', 'strike', 'foul', 'play', 'unknown', 'undefined', 'null'
+]);
+
+function isValidPlayerName(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return false;
+  const key = normalizeNameKey(raw);
+  if (INVALID_PLAYER_NAMES.has(key)) return false;
+  // Require at least one letter and avoid pure event/count words.
+  if (!/[A-Za-z]/.test(raw)) return false;
+  return true;
+}
+
+function rosterCanonicalName(name, ...sets) {
+  if (!isValidPlayerName(name)) return null;
+  const key = normalizeNameKey(name);
+  for (const set of sets) {
+    for (const candidate of set || []) {
+      if (normalizeNameKey(candidate) === key) return candidate;
+    }
+  }
+  return String(name || '').trim();
+}
+
+function playProvidedName(play, camelName, snakeName, altName) {
+  return play?.[camelName] || play?.[snakeName] || play?.[altName] || null;
+}
+
 // ─── Core Processing ──────────────────────────────────────────────────────────
 
 /**
@@ -542,6 +577,29 @@ function processGames(games) {
 
       const pa = parsePA(text);
       if (!pa) continue;
+
+      // Prefer structured names stored by the normalizer. The free-text parser
+      // can misread scoreboard fragments such as "2 Outs" as a batter named
+      // "Outs", which previously created bogus advanced rows and starved the
+      // real players of swing-decision data after recalculation.
+      const structuredBatter = playProvidedName(play, 'batterName', 'batter_name', 'Batter');
+      const structuredPitcher = playProvidedName(play, 'pitcherName', 'pitcher_name', 'Pitcher');
+
+      if (isValidPlayerName(structuredBatter)) {
+        pa.batter = rosterCanonicalName(structuredBatter, ourBatterNames, oppBatterNames);
+      } else if (isValidPlayerName(pa.batter)) {
+        pa.batter = rosterCanonicalName(pa.batter, ourBatterNames, oppBatterNames);
+      } else {
+        pa.batter = null;
+      }
+
+      if (isValidPlayerName(structuredPitcher)) {
+        pa.pitcher = rosterCanonicalName(structuredPitcher, ourPitcherNames, oppPitcherNames);
+      } else if (isValidPlayerName(pa.pitcher)) {
+        pa.pitcher = rosterCanonicalName(pa.pitcher, ourPitcherNames, oppPitcherNames);
+      } else {
+        pa.pitcher = null;
+      }
 
       // ── Attribute each error mention to the fielder who committed it ──
       // Deliberately independent of pa.batter resolving successfully — a

@@ -527,7 +527,7 @@ async function getGameDataForStatsEngine(teamId) {
     ),
     fetchAllRows(
       () => sb.from('play_events')
-        .select('game_id, inning, description, sequence_num')
+        .select('game_id, inning, description, sequence_num, event_type, batter_name, pitcher_name')
         .in('game_id', gameIds),
       'getGameDataForStatsEngine play_events'
     ),
@@ -601,7 +601,13 @@ async function getGameDataForStatsEngine(teamId) {
       batting:  battingByGame[g.id]  || [],
       pitching: pitchingByGame[g.id] || [],
     },
-    plays: (playsByGame[g.id] || []).map(row => ({ inning: row.inning, text: row.description })),
+    plays: (playsByGame[g.id] || []).map(row => ({
+      inning: row.inning,
+      text: row.description,
+      eventType: row.event_type || null,
+      batterName: row.batter_name || null,
+      pitcherName: row.pitcher_name || null,
+    })),
   }));
 }
 
@@ -843,67 +849,28 @@ async function getTeamPitchingAggregates(teamId) {
 async function getRecentPitchingLines(teamId) {
   const sb = getDb();
 
-  // Do not rely on the get_recent_pitching_lines RPC for PitchSmart. The RPC
-  // has produced rows where every outing inherits the report GAME_DATE, which
-  // makes PitchSmart think a pitcher threw several complete games on the same
-  // day. Build the lines directly from games + pitching_lines so every outing
-  // carries its real stored game_date and opponent_name.
-  const { data: games, error: gamesError } = await sb
-    .from('games')
-    .select('id, game_date, opponent_name')
+  // Do not use the legacy RPC here. It has produced rows where every outing
+  // inherits the report date / latest date, which breaks PitchSmart by making
+  // a pitcher appear to throw several historical outings on the same day.
+  // Pull the per-game date directly from games via the game_id relationship.
+  const { data, error } = await sb
+    .from('pitching_lines')
+    .select(`
+      id, game_id, team_id, player_name, is_our_team, team_side, team_name_raw,
+      ip, ip_decimal, bf, pc, strikes, h_allowed, r_allowed, er, bb, so,
+      hr_allowed, era, whip, raw_json,
+      games!inner(game_date, opponent_name)
+    `)
     .eq('team_id', teamId)
-    .order('game_date', { ascending: false })
-    .order('captured_at', { ascending: false });
+    .order('game_id', { ascending: false });
 
-  check(gamesError, 'getRecentPitchingLines games');
-  if (!games || !games.length) return [];
+  check(error, 'getRecentPitchingLines direct');
 
-  const gameById = new Map(games.map(g => [g.id, g]));
-  const gameIds = games.map(g => g.id);
-
-  async function fetchAllRows(makeQuery, context, pageSize = 1000) {
-    const rows = [];
-    let from = 0;
-
-    while (true) {
-      const to = from + pageSize - 1;
-      const { data, error } = await makeQuery().range(from, to);
-      check(error, context);
-
-      const batch = data || [];
-      rows.push(...batch);
-
-      if (batch.length < pageSize) break;
-      from += pageSize;
-    }
-
-    return rows;
-  }
-
-  const rows = await fetchAllRows(
-    () => sb.from('pitching_lines')
-      .select('game_id, team_id, player_name, is_our_team, team_side, team_name_raw, ip, ip_decimal, bf, pc, strikes, h_allowed, r_allowed, er, bb, so, hr_allowed, era, whip, raw_json')
-      .in('game_id', gameIds),
-    'getRecentPitchingLines pitching_lines'
-  );
-
-  return (rows || [])
-    .map(row => {
-      const game = gameById.get(row.game_id) || {};
-      return {
-        ...row,
-        game_date: game.game_date || null,
-        opponent_name: game.opponent_name || null,
-        pitch_count: row.pc ?? null,
-      };
-    })
-    .filter(row => row.player_name && row.game_date)
-    .sort((a, b) => {
-      const ad = String(a.game_date || '');
-      const bd = String(b.game_date || '');
-      if (ad !== bd) return bd.localeCompare(ad);
-      return String(a.player_name || '').localeCompare(String(b.player_name || ''));
-    });
+  return (data || []).map(row => ({
+    ...row,
+    game_date: row.games?.game_date || null,
+    opponent_name: row.games?.opponent_name || null,
+  }));
 }
 
 async function getTeamJerseyMap(teamId) {
