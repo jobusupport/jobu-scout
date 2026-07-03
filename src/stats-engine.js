@@ -302,8 +302,18 @@ function extractBatter(narrative, eventType) {
   // let filler words (e.g. "ground ball and") masquerade as a false-positive
   // "name" immediately before a verb phrase. Case-sensitive is strictly more
   // correct for extracting an actual Title-Case player name.
+  //
+  // First-name token uses [A-Z][a-zA-Z]*\.? (capital letter, then ZERO or
+  // more letters, optional trailing period) rather than [A-Z][a-z]+ (which
+  // requires 2+ letters). GC's actual play-by-play format abbreviates first
+  // names to a single initial with NO trailing period — "W Woodhead",
+  // "P Rollins", "Z Powell" — not "Wyatt Woodhead". The old pattern required
+  // at least one lowercase letter after the capital, so it never matched a
+  // bare initial and this function returned null on effectively every real
+  // play, silently discarding batter attribution (and therefore spray-zone
+  // and swing-decision data, both of which depend on a resolved batter).
   const m = narrative.match(
-    new RegExp(`([A-Z][a-z]+(?:\\s+[A-Z][a-z]+){1,2})\\s+(?:${verbPattern})`)
+    new RegExp(`([A-Z][a-zA-Z]*\\.?(?:\\s+[A-Z][a-zA-Z'-]+){1,2})\\s+(?:${verbPattern})`)
   );
   if (m) return m[1].trim();
 
@@ -314,12 +324,18 @@ function extractBatter(narrative, eventType) {
   // it never matches here even though the batter is unambiguous. Only used
   // when the primary match fails, so this can't regress any case that
   // already resolves correctly.
-  const leading = narrative.match(/^([A-Z][a-zA-Z'-]+(?:\s+[A-Z][a-zA-Z'-]+){0,2})\s+[a-z]/);
+  // Same single-initial fix as above: first token allows a bare capital
+  // letter ([A-Z][a-zA-Z'-]*, zero-or-more trailing chars) instead of
+  // requiring 2+ characters.
+  const leading = narrative.match(/^([A-Z][a-zA-Z'-]*(?:\s+[A-Z][a-zA-Z'-]+){0,2})\s+[a-z]/);
   return leading ? leading[1].trim() : null;
 }
 
 function extractPitcher(narrative) {
-  const m = narrative.match(/([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\s+pitching/i);
+  // Same single-initial fix as extractBatter above — GC abbreviates pitcher
+  // first names to a bare initial too ("N Lopez pitching", "Z Powell
+  // pitching"), which [A-Z][a-z]+ never matched.
+  const m = narrative.match(/([A-Z][a-zA-Z]*\.?(?:\s+[A-Z][a-zA-Z'-]+){1,2})\s+pitching/i);
   return m ? m[1].trim() : null;
 }
 

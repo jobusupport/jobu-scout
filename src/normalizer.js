@@ -238,19 +238,58 @@ function normalizeEventType(description) {
  * Try to extract player name from a play description.
  * GC play text is typically: "Player Name verb phrase"
  */
+// GC play descriptions start with an event-type label and pitch sequence
+// (e.g. "Double Play 3 Outs Ball 1, Ball 2, Foul, In play."; "Walk VBNT 14 -
+// DRMB 0 Ball 1, ..."; "Ground Out 1 Out In play.") followed by the actual
+// narrative sentence naming the batter, e.g. "W Woodhead grounds into a
+// double play, ..." or "P Rollins walks, ...". The batter name is in that
+// narrative, not the leading label.
+//
+// The previous version of this function grabbed the first 2-3 capitalized-
+// looking words of the RAW description — but since GC always leads with the
+// event label, that meant it was extracting the event type itself ("Double
+// Play", "Walk Ball", "Ground Out", "Single Ball") as if it were a player
+// name. That silently corrupted play_events.batter_name for the majority of
+// plays. stats-engine.js trusts this structured batter_name over its own
+// (better) narrative parser when present, so the corruption propagated
+// straight through to broken batter attribution — and therefore broken
+// spray-zone and swing-decision data — for real players.
+const EVENT_LABEL_WORDS = new Set([
+  'Single', 'Double', 'Triple', 'Home', 'Run', 'Strikeout', 'Walk',
+  'Hit', 'By', 'Pitch', 'Fly', 'Out', 'Outs', 'Ground', 'Line', 'Pop',
+  'Foul', 'Error', 'Sacrifice', 'Bunt', "Fielder's", 'Choice',
+  'Intentional', 'Play', 'Stolen', 'Base', 'Wild', 'Passed', 'Ball',
+  'Balk', 'Pickoff', 'Caught', 'Stealing',
+]);
+
 function extractPlayerFromPlay(description) {
   if (!description) return null;
-  // Take first 2–3 words if they look like a name (capitalized, no digits)
-  const words = description.trim().split(/\s+/);
-  const nameParts = [];
-  for (const word of words.slice(0, 3)) {
-    if (/^[A-Z][a-z]+$/.test(word) || /^[A-Z]+$/.test(word)) {
-      nameParts.push(word);
-    } else {
-      break;
-    }
-  }
-  return nameParts.length >= 2 ? nameParts.join(' ') : null;
+
+  // The event-label/pitch-sequence preamble ends at the first ". [Capital]"
+  // boundary, where the actual "PlayerName does something" sentence begins.
+  // Fall back to the raw description for short label-only lines that have
+  // no such boundary (e.g. "Sacrifice Fly", "Ground Out" with no play-by-
+  // play detail) — these correctly resolve to null below since they're
+  // nothing but event-label words.
+  const splitMatch = description.match(/\.\s+([A-Z][\s\S]*)$/);
+  const narrative = (splitMatch ? splitMatch[1] : description).trim();
+
+  // GC abbreviates first names to a bare initial with NO trailing period —
+  // "W Woodhead", "P Rollins", "Z Powell" — not "Wyatt Woodhead". The first
+  // name token only needs to start with a capital letter, not be a full
+  // word, or this misses the large majority of real plays.
+  const m = narrative.match(/^([A-Z][a-zA-Z'-]*(?:\s+[A-Z][a-zA-Z'-]+){1,2})\s+[a-z]/);
+  if (!m) return null;
+
+  const candidate = m[1].trim();
+
+  // Guard against the event label bleeding through when there was no ".
+  // [Capital]" boundary to split on (short lines): if every word in the
+  // candidate is itself a known event-label word, it isn't a real name.
+  const words = candidate.split(/\s+/);
+  if (words.every(w => EVENT_LABEL_WORDS.has(w))) return null;
+
+  return candidate;
 }
 
 // ─── Core Normalizers ─────────────────────────────────────────────────────────
