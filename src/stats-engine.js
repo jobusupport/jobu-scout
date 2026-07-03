@@ -508,6 +508,15 @@ const INVALID_PLAYER_NAMES = new Set([
   'courtesyrunner', 'ball', 'strike', 'foul', 'play', 'unknown', 'undefined', 'null'
 ]);
 
+const NON_PLAYER_NAME_WORDS = new Set([
+  'single', 'double', 'triple', 'home', 'run', 'strikeout', 'walk', 'hit', 'by',
+  'pitch', 'fly', 'out', 'outs', 'ground', 'line', 'pop', 'foul', 'error',
+  'sacrifice', 'bunt', 'fielder', 'fielders', 'choice', 'intentional', 'play',
+  'runner', 'stolen', 'base', 'wild', 'passed', 'ball', 'balk', 'pickoff',
+  'caught', 'stealing', 'strike', 'looking', 'swinging', 'in', 'courtesy',
+  'lineup', 'changed'
+]);
+
 function isValidPlayerName(value) {
   const raw = String(value || '').trim();
   if (!raw) return false;
@@ -515,18 +524,72 @@ function isValidPlayerName(value) {
   if (INVALID_PLAYER_NAMES.has(key)) return false;
   // Require at least one letter and avoid pure event/count words.
   if (!/[A-Za-z]/.test(raw)) return false;
+
+  const words = raw
+    .toLowerCase()
+    .replace(/[^a-z0-9' ]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+
+  // Corrupt legacy rows often look like "Ground Out", "Walk Ball",
+  // "Single Strike", or "Lineup Changed" because older normalizer code
+  // grabbed the play label/pitch sequence instead of the narrative batter.
+  // Treat those as non-names so the narrative parser can recover the player.
+  if (words.length && words.every(w => NON_PLAYER_NAME_WORDS.has(w))) return false;
+
   return true;
+}
+
+function rosterCandidates(...sets) {
+  const seen = new Set();
+  const out = [];
+  for (const set of sets) {
+    for (const candidate of set || []) {
+      if (!candidate) continue;
+      const key = normalizeNameKey(candidate);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push(String(candidate).trim());
+    }
+  }
+  return out;
+}
+
+function initialLastKey(value) {
+  const parts = String(value || '').trim().split(/\s+/).filter(Boolean);
+  if (parts.length < 2) return null;
+  const first = parts[0].replace(/[^A-Za-z0-9]/g, '');
+  const last = parts[parts.length - 1].replace(/[^A-Za-z0-9]/g, '');
+  if (!first || !last) return null;
+  return `${first[0].toLowerCase()}|${normalizeNameKey(last)}`;
 }
 
 function rosterCanonicalName(name, ...sets) {
   if (!isValidPlayerName(name)) return null;
-  const key = normalizeNameKey(name);
-  for (const set of sets) {
-    for (const candidate of set || []) {
-      if (normalizeNameKey(candidate) === key) return candidate;
-    }
+
+  const raw = String(name || '').trim();
+  const candidates = rosterCandidates(...sets);
+
+  // If there is no roster context, keep the legacy behavior and return the
+  // parsed name. With roster context, never let an unmatched structured value
+  // like "Double Ball" become a synthetic player row.
+  if (!candidates.length) return raw;
+
+  const key = normalizeNameKey(raw);
+  for (const candidate of candidates) {
+    if (normalizeNameKey(candidate) === key) return candidate;
   }
-  return String(name || '').trim();
+
+  // GameChanger play text frequently abbreviates first names as a single
+  // initial ("B Millis") while the box score stores the full name
+  // ("Bentley Millis"). Resolve unique first-initial + last-name matches.
+  const wantedInitialLast = initialLastKey(raw);
+  if (wantedInitialLast) {
+    const matches = candidates.filter(candidate => initialLastKey(candidate) === wantedInitialLast);
+    if (matches.length === 1) return matches[0];
+  }
+
+  return null;
 }
 
 function playProvidedName(play, camelName, snakeName, altName) {
@@ -601,21 +664,21 @@ function processGames(games) {
       const structuredBatter = playProvidedName(play, 'batterName', 'batter_name', 'Batter');
       const structuredPitcher = playProvidedName(play, 'pitcherName', 'pitcher_name', 'Pitcher');
 
-      if (isValidPlayerName(structuredBatter)) {
-        pa.batter = rosterCanonicalName(structuredBatter, ourBatterNames, oppBatterNames);
-      } else if (isValidPlayerName(pa.batter)) {
-        pa.batter = rosterCanonicalName(pa.batter, ourBatterNames, oppBatterNames);
-      } else {
-        pa.batter = null;
-      }
+      const structuredBatterName = isValidPlayerName(structuredBatter)
+        ? rosterCanonicalName(structuredBatter, ourBatterNames, oppBatterNames)
+        : null;
+      const parsedBatterName = isValidPlayerName(pa.batter)
+        ? rosterCanonicalName(pa.batter, ourBatterNames, oppBatterNames)
+        : null;
+      pa.batter = structuredBatterName || parsedBatterName || null;
 
-      if (isValidPlayerName(structuredPitcher)) {
-        pa.pitcher = rosterCanonicalName(structuredPitcher, ourPitcherNames, oppPitcherNames);
-      } else if (isValidPlayerName(pa.pitcher)) {
-        pa.pitcher = rosterCanonicalName(pa.pitcher, ourPitcherNames, oppPitcherNames);
-      } else {
-        pa.pitcher = null;
-      }
+      const structuredPitcherName = isValidPlayerName(structuredPitcher)
+        ? rosterCanonicalName(structuredPitcher, ourPitcherNames, oppPitcherNames)
+        : null;
+      const parsedPitcherName = isValidPlayerName(pa.pitcher)
+        ? rosterCanonicalName(pa.pitcher, ourPitcherNames, oppPitcherNames)
+        : null;
+      pa.pitcher = structuredPitcherName || parsedPitcherName || null;
 
       // ── Attribute each error mention to the fielder who committed it ──
       // Deliberately independent of pa.batter resolving successfully — a
