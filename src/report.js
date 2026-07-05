@@ -17,6 +17,7 @@ const fs   = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const { getPGDataForTeam } = require('./pg-reader');
+const { classifyHitter } = require('./defensive-alignment');
 const DESIGN = require('./design/jobu-design-system');
 
 // ─── Fan/Wedge Spray Chart SVG (Bob Jones style) ──────────────────────────────
@@ -724,6 +725,139 @@ async function buildDocx(analysis, outputPath) {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
+  // DEFENSIVE ALIGNMENT GRID
+  // Row set: active roster (last-10-scouted-games filter, same Set used for
+  // "Hitters to Watch"). Classification comes from classifyHitter() against
+  // the same a._playerAdvanced rows that already drive Hitting Summary/spray
+  // charts — no new query. THREAT tier reuses battingAnalysis.protectedHitters
+  // first (the actual "Hitters to Watch" tier), falling back to
+  // playerBreakdowns[].threatLevel for hitters who didn't make that list.
+  // ─────────────────────────────────────────────────────────────────────────
+  function buildDefensiveAlignmentBlock() {
+    const POSITIONS   = ['1B', '2B', '3B', 'SS', 'LF', 'CF', 'RF'];
+    const NAME_WIDTH   = 1500;
+    const SUBCOL_WIDTH = 600; // 7 positions x 2 sub-cols x 600 = 8400; + 1500 = 9900
+    const TIGHT   = { top: 20, bottom: 20, left: 30, right: 30 };
+    const HEAD_SZ = 12;
+    const DATA_SZ = 13;
+    const SHIFT_BLUE = 'BDD7EE'; // primary-shift-zone highlight; distinct from ALTROW/GOLD
+
+    // battingAnalysis.protectedHitters threat wins; playerBreakdowns is the
+    // fallback for hitters not explicitly called out in "Hitters to Watch".
+    const threatMap = {};
+    for (const h of (bat.protectedHitters || [])) {
+      if (h.name) threatMap[h.name] = h.threat;
+    }
+    for (const p of (a.playerBreakdowns || [])) {
+      if (!p.name || threatMap[p.name]) continue;
+      if (p.primaryRole === 'hitter' || p.primaryRole === 'two-way') {
+        threatMap[p.name] = p.threatLevel;
+      }
+    }
+    function threatFor(name) {
+      if (threatMap[name]) return threatMap[name];
+      const norm = n => n.toLowerCase().replace(/[^a-z ]/g, '').trim();
+      const hit = Object.keys(threatMap).find(k => norm(k) === norm(name));
+      return hit ? threatMap[hit] : 'low';
+    }
+
+    // Row set = active roster only; fall back to full opponent batter list
+    // if the active-roster filter returned nothing (e.g. very early season).
+    const rosterFilter = activeSet.size > 0 ? activeSet : null;
+    let gridBatters = rosterFilter
+      ? allOppBatters.filter(b => rosterFilter.has(b.player_name))
+      : [...allOppBatters];
+
+    // Order by real lineup position when available (bundle.lineupOrder from
+    // getTeamLineupOrder), otherwise fall back to AB (same as Hitting Summary).
+    const lineupMap = {};
+    for (const l of (a._bundle?.lineupOrder || [])) lineupMap[l.player_name] = l.avg_order;
+    gridBatters = gridBatters.sort((x, y) => {
+      const lx = lineupMap[x.player_name], ly = lineupMap[y.player_name];
+      if (lx != null && ly != null) return lx - ly;
+      if (lx != null) return -1;
+      if (ly != null) return 1;
+      return (y.total_ab || 0) - (x.total_ab || 0);
+    });
+
+    const smallSampleNames = [];
+
+    const rows = gridBatters.map((b, i) => {
+      const adv    = getAdv(b.player_name);
+      const result = classifyHitter(adv);
+      if (result.confidence === 'low') smallSampleNames.push(b.player_name);
+
+      const isAlt = i % 2 === 1;
+      const threat = threatFor(b.player_name);
+
+      const nameCell = cell(playerLabel(b.player_name), {
+        width: NAME_WIDTH, bold: true, size: DATA_SZ,
+        color: WHITE, bg: threatColor(threat), margins: TIGHT,
+      });
+
+      const posCells = POSITIONS.flatMap(pos => {
+        const [oCode, kCode] = result.grid[pos] || ['—', '—'];
+        return [oCode, kCode].map(code => cell(
+          String(code).replace('+', ''),
+          {
+            width: SUBCOL_WIDTH, align: AlignmentType.CENTER, size: DATA_SZ,
+            isAlt, margins: TIGHT,
+            bg: String(code).includes('+') ? SHIFT_BLUE : undefined,
+          }
+        ));
+      });
+
+      return new TableRow({ children: [nameCell, ...posCells] });
+    });
+
+    // Two-row header: row 1 groups position labels across their O/2K pair,
+    // row 2 labels the sub-columns. First cell is left blank in row 1 (no
+    // rowSpan dependency) so it reads as a merged "PLAYER" header visually.
+    const headerRow1 = new TableRow({ children: [
+      hCell('', NAME_WIDTH, { size: HEAD_SZ, margins: TIGHT }),
+      ...POSITIONS.map(pos => hCell(pos, SUBCOL_WIDTH * 2, { size: HEAD_SZ, margins: TIGHT, colspan: 2 })),
+    ]});
+    const headerRow2 = new TableRow({ children: [
+      hCell('PLAYER', NAME_WIDTH, { size: HEAD_SZ, margins: TIGHT }),
+      ...POSITIONS.flatMap(() => [
+        hCell('O',  SUBCOL_WIDTH, { size: HEAD_SZ, margins: TIGHT }),
+        hCell('2K', SUBCOL_WIDTH, { size: HEAD_SZ, margins: TIGHT }),
+      ]),
+    ]});
+
+    const colWidths = [NAME_WIDTH, ...POSITIONS.flatMap(() => [SUBCOL_WIDTH, SUBCOL_WIDTH])];
+    const tableWidth = colWidths.reduce((sum, w) => sum + w, 0);
+
+    const smallSampleNote = smallSampleNames.length
+      ? [bodyPara(
+          `Insufficient batted-ball sample to assign a directional shift for: ${smallSampleNames.join(', ')}. Shown as STD (balanced) — verify positioning in the scouting report body before adjusting alignment.`,
+          { italic: true, color: '595959' }
+        )]
+      : [];
+
+    return [
+      sectionHeading('DEFENSIVE ALIGNMENT GRID'),
+      new Table({
+        layout: TableLayoutType.FIXED,
+        width: { size: tableWidth, type: WidthType.DXA },
+        columnWidths: colWidths,
+        rows: [headerRow1, headerRow2, ...rows],
+      }),
+      spacer(60),
+      bodyPara(
+        'O = early-count alignment. 2K = two-strike alignment. Blue cells mark each hitter\'s primary shift zone. Name/# color reflects THREAT tier from Hitters to Watch (red=high, orange=medium, green=low).',
+        { italic: true, color: '595959' }
+      ),
+      bodyPara(
+        'O vs. 2K values reflect standard defensive logic applied to each hitter\'s season-long tendency, not measured per-count batted-ball splits, since that data isn\'t available from GC/PG.',
+        { italic: true, color: '595959' }
+      ),
+      ...smallSampleNote,
+      spacer(120),
+    ];
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
   // FIELDING SUMMARY TABLE
   // ─────────────────────────────────────────────────────────────────────────
   function buildFieldingSummaryBlock() {
@@ -888,6 +1022,8 @@ async function buildDocx(analysis, outputPath) {
     }))),
     spacer(140),
   ];
+
+  const defensiveAlignmentBlock = buildDefensiveAlignmentBlock();
 
   // Pitching analysis (AI narrative) + pitcher table (advanced stats)
   const pitchRows = (pit.pitchers || []).map(p => {
@@ -1437,6 +1573,7 @@ async function buildDocx(analysis, outputPath) {
         // AI analysis sections
         ...overviewBlock,
         ...battingBlock,
+        ...defensiveAlignmentBlock,
         ...pitchingBlock,
         ...tendencyBlock,
         ...gamePlanBlock,

@@ -975,6 +975,63 @@ async function getActiveRosterPlayers(teamId, lastNGames = 10, minAppearances = 
   };
 }
 
+/**
+ * Empirical batting-order tendency per opponent hitter, computed from actual
+ * lineup cards (batting_lines.batting_order) in the last N scouted games —
+ * not an estimate. Supabase-native: no raw SQL, aggregation done in JS since
+ * the row counts here are small (one team's roster x N games).
+ */
+async function getTeamLineupOrder(teamId, lastNGames = 10) {
+  const sb = getDb();
+
+  const { data: recentGames, error: gamesErr } = await sb
+    .from('games')
+    .select('id')
+    .eq('team_id', teamId)
+    .order('game_date', { ascending: false })
+    .limit(lastNGames);
+  check(gamesErr, 'getTeamLineupOrder games');
+
+  const gameIds = (recentGames || []).map(g => g.id);
+  if (!gameIds.length) return [];
+
+  const { data: lines, error: linesErr } = await sb
+    .from('batting_lines')
+    .select('player_name, batting_order')
+    .eq('team_id', teamId)
+    .eq('is_our_team', false)
+    .in('game_id', gameIds)
+    .not('batting_order', 'is', null)
+    .gt('batting_order', 0);
+  check(linesErr, 'getTeamLineupOrder batting_lines');
+
+  const byPlayer = {};
+  for (const row of (lines || [])) {
+    if (!row.player_name) continue;
+    if (!byPlayer[row.player_name]) byPlayer[row.player_name] = { orders: [], starts: 0 };
+    byPlayer[row.player_name].orders.push(row.batting_order);
+    byPlayer[row.player_name].starts++;
+  }
+
+  const result = Object.entries(byPlayer).map(([player_name, v]) => {
+    const avgOrder = v.orders.reduce((sum, o) => sum + o, 0) / v.orders.length;
+    const counts = {};
+    for (const o of v.orders) counts[o] = (counts[o] || 0) + 1;
+    const mostCommonOrder = Number(
+      Object.entries(counts).sort((a, b) => b[1] - a[1] || Number(a[0]) - Number(b[0]))[0][0]
+    );
+    return {
+      player_name,
+      avg_order: Math.round(avgOrder * 10) / 10,
+      starts: v.starts,
+      most_common_order: mostCommonOrder,
+    };
+  });
+
+  result.sort((a, b) => a.avg_order - b.avg_order);
+  return result;
+}
+
 async function getTeamAnalysisBundle(teamId) {
   const sb = getDb();
 
@@ -982,7 +1039,7 @@ async function getTeamAnalysisBundle(teamId) {
     teamRes, games, batting, pitching, tendencies,
     recentPitchingLines, jerseyMap, activeRoster,
     scoutedBattersAdv, facedBattersAdv, scoutedPitchersAdv, facedPitchersAdv,
-    rawBattingLines, verifiedTotals,
+    rawBattingLines, verifiedTotals, lineupOrder,
   ] = await Promise.all([
     sb.from('teams').select('*').eq('id', teamId).maybeSingle(),
     getTeamGameResults(teamId),
@@ -998,6 +1055,7 @@ async function getTeamAnalysisBundle(teamId) {
     getPitcherAdvancedStats(teamId, 1),
     getRawBattingLines(teamId),
     getLatestVerifiedTeamTotals(teamId),
+    getTeamLineupOrder(teamId, 10),
   ]);
 
   return {
@@ -1015,6 +1073,7 @@ async function getTeamAnalysisBundle(teamId) {
     opponentBatters:    facedBattersAdv,
     rawBattingLines,
     verifiedTotals,
+    lineupOrder,
     meta: {
       gamesAnalyzed: games.length,
       generatedAt:   new Date().toISOString(),
@@ -1151,6 +1210,7 @@ module.exports = {
   getTeamGameResults,
   getTeamAnalysisBundle,
   getActiveRosterPlayers,
+  getTeamLineupOrder,
   // Reports
   insertScoutingReport,
   // Advanced stats
