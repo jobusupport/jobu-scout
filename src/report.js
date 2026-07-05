@@ -343,9 +343,11 @@ async function buildDocx(analysis, outputPath) {
     return cell(text, { width, bold: true, color: WHITE, bg: NAVY, size: 17, align: AlignmentType.CENTER, ...opts });
   }
 
-  function sectionHeading(text) {
+  function sectionHeading(text, opts = {}) {
+    const { pageBreakBefore = false } = opts;
     return new Paragraph({
       heading: HeadingLevel.HEADING_1,
+      pageBreakBefore,
       spacing: { before: 240, after: 100 },
       border:  { bottom: { style: BorderStyle.SINGLE, size: 8, color: GOLD, space: 1 } },
       children: [new TextRun({ text, bold: true, color: NAVY, size: 26, font: 'Calibri' })],
@@ -836,7 +838,7 @@ async function buildDocx(analysis, outputPath) {
       : [];
 
     return [
-      sectionHeading('DEFENSIVE ALIGNMENT GRID'),
+      sectionHeading('DEFENSIVE ALIGNMENT GRID', { pageBreakBefore: true }),
       new Table({
         layout: TableLayoutType.FIXED,
         width: { size: tableWidth, type: WidthType.DXA },
@@ -1022,8 +1024,6 @@ async function buildDocx(analysis, outputPath) {
     }))),
     spacer(140),
   ];
-
-  const defensiveAlignmentBlock = buildDefensiveAlignmentBlock();
 
   // Pitching analysis (AI narrative) + pitcher table (advanced stats)
   const pitchRows = (pit.pitchers || []).map(p => {
@@ -1493,6 +1493,12 @@ async function buildDocx(analysis, outputPath) {
 
   const gameConditionsBlock = buildGameConditionsBlock();
 
+  // Computed last so it can safely be placed as the final page of the report —
+  // buildDefensiveAlignmentBlock() only reads data (bat, a.playerBreakdowns,
+  // activeSet, allOppBatters, getAdv) that's already fully populated by this
+  // point in buildDocx; nothing about calling it here changes its output.
+  const defensiveAlignmentBlock = buildDefensiveAlignmentBlock();
+
   // ─────────────────────────────────────────────────────────────────────────
   // ASSEMBLE DOCUMENT
   // ─────────────────────────────────────────────────────────────────────────
@@ -1573,13 +1579,14 @@ async function buildDocx(analysis, outputPath) {
         // AI analysis sections
         ...overviewBlock,
         ...battingBlock,
-        ...defensiveAlignmentBlock,
         ...pitchingBlock,
         ...tendencyBlock,
         ...gamePlanBlock,
         // Player summary + per-player detail pages
         ...playerSummaryBlock,
         ...playerPages,
+        // Defensive Alignment Grid — always the last page of the report
+        ...defensiveAlignmentBlock,
       ],
     }],
   });
