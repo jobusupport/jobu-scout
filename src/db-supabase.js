@@ -1107,6 +1107,8 @@ async function upsertPlayerAdvancedStats(teamId, playerName, isOurTeam, stats) {
     risp_ab: s.RISP_AB ?? 0, risp_h: s.RISP_H ?? 0, ba_risp: s.BA_RISP ?? null,
     swing_decisions: sd,
     k_pct: s.K_pct ?? null, bb_pct: s.BB_pct ?? null,
+	bunts: s.BUNT ?? 0,
+	errors: s.E ?? 0,
   };
   if (await tableHasOrgId('player_advanced_stats')) payload.org_id = orgId;
 
@@ -1133,6 +1135,7 @@ async function upsertPitcherAdvancedStats(teamId, playerName, isOurTeam, stats) 
     k_pct_bf: s.K_pct_BF ?? null, bb_pct_bf: s.BB_pct_BF ?? null,
     p_per_ip: s.P_per_IP ?? null,
     wp: s.WP ?? 0, bk: s.BK ?? 0, pik: s.PIK ?? 0,
+	errors: s.E ?? 0,
   };
   if (await tableHasOrgId('pitcher_advanced_stats')) payload.org_id = orgId;
 

@@ -240,7 +240,7 @@ function calcBattingMetrics(line = {}, playerStats = {}, adv = {}) {
   const kPct = pa > 0 ? (so / pa * 100) : firstNum(adv.k_pct, playerStats.k_pct);
   const bbPct = pa > 0 ? (bb / pa * 100) : firstNum(adv.bb_pct, playerStats.bb_pct);
   const gbPct = firstNum(adv.gb_pct, playerStats.gb_pct);
-  const bunts = firstNum(adv.sac_count, line.total_sac, playerStats.sac_count, playerStats.bunts);
+  const bunts = firstNum(adv.bunts, playerStats.bunts, line.total_sac);
 
   return { ab, h, bb, hbp, sac, so, hr, dbl, tpl, sb, pa, xbh, avg, obp, slg, ops, kPct, bbPct, gbPct, bunts };
 }

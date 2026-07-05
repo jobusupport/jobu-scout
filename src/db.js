@@ -855,7 +855,7 @@ function upsertPlayerAdvancedStats(teamId, playerName, isOurTeam, stats) {
       spray_lf_pct, spray_cf_pct, spray_rf_pct, spray_3b_pct,
       spray_ss_pct, spray_2b_pct, spray_1b_pct, spray_pc_pct,
       risp_ab, risp_h, ba_risp,
-      swing_decisions, k_pct, bb_pct, errors
+      swing_decisions, k_pct, bb_pct, errors, bunts
     ) VALUES (
       @teamId, @playerName, @isOurTeam,
       @games, @totalPitches,
@@ -864,7 +864,7 @@ function upsertPlayerAdvancedStats(teamId, playerName, isOurTeam, stats) {
       @sprayLfPct, @sprayCfPct, @sprayRfPct, @spray3bPct,
       @spraySsPct, @spray2bPct, @spray1bPct, @sprayPcPct,
       @rispAb, @rispH, @baRisp,
-      @swingDecisions, @kPct, @bbPct, @errors
+      @swingDecisions, @kPct, @bbPct, @errors, @bunts
     )
     ON CONFLICT(team_id, player_name, is_our_team) DO UPDATE SET
       games         = excluded.games,
@@ -884,6 +884,7 @@ function upsertPlayerAdvancedStats(teamId, playerName, isOurTeam, stats) {
       swing_decisions = excluded.swing_decisions,
       k_pct = excluded.k_pct, bb_pct = excluded.bb_pct,
       errors = excluded.errors,
+	  bunts = excluded.bunts,
       generated_at = datetime('now')
   `).run({
     teamId, playerName, isOurTeam: isOurTeam ? 1 : 0,
@@ -904,6 +905,7 @@ function upsertPlayerAdvancedStats(teamId, playerName, isOurTeam, stats) {
     swingDecisions: sd,
     kPct: s.K_pct ?? null, bbPct: s.BB_pct ?? null,
     errors: s.E ?? 0,
+	bunts: s.BUNT ?? 0,
   });
 }
 

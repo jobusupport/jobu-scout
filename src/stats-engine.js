@@ -177,6 +177,14 @@ function parsePA(rawText) {
   // Detect scoring play
   const rbi = (text.match(/\bscores\b/gi) || []).length;
 
+  // Bunt detection, deliberately independent of eventType — GC only labels
+  // a play "Sac Bunt" for a textbook sacrifice. A bunt for a hit, a bunt
+  // that becomes a fielder's choice/ground out/pop out, or a failed bunt
+  // attempt still contains the word "bunt" in the narrative even though its
+  // primary event is Single/Ground Out/Fielder's Choice/Pop Out. Scanning
+  // the whole text (not just narrativePart) catches all of these.
+  const isBunt = /\bbunt/i.test(text);
+
   return {
     eventType,
     batter,
@@ -193,6 +201,7 @@ function parsePA(rawText) {
     pickoffs,
     hasRISP,
     rbi,
+    isBunt,
     rawText: text,
   };
 }
@@ -463,6 +472,10 @@ function emptyPlayerStats(name) {
     // Situational
     RISP_AB: 0, RISP_H: 0,
     twoOut_AB: 0, twoOut_H: 0, twoOut_RBI: 0,
+	// Find this line:
+	BB: 0, SO: 0, HBP: 0, SF: 0, SAC: 0,
+	// Change to:
+	BB: 0, SO: 0, HBP: 0, SF: 0, SAC: 0, BUNT: 0,
     // Game log
     games: new Set(),
   };
