@@ -773,6 +773,7 @@ function processGames(games) {
       if (pa.eventType === 'Hit By Pitch') batter.HBP++;
       if (pa.eventType === 'Sac Fly')   batter.SF++;
       if (pa.eventType === 'Sacrifice' || pa.eventType === 'Sac Bunt') batter.SAC++;
+	  if (pa.isBunt) batter.BUNT++;
       batter.RBI += pa.rbi || 0;
       batter.SB  += pa.sbCount || 0;
       batter.CS  += pa.csCount || 0;
