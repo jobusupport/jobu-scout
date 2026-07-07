@@ -1929,6 +1929,186 @@ async function autoScrollToLoadAll(page, maxScrolls = 30) {
   await scrollHandle.evaluate((el) => { el.scrollTop = 0; });
 }
 
+// Runs a single extraction pass against whatever play elements are
+// CURRENTLY attached to the DOM. Used repeatedly, once per scroll step, by
+// extractAllPlaysByIncrementalScroll() below.
+//
+// This targets GameChanger's REAL markup, confirmed directly from a saved
+// copy of a rendered Plays page (not guessed from generic class-name
+// patterns like the previous version of this function):
+//
+//   .BatsPlays__inning              — a half-inning header ("Top 1", "Bot 3", ...)
+//   .BatsPlays__play                — one full plate appearance (exact class
+//                                      token — NOT matched by [class*="play"],
+//                                      which also falsely matches
+//                                      .BatsPlays__playName and
+//                                      .BatsPlays__playBorderBottom as if
+//                                      they were separate "plays")
+//   .BatsPlays__playName            — the short result badge inside a play
+//                                      ("Single", "Double Play", "Hit By Pitch", ...)
+//   [data-testid="at-plate-detail"] — one narrative sentence fragment inside
+//                                      a play. There can be SEVERAL per play:
+//                                      the batter's own outcome, PLUS a
+//                                      separate fragment for each other
+//                                      baserunner who advanced or was put
+//                                      out on that same play (e.g. a double
+//                                      play's narrative is followed by
+//                                      "C Fossyl out advancing to home,"
+//                                      "A Pecoroni advances to 3rd," etc.).
+//                                      The old keyword-regex approach only
+//                                      matched fragments containing words
+//                                      like "single"/"double"/"error" and
+//                                      silently dropped every baserunner-
+//                                      advance fragment, since phrases like
+//                                      "advances to 3rd" don't contain any
+//                                      of those keywords.
+async function extractVisiblePlaysOnce(page) {
+  return await page.evaluate(() => {
+    // querySelectorAll with a combined selector returns nodes in document
+    // order, so walking this single list lets us track "current inning"
+    // just by updating it whenever we pass an inning-header node — no
+    // separate DOM-proximity search needed per play.
+    const nodes = Array.from(document.querySelectorAll('.BatsPlays__inning, .BatsPlays__play'));
+
+    const results = [];
+    let currentInning = null;
+
+    for (const node of nodes) {
+      if (node.classList.contains('BatsPlays__inning')) {
+        const inningText = String(node.innerText || "").replace(/\s+/g, " ").trim();
+        if (inningText) currentInning = inningText;
+        continue;
+      }
+
+      // node is a .BatsPlays__play
+      const badgeEl = node.querySelector('.BatsPlays__playName');
+      const badge = badgeEl ? String(badgeEl.innerText || "").replace(/\s+/g, " ").trim() : "";
+
+      // A real, completed plate appearance always has a result badge
+      // ("Single", "Walk", "Strikeout", etc). A .BatsPlays__play block
+      // with NO badge is an in-progress/incomplete at-bat — e.g. the game
+      // ended (or the scraped page loaded) while a batter was still up,
+      // rendered as a placeholder like "B Roper at bat" with no outcome
+      // yet. That's not a real play and shouldn't become a play_events
+      // row — skip it entirely.
+      if (!badge) continue;
+
+      const detailEls = Array.from(node.querySelectorAll('[data-testid="at-plate-detail"]'));
+      const details = detailEls
+        .map((el) => String(el.innerText || "").replace(/\s+/g, " ").trim())
+        .filter(Boolean);
+
+      // Combine badge + all narrative fragments into one string per play,
+      // consistent with the documented normalizer.js expectation that
+      // GameChanger descriptions "start with an event-type label" followed
+      // by the narrative — extractPlayerFromPlay() already knows to skip
+      // a leading label like this.
+      const text = [badge, ...details].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+      if (!text) continue;
+
+      results.push({ inning: currentInning, text });
+    }
+
+    return results;
+  });
+}
+
+// Scrolls the Plays list incrementally, running extractVisiblePlaysOnce()
+// at EVERY step and accumulating results.
+//
+// Confirmed against a real saved copy of this exact game's Plays page:
+// GameChanger renders 52 real .BatsPlays__play elements for a full game,
+// but our automated scroll loop was only ever finding ~19 — and
+// critically, scrollHeight never grew even once across 5 full scroll
+// steps that got most of the way down the page. That rules out
+// virtualization (elements being unmounted after scrolling past them);
+// instead, it means GameChanger's lazy-load trigger for the REST of the
+// plays was never firing at all during automation.
+//
+// Most likely cause: directly assigning `element.scrollTop = X` in large
+// 1000px jumps can leap straight past a lazy-load trigger zone (e.g. an
+// IntersectionObserver watching a small "sentinel" element near the
+// bottom of what's currently rendered) without that zone ever being
+// visible in an actual rendered frame — so the observer never fires,
+// even though scrollTop visibly changed. A real user's mouse-wheel
+// scrolling moves through that zone continuously and reliably triggers
+// it. This version uses Playwright's page.mouse.wheel() with smaller
+// increments instead, to scroll the way a real user would.
+async function extractAllPlaysByIncrementalScroll(page, maxScrolls = 60) {
+  const scrollHandle = await getBestScrollableElementHandle(page);
+
+  const scrollInfo = await scrollHandle.evaluate((el) => ({
+    tag: el.tagName,
+    id: el.id || null,
+    className: typeof el.className === "string" ? el.className : null,
+    scrollHeight: el.scrollHeight,
+    clientHeight: el.clientHeight,
+  }));
+  console.log(`[gc][diag] Scroll container: <${scrollInfo.tag} id="${scrollInfo.id}" class="${scrollInfo.className}"> scrollHeight=${scrollInfo.scrollHeight} clientHeight=${scrollInfo.clientHeight}`);
+
+  // Position the mouse over the scroll container before dispatching wheel
+  // events — page.mouse.wheel() scrolls whatever element is under the
+  // cursor, same as a real user scrolling with their mouse over that
+  // part of the page.
+  const box = await scrollHandle.boundingBox().catch(() => null);
+  if (box) {
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  } else {
+    console.warn('[gc][diag] Could not get bounding box for scroll container — wheel events may not land on the right element.');
+  }
+
+  const seenKey = new Set();
+  const accumulated = [];
+
+  const captureCurrentlyVisible = async () => {
+    const visible = await extractVisiblePlaysOnce(page);
+    let newCount = 0;
+    for (const play of visible) {
+      const key = `${play.inning || ""}|${play.text}`;
+      if (seenKey.has(key)) continue;
+      seenKey.add(key);
+      accumulated.push(play);
+      newCount++;
+    }
+    return newCount;
+  };
+
+  const initialNewCount = await captureCurrentlyVisible();
+  console.log(`[gc][diag] Step 0 (pre-scroll): +${initialNewCount} new plays, total=${accumulated.length}`);
+
+  let stableStepsInARow = 0;
+
+  for (let i = 0; i < maxScrolls; i++) {
+    const prevHeight = await scrollHandle.evaluate((el) => el.scrollHeight);
+
+    await page.mouse.wheel(0, 300);
+    await page.waitForTimeout(600);
+
+    const newCount = await captureCurrentlyVisible();
+
+    const newHeight = await scrollHandle.evaluate((el) => el.scrollHeight);
+    const reachedBottom = await scrollHandle.evaluate(
+      (el) => el.scrollTop + el.clientHeight >= el.scrollHeight - 2
+    );
+
+    console.log(`[gc][diag] Step ${i + 1}: scrollHeight ${prevHeight}→${newHeight}, +${newCount} new plays, total=${accumulated.length}, reachedBottom=${reachedBottom}`);
+
+    if (newCount === 0 && newHeight === prevHeight) {
+      stableStepsInARow++;
+    } else {
+      stableStepsInARow = 0;
+    }
+
+    // Require more consecutive stable steps than before, since smaller
+    // scroll increments mean more steps overall are expected before
+    // genuinely running out of content.
+    if (reachedBottom && stableStepsInARow >= 3) break;
+    if (stableStepsInARow >= 10) break; // safety net if "reachedBottom" never resolves true
+  }
+
+  return accumulated;
+}
+
 async function extractPlays(page) {
   console.log("Extracting play-by-play from DOM...");
 
@@ -1969,41 +2149,11 @@ async function extractPlays(page) {
 
   try {
     await page.waitForTimeout(1000);
-    await withTimeout(autoScrollToLoadAll(page, 12), 20000, 'autoScrollToLoadAll plays');
-  } catch (error) {
-    console.warn(`[gc] Could not fully scroll/load Plays. Continuing with visible plays: ${error.message}`);
-  }
-
-  try {
-    const plays = await withTimeout(page.evaluate(() => {
-      const results = [];
-      const seen = new Set();
-      const playSelectors = ['[class*="play"]','[class*="Play"]','[class*="event"]','[data-testid*="play"]',"li"];
-
-      for (const selector of playSelectors) {
-        for (const el of document.querySelectorAll(selector)) {
-          const text = String(el.innerText || "").replace(/\s+/g, " ").trim();
-          const looksLikePlay = /\b(single|double|triple|home run|strikeout|walk|fly out|ground out|pop out|line out|hit by pitch|stolen base|wild pitch|passed ball|balk|error|fielder.s choice|sacrifice|inning)\b/i.test(text);
-          if (!looksLikePlay || text.length < 5 || text.length > 500 || seen.has(text)) continue;
-          seen.add(text);
-
-          let inning = null;
-          let node = el.parentElement;
-          for (let depth = 0; depth < 8 && node; depth++) {
-            const parentText = String(node.innerText || "");
-            const inningMatch = parentText.match(/\b(Top|Bottom|Mid|End)\s+(\d+)\b/i);
-            if (inningMatch) { inning = `${inningMatch[1]} ${inningMatch[2]}`; break; }
-            node = node.parentElement;
-          }
-
-          results.push({ inning, text });
-        }
-        if (results.length > 20) break;
-      }
-
-      return results;
-    }), 15000, 'evaluate plays DOM');
-
+    const plays = await withTimeout(
+      extractAllPlaysByIncrementalScroll(page, 40),
+      60000,
+      'extractAllPlaysByIncrementalScroll'
+    );
     console.log(`  Extracted ${plays.length} play-by-play events`);
     return plays;
   } catch (error) {
@@ -2958,14 +3108,22 @@ try {
   }
 }
 
-main().catch((error) => {
-  console.error("");
-  console.error("GameChanger team search failed:");
-  console.error(error.message);
-  console.error(error.stack);
-  console.error("");
-  process.exit(1);
-});
+// Only auto-run main() when this file is executed directly
+// (e.g. `node src/search-gamechanger-teams.js`). Without this guard,
+// requiring this file as a module — as test-extract-plays.js does to
+// get extractPlays() — triggered a full production scrape (reading the
+// Google Sheet, launching its own browser, writing live games to
+// Supabase) as an unwanted side effect of the require() call.
+if (require.main === module) {
+  main().catch((error) => {
+    console.error("");
+    console.error("GameChanger team search failed:");
+    console.error(error.message);
+    console.error(error.stack);
+    console.error("");
+    process.exit(1);
+  });
+}
 
 // ─── Entry Point: scrape a single team by DB record (no Google Sheet) ─────────
 async function scrapeTeamById(teamRecord) {

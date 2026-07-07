@@ -34,6 +34,15 @@
 const EVENT_STARTERS = [
   'Home Run', "Fielder's Choice", 'Hit By Pitch',
   'Strikeout', 'Ground Out', 'Line Out', 'Fly Out', 'Pop Out', 'Foul Out',
+  // Double Play / Triple Play must be listed (and therefore checked, since
+  // EVENT_STARTERS is sorted longest-first below) before the plain
+  // 'Double' / 'Triple' entries. GameChanger's "Double Play" badge starts
+  // with the literal word "Double", so without a longer, more specific
+  // match ahead of it, a batter who grounded into a double play (an OUT)
+  // was being classified as eventType 'Double' — crediting them with an
+  // extra-base HIT in the actual batting stat totals (H, doubles, AVG,
+  // SLG all directly consume this eventType below).
+  'Double Play', 'Triple Play',
   'Single', 'Double', 'Triple', 'Walk',
   'Sacrifice', 'Sac Fly', 'Sac Bunt', 'Intentional Walk',
   'Error', 'Pickoff',
@@ -79,7 +88,7 @@ const BATTED_BALL_TYPES = {
 };
 
 const HIT_EVENTS     = new Set(['Single','Double','Triple','Home Run']);
-const OUT_EVENTS     = new Set(['Ground Out','Fly Out','Line Out','Pop Out','Foul Out',"Fielder's Choice"]);
+const OUT_EVENTS     = new Set(['Ground Out','Fly Out','Line Out','Pop Out','Foul Out',"Fielder's Choice",'Double Play','Triple Play']);
 const AB_EVENTS      = new Set([...HIT_EVENTS, ...OUT_EVENTS, 'Strikeout', 'Error']);
 const NON_AB_EVENTS  = new Set(['Walk','Hit By Pitch','Sacrifice','Sac Fly','Sac Bunt','Intentional Walk']);
 

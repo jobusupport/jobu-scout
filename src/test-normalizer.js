@@ -42,17 +42,32 @@ const SAMPLE_RAW_GAME = {
     ],
     raw: {}
   },
+  // NOTE: these play texts use the REAL GameChanger format, confirmed
+  // directly from a saved copy of an actual game's rendered Plays page:
+  // every play starts with a short result badge ("Single", "Walk",
+  // "Ground Out", ...), often followed by a pitch-by-pitch sequence
+  // ("Ball 1, Strike 1 looking, ..."), THEN a period, THEN the narrative
+  // sentence that actually names the batter ("Jake Smith singles...").
+  // The batter's name is NEVER the first word of the description — see
+  // extractPlayerFromPlay()'s doc comment in normalizer.js for the full
+  // explanation. Earlier versions of these fixtures used a fake
+  // "PlayerName verb ..." shape with no leading badge at all, which
+  // happened to pass against the old .includes()-based normalizeEventType()
+  // by accident, and masked real bugs (a "Pickoff attempt" or "passed
+  // ball" phrase elsewhere in the real narrative silently hijacking the
+  // event type, and "Double Play" being misclassified as "double") that
+  // only showed up against real scraped data.
   plays: [
-    { inning: 'Top 1',    text: 'Jake Smith single to center field' },
-    { inning: 'Top 1',    text: 'Tyler Johnson ground out to shortstop' },
-    { inning: 'Top 1',    text: 'Marcus Davis walk' },
-    { inning: 'Top 1',    text: 'Chris Wilson strikeout swinging' },
-    { inning: 'Bottom 1', text: 'Opponent batter fly out to center' },
-    { inning: 'Bottom 1', text: 'Opponent batter strikeout looking' },
-    { inning: 'Bottom 1', text: 'Opponent batter walk' },
-    { inning: 'Top 2',    text: 'Jake Smith home run to left field' },
-    { inning: 'Top 2',    text: 'Tyler Johnson double to right field' },
-    { inning: 'Bottom 7', text: 'End of inning' },
+    { inning: 'Top 1',    text: 'Single In play. Jake Smith singles on a line drive to center fielder A Fisher.' },
+    { inning: 'Top 1',    text: 'Ground Out In play. Tyler Johnson grounds out, shortstop B Turner to first baseman C Reyes.' },
+    { inning: 'Top 1',    text: 'Walk Ball 1, Ball 2, Ball 3, Ball 4. Marcus Davis walks, B Turner pitching.' },
+    { inning: 'Top 1',    text: 'Strikeout Strike 1 looking, Strike 2 swinging, Strike 3 swinging. Chris Wilson strikes out swinging, B Turner pitching.' },
+    { inning: 'Bottom 1', text: 'Fly Out In play. A Fisher flies out to center fielder Jake Smith.' },
+    { inning: 'Bottom 1', text: 'Strikeout Strike 1 looking, Strike 2 looking, Strike 3 looking. B Turner strikes out looking, Marcus Davis pitching.' },
+    { inning: 'Bottom 1', text: 'Walk Ball 1, Ball 2, Ball 3, Ball 4. C Reyes walks, Marcus Davis pitching.' },
+    { inning: 'Top 2',    text: 'Home Run In play. Jake Smith homers to left field, D Alvarez pitching.' },
+    { inning: 'Top 2',    text: 'Double In play. Tyler Johnson doubles on a line drive to right fielder D Alvarez.' },
+    { inning: 'Bottom 7', text: 'End of inning.' },
   ]
 };
 
@@ -152,10 +167,11 @@ test('parseInning() parses inning strings', () => {
 section('Event Type Normalization');
 
 test('normalizeEventType() classifies hits', () => {
-  assert.strictEqual(normalizeEventType('Jake Smith single to center'), 'single');
-  assert.strictEqual(normalizeEventType('Tyler Johnson double to right field'), 'double');
-  assert.strictEqual(normalizeEventType('Marcus Davis triple to left'), 'triple');
-  assert.strictEqual(normalizeEventType('Chris Wilson home run to deep left'), 'home_run');
+  // Inputs use the real GameChanger shape: badge first, name later.
+  assert.strictEqual(normalizeEventType('Single In play. Jake Smith singles to center field.'), 'single');
+  assert.strictEqual(normalizeEventType('Double In play. Tyler Johnson doubles to right field.'), 'double');
+  assert.strictEqual(normalizeEventType('Triple In play. Marcus Davis triples to left field.'), 'triple');
+  assert.strictEqual(normalizeEventType('Home Run In play. Chris Wilson homers to deep left field.'), 'home_run');
 });
 
 test('normalizeEventType() classifies outs', () => {
@@ -166,7 +182,7 @@ test('normalizeEventType() classifies outs', () => {
 });
 
 test('normalizeEventType() classifies walks and HBP', () => {
-  assert.strictEqual(normalizeEventType('Marcus Davis walk'), 'walk');
+  assert.strictEqual(normalizeEventType('Walk Ball 1, Ball 2, Ball 3, Ball 4. Marcus Davis walks.'), 'walk');
   assert.strictEqual(normalizeEventType('hit by pitch'), 'hbp');
 });
 
@@ -178,6 +194,63 @@ test('normalizeEventType() returns unknown for unrecognized', () => {
 test('extractPlayerFromPlay() extracts name from description', () => {
   const name = extractPlayerFromPlay('Jake Smith single to center field');
   assert.strictEqual(name, 'Jake Smith');
+});
+
+section('Event Type Normalization — Real GameChanger Format Regressions');
+// These use verbatim play text pulled from an actual scraped game
+// (game 15bc95e3-468e-4f34-ae9c-ffe67c20bbd5), confirmed against the
+// real GameChanger DOM. Each one previously misclassified before the
+// startsWith() fix and the 'double play' / 'triple play' EVENT_TYPE_MAP
+// entries were added — kept here verbatim so a future change can't
+// silently reintroduce any of them.
+
+test('normalizeEventType() is not hijacked by a mid-text pickoff attempt', () => {
+  // A Single with "Pickoff attempt at 2nd" earlier in the same at-bat was
+  // being classified as 'pickoff' instead of 'single', because the old
+  // .includes()-based match found "pickoff" (7 chars) before "single"
+  // (6 chars) anywhere in the text, regardless of position.
+  const text = "Single Pickoff attempt at 2nd, In play. A Pecoroni singles on a line drive to right fielder A Irvin, B Roper advances to 3rd, C Fossyl advances to 2nd.";
+  assert.strictEqual(normalizeEventType(text), 'single');
+  assert.strictEqual(extractPlayerFromPlay(text), 'A Pecoroni');
+});
+
+test('normalizeEventType() is not hijacked by a mid-text pickoff attempt (Triple)', () => {
+  const text = "Triple Courtesy runner J Bruembelow in for B Roper, Ball 1, Foul, Pickoff attempt at 1st, Ball 2, In play. C Cook triples on a line drive to center fielder C Erwin, J Bruembelow scores.";
+  assert.strictEqual(normalizeEventType(text), 'triple');
+  assert.strictEqual(extractPlayerFromPlay(text), 'C Cook');
+});
+
+test('normalizeEventType() is not hijacked by a mid-text passed ball', () => {
+  // A Walk with another runner's "advances to 2nd on passed ball" mixed
+  // into the pitch sequence was being classified as 'passed_ball'
+  // instead of 'walk', same root cause as the pickoff case above.
+  const text = "Walk Ball 1, B Roper advances to 2nd on passed ball, Strike 1 swinging, Foul, Ball 2, Ball 3, Ball 4. C Cook walks, C Erwin pitching, B Roper remains at 2nd.";
+  assert.strictEqual(normalizeEventType(text), 'walk');
+  assert.strictEqual(extractPlayerFromPlay(text), 'C Cook');
+});
+
+test('normalizeEventType() classifies Double Play as double_play, not double', () => {
+  // "Double Play" starts with the literal word "Double", so without a
+  // dedicated, longer 'double play' entry checked first, this was being
+  // classified as eventType 'double' — crediting the batter with an
+  // extra-base HIT for what is actually an out.
+  const text = "Double Play In play. M Santorelli grounds into a double play, pitcher C Piper to catcher P Rollins to first baseman G McCartney, C Fossyl out advancing to home, A Pecoroni advances to 3rd, M Aldrich advances to 2nd.";
+  assert.strictEqual(normalizeEventType(text), 'double_play');
+  assert.strictEqual(extractPlayerFromPlay(text), 'M Santorelli');
+});
+
+test('normalizeEventType() classifies a second real Double Play correctly', () => {
+  const text = "Double Play Strike 1 looking, In play. R Brewer grounds into a double play, third baseman G Rickard to first baseman C Meliski, C Erwin out advancing to 3rd, N Isensee advances to 2nd.";
+  assert.strictEqual(normalizeEventType(text), 'double_play');
+  assert.strictEqual(extractPlayerFromPlay(text), 'R Brewer');
+});
+
+test('normalizeEventType() still classifies a plain Double correctly', () => {
+  // Sanity check that the new 'double play' entry didn't break the
+  // ordinary two-base-hit case it sits right next to in EVENT_TYPE_MAP.
+  const text = "Double In play. A Pecoroni doubles on a fly ball to left fielder R Long, C Fossyl advances to 3rd.";
+  assert.strictEqual(normalizeEventType(text), 'double');
+  assert.strictEqual(extractPlayerFromPlay(text), 'A Pecoroni');
 });
 
 section('Game Normalization');

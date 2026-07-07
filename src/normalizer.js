@@ -25,11 +25,20 @@ const EVENT_TYPE_MAP = {
   // Hits
   'single':            'single',
   'doubles':           'double',
-  'double':            'double',
+  'double':             'double',
   'triple':            'triple',
   'home run':          'home_run',
   'homer':             'home_run',
   'hr':                'home_run',
+  // Double play / triple play — must be checked before the plain
+  // 'double' / 'triple' entries above (guaranteed by the length-based
+  // sort in normalizeEventType(), since these phrases are longer). A
+  // GameChanger "Double Play" badge starts with the literal word
+  // "Double", so without a longer, more specific match taking priority,
+  // a batter who grounded into a double play (an OUT) was being
+  // classified as eventType 'double' — an extra-base HIT.
+  'double play':       'double_play',
+  'triple play':       'triple_play',
   // Outs — batted ball
   'fly out':           'fly_out',
   'flyout':            'fly_out',
@@ -72,7 +81,12 @@ const EVENT_TYPE_MAP = {
 const SCORING_EVENTS = new Set([
   'single', 'double', 'triple', 'home_run',
   'walk', 'ibb', 'hbp', 'wild_pitch', 'passed_ball',
-  'error', 'fielders_choice', 'sac_fly', 'sac_bunt'
+  'error', 'fielders_choice', 'sac_fly', 'sac_bunt',
+  // A run can score on a double play or triple play (e.g. the trail
+  // runner scores while the batter is retired) — these need to stay
+  // eligible for the isScoringPlay check in normalizePlayEvent() even
+  // though they are NOT hit events for AVG/SLG purposes.
+  'double_play', 'triple_play',
 ]);
 
 // ─── Utility Helpers ──────────────────────────────────────────────────────────
@@ -221,14 +235,25 @@ function parseInning(inningStr) {
  */
 function normalizeEventType(description) {
   if (!description) return 'unknown';
-  const lower = description.toLowerCase();
+  const lower = String(description).toLowerCase().trim();
 
   // Check longest matches first to avoid "single" matching "single" in "strikeout"
   const sorted = Object.entries(EVENT_TYPE_MAP)
     .sort((a, b) => b[0].length - a[0].length);
 
+  // Match against the START of the description only — GameChanger always
+  // leads with the event-type badge (the same principle documented above
+  // extractPlayerFromPlay()). The previous .includes() check matched a
+  // phrase ANYWHERE in the description, which meant unrelated details
+  // later in the richer play-by-play text could silently hijack the real
+  // event type: a "Pickoff attempt at 2nd" mentioned mid-at-bat turned a
+  // Single into eventType 'pickoff'; "advances to 2nd on passed ball" for
+  // an unrelated baserunner turned a Walk into eventType 'passed_ball'.
+  // Anchoring to the start eliminates both, and matches stats-engine.js's
+  // independently-written detectEventType(), which already used
+  // startsWith() for exactly this reason.
   for (const [phrase, type] of sorted) {
-    if (lower.includes(phrase)) return type;
+    if (lower.startsWith(phrase)) return type;
   }
 
   return 'unknown';
