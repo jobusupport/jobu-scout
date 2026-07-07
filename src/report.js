@@ -666,9 +666,10 @@ async function buildDocx(analysis, outputPath) {
       const m = calcBattingMetrics(b, {}, getAdv(b.player_name));
       t.pa += m.pa; t.ab += m.ab; t.h += m.h; t.so += m.so; t.bb += m.bb; t.hbp += m.hbp;
       t.hr += m.hr; t.dbl += m.dbl; t.tpl += m.tpl; t.xbh += m.xbh; t.sb += m.sb; t.sac += m.sac;
+      t.bunts += (m.bunts || 0);
       t.gb += toNum(getAdv(b.player_name).gb); t.battedBalls += toNum(getAdv(b.player_name).batted_balls);
       return t;
-    }, { pa:0, ab:0, h:0, so:0, bb:0, hbp:0, hr:0, dbl:0, tpl:0, xbh:0, sb:0, sac:0, gb:0, battedBalls:0 });
+    }, { pa:0, ab:0, h:0, so:0, bb:0, hbp:0, hr:0, dbl:0, tpl:0, xbh:0, sb:0, sac:0, bunts:0, gb:0, battedBalls:0 });
     const totPA = totals.pa, totAB = totals.ab, totH = totals.h, totSO = totals.so, totBB = totals.bb, totHBP = totals.hbp;
     const totHR = totals.hr, tot2B = totals.dbl, tot3B = totals.tpl, totXBH = totals.xbh, totSB = totals.sb;
     const teamAVG = totAB > 0 ? totH / totAB : null;
@@ -699,7 +700,7 @@ async function buildDocx(analysis, outputPath) {
       cell(teamKpct  != null ? teamKpct.toFixed(1)+'%'  : '—', { width: 460, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
       cell(teamBBpct != null ? teamBBpct.toFixed(1)+'%' : '—', { width: 500, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
       cell(teamGBpct != null ? teamGBpct.toFixed(1)+'%' : '—', { width: 520, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
-      cell(String(totals.sac || '—'), { width: 600, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
+      cell(String(totals.bunts || '—'), { width: 600, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS })
     ]});
 
     const colWidths = [1600,460,420,420,420,420,480,420,480,480,460,480,480,500,460,500,520,600];
