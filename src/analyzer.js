@@ -514,6 +514,142 @@ HARD RULES:
 - Claude explains verified facts; Claude does not calculate new season totals.`;
 }
 
+function normalizePlayerKeyText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/['’]/g, "'")
+    .replace(/["“”]/g, '"')
+    .replace(/[–—]/g, '-')
+    .replace(/[^a-z\s'-]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function buildHandednessMatchKey(fullName) {
+  const cleaned = normalizePlayerKeyText(fullName);
+  const parts = cleaned.split(' ').filter(Boolean);
+  if (!parts.length) return '';
+  const last = parts[parts.length - 1];
+  const firstInitial = parts[0].charAt(0);
+  return `${last}|${firstInitial}`;
+}
+
+function normalizeJersey(value) {
+  if (value === null || value === undefined) return '';
+  return String(value).replace(/^#/, '').trim();
+}
+
+function jerseyForFromMap(jerseyMap = {}, name) {
+  if (!name) return null;
+  if (jerseyMap[name]) return normalizeJersey(jerseyMap[name]);
+  const norm = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const wanted = norm(name);
+  const hit = Object.entries(jerseyMap || {}).find(([player]) => norm(player) === wanted);
+  return hit ? normalizeJersey(hit[1]) : null;
+}
+
+function isKnownBats(value) {
+  return ['L', 'R', 'S'].includes(String(value || '').toUpperCase());
+}
+
+function isKnownThrows(value) {
+  return ['L', 'R'].includes(String(value || '').toUpperCase());
+}
+
+function hasKnownHandedness(hand) {
+  return !!hand && (isKnownBats(hand.bats) || isKnownThrows(hand.throws));
+}
+
+/**
+ * Resolves a player's captured bats/throws from bundle.handednessMap
+ * (see db.js / db-supabase.js getTeamHandednessMap — jersey number first,
+ * falling back to the last-name+first-initial match_key, EXCEPT where that
+ * key is ambiguous between two players on the roster, in which case we
+ * deliberately return null rather than guess).
+ */
+function resolvePlayerHandedness(bundle = {}, playerName) {
+  if (!playerName) return null;
+  const handednessMap = bundle.handednessMap || {};
+  const jersey = jerseyForFromMap(bundle.jerseyMap || {}, playerName);
+
+  if (jersey && handednessMap.byJersey && handednessMap.byJersey[jersey]) {
+    const hit = handednessMap.byJersey[jersey];
+    return hasKnownHandedness(hit) ? { ...hit, source: 'jersey' } : null;
+  }
+
+  const matchKey = buildHandednessMatchKey(playerName);
+  if (!matchKey) return null;
+
+  if (handednessMap.ambiguousMatchKeys && handednessMap.ambiguousMatchKeys[matchKey]) {
+    return null;
+  }
+
+  const hit = (handednessMap.byMatchKey && handednessMap.byMatchKey[matchKey]) || handednessMap[matchKey];
+  return hasKnownHandedness(hit) ? { ...hit, source: 'match_key' } : null;
+}
+
+function handednessCodeLabel(hand, role = 'player') {
+  if (!hasKnownHandedness(hand)) return '';
+  const bats = String(hand.bats || '').toUpperCase();
+  const throws = String(hand.throws || '').toUpperCase();
+
+  if (role === 'pitcher' && isKnownThrows(throws)) return throws === 'L' ? 'LHP' : 'RHP';
+  if (role === 'batter' && isKnownBats(bats)) {
+    if (bats === 'S') return 'Switch';
+    return bats === 'L' ? 'LHH' : 'RHH';
+  }
+
+  const pieces = [];
+  if (isKnownBats(bats)) pieces.push(`Bats:${bats === 'S' ? 'S' : bats}`);
+  if (isKnownThrows(throws)) pieces.push(`Throws:${throws}`);
+  return pieces.join('/');
+}
+
+function appendHandednessToName(bundle, playerName, role = 'player') {
+  const hand = resolvePlayerHandedness(bundle, playerName);
+  const label = handednessCodeLabel(hand, role);
+  return label ? `${playerName} (${label})` : playerName;
+}
+
+/**
+ * Verified-handedness block for the Claude prompt, mirroring
+ * buildVerifiedFactsBlock's "here are the real numbers, don't invent
+ * anything" pattern. Explicitly forbids inferring handedness from a
+ * player's name, position, or stats — GameChanger roster data is the only
+ * legitimate source.
+ */
+function buildVerifiedHandednessBlock(bundle = {}) {
+  const handednessMap = bundle.handednessMap || {};
+  const rows = Array.isArray(handednessMap.rows) ? handednessMap.rows : [];
+  const knownRows = rows.filter(hasKnownHandedness);
+  const ambiguousKeys = Object.keys(handednessMap.ambiguousMatchKeys || {});
+
+  if (!knownRows.length && !ambiguousKeys.length) {
+    return `=== VERIFIED PLAYER HANDEDNESS (GameChanger roster) ===\nNo verified handedness data is available. Do not infer batting or throwing hand.`;
+  }
+
+  const lines = knownRows
+    .slice()
+    .sort((a, b) => {
+      const aj = Number(normalizeJersey(a.jerseyNumber));
+      const bj = Number(normalizeJersey(b.jerseyNumber));
+      if (Number.isFinite(aj) && Number.isFinite(bj) && aj !== bj) return aj - bj;
+      return String(a.fullName || '').localeCompare(String(b.fullName || ''));
+    })
+    .map(row => {
+      const jersey = row.jerseyNumber ? `#${row.jerseyNumber} ` : '';
+      const bats = isKnownBats(row.bats) ? row.bats : 'Unknown';
+      const throws = isKnownThrows(row.throws) ? row.throws : 'Unknown';
+      return `${jersey}${row.fullName}: bats ${bats}, throws ${throws}`;
+    });
+
+  const warnings = ambiguousKeys.length
+    ? [`Ambiguous fuzzy name keys: ${ambiguousKeys.join(', ')}. For those players, use jersey-number matches only; if no jersey match is available, omit handedness.`]
+    : [];
+
+  return `=== VERIFIED PLAYER HANDEDNESS (GameChanger roster) ===\n${lines.join('\n') || 'No known L/R/S values.'}\n${warnings.join('\n')}\nRules: Use handedness only from this block. Do not infer handedness from player name, batting side tendency, position, or pitching stats. If the value is Unknown or ambiguous, omit handedness.`;
+}
+
 function buildAnalysisPrompt(bundle, options = {}) {
   const { team, games, tendencies, meta,
           playerAdvanced = [], oppPitchers = [] } = bundle;
@@ -553,7 +689,7 @@ function buildAnalysisPrompt(bundle, options = {}) {
   ).join('\n');
 
   const battingStr = batting.slice(0, 15).map(b =>
-    `${b.player_name}: ${b.games}G ${b.total_ab}AB ${b.total_h}H ` +
+    `${appendHandednessToName(bundle, b.player_name, 'batter')}: ${b.games}G ${b.total_ab}AB ${b.total_h}H ` +
     `${b.total_2b ?? 0}2B ${b.total_3b ?? 0}3B ${b.total_hr ?? 0}HR ${b.total_rbi}RBI ` +
     `${b.total_bb}BB ${b.total_so}SO ${b.total_hbp ?? 0}HBP ` +
     `AVG:${fmtAvg(b.batting_avg)} OBP:${fmtAvg(b.obp)} SLG:${fmtAvg(b.slg)}`
@@ -565,7 +701,7 @@ function buildAnalysisPrompt(bundle, options = {}) {
       const d = sd[c];
       return d ? `${c}:Sw${d.swing_pct}%/TK${d.take_k_pct}%` : '';
     }).filter(Boolean).join(' ');
-    return `${p.player_name}: GB%:${fmtNum(p.gb_pct,1)} FB%:${fmtNum(p.fb_pct,1)} LD%:${fmtNum(p.ld_pct,1)} ` +
+    return `${appendHandednessToName(bundle, p.player_name, 'batter')}: GB%:${fmtNum(p.gb_pct,1)} FB%:${fmtNum(p.fb_pct,1)} LD%:${fmtNum(p.ld_pct,1)} ` +
            `K%:${fmtNum(p.k_pct,1)} BB%:${fmtNum(p.bb_pct,1)} BA/RISP:${fmtAvg(p.ba_risp)} ` +
            `Spray[LF:${fmtNum(p.spray_lf_pct,0)}% CF:${fmtNum(p.spray_cf_pct,0)}% RF:${fmtNum(p.spray_rf_pct,0)}% ` +
            `Pull3B:${fmtNum(p.spray_3b_pct,0)}% SS:${fmtNum(p.spray_ss_pct,0)}% ` +
@@ -576,23 +712,24 @@ function buildAnalysisPrompt(bundle, options = {}) {
   const pitchingStr = pitching.slice(0, 8).map(p => {
     const velo = pitcherVelo[p.player_name];
     const veloNote = velo && velo.veloString ? ` [${velo.veloString}]` : '';
-    return `${p.player_name}: ${p.games}G ${p.total_ip}IP BF:${p.total_bf ?? '?'} ` +
+    return `${appendHandednessToName(bundle, p.player_name, 'pitcher')}: ${p.games}G ${p.total_ip}IP BF:${p.total_bf ?? '?'} ` +
       `H:${p.total_h} R:${p.total_r} ER:${p.total_er} BB:${p.total_bb} SO:${p.total_so} ` +
       `ERA:${fmtNum(p.era)} WHIP:${fmtNum(p.whip,3)} K/BB:${fmtNum(p.k_bb_ratio)}${veloNote}`;
   }).join('\n');
 
   const advPitchingStr = (bundle.ourPitchers || []).map(p =>
-    `${p.player_name}: S%:${fmtNum(p.s_pct,1)} SO/7:${fmtNum(p.so_per7)} BB/7:${fmtNum(p.bb_per7)} ` +
+    `${appendHandednessToName(bundle, p.player_name, 'pitcher')}: S%:${fmtNum(p.s_pct,1)} SO/7:${fmtNum(p.so_per7)} BB/7:${fmtNum(p.bb_per7)} ` +
     `GB%:${fmtNum(p.gb_pct,1)} FB%:${fmtNum(p.fb_pct,1)} GO/AO:${fmtNum(p.go_ao)} ` +
     `P/IP:${fmtNum(p.p_per_ip,1)} WP:${p.wp ?? 0} BK:${p.bk ?? 0}`
   ).join('\n');
 
   const oppPitStr = (oppPitchers || []).map(p =>
-    `${p.player_name}: S%:${fmtNum(p.s_pct,1)} SO/7:${fmtNum(p.so_per7)} BB/7:${fmtNum(p.bb_per7)} ` +
+    `${appendHandednessToName(bundle, p.player_name, 'pitcher')}: S%:${fmtNum(p.s_pct,1)} SO/7:${fmtNum(p.so_per7)} BB/7:${fmtNum(p.bb_per7)} ` +
     `GB%:${fmtNum(p.gb_pct,1)} ERA:${fmtNum(p.era)} WHIP:${fmtNum(p.whip,3)}`
   ).join('\n');
 
   const verifiedFactsBlock = buildVerifiedFactsBlock(bundle, batting, pitching);
+  const verifiedHandednessBlock = buildVerifiedHandednessBlock(bundle);
 
   // ── PitchSmart Analysis ──────────────────────────────────────────────────
   const pitchSmart = computePitchSmartEligibility(bundle, options);
@@ -689,6 +826,8 @@ ${Object.keys(pitcherVelo).length > 0
   : 'No PG velocity data available.'}
 
 ${verifiedFactsBlock}
+
+${verifiedHandednessBlock}
 
 ${pitchSmartStr}
 

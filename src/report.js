@@ -215,6 +215,91 @@ function firstNum(...values) {
   return null;
 }
 
+// ─── Handedness display (bats/throws captured by scrape-handedness.js) ────
+// Mirrors the resolution logic in analyzer.js's resolvePlayerHandedness —
+// duplicated rather than imported since report.js and analyzer.js don't
+// share a module today. Keep both in sync if the match_key scheme changes.
+
+function normalizePlayerKeyText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/['’]/g, "'")
+    .replace(/["“”]/g, '"')
+    .replace(/[–—]/g, '-')
+    .replace(/[^a-z\s'-]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function buildHandednessMatchKey(fullName) {
+  const cleaned = normalizePlayerKeyText(fullName);
+  const parts = cleaned.split(' ').filter(Boolean);
+  if (!parts.length) return '';
+  const last = parts[parts.length - 1];
+  const firstInitial = parts[0].charAt(0);
+  return `${last}|${firstInitial}`;
+}
+
+function normalizeJersey(value) {
+  if (value === null || value === undefined) return '';
+  return String(value).replace(/^#/, '').trim();
+}
+
+function isKnownBats(value) {
+  return ['L', 'R', 'S'].includes(String(value || '').toUpperCase());
+}
+
+function isKnownThrows(value) {
+  return ['L', 'R'].includes(String(value || '').toUpperCase());
+}
+
+function hasKnownHandedness(hand) {
+  return !!hand && (isKnownBats(hand.bats) || isKnownThrows(hand.throws));
+}
+
+/**
+ * Resolves a player's captured bats/throws from bundle.handednessMap (see
+ * db.js / db-supabase.js getTeamHandednessMap). Jersey number is the
+ * primary, unambiguous identity key; the last-name+first-initial match_key
+ * is the fallback, except where two players on the roster collide on that
+ * key — those are listed in ambiguousMatchKeys and deliberately return
+ * null here rather than guess which player is which.
+ */
+function resolveHandednessFromBundle(bundle = {}, playerName, jerseyMap = {}) {
+  if (!playerName) return null;
+  const handednessMap = bundle.handednessMap || {};
+
+  let jersey = '';
+  if (jerseyMap[playerName]) jersey = normalizeJersey(jerseyMap[playerName]);
+  if (!jersey) {
+    const norm = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const wanted = norm(playerName);
+    const hit = Object.entries(jerseyMap || {}).find(([player]) => norm(player) === wanted);
+    if (hit) jersey = normalizeJersey(hit[1]);
+  }
+
+  if (jersey && handednessMap.byJersey && handednessMap.byJersey[jersey]) {
+    const hit = handednessMap.byJersey[jersey];
+    return hasKnownHandedness(hit) ? hit : null;
+  }
+
+  const matchKey = buildHandednessMatchKey(playerName);
+  if (!matchKey) return null;
+  if (handednessMap.ambiguousMatchKeys && handednessMap.ambiguousMatchKeys[matchKey]) return null;
+
+  const hit = (handednessMap.byMatchKey && handednessMap.byMatchKey[matchKey]) || handednessMap[matchKey];
+  return hasKnownHandedness(hit) ? hit : null;
+}
+
+function formatBatThrowLabel(hand) {
+  if (!hasKnownHandedness(hand)) return '';
+  const bats = String(hand.bats || '').toUpperCase();
+  const throws = String(hand.throws || '').toUpperCase();
+  const b = isKnownBats(bats) ? bats : '?';
+  const t = isKnownThrows(throws) ? throws : '?';
+  return `B/T: ${b}/${t}`;
+}
+
 function calcBattingMetrics(line = {}, playerStats = {}, adv = {}) {
   const ab   = toNum(line.total_ab ?? playerStats.ab);
   const h    = toNum(line.total_h  ?? playerStats.h);
@@ -489,7 +574,10 @@ async function buildDocx(analysis, outputPath) {
 
   function playerLabel(name) {
     const j = jerseyFor(name);
-    return j ? `#${j} ${name}` : name;
+    const base = j ? `#${j} ${name}` : name;
+    const hand = resolveHandednessFromBundle(a._bundle || {}, name, jerseyMap);
+    const handLabel = formatBatThrowLabel(hand);
+    return handLabel ? `${base} (${handLabel})` : base;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -1674,7 +1762,10 @@ function buildReportHtml(analysis) {
 
   function playerLabel(name) {
     const j = jerseyFor(name);
-    return j ? `#${j} ${name}` : name;
+    const base = j ? `#${j} ${name}` : name;
+    const hand = resolveHandednessFromBundle(a._bundle || {}, name, jerseyMap);
+    const handLabel = formatBatThrowLabel(hand);
+    return handLabel ? `${base} (${handLabel})` : base;
   }
 
   // Defensive alignment grid data — see buildDocx for the full rationale.
