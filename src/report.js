@@ -215,91 +215,6 @@ function firstNum(...values) {
   return null;
 }
 
-// ─── Handedness display (bats/throws captured by scrape-handedness.js) ────
-// Mirrors the resolution logic in analyzer.js's resolvePlayerHandedness —
-// duplicated rather than imported since report.js and analyzer.js don't
-// share a module today. Keep both in sync if the match_key scheme changes.
-
-function normalizePlayerKeyText(value) {
-  return String(value || '')
-    .toLowerCase()
-    .replace(/['’]/g, "'")
-    .replace(/["“”]/g, '"')
-    .replace(/[–—]/g, '-')
-    .replace(/[^a-z\s'-]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function buildHandednessMatchKey(fullName) {
-  const cleaned = normalizePlayerKeyText(fullName);
-  const parts = cleaned.split(' ').filter(Boolean);
-  if (!parts.length) return '';
-  const last = parts[parts.length - 1];
-  const firstInitial = parts[0].charAt(0);
-  return `${last}|${firstInitial}`;
-}
-
-function normalizeJersey(value) {
-  if (value === null || value === undefined) return '';
-  return String(value).replace(/^#/, '').trim();
-}
-
-function isKnownBats(value) {
-  return ['L', 'R', 'S'].includes(String(value || '').toUpperCase());
-}
-
-function isKnownThrows(value) {
-  return ['L', 'R'].includes(String(value || '').toUpperCase());
-}
-
-function hasKnownHandedness(hand) {
-  return !!hand && (isKnownBats(hand.bats) || isKnownThrows(hand.throws));
-}
-
-/**
- * Resolves a player's captured bats/throws from bundle.handednessMap (see
- * db.js / db-supabase.js getTeamHandednessMap). Jersey number is the
- * primary, unambiguous identity key; the last-name+first-initial match_key
- * is the fallback, except where two players on the roster collide on that
- * key — those are listed in ambiguousMatchKeys and deliberately return
- * null here rather than guess which player is which.
- */
-function resolveHandednessFromBundle(bundle = {}, playerName, jerseyMap = {}) {
-  if (!playerName) return null;
-  const handednessMap = bundle.handednessMap || {};
-
-  let jersey = '';
-  if (jerseyMap[playerName]) jersey = normalizeJersey(jerseyMap[playerName]);
-  if (!jersey) {
-    const norm = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-    const wanted = norm(playerName);
-    const hit = Object.entries(jerseyMap || {}).find(([player]) => norm(player) === wanted);
-    if (hit) jersey = normalizeJersey(hit[1]);
-  }
-
-  if (jersey && handednessMap.byJersey && handednessMap.byJersey[jersey]) {
-    const hit = handednessMap.byJersey[jersey];
-    return hasKnownHandedness(hit) ? hit : null;
-  }
-
-  const matchKey = buildHandednessMatchKey(playerName);
-  if (!matchKey) return null;
-  if (handednessMap.ambiguousMatchKeys && handednessMap.ambiguousMatchKeys[matchKey]) return null;
-
-  const hit = (handednessMap.byMatchKey && handednessMap.byMatchKey[matchKey]) || handednessMap[matchKey];
-  return hasKnownHandedness(hit) ? hit : null;
-}
-
-function formatBatThrowLabel(hand) {
-  if (!hasKnownHandedness(hand)) return '';
-  const bats = String(hand.bats || '').toUpperCase();
-  const throws = String(hand.throws || '').toUpperCase();
-  const b = isKnownBats(bats) ? bats : '?';
-  const t = isKnownThrows(throws) ? throws : '?';
-  return `B/T: ${b}/${t}`;
-}
-
 function calcBattingMetrics(line = {}, playerStats = {}, adv = {}) {
   const ab   = toNum(line.total_ab ?? playerStats.ab);
   const h    = toNum(line.total_h  ?? playerStats.h);
@@ -574,10 +489,7 @@ async function buildDocx(analysis, outputPath) {
 
   function playerLabel(name) {
     const j = jerseyFor(name);
-    const base = j ? `#${j} ${name}` : name;
-    const hand = resolveHandednessFromBundle(a._bundle || {}, name, jerseyMap);
-    const handLabel = formatBatThrowLabel(hand);
-    return handLabel ? `${base} (${handLabel})` : base;
+    return j ? `#${j} ${name}` : name;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -1004,48 +916,16 @@ async function buildDocx(analysis, outputPath) {
   const ALIGN_BLUE = '3498DB';
   const ALIGN_MARGINS = { top: 40, bottom: 40, left: 40, right: 40 };
   const ALIGN_SIZE = 14;
-  // Widths sum to 9880 (Ord 300 + Player 1300 + Bats 300 + 14 x 570), matching
-  // every other table in this document (all total <=9900 dxa). Ord/Player were
-  // each trimmed 150 to make room for the new Bats column rather than growing
-  // the table total — see prior note: the previous version summed to 12700,
-  // ~30% over, which forced the whole table to shrink/wrap unpredictably.
-  const ALIGN_ORD_W = 300, ALIGN_PLAYER_W = 1300, ALIGN_BATS_W = 300, ALIGN_POS_W = 570;
-
-  // Bare "#12 Name" label with no handedness suffix — deliberately NOT the
-  // shared playerLabel() (which now appends "(B/T: R/R)" everywhere else in
-  // the report). This grid shows bats in its own dedicated column instead,
-  // so the Player cell stays short and doesn't risk wrapping to two lines
-  // in the fixed-width table.
-  function alignPlayerBareLabel(name) {
-    const j = jerseyFor(name);
-    return j ? `#${j} ${name}` : name;
-  }
-
-  /**
-   * Resolves display info for the B column: the letter itself, plus a
-   * "mismatch" flag when the spray-measured pull side is the OPPOSITE of
-   * what's conventional for this hitter's handedness (R hitters
-   * conventionally pull LEFT-side/3B-SS-LF; L hitters conventionally pull
-   * RIGHT-side/1B-2B-RF). Only flagged for known L/R (switch/unknown have
-   * no expectation to contradict), and only when the O-template made an
-   * actual directional call — CENTER/STD aren't a pull-side claim to
-   * begin with. This NEVER changes the shading itself — classifyHitter()
-   * in defensive-alignment.js has no idea this flag exists — it only
-   * changes how the letter is drawn, as a subtle cross-check cue.
-   */
-  function alignBatsInfo(row) {
-    const hand = resolveHandednessFromBundle(a._bundle || {}, row.name, jerseyMap);
-    const bats = isKnownBats(hand?.bats) ? String(hand.bats).toUpperCase() : null;
-    const mismatch = !!bats &&
-      ((bats === 'R' && row.template === 'RIGHT') || (bats === 'L' && row.template === 'LEFT'));
-    return { label: bats || '\u2014', mismatch };
-  }
+  // Widths sum to 9880 (Ord 450 + Player 1450 + 14 x 570), matching every
+  // other table in this document (all total <=9900 dxa). The previous
+  // version summed to 12700 — ~30% over — which is what forced the Ord
+  // column (and everything else) to wrap.
+  const ALIGN_ORD_W = 450, ALIGN_PLAYER_W = 1450, ALIGN_POS_W = 570;
 
   function alignmentHeaderRow() {
     const headerCells = [
       hCell('Ord', ALIGN_ORD_W, { size: ALIGN_SIZE, margins: ALIGN_MARGINS }),
       hCell('Player', ALIGN_PLAYER_W, { size: ALIGN_SIZE, margins: ALIGN_MARGINS, align: AlignmentType.LEFT }),
-      hCell('B', ALIGN_BATS_W, { size: ALIGN_SIZE, margins: ALIGN_MARGINS }),
     ];
     for (const pos of ALIGN_POSITIONS) {
       headerCells.push(hCell(`${pos} O`, ALIGN_POS_W, { size: ALIGN_SIZE, margins: ALIGN_MARGINS }));
@@ -1056,19 +936,14 @@ async function buildDocx(analysis, outputPath) {
 
   function alignmentDataRow(row, i) {
     const rowThreatBg = threatColor(row.threat);
-    const batsInfo = alignBatsInfo(row);
     const cells = [
       cell(row.battingOrder != null ? String(row.battingOrder) : '\u2014', {
         width: ALIGN_ORD_W, align: AlignmentType.CENTER, size: ALIGN_SIZE, margins: ALIGN_MARGINS,
         bold: true, color: WHITE, bg: rowThreatBg,
       }),
-      cell(alignPlayerBareLabel(row.name), {
+      cell(playerLabel(row.name), {
         width: ALIGN_PLAYER_W, size: ALIGN_SIZE, margins: ALIGN_MARGINS,
         bold: true, color: WHITE, bg: rowThreatBg,
-      }),
-      cell(batsInfo.mismatch ? `${batsInfo.label}*` : batsInfo.label, {
-        width: ALIGN_BATS_W, align: AlignmentType.CENTER, size: ALIGN_SIZE, margins: ALIGN_MARGINS,
-        bold: true, isAlt: i % 2 === 1, color: batsInfo.mismatch ? GOLD : BLACK,
       }),
     ];
     for (const pos of ALIGN_POSITIONS) {
@@ -1097,23 +972,16 @@ async function buildDocx(analysis, outputPath) {
     }),
     bodyPara(
       'Shading is derived from each hitter\u2019s real batted-ball spray percentages ' +
-      '(player_advanced_stats), not handedness \u2014 directions are labeled by field side ' +
-      'rather than pull/oppo, since spray is measured per hitter and doesn\u2019t assume a ' +
-      'lefty pulls one way or a righty the other. The B column is the hitter\u2019s captured ' +
-      'batting hand (L/R/S, from the GameChanger roster) shown only as a cross-check \u2014 ' +
-      'compare it against the shift direction yourself; it does not drive the shading. ' +
-      'A gold "*" next to the letter flags a spray-measured pull side opposite the ' +
-      'convention for that hand (e.g. a righty shaded toward the right side) \u2014 not ' +
-      'necessarily wrong, just worth a second look; unflagged is not a guarantee either. ' +
-      '\u2014 means handedness hasn\u2019t been captured for that player yet. Ord/Player cell ' +
-      'color reflects overall threat level (red/orange/green).',
+      '(player_advanced_stats), not handedness \u2014 handedness isn\u2019t tracked, so ' +
+      'directions are labeled by field side rather than pull/oppo. Ord/Player cell color ' +
+      'reflects overall threat level (red/orange/green).',
       { italic: true, color: '595959' }
     ),
     spacer(60),
     ...(alignmentRows.length ? [new Table({
       layout: TableLayoutType.FIXED,
       width: { size: 9880, type: WidthType.DXA },
-      columnWidths: [ALIGN_ORD_W, ALIGN_PLAYER_W, ALIGN_BATS_W, ...ALIGN_POSITIONS.flatMap(() => [ALIGN_POS_W, ALIGN_POS_W])],
+      columnWidths: [ALIGN_ORD_W, ALIGN_PLAYER_W, ...ALIGN_POSITIONS.flatMap(() => [ALIGN_POS_W, ALIGN_POS_W])],
       rows: [alignmentHeaderRow(), ...alignmentRows.map(alignmentDataRow)],
     })] : [bodyPara('No advanced batting data available to build alignment grid.')]),
     spacer(80),
@@ -1698,6 +1566,296 @@ async function buildDocx(analysis, outputPath) {
   return outputPath;
 }
 
+// ─── Generic structured-JSON renderer (self-scout / matchup reports) ─────────
+// The opponent report above has a fixed, hand-styled schema. Self-scout and
+// matchup reports use a different, evolving JSON shape (see analyzer.js:
+// buildSelfScoutPrompt / buildMatchupPrompt), so instead of hand-coding every
+// field twice, this walks the JSON generically: strings become paragraphs,
+// arrays of strings become bullet lists, arrays of objects become mini "cards",
+// and flat objects become label/value blocks. Nested objects recurse. This
+// keeps rendering in sync automatically as the JSON schema evolves — if you
+// want a specific section to look nicer than the generic layout, give it
+// bespoke handling the way buildDocx does for the opponent report.
+
+function humanizeKey(key) {
+  return String(key)
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, c => c.toUpperCase())
+    .trim();
+}
+
+function isFlatObject(obj) {
+  return Object.values(obj).every(v =>
+    v === null || v === undefined ||
+    typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean'
+  );
+}
+
+async function buildGenericDocx(analysis, outputPath, config = {}) {
+  const {
+    Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType,
+    BorderStyle, PageNumber, Header, Footer, TabStopType, TabStopPosition,
+    ImageRun, LevelFormat,
+  } = require('docx');
+
+  const NAVY  = DESIGN.colors.navy;
+  const GOLD  = DESIGN.colors.gold;
+  const BLACK = DESIGN.colors.black;
+  const HEADING_FONT = DESIGN.fonts.docxHeading;
+  const BODY_FONT    = DESIGN.fonts.docxBody;
+
+  const logoBuffer = fs.existsSync(DESIGN.brand.logoPath) ? fs.readFileSync(DESIGN.brand.logoPath) : null;
+  const generated = analysis._generatedAt
+    ? new Date(analysis._generatedAt).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
+    : new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+
+  function sectionHeading(text) {
+    return new Paragraph({
+      heading: HeadingLevel.HEADING_1,
+      spacing: { before: 240, after: 100 },
+      border:  { bottom: { style: BorderStyle.SINGLE, size: 8, color: GOLD, space: 1 } },
+      children: [new TextRun({ text, bold: true, color: NAVY, size: 26, font: 'Calibri' })],
+    });
+  }
+  function subHeading(text) {
+    return new Paragraph({
+      heading: HeadingLevel.HEADING_2,
+      spacing: { before: 140, after: 60 },
+      children: [new TextRun({ text, bold: true, color: GOLD, size: 20, font: 'Calibri' })],
+    });
+  }
+  function bodyPara(text, opts = {}) {
+    const { bold = false, italic = false } = opts;
+    return new Paragraph({
+      spacing: { after: 100 },
+      children: [new TextRun({ text: String(text ?? ''), bold, italic, color: BLACK, size: 18, font: 'Calibri' })],
+    });
+  }
+  function bulletPara(text) {
+    return new Paragraph({
+      numbering: { reference: 'bullets', level: 0 },
+      spacing:   { after: 50 },
+      children:  [new TextRun({ text: String(text ?? ''), size: 18, font: 'Calibri' })],
+    });
+  }
+  function labelValue(label, value) {
+    return new Paragraph({
+      spacing: { after: 70 },
+      children: [
+        new TextRun({ text: `${label}: `, bold: true, size: 18, font: 'Calibri', color: NAVY }),
+        new TextRun({ text: String(value ?? '—'), size: 18, font: 'Calibri' }),
+      ],
+    });
+  }
+  function spacer(size = 100) {
+    return new Paragraph({ spacing: { after: size }, children: [new TextRun('')] });
+  }
+
+  function renderCard(item) {
+    const out = [];
+    const label = item.name || item.title || null;
+    if (label) out.push(subHeading(String(label)));
+    for (const [k, v] of Object.entries(item)) {
+      if (k === 'name' || k === 'title') continue;
+      out.push(...renderValue(humanizeKey(k), v, 2));
+    }
+    out.push(spacer(80));
+    return out;
+  }
+
+  function renderValue(title, value, depth) {
+    const out = [];
+    const heading = depth <= 1 ? sectionHeading : subHeading;
+    if (value === null || value === undefined || value === '') return out;
+
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      out.push(heading(title));
+      out.push(bodyPara(String(value)));
+      return out;
+    }
+
+    if (Array.isArray(value)) {
+      if (!value.length) return out;
+      out.push(heading(title));
+      if (value.every(v => typeof v !== 'object' || v === null)) {
+        for (const item of value) out.push(bulletPara(String(item)));
+      } else {
+        for (const item of value) out.push(...renderCard(item));
+      }
+      return out;
+    }
+
+    if (typeof value === 'object') {
+      const entries = Object.entries(value).filter(([, v]) => v !== null && v !== undefined && v !== '');
+      if (!entries.length) return out;
+      out.push(heading(title));
+      if (isFlatObject(value)) {
+        for (const [k, v] of entries) out.push(labelValue(humanizeKey(k), v));
+      } else {
+        for (const [k, v] of entries) out.push(...renderValue(humanizeKey(k), v, depth + 1));
+      }
+      return out;
+    }
+
+    return out;
+  }
+
+  const children = [];
+
+  // Cover block
+  children.push(new Paragraph({
+    spacing: { after: 60 },
+    children: [
+      ...(logoBuffer ? [new ImageRun({ data: logoBuffer, transformation: { width: 90, height: 90 } })] : []),
+    ],
+  }));
+  children.push(new Paragraph({
+    spacing: { after: 40 },
+    children: [new TextRun({ text: config.title || 'Scouting Report', bold: true, size: 44, color: NAVY, font: HEADING_FONT })],
+  }));
+  if (config.subtitle) {
+    children.push(new Paragraph({
+      spacing: { after: 200 },
+      children: [new TextRun({ text: config.subtitle, size: 24, color: GOLD, font: HEADING_FONT })],
+    }));
+  }
+  for (const line of config.metaLines || []) {
+    children.push(bodyPara(line, { bold: true }));
+  }
+  if (analysis.reportMeta?.coachContextNote) {
+    children.push(spacer(60));
+    children.push(bodyPara(`Coach context: ${analysis.reportMeta.coachContextNote}`, { italic: true }));
+  }
+  children.push(spacer(150));
+
+  // Walk the configured top-level sections in order
+  for (const section of config.sections) {
+    const value = analysis[section.key];
+    children.push(...renderValue(section.title, value, 1));
+  }
+
+  const doc = new Document({
+    numbering: {
+      config: [{
+        reference: 'bullets',
+        levels: [{ level: 0, format: LevelFormat.BULLET, text: '•', alignment: AlignmentType.LEFT,
+          style: { paragraph: { indent: { left: 360, hanging: 260 } } } }],
+      }],
+    },
+    styles: {
+      default: { document: { run: { font: BODY_FONT, size: 18 } } },
+    },
+    sections: [{
+      properties: {
+        page: { size: { width: DESIGN.docx.page.width, height: DESIGN.docx.page.height }, margin: DESIGN.docx.page.margin },
+      },
+      headers: {
+        default: new Header({
+          children: [new Paragraph({
+            spacing: { after: 50 },
+            border:  { bottom: { style: BorderStyle.SINGLE, size: DESIGN.docx.header.borderSize, color: GOLD, space: 1 } },
+            children: [
+              new TextRun({ text: `${DESIGN.brand.name}  |  ${config.subtitle || config.title || ''}`, bold: true, size: DESIGN.docx.header.fontSize, color: NAVY, font: HEADING_FONT }),
+              new TextRun({ text: `\t${generated}`, size: DESIGN.docx.header.fontSize, color: DESIGN.colors.grayText, font: BODY_FONT }),
+            ],
+            tabStops: [{ type: TabStopType.RIGHT, position: TabStopPosition.MAX }],
+          })],
+        }),
+      },
+      footers: {
+        default: new Footer({
+          children: [new Paragraph({
+            spacing: { before: 50 },
+            border:  { top: { style: BorderStyle.SINGLE, size: 6, color: GOLD, space: 1 } },
+            alignment: AlignmentType.CENTER,
+            children: [
+              new TextRun({ text: `${DESIGN.docx.footer.text}  |  Page `, size: DESIGN.docx.footer.fontSize, color: DESIGN.colors.grayText, font: BODY_FONT }),
+              new TextRun({ children: [PageNumber.CURRENT], size: DESIGN.docx.footer.fontSize, color: DESIGN.colors.grayText, font: BODY_FONT }),
+            ],
+          })],
+        }),
+      },
+      children,
+    }],
+  });
+
+  console.log('[report] Building generic structured document...');
+  const buffer = await Packer.toBuffer(doc);
+  fs.writeFileSync(outputPath, buffer);
+  console.log(`[report] Word document saved: ${outputPath}`);
+  return outputPath;
+}
+
+// Section ordering/titles for the self-scout report. Keys must match
+// analyzer.js:buildSelfScoutPrompt's JSON schema.
+const SELF_SCOUT_SECTIONS = [
+  { key: 'executiveSummary',     title: 'Executive Summary' },
+  { key: 'teamIdentity',         title: 'Team Identity' },
+  { key: 'offensiveProfile',     title: 'Offensive Profile' },
+  { key: 'hitterCards',          title: 'Hitter Cards' },
+  { key: 'swingDecisions',       title: 'Swing Decisions & Count Tendencies' },
+  { key: 'baserunning',          title: 'Baserunning & Pressure' },
+  { key: 'pitchingStaff',        title: 'Pitching Staff' },
+  { key: 'pitcherUsage',         title: 'Pitcher Usage Recommendations' },
+  { key: 'defensiveProfile',     title: 'Defensive Profile' },
+  { key: 'lineupConstruction',   title: 'Lineup Construction' },
+  { key: 'opponentView',         title: 'How Opponents Will Scout Us' },
+  { key: 'practicePriorities',   title: 'Practice Priorities' },
+  { key: 'dataQualityNotes',     title: 'Data Quality Notes' },
+];
+
+// Section ordering/titles for the matchup report. Keys must match
+// analyzer.js:buildMatchupPrompt's JSON schema.
+const MATCHUP_SECTIONS = [
+  { key: 'gamePlanSummary',             title: 'Game Plan Summary' },
+  { key: 'ourStrengthsTheirWeaknesses', title: 'Our Strengths vs. Their Weaknesses' },
+  { key: 'theirStrengthsOurWeaknesses', title: 'Their Strengths vs. Our Weaknesses' },
+  { key: 'pitchingPlan',                title: 'Pitching Plan' },
+  { key: 'bullpenPlan',                 title: 'Bullpen / Tournament Usage' },
+  { key: 'offensiveAttackPlan',         title: 'Offensive Attack Plan' },
+  { key: 'hitterMatchupCards',          title: 'Our Hitter Matchup Cards' },
+  { key: 'opponentHitterCards',         title: 'Opponent Hitter Attack Cards' },
+  { key: 'handednessMatchups',          title: 'Handedness Matchups' },
+  { key: 'baserunningMatchup',          title: 'Baserunning / Pressure Matchup' },
+  { key: 'defensiveAlignment',          title: 'Defensive Alignment' },
+  { key: 'situationalPlan',             title: 'Situational Strategy' },
+  { key: 'doNotLetThisBeatUs',          title: 'Do Not Let This Beat Us' },
+  { key: 'lineupRecommendation',        title: 'Recommended Lineup' },
+  { key: 'pregameChecklist',            title: 'Pregame Coach Checklist' },
+  { key: 'dataQualityNotes',            title: 'Data Quality Notes' },
+];
+
+async function buildSelfScoutDocx(analysis, outputPath) {
+  const teamName = analysis.reportMeta?.teamName || analysis._bundle?.team?.team_name || 'Our Team';
+  const games    = analysis.reportMeta?.gamesAnalyzed ?? 0;
+  const ctx      = analysis._gameContext || {};
+  const metaLines = [
+    `Games analyzed: ${games}`,
+    ctx.gameDate ? `Report date: ${ctx.gameDate}` : null,
+    ctx.gameTime ? `Next game time: ${ctx.gameTime}` : null,
+    ctx.gameLocation ? `Location: ${ctx.gameLocation}` : null,
+  ].filter(Boolean);
+  return buildGenericDocx(analysis, outputPath, {
+    title: 'Self-Scouting Report', subtitle: teamName, metaLines, sections: SELF_SCOUT_SECTIONS,
+  });
+}
+
+async function buildMatchupDocx(analysis, outputPath) {
+  const ourName = analysis.reportMeta?.ourTeamName || analysis._ourBundle?.team?.team_name || 'Our Team';
+  const oppName = analysis.reportMeta?.opponentTeamName || analysis._oppBundle?.team?.team_name || 'Opponent';
+  const ctx = analysis._gameContext || {};
+  const metaLines = [
+    `Games analyzed — us: ${analysis.reportMeta?.gamesAnalyzedOurs ?? '?'} | them: ${analysis.reportMeta?.gamesAnalyzedOpponent ?? '?'}`,
+    ctx.gameDate ? `Game date: ${ctx.gameDate}` : null,
+    ctx.gameTime ? `Game time: ${ctx.gameTime}` : null,
+    ctx.gameLocation ? `Location: ${ctx.gameLocation}` : null,
+  ].filter(Boolean);
+  return buildGenericDocx(analysis, outputPath, {
+    title: 'Matchup Report', subtitle: `${ourName} vs ${oppName}`, metaLines, sections: MATCHUP_SECTIONS,
+  });
+}
+
 // ─── PDF via HTML + Playwright ────────────────────────────────────────────────
 
 function buildReportHtml(analysis) {
@@ -1806,10 +1964,7 @@ function buildReportHtml(analysis) {
 
   function playerLabel(name) {
     const j = jerseyFor(name);
-    const base = j ? `#${j} ${name}` : name;
-    const hand = resolveHandednessFromBundle(a._bundle || {}, name, jerseyMap);
-    const handLabel = formatBatThrowLabel(hand);
-    return handLabel ? `${base} (${handLabel})` : base;
+    return j ? `#${j} ${name}` : name;
   }
 
   // Defensive alignment grid data — see buildDocx for the full rationale.
@@ -2285,9 +2440,8 @@ function buildReportHtml(analysis) {
   /* ── Defensive alignment grid ── */
   .alignment-grid { font-size: 10.5px; table-layout: fixed; width: 100%; }
   .alignment-grid th, .alignment-grid td { text-align: center; padding: 4px 6px; white-space: nowrap; }
-  .alignment-grid .align-ord    { width: 30px; }
-  .alignment-grid .align-player { width: 118px; white-space: normal; }
-  .alignment-grid .align-bats   { width: 26px; }
+  .alignment-grid .align-ord    { width: 34px; }
+  .alignment-grid .align-player { width: 130px; white-space: normal; }
   .shift-highlight { background: #3498db; color: white; font-weight: 700; }
 
   /* ── Active roster tags ── */
@@ -2425,21 +2579,14 @@ ${playerDetailPages}
 <div class="page-break"></div>
 <h3 class="section">Defensive Alignment Grid</h3>
 <p class="note-italic">Shading is derived from each hitter's real batted-ball spray percentages
-  (player_advanced_stats), not handedness &mdash; directions are labeled by field side rather
-  than pull/oppo, since spray is measured per hitter and doesn't assume a lefty pulls one way
-  or a righty the other. The B column is the hitter's captured batting hand (L/R/S, from the
-  GameChanger roster) shown only as a cross-check &mdash; compare it against the shift direction
-  yourself; it does not drive the shading. A gold "*" flags a spray-measured pull side opposite
-  the convention for that hand (e.g. a righty shaded toward the right side) &mdash; not
-  necessarily wrong, just worth a second look; unflagged is not a guarantee either. &mdash; means
-  handedness hasn't been captured for that player yet. Ord/Player cell color reflects overall
-  threat level (red/orange/green).</p>
+  (player_advanced_stats), not handedness &mdash; handedness isn't tracked, so directions are
+  labeled by field side rather than pull/oppo. Ord/Player cell color reflects overall threat
+  level (red/orange/green).</p>
 <table class="alignment-grid">
   <thead>
     <tr>
       <th rowspan="2" class="align-ord">Ord</th>
       <th rowspan="2" class="align-player" style="text-align:left">Player</th>
-      <th rowspan="2" class="align-bats">B</th>
       ${ALIGN_POSITIONS.map(pos => `<th colspan="2">${pos}</th>`).join('')}
     </tr>
     <tr>
@@ -2450,21 +2597,6 @@ ${playerDetailPages}
     ${alignmentRows.length ? alignmentRows.map(row => {
       const threatBg = { high: '#c00000', medium: '#e36c09', low: '#375623' }[row.threat] || '#375623';
       const orderCell = row.battingOrder != null ? row.battingOrder : '&mdash;';
-      const j = jerseyFor(row.name);
-      const bareLabel = j ? `#${j} ${row.name}` : row.name;
-      const hand = resolveHandednessFromBundle(a._bundle || {}, row.name, jerseyMap);
-      const bats = isKnownBats(hand?.bats) ? String(hand.bats).toUpperCase() : null;
-      // See alignBatsInfo() in buildDocx for the full rationale — same rule
-      // here: only known L/R hitters, only when the O-template made an
-      // actual LEFT/RIGHT directional call. Display-only; classifyHitter()
-      // never sees this.
-      const batsMismatch = !!bats &&
-        ((bats === 'R' && row.template === 'RIGHT') || (bats === 'L' && row.template === 'LEFT'));
-      const batsLabel = bats || '&mdash;';
-      const batsStyle = batsMismatch ? 'font-weight:700;color:#c79a45' : 'font-weight:700';
-      const batsTitle = batsMismatch
-        ? ' title="Spray-measured pull side is opposite the convention for this hitter\u2019s hand \u2014 worth a second look."'
-        : '';
       const posCells = ALIGN_POSITIONS.map(pos => {
         const [oCode, kCode] = row.grid[pos];
         const hl = row.highlightZones.includes(pos) ? ' class="shift-highlight"' : '';
@@ -2472,11 +2604,10 @@ ${playerDetailPages}
       }).join('');
       return `<tr>
         <td class="align-ord" style="background:${threatBg};color:white;font-weight:700">${orderCell}</td>
-        <td class="align-player" style="background:${threatBg};color:white;font-weight:600;text-align:left">${esc(bareLabel)}</td>
-        <td class="align-bats" style="${batsStyle}"${batsTitle}>${batsLabel}${batsMismatch ? '*' : ''}</td>
+        <td class="align-player" style="background:${threatBg};color:white;font-weight:600;text-align:left">${esc(playerLabel(row.name))}</td>
         ${posCells}
       </tr>`;
-    }).join('') : '<tr><td colspan="17" style="color:#888;text-align:center">No advanced batting data available</td></tr>'}
+    }).join('') : '<tr><td colspan="16" style="color:#888;text-align:center">No advanced batting data available</td></tr>'}
   </tbody>
 </table>
 <p class="note-italic">
@@ -2584,13 +2715,50 @@ async function buildHtmlPdf(analysis, outputPath) {
 // ─── generateReport ───────────────────────────────────────────────────────────
 
 async function generateReport(analysis, outputDir = './reports') {
+  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+
+  const reportType = analysis._reportType || 'opponent';
+
+  // Self-scout and matchup reports use a different JSON schema than the
+  // opponent report (see analyzer.js) and don't carry the same
+  // playerBreakdowns/spray-chart shape, so they skip the PG spray-image
+  // pipeline below and go straight through the generic structured renderer.
+  if (reportType === 'self-scout' || reportType === 'matchup') {
+    const nameForFile = reportType === 'self-scout'
+      ? (analysis.reportMeta?.teamName || analysis._bundle?.team?.team_name || 'team')
+      : `${analysis.reportMeta?.ourTeamName || 'our-team'}-vs-${analysis.reportMeta?.opponentTeamName || 'opponent'}`;
+    const teamNameSanitized = sanitize(nameForFile);
+    const date = new Date().toISOString().slice(0, 10);
+    const prefix = reportType === 'self-scout' ? 'self-scout' : 'matchup';
+    const base = `${prefix}-${teamNameSanitized.replace(/\s+/g, '-')}-${date}`;
+
+    const docxPath = path.join(outputDir, `${base}.docx`);
+    const pdfPath  = path.join(outputDir, `${base}.pdf`);
+
+    console.log(`\n[report] Generating ${reportType} report: ${nameForFile}`);
+
+    try {
+      if (reportType === 'self-scout') await buildSelfScoutDocx(analysis, docxPath);
+      else await buildMatchupDocx(analysis, docxPath);
+    } catch (err) {
+      console.error(`[report] build${reportType === 'self-scout' ? 'SelfScout' : 'Matchup'}Docx failed:`, err.message);
+      throw err;
+    }
+    try {
+      await buildPdfFromDocx(docxPath, pdfPath);
+    } catch (err) {
+      console.error('[report] buildPdfFromDocx failed:', err.message);
+      throw err;
+    }
+
+    return { docx: docxPath, pdf: pdfPath };
+  }
+
   const teamName = analysis.reportMeta?.teamName || analysis._bundle?.team?.team_name || '';
   const pgData   = getPGDataForTeam(analysis._bundle?.team?.team_name || teamName || '');
   analysis._pgData = pgData;
 
   const sprayData = pgData?.sprayData || {};
-
-  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
 
   // PG spray chart PNGs (dot-on-field, only if PG data available)
   analysis._sprayImages = {};
@@ -2654,4 +2822,7 @@ async function generateReport(analysis, outputDir = './reports') {
 
 // ─── Exports ──────────────────────────────────────────────────────────────────
 
-module.exports = { generateReport, buildDocx, buildPdfFromDocx, buildHtmlPdf, buildReportHtml };
+module.exports = {
+  generateReport, buildDocx, buildPdfFromDocx, buildHtmlPdf, buildReportHtml,
+  buildGenericDocx, buildSelfScoutDocx, buildMatchupDocx,
+};

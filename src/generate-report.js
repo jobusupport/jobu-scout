@@ -5,13 +5,23 @@ require('dotenv').config();
  * Voodoo Scout — Report Generation CLI
  *
  * Usage:
- *   node src/generate-report.js "James Clemens"
- *   node src/generate-report.js --all
- *   node src/generate-report.js --list
+ *   node src/generate-report.js "James Clemens"                ← opponent report
+ *   node src/generate-report.js --all                           ← opponent reports, all teams
+ *   node src/generate-report.js --list                          ← list teams
+ *   node src/generate-report.js --self-scout                    ← self-scout report for OUR_TEAM_ID
+ *   node src/generate-report.js --matchup "James Clemens"       ← matchup: OUR_TEAM_ID vs named opponent
  *
- * Optional env vars:
- *   GAME_LOCATION="Huntsville, AL"   ← enables weather + field conditions
- *   GAME_DATE="2026-06-20"           ← defaults to today if not set
+ * Optional env vars (all reports):
+ *   GAME_LOCATION="Huntsville, AL"    ← enables weather + field conditions
+ *   GAME_DATE="2026-06-20"            ← defaults to today if not set
+ *   GAME_TIME="6:00 PM"               ← scheduled first-pitch time, passed to Claude
+ *   HUMAN_OBSERVATIONS="..."          ← coach's own scouting notes, treated as ground truth
+ *   CUSTOM_PROMPT="..."               ← one-off ask for this specific report
+ *   GAME_SCOPE="opponent|self|matchup" ← informational; --self-scout/--matchup flags drive behavior
+ *
+ * Self-scout / matchup only:
+ *   OUR_TEAM_ID="<uuid>"              ← defaults to JoBu 14U (23b74114-5899-43d0-b3a2-10abac740666)
+ *   GAME_INVERT_TEAM_SIDE="true"      ← set false if OUR_TEAM_ID was already ingested inverted
  */
 
 const path     = require('path');
@@ -21,11 +31,15 @@ const report   = require('./report');
 
 const DB_PATH     = path.join(__dirname, '..', 'voodoo-scout.db');
 const REPORTS_DIR = process.env.REPORTS_DIR || path.join(__dirname, '..', 'reports');
+const OUR_TEAM_ID = process.env.OUR_TEAM_ID || '23b74114-5899-43d0-b3a2-10abac740666';
 
 // Options passed through to analyzer
 const analyzerOptions = {
   gameLocation: process.env.GAME_LOCATION || null,
   gameDate:     process.env.GAME_DATE     || new Date().toISOString().slice(0, 10),
+  gameTime:            process.env.GAME_TIME            || null,
+  humanObservations:   process.env.HUMAN_OBSERVATIONS    || null,
+  customPrompt:        process.env.CUSTOM_PROMPT         || null,
   // Advanced stats (player_advanced_stats / pitcher_advanced_stats) are now
   // recalculated automatically at the start of every report (see
   // analyzer.js:analyzeTeam). Pass --skip-recalc on the CLI, or set
@@ -48,6 +62,9 @@ if (analyzerOptions.gameLocation) {
   console.log(`[report] Game location: ${analyzerOptions.gameLocation}`);
   console.log(`[report] Game date: ${analyzerOptions.gameDate}`);
 }
+if (analyzerOptions.gameTime)          console.log(`[report] Game time: ${analyzerOptions.gameTime}`);
+if (analyzerOptions.humanObservations) console.log(`[report] Coach observations provided (${analyzerOptions.humanObservations.length} chars)`);
+if (analyzerOptions.customPrompt)      console.log(`[report] Custom prompt provided (${analyzerOptions.customPrompt.length} chars)`);
 
 db.init(DB_PATH);
 
@@ -145,8 +162,78 @@ async function runForTeam(team) {
   return paths;
 }
 
+async function runSelfScout() {
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`Generating self-scout report — OUR_TEAM_ID=${OUR_TEAM_ID}`);
+  console.log('='.repeat(60));
+
+  const analysis = await analyzer.analyzeSelfScout(OUR_TEAM_ID, analyzerOptions);
+
+  let paths;
+  try {
+    paths = await report.generateReport(analysis, REPORTS_DIR);
+  } catch (err) {
+    console.error('[report] FULL ERROR:', err);
+    throw err;
+  }
+
+  console.log(`\n✓ Self-scout report complete`);
+  console.log(`  Word: ${paths.docx}`);
+  console.log(`  PDF:  ${paths.pdf}`);
+  return paths;
+}
+
+async function runMatchup(opponentNameOrId) {
+  const opponent = await findTeam(opponentNameOrId);
+  if (!opponent) {
+    console.log(`\nNo opponent team found matching: "${opponentNameOrId}"`);
+    await listTeams();
+    process.exit(1);
+  }
+
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`Generating matchup report: JoBu vs ${opponent.team_name}`);
+  console.log('='.repeat(60));
+
+  const analysis = await analyzer.analyzeMatchup(OUR_TEAM_ID, opponent.id, analyzerOptions);
+
+  let paths;
+  try {
+    paths = await report.generateReport(analysis, REPORTS_DIR);
+  } catch (err) {
+    console.error('[report] FULL ERROR:', err);
+    throw err;
+  }
+
+  console.log(`\n✓ Matchup report complete: JoBu vs ${opponent.team_name}`);
+  console.log(`  Word: ${paths.docx}`);
+  console.log(`  PDF:  ${paths.pdf}`);
+  return paths;
+}
+
 async function main() {
-  const args = process.argv.slice(2).filter(a => a !== '--skip-recalc');
+  const rawArgs = process.argv.slice(2).filter(a => a !== '--skip-recalc');
+
+  if (rawArgs.includes('--self-scout')) {
+    await runSelfScout();
+    console.log(`\nReports saved to: ${REPORTS_DIR}`);
+    return;
+  }
+
+  const matchupIdx = rawArgs.indexOf('--matchup');
+  if (matchupIdx !== -1) {
+    const opponentNameOrId = rawArgs.slice(matchupIdx + 1).join(' ');
+    if (!opponentNameOrId) {
+      console.log('\n--matchup requires an opponent team name or id, e.g.:');
+      console.log('  node src/generate-report.js --matchup "James Clemens"\n');
+      process.exit(1);
+    }
+    await runMatchup(opponentNameOrId);
+    console.log(`\nReports saved to: ${REPORTS_DIR}`);
+    return;
+  }
+
+  const args = rawArgs;
 
   if (args.includes('--list') || args.includes('-l')) {
     await listTeams();
@@ -199,9 +286,11 @@ async function main() {
 
   await listTeams();
   console.log('Usage:');
-  console.log('  node src/generate-report.js "Team Name"   ← generate for one team');
-  console.log('  node src/generate-report.js --all          ← generate for all teams');
-  console.log('  node src/generate-report.js --list         ← list teams in DB\n');
+  console.log('  node src/generate-report.js "Team Name"           ← opponent report for one team');
+  console.log('  node src/generate-report.js --all                  ← opponent reports, all teams');
+  console.log('  node src/generate-report.js --list                 ← list teams in DB');
+  console.log('  node src/generate-report.js --self-scout           ← self-scout report (OUR_TEAM_ID)');
+  console.log('  node src/generate-report.js --matchup "Team Name"  ← matchup report (OUR_TEAM_ID vs Team Name)\n');
 }
 
 main().catch(err => {

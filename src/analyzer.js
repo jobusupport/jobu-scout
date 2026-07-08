@@ -514,140 +514,22 @@ HARD RULES:
 - Claude explains verified facts; Claude does not calculate new season totals.`;
 }
 
-function normalizePlayerKeyText(value) {
-  return String(value || '')
-    .toLowerCase()
-    .replace(/['’]/g, "'")
-    .replace(/["“”]/g, '"')
-    .replace(/[–—]/g, '-')
-    .replace(/[^a-z\s'-]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function buildHandednessMatchKey(fullName) {
-  const cleaned = normalizePlayerKeyText(fullName);
-  const parts = cleaned.split(' ').filter(Boolean);
-  if (!parts.length) return '';
-  const last = parts[parts.length - 1];
-  const firstInitial = parts[0].charAt(0);
-  return `${last}|${firstInitial}`;
-}
-
-function normalizeJersey(value) {
-  if (value === null || value === undefined) return '';
-  return String(value).replace(/^#/, '').trim();
-}
-
-function jerseyForFromMap(jerseyMap = {}, name) {
-  if (!name) return null;
-  if (jerseyMap[name]) return normalizeJersey(jerseyMap[name]);
-  const norm = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  const wanted = norm(name);
-  const hit = Object.entries(jerseyMap || {}).find(([player]) => norm(player) === wanted);
-  return hit ? normalizeJersey(hit[1]) : null;
-}
-
-function isKnownBats(value) {
-  return ['L', 'R', 'S'].includes(String(value || '').toUpperCase());
-}
-
-function isKnownThrows(value) {
-  return ['L', 'R'].includes(String(value || '').toUpperCase());
-}
-
-function hasKnownHandedness(hand) {
-  return !!hand && (isKnownBats(hand.bats) || isKnownThrows(hand.throws));
-}
-
-/**
- * Resolves a player's captured bats/throws from bundle.handednessMap
- * (see db.js / db-supabase.js getTeamHandednessMap — jersey number first,
- * falling back to the last-name+first-initial match_key, EXCEPT where that
- * key is ambiguous between two players on the roster, in which case we
- * deliberately return null rather than guess).
- */
-function resolvePlayerHandedness(bundle = {}, playerName) {
-  if (!playerName) return null;
-  const handednessMap = bundle.handednessMap || {};
-  const jersey = jerseyForFromMap(bundle.jerseyMap || {}, playerName);
-
-  if (jersey && handednessMap.byJersey && handednessMap.byJersey[jersey]) {
-    const hit = handednessMap.byJersey[jersey];
-    return hasKnownHandedness(hit) ? { ...hit, source: 'jersey' } : null;
+// Coach-supplied context (gameTime, humanObservations, customPrompt) is shared
+// across the opponent, self-scout, and matchup prompt builders below.
+function buildCoachContextBlock(options = {}) {
+  const { gameTime = null, humanObservations = null, customPrompt = null } = options;
+  if (!gameTime && !humanObservations && !customPrompt) return '';
+  const lines = ['=== COACH-PROVIDED CONTEXT ==='];
+  if (gameTime) lines.push(`Scheduled game time: ${gameTime}`);
+  if (humanObservations) {
+    lines.push(`Coach's own scouting notes / observations (treat as high-value ground truth from someone who watched this team live — reconcile with the statistical data rather than ignoring either one; call out any conflict explicitly):`);
+    lines.push(humanObservations);
   }
-
-  const matchKey = buildHandednessMatchKey(playerName);
-  if (!matchKey) return null;
-
-  if (handednessMap.ambiguousMatchKeys && handednessMap.ambiguousMatchKeys[matchKey]) {
-    return null;
+  if (customPrompt) {
+    lines.push(`Additional coach request for this specific report (address it directly and substantively somewhere in your response, but do not break the required JSON schema below):`);
+    lines.push(customPrompt);
   }
-
-  const hit = (handednessMap.byMatchKey && handednessMap.byMatchKey[matchKey]) || handednessMap[matchKey];
-  return hasKnownHandedness(hit) ? { ...hit, source: 'match_key' } : null;
-}
-
-function handednessCodeLabel(hand, role = 'player') {
-  if (!hasKnownHandedness(hand)) return '';
-  const bats = String(hand.bats || '').toUpperCase();
-  const throws = String(hand.throws || '').toUpperCase();
-
-  if (role === 'pitcher' && isKnownThrows(throws)) return throws === 'L' ? 'LHP' : 'RHP';
-  if (role === 'batter' && isKnownBats(bats)) {
-    if (bats === 'S') return 'Switch';
-    return bats === 'L' ? 'LHH' : 'RHH';
-  }
-
-  const pieces = [];
-  if (isKnownBats(bats)) pieces.push(`Bats:${bats === 'S' ? 'S' : bats}`);
-  if (isKnownThrows(throws)) pieces.push(`Throws:${throws}`);
-  return pieces.join('/');
-}
-
-function appendHandednessToName(bundle, playerName, role = 'player') {
-  const hand = resolvePlayerHandedness(bundle, playerName);
-  const label = handednessCodeLabel(hand, role);
-  return label ? `${playerName} (${label})` : playerName;
-}
-
-/**
- * Verified-handedness block for the Claude prompt, mirroring
- * buildVerifiedFactsBlock's "here are the real numbers, don't invent
- * anything" pattern. Explicitly forbids inferring handedness from a
- * player's name, position, or stats — GameChanger roster data is the only
- * legitimate source.
- */
-function buildVerifiedHandednessBlock(bundle = {}) {
-  const handednessMap = bundle.handednessMap || {};
-  const rows = Array.isArray(handednessMap.rows) ? handednessMap.rows : [];
-  const knownRows = rows.filter(hasKnownHandedness);
-  const ambiguousKeys = Object.keys(handednessMap.ambiguousMatchKeys || {});
-
-  if (!knownRows.length && !ambiguousKeys.length) {
-    return `=== VERIFIED PLAYER HANDEDNESS (GameChanger roster) ===\nNo verified handedness data is available. Do not infer batting or throwing hand.`;
-  }
-
-  const lines = knownRows
-    .slice()
-    .sort((a, b) => {
-      const aj = Number(normalizeJersey(a.jerseyNumber));
-      const bj = Number(normalizeJersey(b.jerseyNumber));
-      if (Number.isFinite(aj) && Number.isFinite(bj) && aj !== bj) return aj - bj;
-      return String(a.fullName || '').localeCompare(String(b.fullName || ''));
-    })
-    .map(row => {
-      const jersey = row.jerseyNumber ? `#${row.jerseyNumber} ` : '';
-      const bats = isKnownBats(row.bats) ? row.bats : 'Unknown';
-      const throws = isKnownThrows(row.throws) ? row.throws : 'Unknown';
-      return `${jersey}${row.fullName}: bats ${bats}, throws ${throws}`;
-    });
-
-  const warnings = ambiguousKeys.length
-    ? [`Ambiguous fuzzy name keys: ${ambiguousKeys.join(', ')}. For those players, use jersey-number matches only; if no jersey match is available, omit handedness.`]
-    : [];
-
-  return `=== VERIFIED PLAYER HANDEDNESS (GameChanger roster) ===\n${lines.join('\n') || 'No known L/R/S values.'}\n${warnings.join('\n')}\nRules: Use handedness only from this block. Do not infer handedness from player name, batting side tendency, position, or pitching stats. If the value is Unknown or ambiguous, omit handedness.`;
+  return lines.join('\n') + '\n';
 }
 
 function buildAnalysisPrompt(bundle, options = {}) {
@@ -664,6 +546,7 @@ function buildAnalysisPrompt(bundle, options = {}) {
   const pitching = (bundle.pitching || []).filter(p => !p.is_our_team);
 
   const { gameLocation = null, gameDate = null } = options;
+  const coachContextBlock = buildCoachContextBlock(options);
 
   const pgData      = getPGDataForTeam(team.team_name);
   const pitcherVelo = pgData ? pgData.pitcherVelo : {};
@@ -689,7 +572,7 @@ function buildAnalysisPrompt(bundle, options = {}) {
   ).join('\n');
 
   const battingStr = batting.slice(0, 15).map(b =>
-    `${appendHandednessToName(bundle, b.player_name, 'batter')}: ${b.games}G ${b.total_ab}AB ${b.total_h}H ` +
+    `${b.player_name}: ${b.games}G ${b.total_ab}AB ${b.total_h}H ` +
     `${b.total_2b ?? 0}2B ${b.total_3b ?? 0}3B ${b.total_hr ?? 0}HR ${b.total_rbi}RBI ` +
     `${b.total_bb}BB ${b.total_so}SO ${b.total_hbp ?? 0}HBP ` +
     `AVG:${fmtAvg(b.batting_avg)} OBP:${fmtAvg(b.obp)} SLG:${fmtAvg(b.slg)}`
@@ -701,7 +584,7 @@ function buildAnalysisPrompt(bundle, options = {}) {
       const d = sd[c];
       return d ? `${c}:Sw${d.swing_pct}%/TK${d.take_k_pct}%` : '';
     }).filter(Boolean).join(' ');
-    return `${appendHandednessToName(bundle, p.player_name, 'batter')}: GB%:${fmtNum(p.gb_pct,1)} FB%:${fmtNum(p.fb_pct,1)} LD%:${fmtNum(p.ld_pct,1)} ` +
+    return `${p.player_name}: GB%:${fmtNum(p.gb_pct,1)} FB%:${fmtNum(p.fb_pct,1)} LD%:${fmtNum(p.ld_pct,1)} ` +
            `K%:${fmtNum(p.k_pct,1)} BB%:${fmtNum(p.bb_pct,1)} BA/RISP:${fmtAvg(p.ba_risp)} ` +
            `Spray[LF:${fmtNum(p.spray_lf_pct,0)}% CF:${fmtNum(p.spray_cf_pct,0)}% RF:${fmtNum(p.spray_rf_pct,0)}% ` +
            `Pull3B:${fmtNum(p.spray_3b_pct,0)}% SS:${fmtNum(p.spray_ss_pct,0)}% ` +
@@ -712,24 +595,23 @@ function buildAnalysisPrompt(bundle, options = {}) {
   const pitchingStr = pitching.slice(0, 8).map(p => {
     const velo = pitcherVelo[p.player_name];
     const veloNote = velo && velo.veloString ? ` [${velo.veloString}]` : '';
-    return `${appendHandednessToName(bundle, p.player_name, 'pitcher')}: ${p.games}G ${p.total_ip}IP BF:${p.total_bf ?? '?'} ` +
+    return `${p.player_name}: ${p.games}G ${p.total_ip}IP BF:${p.total_bf ?? '?'} ` +
       `H:${p.total_h} R:${p.total_r} ER:${p.total_er} BB:${p.total_bb} SO:${p.total_so} ` +
       `ERA:${fmtNum(p.era)} WHIP:${fmtNum(p.whip,3)} K/BB:${fmtNum(p.k_bb_ratio)}${veloNote}`;
   }).join('\n');
 
   const advPitchingStr = (bundle.ourPitchers || []).map(p =>
-    `${appendHandednessToName(bundle, p.player_name, 'pitcher')}: S%:${fmtNum(p.s_pct,1)} SO/7:${fmtNum(p.so_per7)} BB/7:${fmtNum(p.bb_per7)} ` +
+    `${p.player_name}: S%:${fmtNum(p.s_pct,1)} SO/7:${fmtNum(p.so_per7)} BB/7:${fmtNum(p.bb_per7)} ` +
     `GB%:${fmtNum(p.gb_pct,1)} FB%:${fmtNum(p.fb_pct,1)} GO/AO:${fmtNum(p.go_ao)} ` +
     `P/IP:${fmtNum(p.p_per_ip,1)} WP:${p.wp ?? 0} BK:${p.bk ?? 0}`
   ).join('\n');
 
   const oppPitStr = (oppPitchers || []).map(p =>
-    `${appendHandednessToName(bundle, p.player_name, 'pitcher')}: S%:${fmtNum(p.s_pct,1)} SO/7:${fmtNum(p.so_per7)} BB/7:${fmtNum(p.bb_per7)} ` +
+    `${p.player_name}: S%:${fmtNum(p.s_pct,1)} SO/7:${fmtNum(p.so_per7)} BB/7:${fmtNum(p.bb_per7)} ` +
     `GB%:${fmtNum(p.gb_pct,1)} ERA:${fmtNum(p.era)} WHIP:${fmtNum(p.whip,3)}`
   ).join('\n');
 
   const verifiedFactsBlock = buildVerifiedFactsBlock(bundle, batting, pitching);
-  const verifiedHandednessBlock = buildVerifiedHandednessBlock(bundle);
 
   // ── PitchSmart Analysis ──────────────────────────────────────────────────
   const pitchSmart = computePitchSmartEligibility(bundle, options);
@@ -827,12 +709,11 @@ ${Object.keys(pitcherVelo).length > 0
 
 ${verifiedFactsBlock}
 
-${verifiedHandednessBlock}
-
 ${pitchSmartStr}
 
 ${weatherSection}
 
+${coachContextBlock}
 Return this EXACT JSON schema — fill every field, null if truly unknown:
 
 {
@@ -840,7 +721,8 @@ Return this EXACT JSON schema — fill every field, null if truly unknown:
     "teamName": "string",
     "gamesAnalyzed": number,
     "dataConfidence": "low|medium|high",
-    "confidenceNote": "one sentence on confidence based on sample size"
+    "confidenceNote": "one sentence on confidence based on sample size",
+    "coachContextNote": "one sentence acknowledging and addressing the coach's notes/custom request above, or null if none were provided"
   },
   "overallSummary": "2-3 sentence executive summary of this team's identity",
   "record": { "wins": number, "losses": number, "winPct": number },
@@ -992,8 +874,11 @@ async function analyzeTeam(teamId, options = {}) {
   console.log(`[analyzer] Scouted batters (advanced): ${(bundle.playerAdvanced || []).length}`);
   console.log(`[analyzer] Scouted pitchers (advanced): ${(bundle.ourPitchers || []).length}`);
   console.log(`[analyzer] Opp pitchers faced: ${(bundle.oppPitchers || []).length}`);
-  if (options.gameLocation) console.log(`[analyzer] Game location: ${options.gameLocation}`);
-  if (options.gameDate)     console.log(`[analyzer] Game date: ${options.gameDate}`);
+  if (options.gameLocation)       console.log(`[analyzer] Game location: ${options.gameLocation}`);
+  if (options.gameDate)           console.log(`[analyzer] Game date: ${options.gameDate}`);
+  if (options.gameTime)           console.log(`[analyzer] Game time: ${options.gameTime}`);
+  if (options.humanObservations)  console.log(`[analyzer] Coach observations provided (${options.humanObservations.length} chars)`);
+  if (options.customPrompt)       console.log(`[analyzer] Custom prompt provided (${options.customPrompt.length} chars)`);
 
   if (bundle.meta.gamesAnalyzed === 0) {
     throw new Error(`${bundle.team.team_name} has no games yet. Run the scraper first.`);
@@ -1008,8 +893,12 @@ async function analyzeTeam(teamId, options = {}) {
   analysis._gameContext = {
     gameLocation: options.gameLocation || null,
     gameDate: pitchSmart.referenceDate || options.gameDate || null,
+    gameTime: options.gameTime || null,
+    humanObservations: options.humanObservations || null,
+    customPrompt: options.customPrompt || null,
   };
 
+  analysis._reportType  = 'opponent';
   analysis._bundle      = bundle;
   analysis._teamId      = teamId;
   analysis._generatedAt = new Date().toISOString();
@@ -1062,4 +951,396 @@ async function analyzeAllTeams(options = {}) {
   return results;
 }
 
-module.exports = { analyzeTeam, analyzeAllTeams, callClaude, buildAnalysisPrompt, parseClaudeJson, extractJsonCandidate, computePitchSmartEligibility };
+// ─── Self-Scout Report ──────────────────────────────────────────────────────
+// A self-scout report turns OUR OWN GameChanger data into coaching decisions:
+// what do we do, what will opponents notice, what should we fix/exploit before
+// the next game. It is the mirror image of the opponent report — it reads the
+// is_our_team=true rows instead of is_our_team=false.
+
+const SELF_SCOUT_SYSTEM_PROMPT = `You are Voodoo Scout, an elite baseball intelligence analyst. You are writing a SELF-SCOUTING report for a coach about his own team.
+
+The purpose of a self-scout report is different from an opponent report: it is not a stat dump. It must turn the team's own data into coaching decisions. It should answer "what do we actually do, what will opponents notice about us, and what should we fix or exploit before the next game?" Every section should end in something a coach can act on this week.
+
+You respond ONLY with valid JSON matching the exact schema requested. No preamble, no markdown, no explanation outside the JSON. Numbers should be numbers, not strings. Use null for unknown values, and an empty array (not null) when a list has no items.`;
+
+function buildSelfScoutPrompt(bundle, options = {}) {
+  const { team, games, meta, playerAdvanced = [], ourPitchers = [] } = bundle;
+  const { gameLocation = null, gameDate = null } = options;
+  const coachContextBlock = buildCoachContextBlock(options);
+
+  // Self-scout reads is_our_team=true rows — the mirror of the opponent
+  // report's `!b.is_our_team` filter. See buildAnalysisPrompt for the
+  // Supabase-boolean-vs-SQLite-integer note; same falsy-check applies here.
+  const batting  = (bundle.batting  || []).filter(b => b.is_our_team);
+  const pitching = (bundle.pitching || []).filter(p => p.is_our_team);
+
+  const wins   = games.filter(g => g.result === 'W').length;
+  const losses = games.filter(g => g.result === 'L').length;
+  const ties   = games.filter(g => g.result === 'T').length;
+
+  const gamesStr = games.map(g =>
+    `${g.game_date || '?'} vs ${g.opponent_name || 'Unknown'}: ${g.result || '?'} ${g.score_us ?? '?'}-${g.score_them ?? '?'}`
+  ).join('\n');
+
+  const battingStr = batting.map(b =>
+    `${b.player_name}: ${b.games}G ${b.total_ab}AB ${b.total_h}H ` +
+    `${b.total_2b ?? 0}2B ${b.total_3b ?? 0}3B ${b.total_hr ?? 0}HR ${b.total_rbi}RBI ` +
+    `${b.total_bb}BB ${b.total_so}SO ${b.total_hbp ?? 0}HBP ${b.total_sb ?? 0}SB ` +
+    `AVG:${fmtAvg(b.batting_avg)} OBP:${fmtAvg(b.obp)} SLG:${fmtAvg(b.slg)}`
+  ).join('\n');
+
+  const advBattingStr = (playerAdvanced || []).map(p => {
+    const sd = p.swingDecisions || {};
+    const swingLine = ['0-0','1-0','0-2','1-2','3-2'].map(c => {
+      const d = sd[c];
+      return d ? `${c}:Sw${d.swing_pct}%/TK${d.take_k_pct}%` : '';
+    }).filter(Boolean).join(' ');
+    return `${p.player_name}: GB%:${fmtNum(p.gb_pct,1)} FB%:${fmtNum(p.fb_pct,1)} LD%:${fmtNum(p.ld_pct,1)} ` +
+           `K%:${fmtNum(p.k_pct,1)} BB%:${fmtNum(p.bb_pct,1)} BA/RISP:${fmtAvg(p.ba_risp)} ` +
+           `Spray[LF:${fmtNum(p.spray_lf_pct,0)}% CF:${fmtNum(p.spray_cf_pct,0)}% RF:${fmtNum(p.spray_rf_pct,0)}% ` +
+           `Pull3B:${fmtNum(p.spray_3b_pct,0)}% SS:${fmtNum(p.spray_ss_pct,0)}% 2B:${fmtNum(p.spray_2b_pct,0)}% ` +
+           `1B:${fmtNum(p.spray_1b_pct,0)}% P/C:${fmtNum(p.spray_pc_pct,0)}%] Counts[${swingLine}]`;
+  }).join('\n');
+
+  const pitchingStr = pitching.map(p =>
+    `${p.player_name}: ${p.games}G ${p.total_ip}IP BF:${p.total_bf ?? '?'} ` +
+    `H:${p.total_h} R:${p.total_r} ER:${p.total_er} BB:${p.total_bb} SO:${p.total_so} ` +
+    `ERA:${fmtNum(p.era)} WHIP:${fmtNum(p.whip,3)} K/BB:${fmtNum(p.k_bb_ratio)}`
+  ).join('\n');
+
+  const advPitchingStr = (ourPitchers || []).map(p =>
+    `${p.player_name}: S%:${fmtNum(p.s_pct,1)} SO/7:${fmtNum(p.so_per7)} BB/7:${fmtNum(p.bb_per7)} ` +
+    `GB%:${fmtNum(p.gb_pct,1)} FB%:${fmtNum(p.fb_pct,1)} GO/AO:${fmtNum(p.go_ao)} ` +
+    `P/IP:${fmtNum(p.p_per_ip,1)} WP:${p.wp ?? 0} BK:${p.bk ?? 0}`
+  ).join('\n');
+
+  const verifiedFactsBlock = buildVerifiedFactsBlock(bundle, batting, pitching);
+  const pitchSmart = computePitchSmartEligibility(bundle, options);
+
+  return `Analyze this team's OWN data and return a complete self-scouting JSON report. This is written for the coach of this team, not a report about an opponent.
+
+CRITICAL STAT ACCURACY REQUIREMENT:
+Use VERIFIED TEAM FACTS as the source of truth for all season totals. Do not cite raw play-event counts or all-game event distributions as team stats.
+
+TEAM: ${team.team_name}
+CLASSIFICATION: ${team.classification || 'Unknown'} | AGE: ${team.age_group || '?'}U
+GAMES ANALYZED: ${meta.gamesAnalyzed}
+GENERATED: ${meta.generatedAt}
+RECORD: ${wins}W-${losses}L${ties > 0 ? `-${ties}T` : ''}
+
+GAME RESULTS:
+${gamesStr || 'No game results available'}
+
+=== OUR BATTING (box score aggregates) ===
+${battingStr || 'No batting data'}
+
+=== OUR BATTING (advanced — GB/FB/LD, spray, swing decisions) ===
+${advBattingStr || 'No advanced batting data'}
+
+=== OUR PITCHING (box score aggregates) ===
+${pitchingStr || 'No pitching data'}
+
+=== OUR PITCHING (advanced — S%, SO/7, BB/7, batted ball) ===
+${advPitchingStr || 'No advanced pitching data'}
+
+${verifiedFactsBlock}
+
+${coachContextBlock}
+Return this EXACT JSON schema — fill every field, null/empty-array if truly unknown. Every section should end with a concrete coaching decision, not just numbers:
+
+{
+  "reportMeta": {
+    "teamName": "string",
+    "gamesAnalyzed": number,
+    "dataConfidence": "low|medium|high",
+    "confidenceNote": "one sentence",
+    "coachContextNote": "one sentence acknowledging the coach's notes/custom request above, or null if none were provided"
+  },
+  "executiveSummary": "2-4 sentences: are we winning with offense, pitching, defense, or chaos? What is our biggest strength? Biggest leak? What should we emphasize this week?",
+  "teamIdentity": {
+    "summary": "1-2 sentences on team identity",
+    "biggestStrength": "string",
+    "biggestLeak": "string",
+    "weeklyEmphasis": "string"
+  },
+  "offensiveProfile": {
+    "summary": "2-3 sentences on how this team actually hits, not just a stat list",
+    "teamAvg": number_or_null, "teamObp": number_or_null, "teamSlg": number_or_null, "teamOps": number_or_null,
+    "kPct": number_or_null, "bbPct": number_or_null, "gbPct": number_or_null, "fbPct": number_or_null, "ldPct": number_or_null,
+    "firstPitchSwingPct": number_or_null, "twoStrikeAvg": number_or_null, "risp": number_or_null,
+    "findings": ["string — how opponents should pitch us, based on the data", "string", "string"]
+  },
+  "hitterCards": [
+    { "name": "string", "role": "table-setter|run-producer|contact-bat|speed-pressure|developing-bat",
+      "strengths": ["string"], "concerns": ["string"], "coachingNote": "1-2 sentences: green light/take sign/two-strike approach" }
+  ],
+  "swingDecisions": {
+    "summary": "1-2 sentences",
+    "byCountNotes": ["string on first-pitch tendency", "string on two-strike approach", "string on 3-0/3-1 decisions"],
+    "recommendations": { "greenLight": ["name"], "takeSign": ["name"], "bunt": ["name"], "twoStrikeWork": ["name"], "passiveEarly": ["name"] }
+  },
+  "baserunning": {
+    "summary": "1-2 sentences on whether we create pressure efficiently",
+    "sbAttempts": number_or_null, "sbSuccessPct": number_or_null, "outsOnBases": number_or_null,
+    "whoShouldRunMore": ["name"], "whoShouldStopRunningBlindly": ["name"]
+  },
+  "pitchingStaff": {
+    "summary": "2-3 sentences on staff depth and command",
+    "staffEra": number_or_null, "staffWhip": number_or_null, "strikePct": number_or_null, "firstPitchStrikePct": number_or_null,
+    "bbRate": number_or_null, "hbpRate": number_or_null, "soRate": number_or_null,
+    "pitcherCards": [
+      { "name": "string", "profile": "string", "strengths": ["string"], "risks": ["string"], "usageRecommendation": "string" }
+    ]
+  },
+  "pitcherUsage": {
+    "bestStarterOptions": ["name"], "bestFireman": ["name"], "bestLowLeverage": ["name"], "notes": "1-2 sentences"
+  },
+  "defensiveProfile": {
+    "summary": "1-2 sentences on whether defensive issues are random or patterned",
+    "unearnedRuns": number_or_null, "notes": "one sentence — where are we giving away outs?"
+  },
+  "lineupConstruction": {
+    "philosophy": "1-2 sentences on lineup logic for this roster",
+    "recommended": [ { "slot": number, "name": "string", "reason": "string" } ]
+  },
+  "opponentView": {
+    "summary": "\"If I were scouting us, here is what I would tell the other coach.\"",
+    "attackPoints": ["string", "string", "string"]
+  },
+  "practicePriorities": ["string — this week's top practice priority", "string", "string"],
+  "dataQualityNotes": ["string — anything that limits confidence in this report, or empty array if none"]
+}`;
+}
+
+async function analyzeSelfScout(teamId, options = {}) {
+  console.log(`\n[analyzer] Preparing self-scout for team ${teamId}...`);
+
+  if (!options.skipRecalculate && typeof pipeline.recalculateTeamStats === 'function') {
+    console.log('[analyzer] Recalculating advanced stats (self-scout, inverted) before report bundle...');
+    // Self-scout reads is_our_team=true rows, so unless the team was already
+    // ingested inverted, this recalculation needs invertTeamSide=true. Callers
+    // can override via options.invertTeamSide if a given team was ingested
+    // the other way already.
+    await pipeline.recalculateTeamStats(teamId, {
+      invertTeamSide: options.invertTeamSide !== false,
+    });
+  }
+
+  const bundle = await pipeline.getTeamBundle(teamId);
+  if (!bundle || !bundle.team) throw new Error(`No team found with id: ${teamId}`);
+  if (bundle.meta.gamesAnalyzed === 0) {
+    throw new Error(`${bundle.team.team_name} has no games yet. Run the scraper first.`);
+  }
+
+  console.log(`[analyzer] Self-scout team: ${bundle.team.team_name} — ${bundle.meta.gamesAnalyzed} games`);
+  console.log(`[analyzer] Sending to Claude (${CLAUDE_MODEL})...`);
+
+  const analysis = await callClaude(SELF_SCOUT_SYSTEM_PROMPT, buildSelfScoutPrompt(bundle, options));
+
+  analysis._reportType  = 'self-scout';
+  analysis._bundle      = bundle;
+  analysis._teamId      = teamId;
+  analysis._generatedAt = new Date().toISOString();
+  analysis._gameContext = {
+    gameLocation: options.gameLocation || null,
+    gameDate: options.gameDate || null,
+    gameTime: options.gameTime || null,
+    humanObservations: options.humanObservations || null,
+    customPrompt: options.customPrompt || null,
+  };
+
+  console.log(`[analyzer] Self-scout done. Confidence: ${analysis.reportMeta?.dataConfidence}`);
+  return analysis;
+}
+
+// ─── Matchup Report ─────────────────────────────────────────────────────────
+// A matchup report combines OUR data and an OPPONENT's data into a single
+// game plan: given what we do and what they do, how do we win this specific
+// game? It is not two reports stapled together — every section should compare
+// the two datasets and land on a decision.
+
+const MATCHUP_SYSTEM_PROMPT = `You are Voodoo Scout, an elite baseball intelligence analyst. You are writing a MATCHUP report comparing OUR team against a specific upcoming OPPONENT.
+
+The purpose of a matchup report is different from a standalone scouting report: it must combine what we do and what they do into a single game plan for this specific game. Every section should compare the two datasets and land on a concrete decision — a starter recommendation, a bullpen plan, a "do not let this beat us" list, a pregame checklist. Do not just describe both teams separately; find the leverage points where our strength meets their weakness, and the risk points where their strength meets our weakness.
+
+You respond ONLY with valid JSON matching the exact schema requested. No preamble, no markdown, no explanation outside the JSON. Numbers should be numbers, not strings. Use null for unknown values, and an empty array (not null) when a list has no items.`;
+
+function buildMatchupPrompt(ourBundle, oppBundle, options = {}) {
+  const { gameLocation = null, gameDate = null } = options;
+  const coachContextBlock = buildCoachContextBlock(options);
+
+  const ourTeam = ourBundle.team;
+  const oppTeam = oppBundle.team;
+
+  // Mirror of buildSelfScoutPrompt / buildAnalysisPrompt filters.
+  const ourBatting  = (ourBundle.batting  || []).filter(b => b.is_our_team);
+  const ourPitching = (ourBundle.pitching || []).filter(p => p.is_our_team);
+  const oppBatting  = (oppBundle.batting  || []).filter(b => !b.is_our_team);
+  const oppPitching = (oppBundle.pitching || []).filter(p => !p.is_our_team);
+
+  const summarizeBatting = rows => rows.map(b =>
+    `${b.player_name}: ${b.games}G ${b.total_ab}AB ${b.total_h}H ${b.total_2b ?? 0}2B ${b.total_3b ?? 0}3B ${b.total_hr ?? 0}HR ` +
+    `${b.total_rbi}RBI ${b.total_bb}BB ${b.total_so}SO ${b.total_sb ?? 0}SB AVG:${fmtAvg(b.batting_avg)} OBP:${fmtAvg(b.obp)} SLG:${fmtAvg(b.slg)}`
+  ).join('\n');
+
+  const summarizePitching = rows => rows.map(p =>
+    `${p.player_name}: ${p.games}G ${p.total_ip}IP BF:${p.total_bf ?? '?'} H:${p.total_h} R:${p.total_r} ER:${p.total_er} ` +
+    `BB:${p.total_bb} SO:${p.total_so} ERA:${fmtNum(p.era)} WHIP:${fmtNum(p.whip,3)} K/BB:${fmtNum(p.k_bb_ratio)}`
+  ).join('\n');
+
+  const summarizeAdvBatting = rows => (rows || []).map(p =>
+    `${p.player_name}: GB%:${fmtNum(p.gb_pct,1)} FB%:${fmtNum(p.fb_pct,1)} K%:${fmtNum(p.k_pct,1)} BB%:${fmtNum(p.bb_pct,1)} ` +
+    `Spray[LF:${fmtNum(p.spray_lf_pct,0)}% CF:${fmtNum(p.spray_cf_pct,0)}% RF:${fmtNum(p.spray_rf_pct,0)}% Pull3B:${fmtNum(p.spray_3b_pct,0)}% SS:${fmtNum(p.spray_ss_pct,0)}%]`
+  ).join('\n');
+
+  const summarizeAdvPitching = rows => (rows || []).map(p =>
+    `${p.player_name}: S%:${fmtNum(p.s_pct,1)} SO/7:${fmtNum(p.so_per7)} BB/7:${fmtNum(p.bb_per7)} GB%:${fmtNum(p.gb_pct,1)} P/IP:${fmtNum(p.p_per_ip,1)}`
+  ).join('\n');
+
+  const pitchSmart = computePitchSmartEligibility(ourBundle, options);
+  const pitchSmartStr = (pitchSmart.pitchers || []).length
+    ? pitchSmart.pitchers.map(p =>
+        `${p.name}: ${p.pitches} pitches on ${p.mostRecentGameDate} → ` +
+        (p.isEligible ? `ELIGIBLE` : `NOT ELIGIBLE until ${p.eligibleDate}`)
+      ).join('\n')
+    : 'No recent pitch-count activity found for our staff in the lookback window.';
+
+  return `Build a matchup game plan comparing OUR team against our next OPPONENT. Return a complete JSON report.
+
+CRITICAL STAT ACCURACY REQUIREMENT: Use the box-score aggregates below as the source of truth for season totals on both sides. Do not invent numbers for either team.
+
+=== OUR TEAM: ${ourTeam.team_name} ===
+GAMES ANALYZED: ${ourBundle.meta.gamesAnalyzed}
+OUR BATTING:
+${summarizeBatting(ourBatting) || 'No batting data'}
+OUR BATTING (advanced):
+${summarizeAdvBatting(ourBundle.playerAdvanced) || 'No advanced batting data'}
+OUR PITCHING:
+${summarizePitching(ourPitching) || 'No pitching data'}
+OUR PITCHING (advanced):
+${summarizeAdvPitching(ourBundle.ourPitchers) || 'No advanced pitching data'}
+
+=== OPPONENT: ${oppTeam.team_name} (${oppTeam.classification || 'Unknown'} | ${oppTeam.age_group || '?'}U) ===
+GAMES ANALYZED: ${oppBundle.meta.gamesAnalyzed}
+THEIR BATTING:
+${summarizeBatting(oppBatting) || 'No batting data'}
+THEIR BATTING (advanced):
+${summarizeAdvBatting(oppBundle.playerAdvanced) || 'No advanced batting data'}
+THEIR PITCHING:
+${summarizePitching(oppPitching) || 'No pitching data'}
+THEIR PITCHING (advanced):
+${summarizeAdvPitching(oppBundle.ourPitchers) || 'No advanced pitching data'}
+
+=== OUR PITCHSMART / RECENT USAGE ===
+${pitchSmartStr}
+
+${coachContextBlock}
+Return this EXACT JSON schema — fill every field, null/empty-array if truly unknown. This must read as one game plan, not two reports stapled together:
+
+{
+  "reportMeta": {
+    "ourTeamName": "string", "opponentTeamName": "string",
+    "gamesAnalyzedOurs": number, "gamesAnalyzedOpponent": number,
+    "dataConfidence": "low|medium|high", "confidenceNote": "one sentence",
+    "coachContextNote": "one sentence acknowledging the coach's notes/custom request above, or null if none were provided"
+  },
+  "gamePlanSummary": {
+    "summary": "2-4 sentences a coach can read first and know the plan",
+    "winCondition": "what has to happen for us to win",
+    "biggestRisk": "what could beat us",
+    "offensivePlan": "how we should hit them",
+    "defensivePitchingPlan": "how we should pitch and align against them"
+  },
+  "ourStrengthsTheirWeaknesses": [
+    { "ourStrength": "string", "theirExploitableWeakness": "string", "recommendation": "string" }
+  ],
+  "theirStrengthsOurWeaknesses": [
+    { "theirStrength": "string", "ourExposure": "string", "recommendation": "string" }
+  ],
+  "pitchingPlan": {
+    "recommendedStarter": "name_or_null", "why": "string",
+    "plan": ["string", "string"], "pullTriggers": ["string", "string"]
+  },
+  "bullpenPlan": {
+    "ifLeading": ["name"], "ifTrailing": ["name"], "ifTraffic": ["name"], "avoidThisMatchup": ["name"], "notes": "1-2 sentences"
+  },
+  "offensiveAttackPlan": {
+    "firstTimeThrough": "string", "withRunnersOn": "string", "vsWildPitchers": "string", "vsStrikeThrowers": "string"
+  },
+  "hitterMatchupCards": [
+    { "name": "string", "role": "string", "plan": ["string"], "avoid": ["string"] }
+  ],
+  "opponentHitterCards": [
+    { "name": "string", "riskLevel": "high|medium|low", "pitchingPlan": ["string"] }
+  ],
+  "handednessMatchups": {
+    "notes": ["string — platoon advantages worth using, or empty array if handedness data is unavailable"]
+  },
+  "baserunningMatchup": {
+    "canWeRunOnThem": "string", "canTheyRunOnUs": "string", "whoShouldSteal": ["name"], "notes": "1-2 sentences"
+  },
+  "defensiveAlignment": {
+    "perHitter": [ { "name": "string", "tendency": "string", "alignment": "string" } ],
+    "teamPriority": ["string"]
+  },
+  "situationalPlan": {
+    "runnerOn1st0Outs": "string", "runnerOn2ndLessThan2Outs": "string", "twoOutsRunnersOn": "string", "lateInnings": "string"
+  },
+  "doNotLetThisBeatUs": ["string", "string", "string"],
+  "lineupRecommendation": {
+    "logic": "1-2 sentences",
+    "recommended": [ { "slot": number, "name": "string", "reason": "string" } ]
+  },
+  "pregameChecklist": ["string", "string", "string"],
+  "dataQualityNotes": ["string — anything limiting confidence on either side, or empty array if none"]
+}`;
+}
+
+async function analyzeMatchup(ourTeamId, opponentTeamId, options = {}) {
+  console.log(`\n[analyzer] Preparing matchup: our team ${ourTeamId} vs opponent ${opponentTeamId}...`);
+
+  if (!options.skipRecalculate && typeof pipeline.recalculateTeamStats === 'function') {
+    await pipeline.recalculateTeamStats(ourTeamId, { invertTeamSide: options.invertOurTeamSide !== false });
+    await pipeline.recalculateTeamStats(opponentTeamId, { invertTeamSide: options.invertOpponentTeamSide === true });
+  }
+
+  const [ourBundle, oppBundle] = await Promise.all([
+    pipeline.getTeamBundle(ourTeamId),
+    pipeline.getTeamBundle(opponentTeamId),
+  ]);
+
+  if (!ourBundle || !ourBundle.team) throw new Error(`No team found with id: ${ourTeamId}`);
+  if (!oppBundle || !oppBundle.team) throw new Error(`No team found with id: ${opponentTeamId}`);
+  if (ourBundle.meta.gamesAnalyzed === 0) throw new Error(`${ourBundle.team.team_name} has no games yet.`);
+  if (oppBundle.meta.gamesAnalyzed === 0) throw new Error(`${oppBundle.team.team_name} has no games yet. Scout them first.`);
+
+  console.log(`[analyzer] Our team: ${ourBundle.team.team_name} (${ourBundle.meta.gamesAnalyzed}g) vs Opponent: ${oppBundle.team.team_name} (${oppBundle.meta.gamesAnalyzed}g)`);
+  console.log(`[analyzer] Sending to Claude (${CLAUDE_MODEL})...`);
+
+  const analysis = await callClaude(MATCHUP_SYSTEM_PROMPT, buildMatchupPrompt(ourBundle, oppBundle, options));
+
+  analysis._reportType   = 'matchup';
+  analysis._ourBundle    = ourBundle;
+  analysis._oppBundle    = oppBundle;
+  analysis._bundle       = oppBundle; // kept for any shared helper that expects `_bundle`
+  analysis._ourTeamId    = ourTeamId;
+  analysis._opponentTeamId = opponentTeamId;
+  analysis._generatedAt  = new Date().toISOString();
+  analysis._gameContext  = {
+    gameLocation: options.gameLocation || null,
+    gameDate: options.gameDate || null,
+    gameTime: options.gameTime || null,
+    humanObservations: options.humanObservations || null,
+    customPrompt: options.customPrompt || null,
+  };
+
+  console.log(`[analyzer] Matchup done. Confidence: ${analysis.reportMeta?.dataConfidence}`);
+  return analysis;
+}
+
+module.exports = {
+  analyzeTeam, analyzeAllTeams, callClaude, buildAnalysisPrompt, parseClaudeJson, extractJsonCandidate, computePitchSmartEligibility,
+  analyzeSelfScout, buildSelfScoutPrompt,
+  analyzeMatchup, buildMatchupPrompt,
+  buildCoachContextBlock,
+};

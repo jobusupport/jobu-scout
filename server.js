@@ -794,22 +794,64 @@ app.post('/api/run/reingest', requireAuth, async (req, res) => {
   res.json({ jobId: id });
 });
 
-// POST /api/run/report  { teamId, gameLocation?, gameDate? }
+// Shared env-var builder for the coach-context fields every /api/run/*
+// report-generating route now accepts: gameLocation, gameDate, gameTime,
+// humanObservations, gameScope, customPrompt. gameScope is informational
+// (which endpoint was used drives actual behavior) but is passed through so
+// generate-report.js can log/echo it.
+function buildReportContextEnv(body = {}) {
+  const { gameLocation, gameDate, gameTime, humanObservations, gameScope, customPrompt } = body;
+  const env = {};
+  if (gameLocation)      env.GAME_LOCATION      = gameLocation;
+  if (gameDate)           env.GAME_DATE          = gameDate;
+  if (gameTime)           env.GAME_TIME          = gameTime;
+  if (humanObservations)  env.HUMAN_OBSERVATIONS = humanObservations;
+  if (gameScope)          env.GAME_SCOPE         = gameScope;
+  if (customPrompt)       env.CUSTOM_PROMPT      = customPrompt;
+  return env;
+}
+
+// POST /api/run/report  { teamId, gameLocation?, gameDate?, gameTime?, humanObservations?, gameScope?, customPrompt? }
 app.post('/api/run/report', requireAuth, async (req, res) => {
-  const { teamId, gameLocation, gameDate } = req.body;
+  const { teamId } = req.body;
   const team = (await getTeams(req)).find(t => t.id == teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
   const id = createJob(`Report — ${team.team_name}`);
   appendLog(id, `Generating scouting report for: ${team.team_name}`);
-  if (gameLocation) appendLog(id, `Game location: ${gameLocation}`);
-  const env = {};
-  if (gameLocation) env.GAME_LOCATION = gameLocation;
-  if (gameDate)     env.GAME_DATE     = gameDate;
+  if (req.body.gameLocation) appendLog(id, `Game location: ${req.body.gameLocation}`);
+  if (req.body.gameTime)     appendLog(id, `Game time: ${req.body.gameTime}`);
+  if (req.body.humanObservations) appendLog(id, `Coach observations provided (${req.body.humanObservations.length} chars)`);
+  if (req.body.customPrompt)      appendLog(id, `Custom prompt provided (${req.body.customPrompt.length} chars)`);
+  const env = buildReportContextEnv(req.body);
   spawnJob(id, 'node', ['src/generate-report.js', team.team_name], ROOT, env);
   res.json({ jobId: id });
 });
 
-// POST /api/run/full-pipeline  { teamId, gameLocation?, gameDate? }
+// POST /api/run/self-scout  { gameLocation?, gameDate?, gameTime?, humanObservations?, customPrompt?, ourTeamId? }
+app.post('/api/run/self-scout', requireAuth, async (req, res) => {
+  const id = createJob('Self-Scout Report');
+  appendLog(id, 'Generating self-scout report for our own team');
+  const env = buildReportContextEnv({ ...req.body, gameScope: 'self' });
+  if (req.body.ourTeamId) env.OUR_TEAM_ID = req.body.ourTeamId;
+  spawnJob(id, 'node', ['src/generate-report.js', '--self-scout'], ROOT, env);
+  res.json({ jobId: id });
+});
+
+// POST /api/run/matchup  { teamId, gameLocation?, gameDate?, gameTime?, humanObservations?, customPrompt?, ourTeamId? }
+// teamId is the OPPONENT team we're building the matchup game plan against.
+app.post('/api/run/matchup', requireAuth, async (req, res) => {
+  const { teamId } = req.body;
+  const team = (await getTeams(req)).find(t => t.id == teamId);
+  if (!team) return res.status(404).json({ error: 'Opponent team not found' });
+  const id = createJob(`Matchup — ${team.team_name}`);
+  appendLog(id, `Generating matchup report: our team vs ${team.team_name}`);
+  const env = buildReportContextEnv({ ...req.body, gameScope: 'matchup' });
+  if (req.body.ourTeamId) env.OUR_TEAM_ID = req.body.ourTeamId;
+  spawnJob(id, 'node', ['src/generate-report.js', '--matchup', team.team_name], ROOT, env);
+  res.json({ jobId: id });
+});
+
+// POST /api/run/full-pipeline  { teamId, gameLocation?, gameDate?, gameTime?, humanObservations?, gameScope?, customPrompt? }
 app.post('/api/run/full-pipeline', requireAuth, async (req, res) => {
   const { teamId, gameLocation, gameDate } = req.body;
   const team = (await getTeams(req)).find(t => t.id == teamId);
@@ -836,9 +878,7 @@ app.post('/api/run/full-pipeline', requireAuth, async (req, res) => {
       appendLog(id, '── Step 3/4: Reingest & Stats ──');
       await runStep('node', ['reingest-games.js', team.team_name], ROOT);
       appendLog(id, '── Step 4/4: Generate Report ──');
-      const reportEnv = {};
-      if (gameLocation) reportEnv.GAME_LOCATION = gameLocation;
-      if (gameDate)     reportEnv.GAME_DATE     = gameDate;
+      const reportEnv = buildReportContextEnv(req.body);
       await runStep('node', ['src/generate-report.js', team.team_name], ROOT, reportEnv);
       finishJob(id, true, 0);
       appendLog(id, `✓ Pipeline complete for ${team.team_name}`);
