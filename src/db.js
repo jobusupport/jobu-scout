@@ -730,6 +730,49 @@ function getTeamJerseyMap(teamId) {
 }
 
 /**
+ * Empirical batting-order tendency per player, from actual lineup cards in
+ * the last N scouted games (batting_lines.batting_order is captured per
+ * game/player at ingest time — see insertBattingLines). This is real data,
+ * not an estimate: use it in preference to inferring order from stat roles.
+ */
+function getTeamLineupOrder(teamId, lastNGames = 10) {
+  const db = getDb();
+
+  const recentGameIds = db.prepare(`
+    SELECT DISTINCT game_id FROM batting_lines
+    WHERE team_id = ? AND is_our_team = 0 AND batting_order IS NOT NULL
+    ORDER BY game_id DESC
+    LIMIT ?
+  `).all(teamId, lastNGames).map(r => r.game_id);
+
+  if (!recentGameIds.length) return [];
+
+  const placeholders = recentGameIds.map(() => '?').join(',');
+
+  return db.prepare(`
+    SELECT
+      player_name,
+      ROUND(AVG(batting_order), 1) AS avg_order,
+      COUNT(*) AS starts,
+      (
+        SELECT batting_order FROM batting_lines bl2
+        WHERE bl2.player_name = bl.player_name
+          AND bl2.team_id = bl.team_id AND bl2.is_our_team = 0
+          AND bl2.game_id IN (${placeholders})
+        GROUP BY batting_order
+        ORDER BY COUNT(*) DESC, batting_order ASC
+        LIMIT 1
+      ) AS most_common_order
+    FROM batting_lines bl
+    WHERE team_id = ? AND is_our_team = 0
+      AND batting_order IS NOT NULL AND batting_order > 0
+      AND game_id IN (${placeholders})
+    GROUP BY player_name
+    ORDER BY avg_order ASC
+  `).all(...recentGameIds, teamId, ...recentGameIds);
+}
+
+/**
  * Get play-by-play tendencies: event type distribution for a team.
  */
 function getTeamPlayTendencies(teamId) {
@@ -777,6 +820,7 @@ function getTeamAnalysisBundle(teamId) {
   const recentPitchingLines = getRecentPitchingLines(teamId);
   const jerseyMap = getTeamJerseyMap(teamId);
   const activeRoster = getActiveRosterPlayers(teamId, 10, 1);
+  const lineupOrder = getTeamLineupOrder(teamId, 10);
 
   // Report convention: when scouting an opponent team's own GC page, that
   // scouted team's players are stored as is_our_team=0. The teams they faced
@@ -796,6 +840,7 @@ function getTeamAnalysisBundle(teamId) {
     recentPitchingLines,
     jerseyMap,
     activeRoster,     // { players: Set<string>, gameCount, totalGamesWindow }
+    lineupOrder,      // real batting-order tendency per player (see getTeamLineupOrder)
     playerAdvanced:  scoutedBattersAdv,  // advanced batting for scouted team
     ourPitchers:     scoutedPitchersAdv, // advanced pitching for scouted team
     oppPitchers:     facedPitchersAdv,   // pitchers from teams the scouted team faced
@@ -846,6 +891,18 @@ function upsertPlayerAdvancedStats(teamId, playerName, isOurTeam, stats) {
 
   const sd = s.swingDecisions ? JSON.stringify(s.swingDecisions) : null;
 
+  // Real spray-zone split by ball-strike count at contact (see
+  // stats-engine.js sprayByCount / sprayPctEarly / sprayPct2K) — stored as
+  // one JSON blob, same pattern as swing_decisions, rather than 14+ new
+  // columns. Requires a migration:
+  //   ALTER TABLE player_advanced_stats ADD COLUMN spray_by_count TEXT;
+  const sprayByCount = (s.sprayPctEarly || s.sprayPct2K)
+    ? JSON.stringify({
+        early:     { pct: s.sprayPctEarly ?? {}, n: s.sprayEarlyN ?? 0 },
+        twoStrike: { pct: s.sprayPct2K    ?? {}, n: s.spray2KN    ?? 0 },
+      })
+    : null;
+
   db.prepare(`
     INSERT INTO player_advanced_stats (
       team_id, player_name, is_our_team,
@@ -854,8 +911,9 @@ function upsertPlayerAdvancedStats(teamId, playerName, isOurTeam, stats) {
       spray_lf, spray_cf, spray_rf, spray_3b, spray_ss, spray_2b, spray_1b, spray_pc,
       spray_lf_pct, spray_cf_pct, spray_rf_pct, spray_3b_pct,
       spray_ss_pct, spray_2b_pct, spray_1b_pct, spray_pc_pct,
+      spray_by_count,
       risp_ab, risp_h, ba_risp,
-      swing_decisions, k_pct, bb_pct, errors, bunts
+      swing_decisions, k_pct, bb_pct, errors
     ) VALUES (
       @teamId, @playerName, @isOurTeam,
       @games, @totalPitches,
@@ -863,8 +921,9 @@ function upsertPlayerAdvancedStats(teamId, playerName, isOurTeam, stats) {
       @sprayLf, @sprayCf, @sprayRf, @spray3b, @spraySs, @spray2b, @spray1b, @sprayPc,
       @sprayLfPct, @sprayCfPct, @sprayRfPct, @spray3bPct,
       @spraySsPct, @spray2bPct, @spray1bPct, @sprayPcPct,
+      @sprayByCount,
       @rispAb, @rispH, @baRisp,
-      @swingDecisions, @kPct, @bbPct, @errors, @bunts
+      @swingDecisions, @kPct, @bbPct, @errors
     )
     ON CONFLICT(team_id, player_name, is_our_team) DO UPDATE SET
       games         = excluded.games,
@@ -880,11 +939,11 @@ function upsertPlayerAdvancedStats(teamId, playerName, isOurTeam, stats) {
       spray_rf_pct = excluded.spray_rf_pct, spray_3b_pct = excluded.spray_3b_pct,
       spray_ss_pct = excluded.spray_ss_pct, spray_2b_pct = excluded.spray_2b_pct,
       spray_1b_pct = excluded.spray_1b_pct, spray_pc_pct = excluded.spray_pc_pct,
+      spray_by_count = excluded.spray_by_count,
       risp_ab = excluded.risp_ab, risp_h = excluded.risp_h, ba_risp = excluded.ba_risp,
       swing_decisions = excluded.swing_decisions,
       k_pct = excluded.k_pct, bb_pct = excluded.bb_pct,
       errors = excluded.errors,
-	  bunts = excluded.bunts,
       generated_at = datetime('now')
   `).run({
     teamId, playerName, isOurTeam: isOurTeam ? 1 : 0,
@@ -901,11 +960,11 @@ function upsertPlayerAdvancedStats(teamId, playerName, isOurTeam, stats) {
     sprayRfPct: s.sprayPct?.RF ?? null,  spray3bPct: s.sprayPct?.['3B'] ?? null,
     spraySsPct: s.sprayPct?.SS ?? null,  spray2bPct: s.sprayPct?.['2B'] ?? null,
     spray1bPct: s.sprayPct?.['1B'] ?? null, sprayPcPct: s.sprayPct?.P ?? null,
+    sprayByCount,
     rispAb: s.RISP_AB ?? 0, rispH: s.RISP_H ?? 0, baRisp: s.BA_RISP ?? null,
     swingDecisions: sd,
     kPct: s.K_pct ?? null, bbPct: s.BB_pct ?? null,
     errors: s.E ?? 0,
-	bunts: s.BUNT ?? 0,
   });
 }
 
@@ -1015,6 +1074,7 @@ module.exports = {
   getTeamGameResults,
   getTeamAnalysisBundle,
   getActiveRosterPlayers,
+  getTeamLineupOrder,
   // Reports
   insertScoutingReport,
   // Advanced stats

@@ -34,15 +34,6 @@
 const EVENT_STARTERS = [
   'Home Run', "Fielder's Choice", 'Hit By Pitch',
   'Strikeout', 'Ground Out', 'Line Out', 'Fly Out', 'Pop Out', 'Foul Out',
-  // Double Play / Triple Play must be listed (and therefore checked, since
-  // EVENT_STARTERS is sorted longest-first below) before the plain
-  // 'Double' / 'Triple' entries. GameChanger's "Double Play" badge starts
-  // with the literal word "Double", so without a longer, more specific
-  // match ahead of it, a batter who grounded into a double play (an OUT)
-  // was being classified as eventType 'Double' — crediting them with an
-  // extra-base HIT in the actual batting stat totals (H, doubles, AVG,
-  // SLG all directly consume this eventType below).
-  'Double Play', 'Triple Play',
   'Single', 'Double', 'Triple', 'Walk',
   'Sacrifice', 'Sac Fly', 'Sac Bunt', 'Intentional Walk',
   'Error', 'Pickoff',
@@ -88,7 +79,7 @@ const BATTED_BALL_TYPES = {
 };
 
 const HIT_EVENTS     = new Set(['Single','Double','Triple','Home Run']);
-const OUT_EVENTS     = new Set(['Ground Out','Fly Out','Line Out','Pop Out','Foul Out',"Fielder's Choice",'Double Play','Triple Play']);
+const OUT_EVENTS     = new Set(['Ground Out','Fly Out','Line Out','Pop Out','Foul Out',"Fielder's Choice"]);
 const AB_EVENTS      = new Set([...HIT_EVENTS, ...OUT_EVENTS, 'Strikeout', 'Error']);
 const NON_AB_EVENTS  = new Set(['Walk','Hit By Pitch','Sacrifice','Sac Fly','Sac Bunt','Intentional Walk']);
 
@@ -186,14 +177,6 @@ function parsePA(rawText) {
   // Detect scoring play
   const rbi = (text.match(/\bscores\b/gi) || []).length;
 
-  // Bunt detection, deliberately independent of eventType — GC only labels
-  // a play "Sac Bunt" for a textbook sacrifice. A bunt for a hit, a bunt
-  // that becomes a fielder's choice/ground out/pop out, or a failed bunt
-  // attempt still contains the word "bunt" in the narrative even though its
-  // primary event is Single/Ground Out/Fielder's Choice/Pop Out. Scanning
-  // the whole text (not just narrativePart) catches all of these.
-  const isBunt = /\bbunt/i.test(text);
-
   return {
     eventType,
     batter,
@@ -210,7 +193,6 @@ function parsePA(rawText) {
     pickoffs,
     hasRISP,
     rbi,
-    isBunt,
     rawText: text,
   };
 }
@@ -473,6 +455,13 @@ function emptyPlayerStats(name) {
     GB: 0, FB: 0, LD: 0, battedBalls: 0,
     // Spray zones
     spray: { LF:0, CF:0, RF:0, '3B':0, SS:0, '2B':0, '1B':0, P:0, C:0 },
+    // Spray zones split by ball-strike count at the moment of contact —
+    // real measured location data, not inferred from swing behavior.
+    // See the in-play pitch's countBefore, attributed just below.
+    sprayByCount: {
+      early:      { LF:0, CF:0, RF:0, '3B':0, SS:0, '2B':0, '1B':0, P:0, C:0 },
+      twoStrike:  { LF:0, CF:0, RF:0, '3B':0, SS:0, '2B':0, '1B':0, P:0, C:0 },
+    },
     // Count-by-count swing decisions
     // counts[count] = { swing, take_k, total }
     counts: {},
@@ -481,10 +470,6 @@ function emptyPlayerStats(name) {
     // Situational
     RISP_AB: 0, RISP_H: 0,
     twoOut_AB: 0, twoOut_H: 0, twoOut_RBI: 0,
-	// Find this line:
-	BB: 0, SO: 0, HBP: 0, SF: 0, SAC: 0,
-	// Change to:
-	BB: 0, SO: 0, HBP: 0, SF: 0, SAC: 0, BUNT: 0,
     // Game log
     games: new Set(),
   };
@@ -782,7 +767,6 @@ function processGames(games) {
       if (pa.eventType === 'Hit By Pitch') batter.HBP++;
       if (pa.eventType === 'Sac Fly')   batter.SF++;
       if (pa.eventType === 'Sacrifice' || pa.eventType === 'Sac Bunt') batter.SAC++;
-	  if (pa.isBunt) batter.BUNT++;
       batter.RBI += pa.rbi || 0;
       batter.SB  += pa.sbCount || 0;
       batter.CS  += pa.csCount || 0;
@@ -799,6 +783,18 @@ function processGames(games) {
       // Spray zone
       if (pa.sprayZone && batter.spray[pa.sprayZone] !== undefined) {
         batter.spray[pa.sprayZone]++;
+
+        // Attribute to early-count vs two-strike bucket using the actual
+        // ball-strike count at the moment the ball was put in play — not a
+        // proxy. countBefore is "balls-strikes", e.g. "1-2".
+        const inPlayPitch = pa.pitches.find(p => p.type === 'in_play');
+        if (inPlayPitch && inPlayPitch.countBefore) {
+          const strikesAtContact = parseInt(inPlayPitch.countBefore.split('-')[1], 10);
+          const bucket = Number.isFinite(strikesAtContact) && strikesAtContact >= 2
+            ? batter.sprayByCount.twoStrike
+            : batter.sprayByCount.early;
+          bucket[pa.sprayZone]++;
+        }
       }
 
       // RISP
@@ -904,6 +900,23 @@ function finalizeStats(statMap) {
       s.sprayPct[zone] = totalZone > 0 ? +(count / totalZone * 100).toFixed(1) : 0;
     }
 
+    // Spray zone percentages split by count — real measured location data
+    // (see sprayByCount attribution above), not inferred from swing%.
+    function sprayBucketPct(bucket = {}) {
+      const total = Object.values(bucket).reduce((a, b) => a + b, 0);
+      const pct = {};
+      for (const [zone, count] of Object.entries(bucket)) {
+        pct[zone] = total > 0 ? +(count / total * 100).toFixed(1) : 0;
+      }
+      return { pct, n: total };
+    }
+    const earlyBucket = sprayBucketPct(s.sprayByCount?.early);
+    const twoKBucket   = sprayBucketPct(s.sprayByCount?.twoStrike);
+    s.sprayPctEarly = earlyBucket.pct;
+    s.sprayEarlyN   = earlyBucket.n;
+    s.sprayPct2K    = twoKBucket.pct;
+    s.spray2KN      = twoKBucket.n;
+
     // Swing decisions table (matching Bob Jones format)
     s.swingDecisions = {};
     const ALL_COUNTS = ['0-0','0-1','0-2','1-0','1-1','1-2','2-0','2-1','2-2','3-0','3-1','3-2'];
@@ -942,6 +955,7 @@ function finalizeStats(statMap) {
     // Clean up internal accumulators
     delete s.counts;
     delete s.spray;
+    delete s.sprayByCount;
     delete s.battedBalls;
 
     result[name] = s;

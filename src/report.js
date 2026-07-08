@@ -17,8 +17,8 @@ const fs   = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const { getPGDataForTeam } = require('./pg-reader');
-const { classifyHitter } = require('./defensive-alignment');
 const DESIGN = require('./design/jobu-design-system');
+const { POSITIONS: ALIGN_POSITIONS, buildAlignmentRows } = require('./defensive-alignment');
 
 // ─── Fan/Wedge Spray Chart SVG (Bob Jones style) ──────────────────────────────
 // Draws a baseball field fan with shaded wedges sized by zone percentage.
@@ -240,7 +240,7 @@ function calcBattingMetrics(line = {}, playerStats = {}, adv = {}) {
   const kPct = pa > 0 ? (so / pa * 100) : firstNum(adv.k_pct, playerStats.k_pct);
   const bbPct = pa > 0 ? (bb / pa * 100) : firstNum(adv.bb_pct, playerStats.bb_pct);
   const gbPct = firstNum(adv.gb_pct, playerStats.gb_pct);
-  const bunts = firstNum(adv.bunts, playerStats.bunts, line.total_sac);
+  const bunts = firstNum(adv.sac_count, line.total_sac, playerStats.sac_count, playerStats.bunts);
 
   return { ab, h, bb, hbp, sac, so, hr, dbl, tpl, sb, pa, xbh, avg, obp, slg, ops, kPct, bbPct, gbPct, bunts };
 }
@@ -343,11 +343,9 @@ async function buildDocx(analysis, outputPath) {
     return cell(text, { width, bold: true, color: WHITE, bg: NAVY, size: 17, align: AlignmentType.CENTER, ...opts });
   }
 
-  function sectionHeading(text, opts = {}) {
-    const { pageBreakBefore = false } = opts;
+  function sectionHeading(text) {
     return new Paragraph({
       heading: HeadingLevel.HEADING_1,
-      pageBreakBefore,
       spacing: { before: 240, after: 100 },
       border:  { bottom: { style: BorderStyle.SINGLE, size: 8, color: GOLD, space: 1 } },
       children: [new TextRun({ text, bold: true, color: NAVY, size: 26, font: 'Calibri' })],
@@ -666,10 +664,9 @@ async function buildDocx(analysis, outputPath) {
       const m = calcBattingMetrics(b, {}, getAdv(b.player_name));
       t.pa += m.pa; t.ab += m.ab; t.h += m.h; t.so += m.so; t.bb += m.bb; t.hbp += m.hbp;
       t.hr += m.hr; t.dbl += m.dbl; t.tpl += m.tpl; t.xbh += m.xbh; t.sb += m.sb; t.sac += m.sac;
-      t.bunts += (m.bunts || 0);
       t.gb += toNum(getAdv(b.player_name).gb); t.battedBalls += toNum(getAdv(b.player_name).batted_balls);
       return t;
-    }, { pa:0, ab:0, h:0, so:0, bb:0, hbp:0, hr:0, dbl:0, tpl:0, xbh:0, sb:0, sac:0, bunts:0, gb:0, battedBalls:0 });
+    }, { pa:0, ab:0, h:0, so:0, bb:0, hbp:0, hr:0, dbl:0, tpl:0, xbh:0, sb:0, sac:0, gb:0, battedBalls:0 });
     const totPA = totals.pa, totAB = totals.ab, totH = totals.h, totSO = totals.so, totBB = totals.bb, totHBP = totals.hbp;
     const totHR = totals.hr, tot2B = totals.dbl, tot3B = totals.tpl, totXBH = totals.xbh, totSB = totals.sb;
     const teamAVG = totAB > 0 ? totH / totAB : null;
@@ -700,7 +697,7 @@ async function buildDocx(analysis, outputPath) {
       cell(teamKpct  != null ? teamKpct.toFixed(1)+'%'  : '—', { width: 460, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
       cell(teamBBpct != null ? teamBBpct.toFixed(1)+'%' : '—', { width: 500, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
       cell(teamGBpct != null ? teamGBpct.toFixed(1)+'%' : '—', { width: 520, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
-      cell(String(totals.bunts || '—'), { width: 600, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS })
+      cell(String(totals.sac || '—'), { width: 600, align: AlignmentType.CENTER, bold: true, bg: LGRAY, size: DATA_SIZE, margins: TIGHT_MARGINS }),
     ]});
 
     const colWidths = [1600,460,420,420,420,420,480,420,480,480,460,480,480,500,460,500,520,600];
@@ -723,139 +720,6 @@ async function buildDocx(analysis, outputPath) {
           totRow,
         ],
       }),
-      spacer(120),
-    ];
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // DEFENSIVE ALIGNMENT GRID
-  // Row set: active roster (last-10-scouted-games filter, same Set used for
-  // "Hitters to Watch"). Classification comes from classifyHitter() against
-  // the same a._playerAdvanced rows that already drive Hitting Summary/spray
-  // charts — no new query. THREAT tier reuses battingAnalysis.protectedHitters
-  // first (the actual "Hitters to Watch" tier), falling back to
-  // playerBreakdowns[].threatLevel for hitters who didn't make that list.
-  // ─────────────────────────────────────────────────────────────────────────
-  function buildDefensiveAlignmentBlock() {
-    const POSITIONS   = ['1B', '2B', '3B', 'SS', 'LF', 'CF', 'RF'];
-    const NAME_WIDTH   = 1500;
-    const SUBCOL_WIDTH = 600; // 7 positions x 2 sub-cols x 600 = 8400; + 1500 = 9900
-    const TIGHT   = { top: 20, bottom: 20, left: 30, right: 30 };
-    const HEAD_SZ = 12;
-    const DATA_SZ = 13;
-    const SHIFT_BLUE = 'BDD7EE'; // primary-shift-zone highlight; distinct from ALTROW/GOLD
-
-    // battingAnalysis.protectedHitters threat wins; playerBreakdowns is the
-    // fallback for hitters not explicitly called out in "Hitters to Watch".
-    const threatMap = {};
-    for (const h of (bat.protectedHitters || [])) {
-      if (h.name) threatMap[h.name] = h.threat;
-    }
-    for (const p of (a.playerBreakdowns || [])) {
-      if (!p.name || threatMap[p.name]) continue;
-      if (p.primaryRole === 'hitter' || p.primaryRole === 'two-way') {
-        threatMap[p.name] = p.threatLevel;
-      }
-    }
-    function threatFor(name) {
-      if (threatMap[name]) return threatMap[name];
-      const norm = n => n.toLowerCase().replace(/[^a-z ]/g, '').trim();
-      const hit = Object.keys(threatMap).find(k => norm(k) === norm(name));
-      return hit ? threatMap[hit] : 'low';
-    }
-
-    // Row set = active roster only; fall back to full opponent batter list
-    // if the active-roster filter returned nothing (e.g. very early season).
-    const rosterFilter = activeSet.size > 0 ? activeSet : null;
-    let gridBatters = rosterFilter
-      ? allOppBatters.filter(b => rosterFilter.has(b.player_name))
-      : [...allOppBatters];
-
-    // Order by real lineup position when available (bundle.lineupOrder from
-    // getTeamLineupOrder), otherwise fall back to AB (same as Hitting Summary).
-    const lineupMap = {};
-    for (const l of (a._bundle?.lineupOrder || [])) lineupMap[l.player_name] = l.avg_order;
-    gridBatters = gridBatters.sort((x, y) => {
-      const lx = lineupMap[x.player_name], ly = lineupMap[y.player_name];
-      if (lx != null && ly != null) return lx - ly;
-      if (lx != null) return -1;
-      if (ly != null) return 1;
-      return (y.total_ab || 0) - (x.total_ab || 0);
-    });
-
-    const smallSampleNames = [];
-
-    const rows = gridBatters.map((b, i) => {
-      const adv    = getAdv(b.player_name);
-      const result = classifyHitter(adv);
-      if (result.confidence === 'low') smallSampleNames.push(b.player_name);
-
-      const isAlt = i % 2 === 1;
-      const threat = threatFor(b.player_name);
-
-      const nameCell = cell(playerLabel(b.player_name), {
-        width: NAME_WIDTH, bold: true, size: DATA_SZ,
-        color: WHITE, bg: threatColor(threat), margins: TIGHT,
-      });
-
-      const posCells = POSITIONS.flatMap(pos => {
-        const [oCode, kCode] = result.grid[pos] || ['—', '—'];
-        return [oCode, kCode].map(code => cell(
-          String(code).replace('+', ''),
-          {
-            width: SUBCOL_WIDTH, align: AlignmentType.CENTER, size: DATA_SZ,
-            isAlt, margins: TIGHT,
-            bg: String(code).includes('+') ? SHIFT_BLUE : undefined,
-          }
-        ));
-      });
-
-      return new TableRow({ children: [nameCell, ...posCells] });
-    });
-
-    // Two-row header: row 1 groups position labels across their O/2K pair,
-    // row 2 labels the sub-columns. First cell is left blank in row 1 (no
-    // rowSpan dependency) so it reads as a merged "PLAYER" header visually.
-    const headerRow1 = new TableRow({ children: [
-      hCell('', NAME_WIDTH, { size: HEAD_SZ, margins: TIGHT }),
-      ...POSITIONS.map(pos => hCell(pos, SUBCOL_WIDTH * 2, { size: HEAD_SZ, margins: TIGHT, colspan: 2 })),
-    ]});
-    const headerRow2 = new TableRow({ children: [
-      hCell('PLAYER', NAME_WIDTH, { size: HEAD_SZ, margins: TIGHT }),
-      ...POSITIONS.flatMap(() => [
-        hCell('O',  SUBCOL_WIDTH, { size: HEAD_SZ, margins: TIGHT }),
-        hCell('2K', SUBCOL_WIDTH, { size: HEAD_SZ, margins: TIGHT }),
-      ]),
-    ]});
-
-    const colWidths = [NAME_WIDTH, ...POSITIONS.flatMap(() => [SUBCOL_WIDTH, SUBCOL_WIDTH])];
-    const tableWidth = colWidths.reduce((sum, w) => sum + w, 0);
-
-    const smallSampleNote = smallSampleNames.length
-      ? [bodyPara(
-          `Insufficient batted-ball sample to assign a directional shift for: ${smallSampleNames.join(', ')}. Shown as STD (balanced) — verify positioning in the scouting report body before adjusting alignment.`,
-          { italic: true, color: '595959' }
-        )]
-      : [];
-
-    return [
-      sectionHeading('DEFENSIVE ALIGNMENT GRID', { pageBreakBefore: true }),
-      new Table({
-        layout: TableLayoutType.FIXED,
-        width: { size: tableWidth, type: WidthType.DXA },
-        columnWidths: colWidths,
-        rows: [headerRow1, headerRow2, ...rows],
-      }),
-      spacer(60),
-      bodyPara(
-        'O = early-count alignment. 2K = two-strike alignment. Blue cells mark each hitter\'s primary shift zone. Name/# color reflects THREAT tier from Hitters to Watch (red=high, orange=medium, green=low).',
-        { italic: true, color: '595959' }
-      ),
-      bodyPara(
-        'O vs. 2K values reflect standard defensive logic applied to each hitter\'s season-long tendency, not measured per-count batted-ball splits, since that data isn\'t available from GC/PG.',
-        { italic: true, color: '595959' }
-      ),
-      ...smallSampleNote,
       spacer(120),
     ];
   }
@@ -1023,6 +887,98 @@ async function buildDocx(analysis, outputPath) {
         cell(h.note, { width:5100 }),
       ]})],
     }))),
+    spacer(140),
+  ];
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // DEFENSIVE ALIGNMENT GRID
+  // Built from a._playerAdvanced (scouted team's own hitters, is_our_team=0 —
+  // NOT a._bundle.opponentBatters, which is batters faced by this team's
+  // pitchers across every opponent, is_our_team=1) and real batting_order
+  // data from a._lineupOrder (db.getTeamLineupOrder), joined against the
+  // AI-assigned threat level already computed for playerBreakdowns.
+  // ─────────────────────────────────────────────────────────────────────────
+  const alignmentThreatByName = {};
+  for (const p of (a.playerBreakdowns || [])) {
+    if (p?.name && p.threatLevel) alignmentThreatByName[normPlayerName(p.name)] = p.threatLevel;
+  }
+  for (const h of (bat.protectedHitters || [])) {
+    const key = normPlayerName(h?.name || '');
+    if (h?.name && h.threat && !alignmentThreatByName[key]) alignmentThreatByName[key] = h.threat;
+  }
+
+  const alignmentRows = buildAlignmentRows(
+    a._playerAdvanced || [],
+    a._lineupOrder || [],
+    alignmentThreatByName
+  );
+
+  const ALIGN_BLUE = '3498DB';
+
+  function alignmentHeaderRow() {
+    const headerCells = [hCell('Ord', 500), hCell('Player', 2400)];
+    for (const pos of ALIGN_POSITIONS) {
+      headerCells.push(hCell(`${pos} O`, 700));
+      headerCells.push(hCell(`${pos} 2K`, 700));
+    }
+    return new TableRow({ children: headerCells });
+  }
+
+  function alignmentDataRow(row, i) {
+    const cells = [
+      cell(row.battingOrder != null ? String(row.battingOrder) : '—', {
+        width: 500, align: AlignmentType.CENTER, isAlt: i % 2 === 1,
+      }),
+      cell(playerLabel(row.name), { width: 2400, bold: true, color: NAVY, isAlt: i % 2 === 1 }),
+    ];
+    for (const pos of ALIGN_POSITIONS) {
+      const [oCode, kCode] = row.grid[pos];
+      const isHighlight = row.highlightZones.includes(pos);
+      cells.push(cell(oCode, {
+        width: 700, align: AlignmentType.CENTER,
+        bg: isHighlight ? ALIGN_BLUE : undefined,
+        color: isHighlight ? WHITE : BLACK,
+        bold: isHighlight,
+        isAlt: !isHighlight && i % 2 === 1,
+      }));
+      cells.push(cell(kCode, {
+        width: 700, align: AlignmentType.CENTER,
+        bg: isHighlight ? ALIGN_BLUE : undefined,
+        color: isHighlight ? WHITE : BLACK,
+        bold: isHighlight,
+        isAlt: !isHighlight && i % 2 === 1,
+      }));
+    }
+    return new TableRow({ children: cells });
+  }
+
+  const defensiveAlignmentBlock = [
+    sectionHeading('DEFENSIVE ALIGNMENT GRID'),
+    bodyPara(
+      'Shading is derived from each hitter\u2019s real batted-ball spray percentages ' +
+      '(player_advanced_stats), not handedness \u2014 handedness isn\u2019t tracked, so ' +
+      'directions are labeled by field side rather than pull/oppo.',
+      { italic: true, color: '595959' }
+    ),
+    spacer(60),
+    ...(alignmentRows.length ? [new Table({
+      layout: TableLayoutType.FIXED,
+      width: { size: 9900, type: WidthType.DXA },
+      columnWidths: [500, 2400, ...ALIGN_POSITIONS.flatMap(() => [700, 700])],
+      rows: [alignmentHeaderRow(), ...alignmentRows.map(alignmentDataRow)],
+    })] : [bodyPara('No advanced batting data available to build alignment grid.')]),
+    spacer(80),
+    bodyPara(
+      'Legend: PULL = shift hard to that side  |  SP = standard position, no shift  |  ' +
+      'SU = standard, shade up the middle  |  SO = standard, ease toward the opposite side  |  ' +
+      '"+" = deeper/more pronounced shade.  O = early count.  2K = two-strike count, eased ' +
+      'per-hitter using each player\u2019s actual swing_pct jump from early counts to two-strike ' +
+      'counts (swing_decisions) \u2014 a big jump eases the shift toward standard, little/no ' +
+      'change holds the full shift. Not a uniform rule applied to every hitter. ' +
+      'Ord = batting-order slot from actual lineup cards in recent games (\u2014 if a player ' +
+      'hasn\u2019t started enough recent games to establish a pattern).',
+      { color: '595959' }
+    ),
     spacer(140),
   ];
 
@@ -1494,12 +1450,6 @@ async function buildDocx(analysis, outputPath) {
 
   const gameConditionsBlock = buildGameConditionsBlock();
 
-  // Computed last so it can safely be placed as the final page of the report —
-  // buildDefensiveAlignmentBlock() only reads data (bat, a.playerBreakdowns,
-  // activeSet, allOppBatters, getAdv) that's already fully populated by this
-  // point in buildDocx; nothing about calling it here changes its output.
-  const defensiveAlignmentBlock = buildDefensiveAlignmentBlock();
-
   // ─────────────────────────────────────────────────────────────────────────
   // ASSEMBLE DOCUMENT
   // ─────────────────────────────────────────────────────────────────────────
@@ -1580,14 +1530,13 @@ async function buildDocx(analysis, outputPath) {
         // AI analysis sections
         ...overviewBlock,
         ...battingBlock,
+        ...defensiveAlignmentBlock,
         ...pitchingBlock,
         ...tendencyBlock,
         ...gamePlanBlock,
         // Player summary + per-player detail pages
         ...playerSummaryBlock,
         ...playerPages,
-        // Defensive Alignment Grid — always the last page of the report
-        ...defensiveAlignmentBlock,
       ],
     }],
   });
@@ -1709,6 +1658,24 @@ function buildReportHtml(analysis) {
     const j = jerseyFor(name);
     return j ? `#${j} ${name}` : name;
   }
+
+  // Defensive alignment grid data — see buildDocx for the full rationale.
+  // Uses a._playerAdvanced (scouted team's own hitters), NOT
+  // a._bundle.opponentBatters (batters faced across every opponent).
+  const alignmentThreatByName = {};
+  for (const p of (a.playerBreakdowns || [])) {
+    if (p?.name && p.threatLevel) alignmentThreatByName[normPlayerName(p.name)] = p.threatLevel;
+  }
+  for (const h of (bat.protectedHitters || [])) {
+    const key = normPlayerName(h?.name || '');
+    if (h?.name && h.threat && !alignmentThreatByName[key]) alignmentThreatByName[key] = h.threat;
+  }
+  const alignmentRows = buildAlignmentRows(
+    a._playerAdvanced || [],
+    a._lineupOrder || [],
+    alignmentThreatByName
+  );
+
   function threatBadge(level) {
     const cls = { high:'threat-high', medium:'threat-medium', low:'threat-low' };
     return `<span class="${cls[level]||'threat-low'}">${(level||'').toUpperCase()}</span>`;
@@ -2162,6 +2129,14 @@ function buildReportHtml(analysis) {
   .threat-medium { background:#e36c09; color:white; padding:2px 9px; border-radius:3px; font-size:10px; font-weight:700; font-family:'Oswald',sans-serif; letter-spacing:0.5px; }
   .threat-low    { background:#375623; color:white; padding:2px 9px; border-radius:3px; font-size:10px; font-weight:700; font-family:'Oswald',sans-serif; letter-spacing:0.5px; }
 
+  /* ── Defensive alignment grid ── */
+  .alignment-grid { font-size: 10.5px; }
+  .alignment-grid th, .alignment-grid td { text-align: center; padding: 4px 6px; }
+  .shift-highlight { background: #3498db; color: white; font-weight: 700; }
+  .row-threat-high   td:nth-child(2) { border-left: 3px solid #c00000; }
+  .row-threat-medium td:nth-child(2) { border-left: 3px solid #e36c09; }
+  .row-threat-low    td:nth-child(2) { border-left: 3px solid #375623; }
+
   /* ── Active roster tags ── */
   .roster-tag {
     display: inline-block;
@@ -2248,6 +2223,46 @@ ${(bat.protectedHitters||[]).map(h=>`
     ${threatBadge(h.threat)}
     <div style="font-size:11px;color:#333;font-family:'Inter',sans-serif">${h.note}</div>
   </div>`).join('')||'<p style="color:#888;font-style:italic">None identified.</p>'}
+
+<!-- Defensive Alignment Grid -->
+<div class="page-break"></div>
+<h3 class="section">Defensive Alignment Grid</h3>
+<p class="note-italic">Shading is derived from each hitter's real batted-ball spray percentages
+  (player_advanced_stats), not handedness &mdash; handedness isn't tracked, so directions are
+  labeled by field side rather than pull/oppo.</p>
+<table class="alignment-grid">
+  <thead>
+    <tr>
+      <th rowspan="2">Ord</th>
+      <th rowspan="2" style="text-align:left">Player</th>
+      ${ALIGN_POSITIONS.map(pos => `<th colspan="2">${pos}</th>`).join('')}
+    </tr>
+    <tr>
+      ${ALIGN_POSITIONS.map(() => `<th>O</th><th>2K</th>`).join('')}
+    </tr>
+  </thead>
+  <tbody>
+    ${alignmentRows.length ? alignmentRows.map(row => {
+      const threatCls = { high: 'row-threat-high', medium: 'row-threat-medium', low: 'row-threat-low' }[row.threat] || 'row-threat-low';
+      const orderCell = row.battingOrder != null ? row.battingOrder : '&mdash;';
+      const posCells = ALIGN_POSITIONS.map(pos => {
+        const [oCode, kCode] = row.grid[pos];
+        const hl = row.highlightZones.includes(pos) ? ' class="shift-highlight"' : '';
+        return `<td${hl}>${oCode}</td><td${hl}>${kCode}</td>`;
+      }).join('');
+      return `<tr class="${threatCls}"><td>${orderCell}</td><td style="text-align:left">${esc(playerLabel(row.name))}</td>${posCells}</tr>`;
+    }).join('') : '<tr><td colspan="16" style="color:#888;text-align:center">No advanced batting data available</td></tr>'}
+  </tbody>
+</table>
+<p class="note-italic">
+  Legend: PULL = shift hard to that side | SP = standard position, no shift |
+  SU = standard, shade up the middle | SO = standard, ease toward the opposite side |
+  "+" = deeper/more pronounced shade. O = early count. 2K = two-strike count, eased per-hitter
+  using each player's actual swing% jump from early counts to two-strike counts (swing_decisions)
+  &mdash; a big jump eases the shift toward standard, little/no change holds the full shift. Not a
+  uniform rule applied to every hitter. Ord = batting-order slot from actual lineup cards in recent
+  games (&mdash; if a player hasn't started enough recent games to establish a pattern).
+</p>
 
 <!-- Pitching -->
 <div class="page-break"></div>

@@ -877,6 +877,7 @@ async function analyzeTeam(teamId, options = {}) {
   analysis._playerAdvanced = bundle.playerAdvanced || [];
   analysis._ourPitchers    = bundle.ourPitchers    || [];
   analysis._oppPitchers    = bundle.oppPitchers    || [];
+  analysis._lineupOrder    = bundle.lineupOrder    || [];
 
   const gms    = bundle.games || [];
   const wins   = gms.filter(g => g.result === 'W').length;
