@@ -914,57 +914,74 @@ async function buildDocx(analysis, outputPath) {
   );
 
   const ALIGN_BLUE = '3498DB';
+  const ALIGN_MARGINS = { top: 40, bottom: 40, left: 40, right: 40 };
+  const ALIGN_SIZE = 14;
+  // Widths sum to 9880 (Ord 450 + Player 1450 + 14 x 570), matching every
+  // other table in this document (all total <=9900 dxa). The previous
+  // version summed to 12700 — ~30% over — which is what forced the Ord
+  // column (and everything else) to wrap.
+  const ALIGN_ORD_W = 450, ALIGN_PLAYER_W = 1450, ALIGN_POS_W = 570;
 
   function alignmentHeaderRow() {
-    const headerCells = [hCell('Ord', 500), hCell('Player', 2400)];
+    const headerCells = [
+      hCell('Ord', ALIGN_ORD_W, { size: ALIGN_SIZE, margins: ALIGN_MARGINS }),
+      hCell('Player', ALIGN_PLAYER_W, { size: ALIGN_SIZE, margins: ALIGN_MARGINS, align: AlignmentType.LEFT }),
+    ];
     for (const pos of ALIGN_POSITIONS) {
-      headerCells.push(hCell(`${pos} O`, 700));
-      headerCells.push(hCell(`${pos} 2K`, 700));
+      headerCells.push(hCell(`${pos} O`, ALIGN_POS_W, { size: ALIGN_SIZE, margins: ALIGN_MARGINS }));
+      headerCells.push(hCell(`${pos} 2K`, ALIGN_POS_W, { size: ALIGN_SIZE, margins: ALIGN_MARGINS }));
     }
     return new TableRow({ children: headerCells });
   }
 
   function alignmentDataRow(row, i) {
+    const rowThreatBg = threatColor(row.threat);
     const cells = [
-      cell(row.battingOrder != null ? String(row.battingOrder) : '—', {
-        width: 500, align: AlignmentType.CENTER, isAlt: i % 2 === 1,
+      cell(row.battingOrder != null ? String(row.battingOrder) : '\u2014', {
+        width: ALIGN_ORD_W, align: AlignmentType.CENTER, size: ALIGN_SIZE, margins: ALIGN_MARGINS,
+        bold: true, color: WHITE, bg: rowThreatBg,
       }),
-      cell(playerLabel(row.name), { width: 2400, bold: true, color: NAVY, isAlt: i % 2 === 1 }),
+      cell(playerLabel(row.name), {
+        width: ALIGN_PLAYER_W, size: ALIGN_SIZE, margins: ALIGN_MARGINS,
+        bold: true, color: WHITE, bg: rowThreatBg,
+      }),
     ];
     for (const pos of ALIGN_POSITIONS) {
       const [oCode, kCode] = row.grid[pos];
       const isHighlight = row.highlightZones.includes(pos);
-      cells.push(cell(oCode, {
-        width: 700, align: AlignmentType.CENTER,
+      const shared = {
+        width: ALIGN_POS_W, align: AlignmentType.CENTER, size: ALIGN_SIZE, margins: ALIGN_MARGINS,
         bg: isHighlight ? ALIGN_BLUE : undefined,
         color: isHighlight ? WHITE : BLACK,
         bold: isHighlight,
         isAlt: !isHighlight && i % 2 === 1,
-      }));
-      cells.push(cell(kCode, {
-        width: 700, align: AlignmentType.CENTER,
-        bg: isHighlight ? ALIGN_BLUE : undefined,
-        color: isHighlight ? WHITE : BLACK,
-        bold: isHighlight,
-        isAlt: !isHighlight && i % 2 === 1,
-      }));
+      };
+      cells.push(cell(oCode, shared));
+      cells.push(cell(kCode, shared));
     }
     return new TableRow({ children: cells });
   }
 
   const defensiveAlignmentBlock = [
-    sectionHeading('DEFENSIVE ALIGNMENT GRID'),
+    new Paragraph({
+      pageBreakBefore: true,
+      heading: HeadingLevel.HEADING_1,
+      spacing: { before: 240, after: 100 },
+      border:  { bottom: { style: BorderStyle.SINGLE, size: 8, color: GOLD, space: 1 } },
+      children: [new TextRun({ text: 'DEFENSIVE ALIGNMENT GRID', bold: true, color: NAVY, size: 26, font: 'Calibri' })],
+    }),
     bodyPara(
       'Shading is derived from each hitter\u2019s real batted-ball spray percentages ' +
       '(player_advanced_stats), not handedness \u2014 handedness isn\u2019t tracked, so ' +
-      'directions are labeled by field side rather than pull/oppo.',
+      'directions are labeled by field side rather than pull/oppo. Ord/Player cell color ' +
+      'reflects overall threat level (red/orange/green).',
       { italic: true, color: '595959' }
     ),
     spacer(60),
     ...(alignmentRows.length ? [new Table({
       layout: TableLayoutType.FIXED,
-      width: { size: 9900, type: WidthType.DXA },
-      columnWidths: [500, 2400, ...ALIGN_POSITIONS.flatMap(() => [700, 700])],
+      width: { size: 9880, type: WidthType.DXA },
+      columnWidths: [ALIGN_ORD_W, ALIGN_PLAYER_W, ...ALIGN_POSITIONS.flatMap(() => [ALIGN_POS_W, ALIGN_POS_W])],
       rows: [alignmentHeaderRow(), ...alignmentRows.map(alignmentDataRow)],
     })] : [bodyPara('No advanced batting data available to build alignment grid.')]),
     spacer(80),
@@ -1530,13 +1547,14 @@ async function buildDocx(analysis, outputPath) {
         // AI analysis sections
         ...overviewBlock,
         ...battingBlock,
-        ...defensiveAlignmentBlock,
         ...pitchingBlock,
         ...tendencyBlock,
         ...gamePlanBlock,
         // Player summary + per-player detail pages
         ...playerSummaryBlock,
         ...playerPages,
+        // Defensive alignment grid — last section in the report
+        ...defensiveAlignmentBlock,
       ],
     }],
   });
@@ -2130,12 +2148,11 @@ function buildReportHtml(analysis) {
   .threat-low    { background:#375623; color:white; padding:2px 9px; border-radius:3px; font-size:10px; font-weight:700; font-family:'Oswald',sans-serif; letter-spacing:0.5px; }
 
   /* ── Defensive alignment grid ── */
-  .alignment-grid { font-size: 10.5px; }
-  .alignment-grid th, .alignment-grid td { text-align: center; padding: 4px 6px; }
+  .alignment-grid { font-size: 10.5px; table-layout: fixed; width: 100%; }
+  .alignment-grid th, .alignment-grid td { text-align: center; padding: 4px 6px; white-space: nowrap; }
+  .alignment-grid .align-ord    { width: 34px; }
+  .alignment-grid .align-player { width: 130px; white-space: normal; }
   .shift-highlight { background: #3498db; color: white; font-weight: 700; }
-  .row-threat-high   td:nth-child(2) { border-left: 3px solid #c00000; }
-  .row-threat-medium td:nth-child(2) { border-left: 3px solid #e36c09; }
-  .row-threat-low    td:nth-child(2) { border-left: 3px solid #375623; }
 
   /* ── Active roster tags ── */
   .roster-tag {
@@ -2224,46 +2241,6 @@ ${(bat.protectedHitters||[]).map(h=>`
     <div style="font-size:11px;color:#333;font-family:'Inter',sans-serif">${h.note}</div>
   </div>`).join('')||'<p style="color:#888;font-style:italic">None identified.</p>'}
 
-<!-- Defensive Alignment Grid -->
-<div class="page-break"></div>
-<h3 class="section">Defensive Alignment Grid</h3>
-<p class="note-italic">Shading is derived from each hitter's real batted-ball spray percentages
-  (player_advanced_stats), not handedness &mdash; handedness isn't tracked, so directions are
-  labeled by field side rather than pull/oppo.</p>
-<table class="alignment-grid">
-  <thead>
-    <tr>
-      <th rowspan="2">Ord</th>
-      <th rowspan="2" style="text-align:left">Player</th>
-      ${ALIGN_POSITIONS.map(pos => `<th colspan="2">${pos}</th>`).join('')}
-    </tr>
-    <tr>
-      ${ALIGN_POSITIONS.map(() => `<th>O</th><th>2K</th>`).join('')}
-    </tr>
-  </thead>
-  <tbody>
-    ${alignmentRows.length ? alignmentRows.map(row => {
-      const threatCls = { high: 'row-threat-high', medium: 'row-threat-medium', low: 'row-threat-low' }[row.threat] || 'row-threat-low';
-      const orderCell = row.battingOrder != null ? row.battingOrder : '&mdash;';
-      const posCells = ALIGN_POSITIONS.map(pos => {
-        const [oCode, kCode] = row.grid[pos];
-        const hl = row.highlightZones.includes(pos) ? ' class="shift-highlight"' : '';
-        return `<td${hl}>${oCode}</td><td${hl}>${kCode}</td>`;
-      }).join('');
-      return `<tr class="${threatCls}"><td>${orderCell}</td><td style="text-align:left">${esc(playerLabel(row.name))}</td>${posCells}</tr>`;
-    }).join('') : '<tr><td colspan="16" style="color:#888;text-align:center">No advanced batting data available</td></tr>'}
-  </tbody>
-</table>
-<p class="note-italic">
-  Legend: PULL = shift hard to that side | SP = standard position, no shift |
-  SU = standard, shade up the middle | SO = standard, ease toward the opposite side |
-  "+" = deeper/more pronounced shade. O = early count. 2K = two-strike count, eased per-hitter
-  using each player's actual swing% jump from early counts to two-strike counts (swing_decisions)
-  &mdash; a big jump eases the shift toward standard, little/no change holds the full shift. Not a
-  uniform rule applied to every hitter. Ord = batting-order slot from actual lineup cards in recent
-  games (&mdash; if a player hasn't started enough recent games to establish a pattern).
-</p>
-
 <!-- Pitching -->
 <div class="page-break"></div>
 <h3 class="section">Pitching Analysis</h3>
@@ -2307,6 +2284,51 @@ ${(bat.protectedHitters||[]).map(h=>`
 
 <!-- Per-player detail pages -->
 ${playerDetailPages}
+
+<!-- Defensive Alignment Grid — last section in the report -->
+<div class="page-break"></div>
+<h3 class="section">Defensive Alignment Grid</h3>
+<p class="note-italic">Shading is derived from each hitter's real batted-ball spray percentages
+  (player_advanced_stats), not handedness &mdash; handedness isn't tracked, so directions are
+  labeled by field side rather than pull/oppo. Ord/Player cell color reflects overall threat
+  level (red/orange/green).</p>
+<table class="alignment-grid">
+  <thead>
+    <tr>
+      <th rowspan="2" class="align-ord">Ord</th>
+      <th rowspan="2" class="align-player" style="text-align:left">Player</th>
+      ${ALIGN_POSITIONS.map(pos => `<th colspan="2">${pos}</th>`).join('')}
+    </tr>
+    <tr>
+      ${ALIGN_POSITIONS.map(() => `<th>O</th><th>2K</th>`).join('')}
+    </tr>
+  </thead>
+  <tbody>
+    ${alignmentRows.length ? alignmentRows.map(row => {
+      const threatBg = { high: '#c00000', medium: '#e36c09', low: '#375623' }[row.threat] || '#375623';
+      const orderCell = row.battingOrder != null ? row.battingOrder : '&mdash;';
+      const posCells = ALIGN_POSITIONS.map(pos => {
+        const [oCode, kCode] = row.grid[pos];
+        const hl = row.highlightZones.includes(pos) ? ' class="shift-highlight"' : '';
+        return `<td${hl}>${oCode}</td><td${hl}>${kCode}</td>`;
+      }).join('');
+      return `<tr>
+        <td class="align-ord" style="background:${threatBg};color:white;font-weight:700">${orderCell}</td>
+        <td class="align-player" style="background:${threatBg};color:white;font-weight:600;text-align:left">${esc(playerLabel(row.name))}</td>
+        ${posCells}
+      </tr>`;
+    }).join('') : '<tr><td colspan="16" style="color:#888;text-align:center">No advanced batting data available</td></tr>'}
+  </tbody>
+</table>
+<p class="note-italic">
+  Legend: PULL = shift hard to that side | SP = standard position, no shift |
+  SU = standard, shade up the middle | SO = standard, ease toward the opposite side |
+  "+" = deeper/more pronounced shade. O = early count. 2K = two-strike count, eased per-hitter
+  using each player's actual swing% jump from early counts to two-strike counts (swing_decisions)
+  &mdash; a big jump eases the shift toward standard, little/no change holds the full shift. Not a
+  uniform rule applied to every hitter. Ord = batting-order slot from actual lineup cards in recent
+  games (&mdash; if a player hasn't started enough recent games to establish a pattern).
+</p>
 
 <p class="note-italic" style="margin-top:20px">
   Data confidence: ${confidence}. ${a.reportMeta?.confidenceNote||''}
