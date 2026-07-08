@@ -1004,16 +1004,48 @@ async function buildDocx(analysis, outputPath) {
   const ALIGN_BLUE = '3498DB';
   const ALIGN_MARGINS = { top: 40, bottom: 40, left: 40, right: 40 };
   const ALIGN_SIZE = 14;
-  // Widths sum to 9880 (Ord 450 + Player 1450 + 14 x 570), matching every
-  // other table in this document (all total <=9900 dxa). The previous
-  // version summed to 12700 — ~30% over — which is what forced the Ord
-  // column (and everything else) to wrap.
-  const ALIGN_ORD_W = 450, ALIGN_PLAYER_W = 1450, ALIGN_POS_W = 570;
+  // Widths sum to 9880 (Ord 300 + Player 1300 + Bats 300 + 14 x 570), matching
+  // every other table in this document (all total <=9900 dxa). Ord/Player were
+  // each trimmed 150 to make room for the new Bats column rather than growing
+  // the table total — see prior note: the previous version summed to 12700,
+  // ~30% over, which forced the whole table to shrink/wrap unpredictably.
+  const ALIGN_ORD_W = 300, ALIGN_PLAYER_W = 1300, ALIGN_BATS_W = 300, ALIGN_POS_W = 570;
+
+  // Bare "#12 Name" label with no handedness suffix — deliberately NOT the
+  // shared playerLabel() (which now appends "(B/T: R/R)" everywhere else in
+  // the report). This grid shows bats in its own dedicated column instead,
+  // so the Player cell stays short and doesn't risk wrapping to two lines
+  // in the fixed-width table.
+  function alignPlayerBareLabel(name) {
+    const j = jerseyFor(name);
+    return j ? `#${j} ${name}` : name;
+  }
+
+  /**
+   * Resolves display info for the B column: the letter itself, plus a
+   * "mismatch" flag when the spray-measured pull side is the OPPOSITE of
+   * what's conventional for this hitter's handedness (R hitters
+   * conventionally pull LEFT-side/3B-SS-LF; L hitters conventionally pull
+   * RIGHT-side/1B-2B-RF). Only flagged for known L/R (switch/unknown have
+   * no expectation to contradict), and only when the O-template made an
+   * actual directional call — CENTER/STD aren't a pull-side claim to
+   * begin with. This NEVER changes the shading itself — classifyHitter()
+   * in defensive-alignment.js has no idea this flag exists — it only
+   * changes how the letter is drawn, as a subtle cross-check cue.
+   */
+  function alignBatsInfo(row) {
+    const hand = resolveHandednessFromBundle(a._bundle || {}, row.name, jerseyMap);
+    const bats = isKnownBats(hand?.bats) ? String(hand.bats).toUpperCase() : null;
+    const mismatch = !!bats &&
+      ((bats === 'R' && row.template === 'RIGHT') || (bats === 'L' && row.template === 'LEFT'));
+    return { label: bats || '\u2014', mismatch };
+  }
 
   function alignmentHeaderRow() {
     const headerCells = [
       hCell('Ord', ALIGN_ORD_W, { size: ALIGN_SIZE, margins: ALIGN_MARGINS }),
       hCell('Player', ALIGN_PLAYER_W, { size: ALIGN_SIZE, margins: ALIGN_MARGINS, align: AlignmentType.LEFT }),
+      hCell('B', ALIGN_BATS_W, { size: ALIGN_SIZE, margins: ALIGN_MARGINS }),
     ];
     for (const pos of ALIGN_POSITIONS) {
       headerCells.push(hCell(`${pos} O`, ALIGN_POS_W, { size: ALIGN_SIZE, margins: ALIGN_MARGINS }));
@@ -1024,14 +1056,19 @@ async function buildDocx(analysis, outputPath) {
 
   function alignmentDataRow(row, i) {
     const rowThreatBg = threatColor(row.threat);
+    const batsInfo = alignBatsInfo(row);
     const cells = [
       cell(row.battingOrder != null ? String(row.battingOrder) : '\u2014', {
         width: ALIGN_ORD_W, align: AlignmentType.CENTER, size: ALIGN_SIZE, margins: ALIGN_MARGINS,
         bold: true, color: WHITE, bg: rowThreatBg,
       }),
-      cell(playerLabel(row.name), {
+      cell(alignPlayerBareLabel(row.name), {
         width: ALIGN_PLAYER_W, size: ALIGN_SIZE, margins: ALIGN_MARGINS,
         bold: true, color: WHITE, bg: rowThreatBg,
+      }),
+      cell(batsInfo.mismatch ? `${batsInfo.label}*` : batsInfo.label, {
+        width: ALIGN_BATS_W, align: AlignmentType.CENTER, size: ALIGN_SIZE, margins: ALIGN_MARGINS,
+        bold: true, isAlt: i % 2 === 1, color: batsInfo.mismatch ? GOLD : BLACK,
       }),
     ];
     for (const pos of ALIGN_POSITIONS) {
@@ -1060,16 +1097,23 @@ async function buildDocx(analysis, outputPath) {
     }),
     bodyPara(
       'Shading is derived from each hitter\u2019s real batted-ball spray percentages ' +
-      '(player_advanced_stats), not handedness \u2014 handedness isn\u2019t tracked, so ' +
-      'directions are labeled by field side rather than pull/oppo. Ord/Player cell color ' +
-      'reflects overall threat level (red/orange/green).',
+      '(player_advanced_stats), not handedness \u2014 directions are labeled by field side ' +
+      'rather than pull/oppo, since spray is measured per hitter and doesn\u2019t assume a ' +
+      'lefty pulls one way or a righty the other. The B column is the hitter\u2019s captured ' +
+      'batting hand (L/R/S, from the GameChanger roster) shown only as a cross-check \u2014 ' +
+      'compare it against the shift direction yourself; it does not drive the shading. ' +
+      'A gold "*" next to the letter flags a spray-measured pull side opposite the ' +
+      'convention for that hand (e.g. a righty shaded toward the right side) \u2014 not ' +
+      'necessarily wrong, just worth a second look; unflagged is not a guarantee either. ' +
+      '\u2014 means handedness hasn\u2019t been captured for that player yet. Ord/Player cell ' +
+      'color reflects overall threat level (red/orange/green).',
       { italic: true, color: '595959' }
     ),
     spacer(60),
     ...(alignmentRows.length ? [new Table({
       layout: TableLayoutType.FIXED,
       width: { size: 9880, type: WidthType.DXA },
-      columnWidths: [ALIGN_ORD_W, ALIGN_PLAYER_W, ...ALIGN_POSITIONS.flatMap(() => [ALIGN_POS_W, ALIGN_POS_W])],
+      columnWidths: [ALIGN_ORD_W, ALIGN_PLAYER_W, ALIGN_BATS_W, ...ALIGN_POSITIONS.flatMap(() => [ALIGN_POS_W, ALIGN_POS_W])],
       rows: [alignmentHeaderRow(), ...alignmentRows.map(alignmentDataRow)],
     })] : [bodyPara('No advanced batting data available to build alignment grid.')]),
     spacer(80),
@@ -2241,8 +2285,9 @@ function buildReportHtml(analysis) {
   /* ── Defensive alignment grid ── */
   .alignment-grid { font-size: 10.5px; table-layout: fixed; width: 100%; }
   .alignment-grid th, .alignment-grid td { text-align: center; padding: 4px 6px; white-space: nowrap; }
-  .alignment-grid .align-ord    { width: 34px; }
-  .alignment-grid .align-player { width: 130px; white-space: normal; }
+  .alignment-grid .align-ord    { width: 30px; }
+  .alignment-grid .align-player { width: 118px; white-space: normal; }
+  .alignment-grid .align-bats   { width: 26px; }
   .shift-highlight { background: #3498db; color: white; font-weight: 700; }
 
   /* ── Active roster tags ── */
@@ -2380,14 +2425,21 @@ ${playerDetailPages}
 <div class="page-break"></div>
 <h3 class="section">Defensive Alignment Grid</h3>
 <p class="note-italic">Shading is derived from each hitter's real batted-ball spray percentages
-  (player_advanced_stats), not handedness &mdash; handedness isn't tracked, so directions are
-  labeled by field side rather than pull/oppo. Ord/Player cell color reflects overall threat
-  level (red/orange/green).</p>
+  (player_advanced_stats), not handedness &mdash; directions are labeled by field side rather
+  than pull/oppo, since spray is measured per hitter and doesn't assume a lefty pulls one way
+  or a righty the other. The B column is the hitter's captured batting hand (L/R/S, from the
+  GameChanger roster) shown only as a cross-check &mdash; compare it against the shift direction
+  yourself; it does not drive the shading. A gold "*" flags a spray-measured pull side opposite
+  the convention for that hand (e.g. a righty shaded toward the right side) &mdash; not
+  necessarily wrong, just worth a second look; unflagged is not a guarantee either. &mdash; means
+  handedness hasn't been captured for that player yet. Ord/Player cell color reflects overall
+  threat level (red/orange/green).</p>
 <table class="alignment-grid">
   <thead>
     <tr>
       <th rowspan="2" class="align-ord">Ord</th>
       <th rowspan="2" class="align-player" style="text-align:left">Player</th>
+      <th rowspan="2" class="align-bats">B</th>
       ${ALIGN_POSITIONS.map(pos => `<th colspan="2">${pos}</th>`).join('')}
     </tr>
     <tr>
@@ -2398,6 +2450,21 @@ ${playerDetailPages}
     ${alignmentRows.length ? alignmentRows.map(row => {
       const threatBg = { high: '#c00000', medium: '#e36c09', low: '#375623' }[row.threat] || '#375623';
       const orderCell = row.battingOrder != null ? row.battingOrder : '&mdash;';
+      const j = jerseyFor(row.name);
+      const bareLabel = j ? `#${j} ${row.name}` : row.name;
+      const hand = resolveHandednessFromBundle(a._bundle || {}, row.name, jerseyMap);
+      const bats = isKnownBats(hand?.bats) ? String(hand.bats).toUpperCase() : null;
+      // See alignBatsInfo() in buildDocx for the full rationale — same rule
+      // here: only known L/R hitters, only when the O-template made an
+      // actual LEFT/RIGHT directional call. Display-only; classifyHitter()
+      // never sees this.
+      const batsMismatch = !!bats &&
+        ((bats === 'R' && row.template === 'RIGHT') || (bats === 'L' && row.template === 'LEFT'));
+      const batsLabel = bats || '&mdash;';
+      const batsStyle = batsMismatch ? 'font-weight:700;color:#c79a45' : 'font-weight:700';
+      const batsTitle = batsMismatch
+        ? ' title="Spray-measured pull side is opposite the convention for this hitter\u2019s hand \u2014 worth a second look."'
+        : '';
       const posCells = ALIGN_POSITIONS.map(pos => {
         const [oCode, kCode] = row.grid[pos];
         const hl = row.highlightZones.includes(pos) ? ' class="shift-highlight"' : '';
@@ -2405,10 +2472,11 @@ ${playerDetailPages}
       }).join('');
       return `<tr>
         <td class="align-ord" style="background:${threatBg};color:white;font-weight:700">${orderCell}</td>
-        <td class="align-player" style="background:${threatBg};color:white;font-weight:600;text-align:left">${esc(playerLabel(row.name))}</td>
+        <td class="align-player" style="background:${threatBg};color:white;font-weight:600;text-align:left">${esc(bareLabel)}</td>
+        <td class="align-bats" style="${batsStyle}"${batsTitle}>${batsLabel}${batsMismatch ? '*' : ''}</td>
         ${posCells}
       </tr>`;
-    }).join('') : '<tr><td colspan="16" style="color:#888;text-align:center">No advanced batting data available</td></tr>'}
+    }).join('') : '<tr><td colspan="17" style="color:#888;text-align:center">No advanced batting data available</td></tr>'}
   </tbody>
 </table>
 <p class="note-italic">

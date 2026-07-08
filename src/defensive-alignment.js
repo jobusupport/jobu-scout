@@ -25,10 +25,17 @@
  *   3. DEFAULT EASE — neither is available; ease fully to standard as a
  *      safe default rather than guess.
  *
- * IMPORTANT: we do not track batter handedness anywhere in the schema
- * (normalizer.js / db.js), so "pull side" cannot be expressed relative to
- * the hitter — only as an absolute field side. Templates are named LEFT /
- * RIGHT / CENTER / STD rather than PULL / OPPO for that reason.
+ * IMPORTANT: this module deliberately does NOT use batter handedness, even
+ * though it's now captured separately (see player_handedness /
+ * scrape-handedness.js). Shading here is driven entirely by each hitter's
+ * own measured spray data, not an assumption about which way a lefty or
+ * righty typically pulls the ball — that's a stronger signal for an
+ * individual hitter than handedness alone. Templates are named LEFT /
+ * RIGHT / CENTER / STD (absolute field side) rather than PULL / OPPO for
+ * that reason. report.js renders a dedicated "B" column in this grid
+ * showing each hitter's captured batting hand (L/R/S) as a labeled
+ * cross-check next to the shading — informational only, and it does not
+ * feed classifyHitter() below.
  */
 
 const SHIFT_THRESHOLD  = 8;  // pct-point gap between sides needed to call a shift
