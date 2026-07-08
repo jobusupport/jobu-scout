@@ -195,15 +195,18 @@ function getDb() {
   return new Database(DB_PATH, { readonly: true });
 }
 
-async function getTeams(req = null) {
+async function getTeams(req = null, includeArchived = false) {
   if (USE_SUPABASE) {
     const orgId = await getRequestOrgId(req);
 
-    const { data: teams, error } = await adminClient
+    let query = adminClient
       .from('teams')
       .select('*')
       .eq('org_id', orgId)
       .order('team_name');
+    if (!includeArchived) query = query.eq('archived', false);
+
+    const { data: teams, error } = await query;
 
     if (error) throw error;
     if (!teams?.length) return [];
@@ -236,6 +239,7 @@ async function getTeams(req = null) {
     const teams = db.prepare(`
       SELECT t.*, COUNT(DISTINCT g.id) AS game_count, MAX(g.game_date) AS last_game
       FROM teams t LEFT JOIN games g ON g.team_id = t.id
+      ${includeArchived ? '' : 'WHERE (t.archived = 0 OR t.archived IS NULL)'}
       GROUP BY t.id ORDER BY t.team_name
     `).all();
     db.close();
@@ -666,7 +670,8 @@ app.get('/api/debug/auth', (req, res) => {
 
 app.get('/api/teams', requireAuth, async (req, res) => {
   try {
-    const rawTeams = await getTeams(req);
+    const includeArchived = req.query.includeArchived === 'true';
+    const rawTeams = await getTeams(req, includeArchived);
     const teams = await Promise.all(rawTeams.map(async t => {
       const hasUrls = await hasGameUrls(t.id);
       return {
@@ -1169,6 +1174,38 @@ app.delete('/api/teams/:id', requireAuth, async (req, res) => {
     return res.json({ ok: true });
   } catch (err) {
     console.error('[api/teams/:id DELETE]', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Archive (soft-hide) or restore a team without touching games/stats.
+// This is what the dashboard's "×" button calls now instead of DELETE —
+// DELETE remains available but stays blocked whenever games are attached.
+app.patch('/api/teams/:id/archive', requireAuth, async (req, res) => {
+  const teamId = req.params.id;
+  const archived = req.body?.archived !== false; // default true
+
+  try {
+    if (USE_SUPABASE) {
+      const orgId = await getRequestOrgId(req);
+      await assertTeamInRequestOrg(req, teamId);
+
+      const { error } = await adminClient
+        .from('teams')
+        .update({ archived, updated_at: new Date().toISOString() })
+        .eq('id', teamId)
+        .eq('org_id', orgId);
+      if (error) throw error;
+      return res.json({ ok: true, archived });
+    }
+
+    const db = new (getSQLiteDatabase())(DB_PATH);
+    db.prepare(`UPDATE teams SET archived = ?, updated_at = datetime('now') WHERE id = ?`)
+      .run(archived ? 1 : 0, teamId);
+    db.close();
+    return res.json({ ok: true, archived });
+  } catch (err) {
+    console.error('[api/teams/:id/archive PATCH]', err);
     return res.status(500).json({ error: err.message });
   }
 });

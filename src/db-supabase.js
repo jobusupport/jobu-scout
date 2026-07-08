@@ -378,10 +378,26 @@ async function getTeamByUrl(gcTeamUrl) {
   return data;
 }
 
-async function getAllTeams() {
-  const { data, error } = await getDb().from('teams').select('*').order('team_name');
+async function getAllTeams(includeArchived = false) {
+  let q = getDb().from('teams').select('*').order('team_name');
+  if (!includeArchived) q = q.eq('archived', false);
+  const { data, error } = await q;
   check(error, 'getAllTeams');
   return data || [];
+}
+
+/**
+ * Archive (soft-hide) or restore a team. Does not touch games, batting_lines,
+ * pitching_lines, play_events, or advanced stats — all history stays intact.
+ * Used when a coach stops playing an opponent but doesn't want to lose data.
+ */
+async function setTeamArchived(teamId, archived) {
+  const { error } = await getDb()
+    .from('teams')
+    .update({ archived: !!archived, updated_at: new Date().toISOString() })
+    .eq('id', teamId);
+  check(error, 'setTeamArchived');
+  return true;
 }
 
 // ─── Games ────────────────────────────────────────────────────────────────────
@@ -1193,6 +1209,7 @@ module.exports = {
   upsertTeam,
   getTeamByUrl,
   getAllTeams,
+  setTeamArchived,
   // Games
   insertGame,
   getGamesByTeam,

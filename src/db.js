@@ -135,6 +135,16 @@ function init(dbPath = './voodoo-scout.db') {
     console.log('[db] Migrated: added spray_by_count column to player_advanced_stats');
   }
 
+  // "archived" lets a coach hide an opponent from the dashboard sidebar
+  // without deleting games/stats — same idempotent ALTER TABLE pattern as
+  // spray_by_count above (SQLite has no ADD COLUMN IF NOT EXISTS).
+  const teamCols = _db.prepare(`PRAGMA table_info(teams)`).all().map(c => c.name);
+  if (!teamCols.includes('archived')) {
+    _db.exec(`ALTER TABLE teams ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;`);
+    _db.exec(`CREATE INDEX IF NOT EXISTS idx_teams_archived ON teams(archived);`);
+    console.log('[db] Migrated: added archived column to teams');
+  }
+
   return _db;
 }
 
@@ -288,8 +298,26 @@ function getTeamByUrl(gcTeamUrl) {
   return getDb().prepare(`SELECT * FROM teams WHERE gc_team_url = ?`).get(gcTeamUrl);
 }
 
-function getAllTeams() {
-  return getDb().prepare(`SELECT * FROM teams ORDER BY team_name`).all();
+function getAllTeams(includeArchived = false) {
+  if (includeArchived) {
+    return getDb().prepare(`SELECT * FROM teams ORDER BY team_name`).all();
+  }
+  return getDb().prepare(`
+    SELECT * FROM teams
+    WHERE archived = 0 OR archived IS NULL
+    ORDER BY team_name
+  `).all();
+}
+
+/**
+ * Archive (soft-hide) or restore a team. Does not touch games, batting_lines,
+ * pitching_lines, play_events, or advanced stats — all history stays intact.
+ * Used when a coach stops playing an opponent but doesn't want to lose data.
+ */
+function setTeamArchived(teamId, archived) {
+  getDb().prepare(`UPDATE teams SET archived = ?, updated_at = datetime('now') WHERE id = ?`)
+    .run(archived ? 1 : 0, teamId);
+  return true;
 }
 
 // ─── Games ────────────────────────────────────────────────────────────────────
@@ -1070,6 +1098,7 @@ module.exports = {
   upsertTeam,
   getTeamByUrl,
   getAllTeams,
+  setTeamArchived,
   // Games
   insertGame,
   getGamesByTeam,
