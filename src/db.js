@@ -120,6 +120,21 @@ function init(dbPath = './voodoo-scout.db') {
 
   console.log('[db] Schema initialized.');
 
+  // spray_by_count (added for the defensive-alignment grid) postdates the
+  // inline CREATE TABLE IF NOT EXISTS above, which is a no-op on a table
+  // that already exists — so on an existing local DB the column needs an
+  // explicit, idempotent ALTER TABLE. SQLite has no "ADD COLUMN IF NOT
+  // EXISTS", so check pragma_table_info first rather than rerun a raw
+  // ALTER TABLE on every init() (which would throw "duplicate column" on
+  // the second run). This only affects local SQLite — production uses
+  // Supabase/Postgres, which does support ADD COLUMN IF NOT EXISTS; that
+  // migration is applied separately, not through this code path.
+  const playerAdvCols = _db.prepare(`PRAGMA table_info(player_advanced_stats)`).all().map(c => c.name);
+  if (!playerAdvCols.includes('spray_by_count')) {
+    _db.exec(`ALTER TABLE player_advanced_stats ADD COLUMN spray_by_count TEXT;`);
+    console.log('[db] Migrated: added spray_by_count column to player_advanced_stats');
+  }
+
   return _db;
 }
 
