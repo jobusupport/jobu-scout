@@ -1014,52 +1014,12 @@ async function closePlayerModal(page) {
 
 // ─── Main entry point ───────────────────────────────────────────────────────
 
-/**
- * @param {object} opts
- * @param {import('@playwright/test').Page} opts.page
- * @param {string} opts.myTeamGcUrl        Our team's GameChanger team URL.
- * @param {string} opts.opponentTeamName   The opponent team's name as stored in our DB.
- * @param {number|string} opts.teamId      The opponent team's row id in our DB.
- * @param {object} opts.db                 db.js/db-supabase.js module (already init()'d).
- * @param {boolean} [opts.forceRefresh]    Re-capture every player, ignoring existing rows.
- * @returns {Promise<{captured: number, skipped: number, failed: number}>}
- */
-async function captureTeamHandedness({ page, myTeamGcUrl, opponentTeamName, teamId, db, forceRefresh = false }) {
-  if (!myTeamGcUrl) throw new Error('captureTeamHandedness: myTeamGcUrl is required.');
-  if (!opponentTeamName) throw new Error('captureTeamHandedness: opponentTeamName is required.');
-  if (!teamId) throw new Error('captureTeamHandedness: teamId is required.');
-  if (!db) throw new Error('captureTeamHandedness: db module is required.');
-
+// ─── Shared roster-capture loop ────────────────────────────────────────────
+// Used by both entry points below once the page is already sitting on the
+// target team's own Roster tab. Handles dedup against already-captured
+// players and the per-player modal open/extract/upsert/close cycle.
+async function captureRosterHandedness(page, { teamName, teamId, db, forceRefresh = false }) {
   const result = { captured: 0, skipped: 0, failed: 0 };
-
-  await openTeamPage(page, myTeamGcUrl);
-
-  const openedOpponentsTab = await openOpponentsTab(page);
-
-  let foundOpponent = false;
-  if (openedOpponentsTab) {
-    foundOpponent = await clickOpponentTeamLink(page, opponentTeamName, { contextLabel: 'opponents-list-page' });
-  }
-
-  if (!foundOpponent) {
-    console.log('[handedness] Opponents tab did not produce a match. Falling back to Schedule tab.');
-    await openTeamPage(page, myTeamGcUrl);
-    const openedSchedule = await openScheduleTab(page);
-    if (openedSchedule) {
-      foundOpponent = await clickOpponentTeamLink(page, opponentTeamName, { contextLabel: 'schedule-page' });
-    }
-  }
-
-  if (!foundOpponent) {
-    console.error(`[handedness] Could not find/click opponent "${opponentTeamName}" from our team's page or schedule.`);
-    return result;
-  }
-
-  const openedRoster = await openRosterTab(page);
-  if (!openedRoster) {
-    console.error(`[handedness] Could not open Roster tab for "${opponentTeamName}".`);
-    return result;
-  }
 
   const existing = forceRefresh ? [] : await db.getExistingHandednessForTeam(teamId);
   const existingByJersey = new Map(existing.map((r) => [String(r.jersey_number || ''), r]));
@@ -1118,13 +1078,113 @@ async function captureTeamHandedness({ page, myTeamGcUrl, opponentTeamName, team
   }
 
   console.log(
-    `[handedness] Done with "${opponentTeamName}": captured ${result.captured}, ` +
+    `[handedness] Done with "${teamName}": captured ${result.captured}, ` +
     `skipped ${result.skipped}, failed ${result.failed}.`
   );
   return result;
 }
 
+// ─── Main entry point (direct URL — preferred) ─────────────────────────────
+
+/**
+ * Capture handedness for a team we already know the GC URL for — no
+ * navigating from "our team" through an Opponents/Schedule list and
+ * fuzzy-matching this team's name against every other team's name first.
+ *
+ * This is the preferred entry point. The caller (search-gamechanger-teams.js)
+ * is invoked once per team it's already scraping games for, and by the time
+ * it calls this it has ALREADY resolved and visited that exact team's GC
+ * page — the fuzzy Opponents-list search in captureTeamHandedness() below
+ * was solving a problem that doesn't need solving here: we're not looking
+ * for this team among a pile of others, we're already standing on it.
+ *
+ * @param {object} opts
+ * @param {import('@playwright/test').Page} opts.page
+ * @param {string} opts.teamGcUrl        This team's own resolved GameChanger URL.
+ * @param {number|string} opts.teamId    This team's row id in our DB.
+ * @param {object} opts.db               db.js/db-supabase.js module (already init()'d).
+ * @param {boolean} [opts.forceRefresh]  Re-capture every player, ignoring existing rows.
+ * @param {string} [opts.teamName]       Display name only, for logging.
+ * @returns {Promise<{captured: number, skipped: number, failed: number}>}
+ */
+async function captureTeamHandednessByUrl({ page, teamGcUrl, teamId, db, forceRefresh = false, teamName = '' }) {
+  if (!teamGcUrl) throw new Error('captureTeamHandednessByUrl: teamGcUrl is required.');
+  if (!teamId) throw new Error('captureTeamHandednessByUrl: teamId is required.');
+  if (!db) throw new Error('captureTeamHandednessByUrl: db module is required.');
+
+  const label = teamName || teamGcUrl;
+  const result = { captured: 0, skipped: 0, failed: 0 };
+
+  await openTeamPage(page, teamGcUrl);
+
+  const openedRoster = await openRosterTab(page);
+  if (!openedRoster) {
+    console.error(`[handedness] Could not open Roster tab for "${label}".`);
+    return result;
+  }
+
+  return captureRosterHandedness(page, { teamName: label, teamId, db, forceRefresh });
+}
+
+// ─── Legacy entry point (Our Team -> Opponents -> fuzzy match) ────────────
+// Kept for reference / possible future use (e.g. capturing handedness for a
+// team we have a name for but no direct URL yet), but NOT used by the main
+// scrape flow anymore — see captureTeamHandednessByUrl's doc comment above
+// for why. This path relies on scanForOpponentLink/clickOpponentTeamLink
+// correctly picking one team's row out of a page that can render ~40 of
+// them at once, which has been a recurring source of mis-clicks.
+/**
+ * @param {object} opts
+ * @param {import('@playwright/test').Page} opts.page
+ * @param {string} opts.myTeamGcUrl        Our team's GameChanger team URL.
+ * @param {string} opts.opponentTeamName   The opponent team's name as stored in our DB.
+ * @param {number|string} opts.teamId      The opponent team's row id in our DB.
+ * @param {object} opts.db                 db.js/db-supabase.js module (already init()'d).
+ * @param {boolean} [opts.forceRefresh]    Re-capture every player, ignoring existing rows.
+ * @returns {Promise<{captured: number, skipped: number, failed: number}>}
+ */
+async function captureTeamHandedness({ page, myTeamGcUrl, opponentTeamName, teamId, db, forceRefresh = false }) {
+  if (!myTeamGcUrl) throw new Error('captureTeamHandedness: myTeamGcUrl is required.');
+  if (!opponentTeamName) throw new Error('captureTeamHandedness: opponentTeamName is required.');
+  if (!teamId) throw new Error('captureTeamHandedness: teamId is required.');
+  if (!db) throw new Error('captureTeamHandedness: db module is required.');
+
+  const result = { captured: 0, skipped: 0, failed: 0 };
+
+  await openTeamPage(page, myTeamGcUrl);
+
+  const openedOpponentsTab = await openOpponentsTab(page);
+
+  let foundOpponent = false;
+  if (openedOpponentsTab) {
+    foundOpponent = await clickOpponentTeamLink(page, opponentTeamName, { contextLabel: 'opponents-list-page' });
+  }
+
+  if (!foundOpponent) {
+    console.log('[handedness] Opponents tab did not produce a match. Falling back to Schedule tab.');
+    await openTeamPage(page, myTeamGcUrl);
+    const openedSchedule = await openScheduleTab(page);
+    if (openedSchedule) {
+      foundOpponent = await clickOpponentTeamLink(page, opponentTeamName, { contextLabel: 'schedule-page' });
+    }
+  }
+
+  if (!foundOpponent) {
+    console.error(`[handedness] Could not find/click opponent "${opponentTeamName}" from our team's page or schedule.`);
+    return result;
+  }
+
+  const openedRoster = await openRosterTab(page);
+  if (!openedRoster) {
+    console.error(`[handedness] Could not open Roster tab for "${opponentTeamName}".`);
+    return result;
+  }
+
+  return captureRosterHandedness(page, { teamName: opponentTeamName, teamId, db, forceRefresh });
+}
+
 module.exports = {
+  captureTeamHandednessByUrl,
   captureTeamHandedness,
   buildMatchKey,
   // exported for testing
