@@ -73,8 +73,20 @@ async function maybeDumpDebugHtml(page, filename) {
 
 // ─── Tab helpers ────────────────────────────────────────────────────────────
 
-async function clickTabByName(page, name, { timeout = 8000 } = {}) {
-  const tab = page.getByRole('tab', { name: new RegExp(`^${name}$`, 'i') });
+// GameChanger's team-wide nav bar has its OWN role="tab" element with
+// accessible name "Stats" (data-testid="team-nav-bar-stats", linking to a
+// completely different /season-stats page) that sits earlier in the DOM
+// than the player-profile-local Stats/Spray Charts chooser. An unscoped
+// page-wide role=tab search for "Stats" grabs that nav-bar tab instead —
+// confirmed live: it silently navigates off the player's profile entirely,
+// which is why the Batting/Pitching/Fielding sub-tabs then "don't exist"
+// (we're not on the profile pane anymore) and Spray Charts fails right
+// after. Every tab click below is scoped to a specific container for
+// exactly this reason — do not switch back to a page-wide search.
+
+async function clickTabByName(page, name, container = null, { timeout = 8000 } = {}) {
+  const scope = container || page;
+  const tab = scope.getByRole('tab', { name: new RegExp(`^${name}$`, 'i') });
   try {
     await tab.first().waitFor({ state: 'visible', timeout });
     await tab.first().click();
@@ -83,6 +95,16 @@ async function clickTabByName(page, name, { timeout = 8000 } = {}) {
   } catch {
     return false;
   }
+}
+
+// The player-profile-local Stats/Spray Charts chooser shares a testid
+// ("stats-selector") with the Standard/Advanced sub-chooser shown once
+// inside the Stats tab — disambiguate by requiring the container to
+// literally contain "Spray Charts" text, which only the top-level chooser
+// has (and which the team-nav-bar "Stats" link, a plain <a>/<div> with a
+// different testid, doesn't match at all).
+function getStatsOrSprayChooser(page) {
+  return page.locator('[data-testid="stats-selector"]').filter({ hasText: 'Spray Charts' });
 }
 
 // Returns the visible tab labels inside a specific chooser container, so we
@@ -218,7 +240,11 @@ async function captureGcStatsAndSprayForPlayer(page, { teamId, jerseyNumber, ful
 
   // ── Stats tab: enumerate top categories (Batting/Pitching/Fielding), then
   // enumerate whatever sub-tabs each one actually has, rather than assuming.
-  const openedStats = await clickTabByName(page, 'Stats');
+  const statsSprayChooser = getStatsOrSprayChooser(page);
+  const viewChooser = page.locator('[data-testid="stats-view-chooser"]');
+  const subChooser = page.locator('.StatsTable__tabviewSelector');
+
+  const openedStats = await clickTabByName(page, 'Stats', statsSprayChooser);
   if (!openedStats) {
     console.log(`[gc-stats] Stats tab not available for ${label} (team likely doesn't share this on GameChanger).`);
   } else {
@@ -229,7 +255,7 @@ async function captureGcStatsAndSprayForPlayer(page, { teamId, jerseyNumber, ful
     }
 
     for (const topCategory of topCategories) {
-      const clickedTop = await clickTabByName(page, topCategory);
+      const clickedTop = await clickTabByName(page, topCategory, viewChooser);
       if (!clickedTop) continue;
 
       const subTabs = await enumerateTabLabels(page, '.StatsTable__tabviewSelector');
@@ -237,7 +263,7 @@ async function captureGcStatsAndSprayForPlayer(page, { teamId, jerseyNumber, ful
 
       for (const subTab of iterableSubs) {
         if (subTab) {
-          const clickedSub = await clickTabByName(page, subTab);
+          const clickedSub = await clickTabByName(page, subTab, subChooser);
           if (!clickedSub) continue;
         }
 
@@ -276,14 +302,16 @@ async function captureGcStatsAndSprayForPlayer(page, { teamId, jerseyNumber, ful
   }
 
   // ── Spray Charts tab: batting only, per Troy's ask.
-  const openedSpray = await clickTabByName(page, 'Spray Charts');
+  const openedSpray = await clickTabByName(page, 'Spray Charts', statsSprayChooser);
   if (!openedSpray) {
     console.log(`[gc-stats] Spray Charts tab not available for ${label} (team likely doesn't share this on GameChanger).`);
   } else {
     result.sprayTabFound = true;
     // Batting is the default sub-view in every dump we've seen, but click it
     // explicitly in case Pitching was left selected from a prior player.
-    await clickTabByName(page, 'Batting');
+    // Reuses viewChooser — GC reuses the same data-testid="stats-view-chooser"
+    // container for this Batting/Pitching selector on the Spray Charts pane.
+    await clickTabByName(page, 'Batting', viewChooser);
 
     try {
       const chart = await extractBattingSprayChart(page);
