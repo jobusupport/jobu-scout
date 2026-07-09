@@ -605,6 +605,7 @@
     font-family: var(--font-body);
     font-size: 14px;
     min-height: 100vh;
+    color-scheme: dark;
   }
 
   /* ── Header ── */
@@ -711,18 +712,11 @@
   }
   .opt-input:focus { outline: none; border-color: var(--red); }
   /* Native date/time inputs render their calendar/clock icon black by
-     default, which disappears against the dark field. Invert it to white
-     (webkit-only — Chrome/Edge/Safari, which covers this app's users). */
-  .opt-input[type="date"]::-webkit-calendar-picker-indicator,
-  .opt-input[type="time"]::-webkit-calendar-picker-indicator {
-    filter: invert(1) brightness(1.4);
-    cursor: pointer;
-    opacity: 0.85;
-  }
-  .opt-input[type="date"]::-webkit-calendar-picker-indicator:hover,
-  .opt-input[type="time"]::-webkit-calendar-picker-indicator:hover {
-    opacity: 1;
-  }
+     default, which disappears against the dark field. Setting color-scheme
+     to dark tells the browser to draw its own native controls (including
+     that icon) in a light color to match — this alone is enough; do NOT
+     also add a CSS filter on ::-webkit-calendar-picker-indicator, since that
+     would invert the icon a second time and flip it back to dark. */
   .opt-input[type="date"], .opt-input[type="time"] { color-scheme: dark; }
   .opt-select {
     background: var(--navy); border: 1px solid var(--border); color: var(--text);
@@ -1734,6 +1728,8 @@ function renderMain() {
         <p class="log-empty" style="color:var(--muted)">Loading reports...</p>
       </div>
     </div>
+
+    ${renderJobLogBar()}
   `;
 
   if (activeTab === 'games')   loadGames();
@@ -1755,7 +1751,16 @@ function renderPipelineActions() {
         <button class="btn btn-primary" onclick="runJob('full-pipeline')" ${t.game_count<1&&!t.gc_team_url?'disabled':''}><svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M7 4v16l13-8z"/></svg> Full Pipeline</button>
       </div>
     </div>
+    <hr class="divider">
+  `;
+}
 
+// Single shared Job Log — used by every job type (GC/PG/Reingest/Generate
+// Report/Full Pipeline/Self-Scout/Matchup). Rendered once, at the bottom of
+// the panel, regardless of which tab is active, so there is never more than
+// one Job Log visible at a time.
+function renderJobLogBar() {
+  return `
     <hr class="divider">
     <div class="section-label">Job Log</div>
     <div class="job-status">
@@ -1847,17 +1852,6 @@ function renderSelfPane() {
     <div class="actions">
       <button class="btn btn-scout" onclick="runSelfScout()" ${selectedTeam?.game_count<1?'disabled title="No games yet"':''}><svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.2-3.2"/></svg> Generate Self-Scout Report</button>
     </div>
-
-    <hr class="divider">
-    <div class="section-label">Job Log</div>
-    <div class="job-status">
-      <span id="selfStatusPill" class="status-pill status-idle">Idle</span>
-      <span id="selfLabel" style="color:var(--muted)">No job running</span>
-      <button class="refresh-btn stop-job-btn" onclick="stopCurrentJob()">Stop Job</button>
-    </div>
-    <div class="log-container" id="selfLogContainer">
-      <p class="log-empty">Generate a self-scout report to see logs here.</p>
-    </div>
   `;
 }
 
@@ -1932,17 +1926,6 @@ function renderMatchupPane() {
 
     <div class="actions">
       <button class="btn btn-matchup" onclick="runMatchup()"><svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"><polyline points="14.5 17.5 3 6 3 3 6 3 17.5 14.5"/><line x1="13" y1="19" x2="19.5" y2="12.5"/><line x1="16" y1="16" x2="20" y2="20"/><polyline points="14.5 6.5 18 3 21 3 21 6 17.5 9.5"/><line x1="5.5" y1="13.5" x2="11" y2="19"/><line x1="8" y1="16" x2="4" y2="20"/></svg> Generate Matchup Report</button>
-    </div>
-
-    <hr class="divider">
-    <div class="section-label">Job Log</div>
-    <div class="job-status">
-      <span id="matchupStatusPill" class="status-pill status-idle">Idle</span>
-      <span id="matchupLabel" style="color:var(--muted)">No job running</span>
-      <button class="refresh-btn stop-job-btn" onclick="stopCurrentJob()">Stop Job</button>
-    </div>
-    <div class="log-container" id="matchupLogContainer">
-      <p class="log-empty">Generate a matchup report to see logs here.</p>
     </div>
   `;
 }
@@ -2031,9 +2014,9 @@ function stopLiveTeamSummaryRefresh() {
 async function runJob(type) {
   if (!selectedTeam) return;
 
-  const logId = type === 'self' ? 'selfLogContainer' : type === 'matchup' ? 'matchupLogContainer' : 'logContainer';
-  const pillId = type === 'self' ? 'selfStatusPill' : type === 'matchup' ? 'matchupStatusPill' : 'jobStatusPill';
-  const labelId = type === 'self' ? 'selfLabel' : type === 'matchup' ? 'matchupLabel' : 'jobLabel';
+  const logId = 'logContainer';
+  const pillId = 'jobStatusPill';
+  const labelId = 'jobLabel';
 
   if (jobStream) { jobStream.close(); jobStream = null; }
   currentJobType = type;
@@ -2088,10 +2071,10 @@ async function runSelfScout() {
   if (jobStream) { jobStream.close(); jobStream = null; }
   currentJobType = 'self-scout';
 
-  const logEl  = document.getElementById('selfLogContainer');
+  const logEl  = document.getElementById('logContainer');
   if (!logEl) return;
   logEl.innerHTML = '';
-  setStatus('selfStatusPill', 'selfLabel', 'running', 'self-scout');
+  setStatus('jobStatusPill', 'jobLabel', 'running', 'self-scout');
   setStopButtonsVisible(true);
 
   const body = { teamId: selectedTeam.id };
@@ -2113,16 +2096,16 @@ async function runSelfScout() {
   jobStream.onmessage = e => {
     const data = JSON.parse(e.data);
     if (data.done) {
-      setStatus('selfStatusPill', 'selfLabel', data.status, 'self-scout');
+      setStatus('jobStatusPill', 'jobLabel', data.status, 'self-scout');
       setStopButtonsVisible(false);
       currentJobId = null;
       currentJobType = null;
       jobStream.close();
       return;
     }
-    appendJobLogLine('selfLogContainer', logEl, data.line);
+    appendJobLogLine('logContainer', logEl, data.line);
   };
-  jobStream.onerror = () => { appendJobLogLine('selfLogContainer', logEl, '✗ Job log stream disconnected. Check Railway logs if the job is still running.'); setStatus('selfStatusPill', 'selfLabel', 'failed', 'self-scout'); setStopButtonsVisible(false); if (jobStream) jobStream.close(); };
+  jobStream.onerror = () => { appendJobLogLine('logContainer', logEl, '✗ Job log stream disconnected. Check Railway logs if the job is still running.'); setStatus('jobStatusPill', 'jobLabel', 'failed', 'self-scout'); setStopButtonsVisible(false); if (jobStream) jobStream.close(); };
 }
 
 async function runMatchup() {
@@ -2135,10 +2118,10 @@ async function runMatchup() {
   if (jobStream) { jobStream.close(); jobStream = null; }
   currentJobType = 'matchup';
 
-  const logEl = document.getElementById('matchupLogContainer');
+  const logEl = document.getElementById('logContainer');
   if (!logEl) return;
   logEl.innerHTML = '';
-  setStatus('matchupStatusPill', 'matchupLabel', 'running', 'matchup');
+  setStatus('jobStatusPill', 'jobLabel', 'running', 'matchup');
   setStopButtonsVisible(true);
 
   // server.js's /api/run/matchup expects `teamId` for the opponent (matching
@@ -2162,16 +2145,16 @@ async function runMatchup() {
   jobStream.onmessage = e => {
     const data = JSON.parse(e.data);
     if (data.done) {
-      setStatus('matchupStatusPill', 'matchupLabel', data.status, 'matchup');
+      setStatus('jobStatusPill', 'jobLabel', data.status, 'matchup');
       setStopButtonsVisible(false);
       currentJobId = null;
       currentJobType = null;
       jobStream.close();
       return;
     }
-    appendJobLogLine('matchupLogContainer', logEl, data.line);
+    appendJobLogLine('logContainer', logEl, data.line);
   };
-  jobStream.onerror = () => { appendJobLogLine('matchupLogContainer', logEl, '✗ Job log stream disconnected. Check Railway logs if the job is still running.'); setStatus('matchupStatusPill', 'matchupLabel', 'failed', 'matchup'); setStopButtonsVisible(false); if (jobStream) jobStream.close(); };
+  jobStream.onerror = () => { appendJobLogLine('logContainer', logEl, '✗ Job log stream disconnected. Check Railway logs if the job is still running.'); setStatus('jobStatusPill', 'jobLabel', 'failed', 'matchup'); setStopButtonsVisible(false); if (jobStream) jobStream.close(); };
 }
 
 function setStopButtonsVisible(visible) {
@@ -2183,14 +2166,7 @@ function setStopButtonsVisible(visible) {
 }
 
 function getCurrentJobUi() {
-  const type = currentJobType || 'gc-scraper';
-  if (type === 'self-scout' || type === 'self') return {
-    logId: 'selfLogContainer', pillId: 'selfStatusPill', labelId: 'selfLabel', label: 'self-scout'
-  };
-  if (type === 'matchup') return {
-    logId: 'matchupLogContainer', pillId: 'matchupStatusPill', labelId: 'matchupLabel', label: 'matchup'
-  };
-  return { logId: 'logContainer', pillId: 'jobStatusPill', labelId: 'jobLabel', label: type };
+  return { logId: 'logContainer', pillId: 'jobStatusPill', labelId: 'jobLabel', label: currentJobType || 'gc-scraper' };
 }
 
 async function stopCurrentJob() {
