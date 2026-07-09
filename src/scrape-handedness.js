@@ -1031,6 +1031,12 @@ async function captureRosterHandedness(page, { teamName, teamId, db, forceRefres
     return result;
   }
 
+  // Recovery anchor: if a player's row/modal handling leaves the page in a
+  // broken state (stuck overlay, wrong scroll position, etc.), reload back
+  // to this exact roster URL before attempting the next player rather than
+  // letting one bad interaction cascade into failing every player after it.
+  const rosterUrl = page.url();
+
   for (const entry of rosterEntries) {
     const matchKey = buildMatchKey(entry.name);
     const jerseyKey = String(entry.jerseyNumber || '');
@@ -1047,12 +1053,30 @@ async function captureRosterHandedness(page, { teamName, teamId, db, forceRefres
 
     console.log(`[handedness] Capturing new player: ${entry.name} (#${entry.jerseyNumber || '?'})`);
 
+    let failed = false;
     try {
       const opened = await openPlayerModalByRosterEntry(page, entry);
-      if (!opened) throw new Error('could not open roster row');
+      if (!opened) {
+        // If a prior player's failure left a stray overlay/backdrop behind,
+        // it would show up in the page HTML right now — dump it rather than
+        // assuming this is identical to the plain roster-page.html capture.
+        const safeName = String(entry.name || 'unknown').replace(/[^a-z0-9]/gi, '-').toLowerCase();
+        await maybeDumpDebugHtml(page, `NOCLICK-${safeName}-${entry.jerseyNumber || 'nojersey'}.html`, { force: true });
+        throw new Error('could not open roster row');
+      }
 
       const modalReady = await waitForPlayerModal(page);
-      if (!modalReady) throw new Error('Edit Player modal did not appear');
+      if (!modalReady) {
+        // THIS is the failure we've had zero visibility into so far: a
+        // click landed (opened === true) but nothing matching our "Edit
+        // Player" dialog checks showed up. Dump whatever actually is on
+        // screen — either a differently-labeled dialog (selector needs
+        // widening) or a genuinely different UI for opponent rosters
+        // (e.g. a read-only player card instead of an editable modal).
+        const safeName = String(entry.name || 'unknown').replace(/[^a-z0-9]/gi, '-').toLowerCase();
+        await maybeDumpDebugHtml(page, `NOMODAL-${safeName}-${entry.jerseyNumber || 'nojersey'}.html`, { force: true });
+        throw new Error('Edit Player modal did not appear');
+      }
 
       const captured = await extractHandednessFromModal(page);
       const { firstName, lastName } = splitFullName(entry.name);
@@ -1072,8 +1096,20 @@ async function captureRosterHandedness(page, { teamName, teamId, db, forceRefres
     } catch (error) {
       console.error(`[handedness] Failed to capture ${entry.name}: ${error.message}`);
       result.failed++;
+      failed = true;
     } finally {
       await closePlayerModal(page);
+    }
+
+    if (failed) {
+      try {
+        console.log(`[handedness] Reloading roster page to recover before the next player (${rosterUrl})...`);
+        await page.goto(rosterUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.waitForTimeout(1500);
+        await dismissDontMissOutPopup(page);
+      } catch (recoverError) {
+        console.warn(`[handedness] Recovery reload failed: ${recoverError.message}. Continuing anyway — subsequent players may keep failing until the page is reset.`);
+      }
     }
   }
 
