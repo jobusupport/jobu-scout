@@ -798,9 +798,14 @@ async function extractHandednessFromModal(page) {
         // clickable root. Include descendants too, but only inside the option.
         for (const child of Array.from(optionEl.querySelectorAll('*')).slice(0, 20)) add(child);
 
+        // Keep the live element alongside each sample so bluePillVisual below
+        // can check actual containment, not just "found somewhere in the
+        // scan". `el` is stripped before this object leaves inspectOption —
+        // Playwright can't serialize a DOM handle back across page.evaluate().
         const samples = nodes.map((el) => {
           const style = getComputedStyle(el);
           return {
+            el,
             tag: el.tagName,
             text: norm(el.textContent),
             className: String(el.className || ''),
@@ -833,13 +838,33 @@ async function extractHandednessFromModal(page) {
           /(__|--)(active|selected|checked|pressed)\b/i.test(s.className)
         );
 
-        const hasBlueBackground = samples.some((s) => s.selectedBlueBg);
-        const hasLightText = samples.some((s) => s.lightText);
+        // A real selected pill is a blue-background element with light text
+        // that belongs to THAT SAME pill — either the background element's
+        // own computed text color is light (covers the common case where
+        // color is set once and inherited down), or the light text sits on
+        // a descendant inside that specific blue element (covers GC builds
+        // where a child span carries an explicit override color). We do NOT
+        // count a blue node and a light-text node as a match just because
+        // both showed up somewhere in the option's ancestor/descendant scan
+        // — that pairs unrelated elements (e.g. a blue page-level wrapper
+        // several levels up plus an unrelated light-colored icon inside the
+        // option) and produces false positives.
+        const blueSamples = samples.filter((s) => s.selectedBlueBg);
+        const bluePillVisual = blueSamples.some((blueSample) => {
+          if (blueSample.lightText) return true;
+          return samples.some((lightSample) =>
+            lightSample.lightText &&
+            lightSample.el !== blueSample.el &&
+            blueSample.el.contains(lightSample.el)
+          );
+        });
+
+        for (const s of samples) delete s.el;
 
         return {
           explicit,
           classSelected,
-          bluePillVisual: hasBlueBackground && hasLightText,
+          bluePillVisual,
           samples
         };
       }
