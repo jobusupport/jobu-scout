@@ -968,11 +968,24 @@ function buildSelfScoutPrompt(bundle, options = {}) {
   const { gameLocation = null, gameDate = null } = options;
   const coachContextBlock = buildCoachContextBlock(options);
 
-  // Self-scout reads is_our_team=true rows — the mirror of the opponent
-  // report's `!b.is_our_team` filter. See buildAnalysisPrompt for the
-  // Supabase-boolean-vs-SQLite-integer note; same falsy-check applies here.
-  const batting  = (bundle.batting  || []).filter(b => b.is_our_team);
-  const pitching = (bundle.pitching || []).filter(p => p.is_our_team);
+  // IMPORTANT: despite the name, self-scout reads the SAME side as the
+  // opponent report (`!b.is_our_team`), not the opposite side. Teams in this
+  // DB are ingested through the normal opponent-scrape pipeline regardless of
+  // whether they end up being scouted as an opponent or flagged as our own
+  // team (teams.is_our_team) — the scraped team's own players always land on
+  // the is_our_team=false side of batting_lines/pitching_lines, and whoever
+  // they played land on the true side. Confirmed directly against Supabase
+  // for VBA National 14U (team_id 489f5656-205a-49a5-a3de-d1c8c3f226b6): 249
+  // rows for VBA's own 12 players at is_our_team=false vs 246 rows spread
+  // across 21 different opponents at is_our_team=true. Only flip this if a
+  // team was deliberately ingested with GAME_INVERT_TEAM_SIDE=true at scrape
+  // time (options.invertTeamSide === true) — see analyzeSelfScout below.
+  const batting  = options.invertTeamSide === true
+    ? (bundle.batting  || []).filter(b => b.is_our_team)
+    : (bundle.batting  || []).filter(b => !b.is_our_team);
+  const pitching = options.invertTeamSide === true
+    ? (bundle.pitching || []).filter(p => p.is_our_team)
+    : (bundle.pitching || []).filter(p => !p.is_our_team);
 
   const wins   = games.filter(g => g.result === 'W').length;
   const losses = games.filter(g => g.result === 'L').length;
@@ -1116,13 +1129,13 @@ async function analyzeSelfScout(teamId, options = {}) {
   console.log(`\n[analyzer] Preparing self-scout for team ${teamId}...`);
 
   if (!options.skipRecalculate && typeof pipeline.recalculateTeamStats === 'function') {
-    console.log('[analyzer] Recalculating advanced stats (self-scout, inverted) before report bundle...');
-    // Self-scout reads is_our_team=true rows, so unless the team was already
-    // ingested inverted, this recalculation needs invertTeamSide=true. Callers
-    // can override via options.invertTeamSide if a given team was ingested
-    // the other way already.
+    console.log('[analyzer] Recalculating advanced stats before self-scout bundle...');
+    // Teams are ingested through the normal (non-inverted) pipeline unless
+    // explicitly scraped with GAME_INVERT_TEAM_SIDE=true, so this defaults to
+    // invertTeamSide=false — the same default every opponent report uses.
+    // Pass invertTeamSide:true only for a team you know was ingested inverted.
     await pipeline.recalculateTeamStats(teamId, {
-      invertTeamSide: options.invertTeamSide !== false,
+      invertTeamSide: options.invertTeamSide === true,
     });
   }
 
@@ -1172,9 +1185,15 @@ function buildMatchupPrompt(ourBundle, oppBundle, options = {}) {
   const ourTeam = ourBundle.team;
   const oppTeam = oppBundle.team;
 
-  // Mirror of buildSelfScoutPrompt / buildAnalysisPrompt filters.
-  const ourBatting  = (ourBundle.batting  || []).filter(b => b.is_our_team);
-  const ourPitching = (ourBundle.pitching || []).filter(p => p.is_our_team);
+  // Same fix as buildSelfScoutPrompt: our own team's data sits on the
+  // is_our_team=false side unless it was deliberately ingested inverted.
+  const ourInverted = options.invertOurTeamSide === true;
+  const ourBatting  = ourInverted
+    ? (ourBundle.batting  || []).filter(b => b.is_our_team)
+    : (ourBundle.batting  || []).filter(b => !b.is_our_team);
+  const ourPitching = ourInverted
+    ? (ourBundle.pitching || []).filter(p => p.is_our_team)
+    : (ourBundle.pitching || []).filter(p => !p.is_our_team);
   const oppBatting  = (oppBundle.batting  || []).filter(b => !b.is_our_team);
   const oppPitching = (oppBundle.pitching || []).filter(p => !p.is_our_team);
 
@@ -1300,7 +1319,7 @@ async function analyzeMatchup(ourTeamId, opponentTeamId, options = {}) {
   console.log(`\n[analyzer] Preparing matchup: our team ${ourTeamId} vs opponent ${opponentTeamId}...`);
 
   if (!options.skipRecalculate && typeof pipeline.recalculateTeamStats === 'function') {
-    await pipeline.recalculateTeamStats(ourTeamId, { invertTeamSide: options.invertOurTeamSide !== false });
+    await pipeline.recalculateTeamStats(ourTeamId, { invertTeamSide: options.invertOurTeamSide === true });
     await pipeline.recalculateTeamStats(opponentTeamId, { invertTeamSide: options.invertOpponentTeamSide === true });
   }
 

@@ -20,8 +20,11 @@ require('dotenv').config();
  *   GAME_SCOPE="opponent|self|matchup" ← informational; --self-scout/--matchup flags drive behavior
  *
  * Self-scout / matchup only:
- *   OUR_TEAM_ID="<uuid>"              ← defaults to JoBu 14U (23b74114-5899-43d0-b3a2-10abac740666)
- *   GAME_INVERT_TEAM_SIDE="true"      ← set false if OUR_TEAM_ID was already ingested inverted
+ *   OUR_TEAM_ID="<uuid>"              ← defaults to VBA National 14U (489f5656-205a-49a5-a3de-d1c8c3f226b6),
+ *                                        the team flagged teams.is_our_team=true in Supabase
+ *   GAME_INVERT_TEAM_SIDE="true"      ← only set true if OUR_TEAM_ID was scraped with an inverted pipeline;
+ *                                        every team ingested so far (including VBA National 14U) was NOT,
+ *                                        so leave this unset/false unless you know otherwise
  */
 
 const path     = require('path');
@@ -31,7 +34,7 @@ const report   = require('./report');
 
 const DB_PATH     = path.join(__dirname, '..', 'voodoo-scout.db');
 const REPORTS_DIR = process.env.REPORTS_DIR || path.join(__dirname, '..', 'reports');
-const OUR_TEAM_ID = process.env.OUR_TEAM_ID || '23b74114-5899-43d0-b3a2-10abac740666';
+const OUR_TEAM_ID = process.env.OUR_TEAM_ID || '489f5656-205a-49a5-a3de-d1c8c3f226b6';
 
 // Options passed through to analyzer
 const analyzerOptions = {

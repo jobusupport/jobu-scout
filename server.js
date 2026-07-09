@@ -1069,7 +1069,7 @@ app.delete('/api/teams/:id/game-urls/:urlId', requireAuth, async (req, res) => {
 
 // ── Add Team ─────────────────────────────────────────────────────────────────
 app.post('/api/teams/add', requireAuth, async (req, res) => {
-  const { teamName, gcTeamUrl, pgTeamUrl } = req.body;
+  const { teamName, gcTeamUrl, pgTeamUrl, isOurTeam, seasonYear, seasonType } = req.body;
   if (!teamName) return res.status(400).json({ error: 'teamName is required' });
 
   try {
@@ -1097,7 +1097,9 @@ app.post('/api/teams/add', requireAuth, async (req, res) => {
           team_name: teamName.trim(),
           gc_team_url: gcTeamUrl || null,
           pg_team_url: pgTeamUrl || null,
-          is_our_team: false,
+          is_our_team: !!isOurTeam,
+          season_year: seasonYear || null,
+          season_type: seasonType || null,
         })
         .select('id')
         .single();
@@ -1122,7 +1124,7 @@ app.post('/api/teams/add', requireAuth, async (req, res) => {
 
 // ── Edit / Remove Team ───────────────────────────────────────────────────────
 app.put('/api/teams/:id', requireAuth, async (req, res) => {
-  const { teamName, gcTeamUrl, pgTeamUrl } = req.body;
+  const { teamName, gcTeamUrl, pgTeamUrl, seasonYear, seasonType } = req.body;
   const teamId = req.params.id;
 
   if (!teamName || !String(teamName).trim()) {
@@ -1147,14 +1149,20 @@ app.put('/api/teams/:id', requireAuth, async (req, res) => {
         return res.status(409).json({ error: `Another opponent already uses the name "${teamName}".` });
       }
 
+      const updates = {
+        team_name: String(teamName).trim(),
+        gc_team_url: gcTeamUrl ? String(gcTeamUrl).trim() : null,
+        pg_team_url: pgTeamUrl ? String(pgTeamUrl).trim() : null,
+        updated_at: new Date().toISOString(),
+      };
+      // Only touch season_year/season_type when explicitly provided (the
+      // Opponent edit modal doesn't send these; the My Team edit modal does).
+      if (seasonYear !== undefined) updates.season_year = seasonYear || null;
+      if (seasonType !== undefined) updates.season_type = seasonType || null;
+
       const { error } = await adminClient
         .from('teams')
-        .update({
-          team_name: String(teamName).trim(),
-          gc_team_url: gcTeamUrl ? String(gcTeamUrl).trim() : null,
-          pg_team_url: pgTeamUrl ? String(pgTeamUrl).trim() : null,
-          updated_at: new Date().toISOString(),
-        })
+        .update(updates)
         .eq('id', teamId)
         .eq('org_id', orgId);
 
