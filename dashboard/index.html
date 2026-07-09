@@ -710,6 +710,20 @@
     transition: border-color 0.15s;
   }
   .opt-input:focus { outline: none; border-color: var(--red); }
+  /* Native date/time inputs render their calendar/clock icon black by
+     default, which disappears against the dark field. Invert it to white
+     (webkit-only — Chrome/Edge/Safari, which covers this app's users). */
+  .opt-input[type="date"]::-webkit-calendar-picker-indicator,
+  .opt-input[type="time"]::-webkit-calendar-picker-indicator {
+    filter: invert(1) brightness(1.4);
+    cursor: pointer;
+    opacity: 0.85;
+  }
+  .opt-input[type="date"]::-webkit-calendar-picker-indicator:hover,
+  .opt-input[type="time"]::-webkit-calendar-picker-indicator:hover {
+    opacity: 1;
+  }
+  .opt-input[type="date"], .opt-input[type="time"] { color-scheme: dark; }
   .opt-select {
     background: var(--navy); border: 1px solid var(--border); color: var(--text);
     padding: 7px 10px; border-radius: 5px; font-size: 12px; font-family: inherit;
@@ -1500,6 +1514,15 @@ function selectTeam(teamId) {
     console.error('Team not found for id:', teamId);
     return;
   }
+  // 'run' (Single Opponent Scout) only exists for opponents; 'self'/'matchup'
+  // only exist for My Team. Switch to a tab that actually exists for the
+  // newly selected team's type, defaulting to Games/Reports otherwise.
+  const ourTeamTabs = ['self', 'matchup', 'games', 'reports'];
+  const opponentTabs = ['run', 'games', 'reports'];
+  const validTabs = selectedTeam.is_our_team ? ourTeamTabs : opponentTabs;
+  if (!validTabs.includes(activeTab)) {
+    activeTab = selectedTeam.is_our_team ? 'self' : 'run';
+  }
   renderMain();
   document.querySelectorAll('.team-item').forEach(el => {
     el.classList.toggle('active', String(el.dataset.teamId) === String(selectedTeam.id));
@@ -1619,12 +1642,14 @@ function renderMyTeams() {
     return;
   }
   list.innerHTML = myTeams.map((t) => `
-    <div class="team-item" style="cursor:default">
+    <div class="team-item ${String(selectedTeam?.id) === String(t.id) ? 'active' : ''}"
+         data-team-id="${escHtml(t.id)}"
+         onclick="selectTeamById(this.dataset.teamId)">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
         <div class="team-name">${escHtml(t.team_name)}</div>
         <div class="team-actions" style="opacity:1">
-          <button class="team-action-btn" title="Edit team" onclick="showEditMyTeam('${escHtml(t.id)}')">Edit</button>
-          <button class="team-action-btn danger" title="Remove" onclick="removeMyTeam('${escHtml(t.id)}')">×</button>
+          <button class="team-action-btn" title="Edit team" onclick="event.stopPropagation(); showEditMyTeam('${escHtml(t.id)}')">Edit</button>
+          <button class="team-action-btn danger" title="Remove" onclick="event.stopPropagation(); removeMyTeam('${escHtml(t.id)}')">×</button>
         </div>
       </div>
       <div class="team-meta">
@@ -1652,8 +1677,8 @@ function renderMain() {
       <div class="team-urls">
         ${t.gc_team_url ? `<a class="url-link" href="${t.gc_team_url}" target="_blank"><svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"><path d="M9 15a5 5 0 0 0 7 0l3-3a5 5 0 1 0-7-7l-1 1"/><path d="M15 9a5 5 0 0 0-7 0l-3 3a5 5 0 1 0 7 7l1-1"/></svg> GameChanger</a>` : ''}
         ${t.pg_team_url ? `<a class="url-link" href="${t.pg_team_url}" target="_blank"><svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"><path d="M9 15a5 5 0 0 0 7 0l3-3a5 5 0 1 0-7-7l-1 1"/><path d="M15 9a5 5 0 0 0-7 0l-3 3a5 5 0 1 0 7 7l1-1"/></svg> Perfect Game</a>` : ''}
-        <button class="refresh-btn" onclick="showEditTeam('${escHtml(t.id)}')">Edit Opponent</button>
-        <button class="refresh-btn" onclick="removeOpponent('${escHtml(t.id)}')" style="border-color:var(--red);color:#ff8a80">Remove</button>
+        <button class="refresh-btn" onclick="${t.is_our_team ? `showEditMyTeam('${escHtml(t.id)}')` : `showEditTeam('${escHtml(t.id)}')`}">${t.is_our_team ? 'Edit Team' : 'Edit Opponent'}</button>
+        <button class="refresh-btn" onclick="${t.is_our_team ? `removeMyTeam('${escHtml(t.id)}')` : `removeOpponent('${escHtml(t.id)}')`}" style="border-color:var(--red);color:#ff8a80">Remove</button>
       </div>
     </div>
 
@@ -1661,26 +1686,28 @@ function renderMain() {
       <div class="stat-box"><div class="stat-val" id="statGames">${s.games ?? s.game_count ?? t.game_count ?? 0}</div><div class="stat-lbl">Games</div></div>
       <div class="stat-box"><div class="stat-val" id="statWins">${s.wins ?? '—'}</div><div class="stat-lbl">Wins</div></div>
       <div class="stat-box"><div class="stat-val" id="statLosses">${s.losses ?? '—'}</div><div class="stat-lbl">Losses</div></div>
+      <div class="stat-box"><div class="stat-val" id="statTies">${s.ties ?? '—'}</div><div class="stat-lbl">Ties</div></div>
       <div class="stat-box"><div class="stat-val" id="statBatters">${s.batters ?? '—'}</div><div class="stat-lbl">Batters</div></div>
       <div class="stat-box"><div class="stat-val" id="statLastGame">${lastGame}</div><div class="stat-lbl">Last Game</div></div>
       <div class="stat-box"><div class="stat-val">${t.hasGC ? '✓' : '—'}</div><div class="stat-lbl">GC Data</div></div>
       <div class="stat-box"><div class="stat-val">${t.hasPG ? '✓' : '—'}</div><div class="stat-lbl">PG Data</div></div>
     </div>
 
+    ${renderPipelineActions()}
+
     <div class="main-tabs" id="mainTabs">
-      <div class="main-tab ${activeTab==='run'?'active':''}"      onclick="switchTab('run')">Single Opponent Scout</div>
+      ${t.is_our_team ? `
       <div class="main-tab ${activeTab==='self'?'active':''}"     onclick="switchTab('self')">Self-Scout</div>
       <div class="main-tab ${activeTab==='matchup'?'active':''}"  onclick="switchTab('matchup')">Matchup</div>
+      ` : `
+      <div class="main-tab ${activeTab==='run'?'active':''}"      onclick="switchTab('run')">Single Opponent Scout</div>
+      `}
       <div class="main-tab ${activeTab==='games'?'active':''}"    onclick="switchTab('games')">Games</div>
       <div class="main-tab ${activeTab==='reports'?'active':''}"  onclick="switchTab('reports')">Reports</div>
     </div>
 
     <div class="main-content">
-      <!-- RUN TAB -->
-      <div class="main-pane ${activeTab==='run'?'active':''}" id="pane-run">
-        ${renderRunPane()}
-      </div>
-
+      ${t.is_our_team ? `
       <!-- SELF-SCOUT TAB -->
       <div class="main-pane ${activeTab==='self'?'active':''}" id="pane-self">
         ${renderSelfPane()}
@@ -1690,6 +1717,12 @@ function renderMain() {
       <div class="main-pane ${activeTab==='matchup'?'active':''}" id="pane-matchup">
         ${renderMatchupPane()}
       </div>
+      ` : `
+      <!-- RUN TAB -->
+      <div class="main-pane ${activeTab==='run'?'active':''}" id="pane-run">
+        ${renderRunPane()}
+      </div>
+      `}
 
       <!-- GAMES TAB -->
       <div class="main-pane ${activeTab==='games'?'active':''}" id="pane-games">
@@ -1709,7 +1742,7 @@ function renderMain() {
 
 // ── Pane renderers ────────────────────────────────────────────────────────────
 
-function renderRunPane() {
+function renderPipelineActions() {
   const t = selectedTeam;
   return `
     <div class="run-section">
@@ -1717,13 +1750,28 @@ function renderRunPane() {
       <div class="actions">
         <button class="btn btn-outline" onclick="runJob('gc-scraper')"><svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"><path d="M12 3v12"/><path d="m7 11 5 5 5-5"/><path d="M5 21h14"/></svg> GC Scrape</button>
         <button class="btn btn-outline" onclick="runJob('pg-scraper')" ${!t.pg_team_url?'disabled title="No PG URL"':''}><svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"><path d="M12 3v12"/><path d="m7 11 5 5 5-5"/><path d="M5 21h14"/></svg> PG Scrape</button>
-        <button class="btn btn-outline" onclick="runJob('reingest')"><svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v5h-5"/></svg> Reingest</button>
+        <button class="btn btn-outline" onclick="runJob('reingest')" title="Reprocess game data already saved from prior scrapes using the current normalizer/stats logic — no re-scrape of GameChanger. Use this after a stats/bug fix to correct already-stored numbers without waiting on GC again."><svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v5h-5"/></svg> Reingest</button>
         <button class="btn btn-outline" onclick="runJob('report')" ${t.game_count<1?'disabled title="No games yet"':''}><svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="M9 13h6M9 17h4"/></svg> Generate Report</button>
         <button class="btn btn-primary" onclick="runJob('full-pipeline')" ${t.game_count<1&&!t.gc_team_url?'disabled':''}><svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M7 4v16l13-8z"/></svg> Full Pipeline</button>
       </div>
     </div>
 
     <hr class="divider">
+    <div class="section-label">Job Log</div>
+    <div class="job-status">
+      <span id="jobStatusPill" class="status-pill status-idle">Idle</span>
+      <span id="jobLabel" style="color:var(--muted)">No job running</span>
+      <button class="refresh-btn stop-job-btn" onclick="stopCurrentJob()">Stop Job</button>
+    </div>
+    <div class="log-container" id="logContainer">
+      <p class="log-empty">Run a pipeline step above to see logs here.</p>
+    </div>
+    <hr class="divider">
+  `;
+}
+
+function renderRunPane() {
+  return `
     <div class="section-label">Report Options</div>
 
     <div class="options-grid">
@@ -1755,17 +1803,6 @@ function renderRunPane() {
       <label>Human Observations <span style="font-weight:400;text-transform:none;letter-spacing:0">(live scouting notes — tell Jobu what you know and what you have seen)</span></label>
       <textarea class="obs-textarea" id="opt-obs" placeholder="e.g. Their #12 has a big leg kick and struggles with inside fastballs. Catcher has a weak arm, ran on him twice. Their CF was shading right on all their lefties..."
         oninput="opts.humanObs=this.value">${escHtml(opts.humanObs)}</textarea>
-    </div>
-
-    <hr class="divider">
-    <div class="section-label">Job Log</div>
-    <div class="job-status">
-      <span id="jobStatusPill" class="status-pill status-idle">Idle</span>
-      <span id="jobLabel" style="color:var(--muted)">No job running</span>
-      <button class="refresh-btn stop-job-btn" onclick="stopCurrentJob()">Stop Job</button>
-    </div>
-    <div class="log-container" id="logContainer">
-      <p class="log-empty">Run a pipeline step above to see logs here.</p>
     </div>
   `;
 }
@@ -1825,11 +1862,16 @@ function renderSelfPane() {
 }
 
 function renderMatchupPane() {
+  // Default "Our Team" to whichever My Team is currently selected.
+  if (!opts.matchupOurTeamId && selectedTeam?.is_our_team) {
+    opts.matchupOurTeamId = selectedTeam.id;
+  }
+
   const teamOptions = allTeams.map(t =>
-    `<option value="${t.id}" ${t.id===opts.matchupOurTeamId?'selected':''}>${escHtml(t.team_name)}</option>`
+    `<option value="${t.id}" ${String(t.id)===String(opts.matchupOurTeamId)?'selected':''}>${escHtml(t.team_name)}</option>`
   ).join('');
-  const oppOptions = allTeams.map(t =>
-    `<option value="${t.id}" ${t.id===opts.matchupOppTeamId?'selected':''}>${escHtml(t.team_name)}</option>`
+  const oppOptions = allTeams.filter(t => !t.is_our_team).map(t =>
+    `<option value="${t.id}" ${String(t.id)===String(opts.matchupOppTeamId)?'selected':''}>${escHtml(t.team_name)}</option>`
   ).join('');
 
   return `
@@ -1840,7 +1882,7 @@ function renderMatchupPane() {
       <div class="matchup-team-box">
         <label>Our Team</label>
         <div class="team-select-wrap">
-          <select id="matchup-our" onchange="opts.matchupOurTeamId=parseInt(this.value)">
+          <select id="matchup-our" onchange="opts.matchupOurTeamId=this.value">
             <option value="">— Select our team —</option>
             ${teamOptions}
           </select>
@@ -1849,7 +1891,7 @@ function renderMatchupPane() {
       <div class="matchup-team-box">
         <label>Opponent</label>
         <div class="team-select-wrap">
-          <select id="matchup-opp" onchange="opts.matchupOppTeamId=parseInt(this.value)">
+          <select id="matchup-opp" onchange="opts.matchupOppTeamId=this.value">
             <option value="">— Select opponent —</option>
             ${oppOptions}
           </select>
@@ -1939,6 +1981,7 @@ function updateSelectedTeamSummaryCounters(summary) {
   setText('statGames', summary.games ?? summary.game_count ?? 0);
   setText('statWins', summary.wins ?? '—');
   setText('statLosses', summary.losses ?? '—');
+  setText('statTies', summary.ties ?? '—');
   setText('statBatters', summary.batters ?? '—');
 
   const lastGame = summary.last_game || summary.lastGame || null;
@@ -1952,6 +1995,7 @@ function updateSelectedTeamSummaryCounters(summary) {
       games: summary.games ?? summary.game_count ?? selectedTeam.stats?.games,
       wins: summary.wins ?? selectedTeam.stats?.wins,
       losses: summary.losses ?? selectedTeam.stats?.losses,
+      ties: summary.ties ?? selectedTeam.stats?.ties,
       batters: summary.batters ?? selectedTeam.stats?.batters,
       plays: summary.plays ?? selectedTeam.stats?.plays,
     };
@@ -2082,11 +2126,11 @@ async function runSelfScout() {
 }
 
 async function runMatchup() {
-  const ourId = opts.matchupOurTeamId || parseInt(document.getElementById('matchup-our')?.value);
-  const oppId = opts.matchupOppTeamId || parseInt(document.getElementById('matchup-opp')?.value);
+  const ourId = opts.matchupOurTeamId || document.getElementById('matchup-our')?.value || null;
+  const oppId = opts.matchupOppTeamId || document.getElementById('matchup-opp')?.value || null;
 
   if (!ourId || !oppId) { alert('Please select both teams for the matchup report.'); return; }
-  if (ourId === oppId)  { alert('Our team and opponent must be different teams.'); return; }
+  if (String(ourId) === String(oppId)) { alert('Our team and opponent must be different teams.'); return; }
 
   if (jobStream) { jobStream.close(); jobStream = null; }
   currentJobType = 'matchup';
@@ -2097,7 +2141,9 @@ async function runMatchup() {
   setStatus('matchupStatusPill', 'matchupLabel', 'running', 'matchup');
   setStopButtonsVisible(true);
 
-  const body = { ourTeamId: ourId, oppTeamId: oppId };
+  // server.js's /api/run/matchup expects `teamId` for the opponent (matching
+  // every other /api/run/* route) plus an optional `ourTeamId` override.
+  const body = { teamId: oppId, ourTeamId: ourId };
   if (opts.gameLocation)    body.gameLocation      = opts.gameLocation;
   if (opts.gameDate)        body.gameDate          = opts.gameDate;
   if (opts.humanObs)        body.humanObservations = opts.humanObs;
