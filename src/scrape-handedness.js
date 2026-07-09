@@ -27,6 +27,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { captureGcStatsAndSprayForPlayer } = require('./scrape-gc-player-stats');
 
 const OUTPUT_DIR = path.join(__dirname, '..', 'output');
 const DEBUG_DIR = path.join(OUTPUT_DIR, '_handedness-debug');
@@ -698,6 +699,15 @@ async function openPlayerModalByRowText(page, playerName) {
 }
 
 // ─── Edit Player modal extraction ──────────────────────────────────────────
+// NOTE: confirmed via real debug dumps (16/16 players on an opponent
+// roster) that this "Edit Player" modal path is NOT what actually renders
+// when viewing a team you don't manage. GameChanger instead swaps in a
+// read-only "FanPlayerProfile" pane — see the "Fan player profile
+// extraction" section below, which is what captureRosterHandedness()
+// actually calls. This modal-based path is kept for a team you DO manage
+// (e.g. if this is ever pointed at our own roster), where GC does give you
+// an editable modal with the segmented Left/Right/Both controls this code
+// was originally built to read.
 
 async function waitForPlayerModal(page) {
   const candidates = [
@@ -981,6 +991,82 @@ async function extractHandednessFromModal(page) {
   };
 }
 
+// ─── Fan player profile extraction (opponent rosters — the real path) ─────
+// Confirmed against real debug dumps: clicking a player row on a team you
+// don't manage swaps in a read-only ".FanPlayerProfile__playerProfileContainer"
+// pane (a client-side route change within the SPA — NOT a dialog; the
+// #modal-root portal stays empty the whole time). It already shows handedness
+// as plain text: a "Bats: right" / "Throws: left" pair of <span> elements
+// inside ".FanPlayerProfile__playerProfileBioInfo", right next to the
+// player's name/jersey. No color inspection, no segmented-control ancestor
+// climbing needed — just read the text.
+
+async function waitForPlayerProfile(page) {
+  const candidates = [
+    page.locator('.FanPlayerProfile__playerProfileBioInfo'),
+    page.locator('.FanPlayerProfile__playerProfileContainer'),
+  ];
+  for (const locator of candidates) {
+    try {
+      await locator.first().waitFor({ state: 'visible', timeout: 8000 });
+      return true;
+    } catch {
+      // try next
+    }
+  }
+  return false;
+}
+
+async function extractHandednessFromProfile(page) {
+  await maybeDumpDebugHtml(page, `profile-${Date.now()}.html`);
+
+  const data = await page.evaluate(() => {
+    function norm(t) { return (t || '').replace(/\s+/g, ' ').trim(); }
+
+    const bioInfo = document.querySelector('.FanPlayerProfile__playerProfileBioInfo');
+    if (!bioInfo) return { nameLine: '', batsRaw: '', throwsRaw: '' };
+
+    const nameEl = bioInfo.querySelector('.FanPlayerProfile__playerProfileBioInfoName');
+    const nameLine = norm(nameEl ? nameEl.textContent : '');
+
+    let batsRaw = '';
+    let throwsRaw = '';
+    for (const span of Array.from(bioInfo.querySelectorAll('span'))) {
+      const t = norm(span.textContent);
+      const batsMatch = t.match(/^bats:\s*(.+)$/i);
+      const throwsMatch = t.match(/^throws:\s*(.+)$/i);
+      if (batsMatch) batsRaw = batsMatch[1];
+      if (throwsMatch) throwsRaw = throwsMatch[1];
+    }
+
+    return { nameLine, batsRaw, throwsRaw };
+  });
+
+  await maybeDumpDebugJson(page, `profile-extraction-${Date.now()}.json`, data);
+
+  const handMap = { left: 'L', right: 'R', both: 'S' };
+  const throwMap = { left: 'L', right: 'R' };
+
+  const bats = handMap[String(data.batsRaw || '').toLowerCase()] || 'Unknown';
+  const throws = throwMap[String(data.throwsRaw || '').toLowerCase()] || 'Unknown';
+
+  // "Name, #Number" — a cross-check / fallback for jersey number. Some GC
+  // rosters have players with only a single-letter/placeholder display name
+  // (seen for real: "C, #82") — that's genuine upstream data, not a parsing
+  // bug, so no name-length validation here.
+  const m = data.nameLine.match(/^(.+?),\s*#\s*([A-Za-z0-9-]+)$/);
+  const jerseyNumber = m ? m[2].trim() : null;
+
+  if (process.env.GC_HANDEDNESS_DEBUG_HTML === 'true') {
+    console.log(
+      `[handedness] Profile hand extraction: bats=${bats}, throws=${throws} ` +
+      `(raw: "${data.batsRaw}" / "${data.throwsRaw}")`
+    );
+  }
+
+  return { jerseyNumber, bats, throws };
+}
+
 async function closePlayerModal(page) {
   const candidates = [
     page.getByRole('dialog').getByRole('button', { name: /close/i }),
@@ -1037,6 +1123,14 @@ async function captureRosterHandedness(page, { teamName, teamId, db, forceRefres
   // letting one bad interaction cascade into failing every player after it.
   const rosterUrl = page.url();
 
+  // Not every team makes GC's own Stats/Spray Charts tabs available — that's
+  // a normal per-team setting, not a bug. Check once (on the first player)
+  // and if neither tab exists at all, stop trying for the rest of this
+  // roster rather than paying a full tab-detection timeout on every single
+  // player for a team that plainly doesn't share this.
+  let gcStatsChecked = false;
+  let gcStatsAvailableForTeam = true;
+
   for (const entry of rosterEntries) {
     const matchKey = buildMatchKey(entry.name);
     const jerseyKey = String(entry.jerseyNumber || '');
@@ -1053,39 +1147,34 @@ async function captureRosterHandedness(page, { teamName, teamId, db, forceRefres
 
     console.log(`[handedness] Capturing new player: ${entry.name} (#${entry.jerseyNumber || '?'})`);
 
-    let failed = false;
     try {
       const opened = await openPlayerModalByRosterEntry(page, entry);
       if (!opened) {
-        // If a prior player's failure left a stray overlay/backdrop behind,
-        // it would show up in the page HTML right now — dump it rather than
-        // assuming this is identical to the plain roster-page.html capture.
         const safeName = String(entry.name || 'unknown').replace(/[^a-z0-9]/gi, '-').toLowerCase();
         await maybeDumpDebugHtml(page, `NOCLICK-${safeName}-${entry.jerseyNumber || 'nojersey'}.html`, { force: true });
         throw new Error('could not open roster row');
       }
 
-      const modalReady = await waitForPlayerModal(page);
-      if (!modalReady) {
-        // THIS is the failure we've had zero visibility into so far: a
-        // click landed (opened === true) but nothing matching our "Edit
-        // Player" dialog checks showed up. Dump whatever actually is on
-        // screen — either a differently-labeled dialog (selector needs
-        // widening) or a genuinely different UI for opponent rosters
-        // (e.g. a read-only player card instead of an editable modal).
+      const profileReady = await waitForPlayerProfile(page);
+      if (!profileReady) {
+        // Confirmed via real debug dumps (16/16 players) that opponent
+        // rosters render a FanPlayerProfile pane, not an "Edit Player"
+        // dialog — if THIS still fails, something upstream of that
+        // assumption has changed (GC markup update, or this really is a
+        // team we manage and should be using the modal path instead).
         const safeName = String(entry.name || 'unknown').replace(/[^a-z0-9]/gi, '-').toLowerCase();
-        await maybeDumpDebugHtml(page, `NOMODAL-${safeName}-${entry.jerseyNumber || 'nojersey'}.html`, { force: true });
-        throw new Error('Edit Player modal did not appear');
+        await maybeDumpDebugHtml(page, `NOPROFILE-${safeName}-${entry.jerseyNumber || 'nojersey'}.html`, { force: true });
+        throw new Error('Fan player profile did not appear');
       }
 
-      const captured = await extractHandednessFromModal(page);
+      const captured = await extractHandednessFromProfile(page);
       const { firstName, lastName } = splitFullName(entry.name);
       const fullName = entry.name;
 
       await db.upsertPlayerHandedness(teamId, {
         jerseyNumber: captured.jerseyNumber || entry.jerseyNumber || null,
-        firstName: captured.firstName || firstName,
-        lastName: captured.lastName || lastName,
+        firstName,
+        lastName,
         fullName,
         matchKey: buildMatchKey(fullName),
         bats: captured.bats,
@@ -1093,23 +1182,57 @@ async function captureRosterHandedness(page, { teamName, teamId, db, forceRefres
       });
 
       result.captured++;
+
+      // GC-native stats tables + batting spray chart — separate capture,
+      // separate table, intentionally isolated in its own try/catch so a
+      // failure here doesn't get counted against handedness capture above
+      // (which already succeeded by this point) or abort the roster loop.
+      // This adds up to 7 extra page interactions per player (6 stats
+      // sub-tabs + spray chart), so GC_SKIP_GC_STATS=true is available to
+      // disable it independently while iterating on other parts of the
+      // scraper.
+      if (process.env.GC_SKIP_GC_STATS === 'true') {
+        // explicitly disabled — skip silently, no per-player log spam
+      } else if (gcStatsChecked && !gcStatsAvailableForTeam) {
+        // Already confirmed on an earlier player this team doesn't expose
+        // Stats/Spray Charts — don't re-pay the tab-detection timeout for
+        // every remaining roster player.
+      } else {
+        try {
+          const gcResult = await captureGcStatsAndSprayForPlayer(page, {
+            teamId,
+            jerseyNumber: captured.jerseyNumber || entry.jerseyNumber || null,
+            fullName,
+            matchKey: buildMatchKey(fullName),
+            db,
+          });
+
+          if (!gcStatsChecked) {
+            gcStatsChecked = true;
+            gcStatsAvailableForTeam = gcResult.statsTabFound || gcResult.sprayTabFound;
+            if (!gcStatsAvailableForTeam) {
+              console.log(`[gc-stats] "${teamName}" does not appear to share Stats/Spray Charts on GameChanger — skipping this for the rest of the roster.`);
+            }
+          }
+        } catch (gcStatsError) {
+          console.error(`[gc-stats] Unexpected failure capturing stats/spray for ${entry.name}: ${gcStatsError.message}`);
+        }
+      }
     } catch (error) {
       console.error(`[handedness] Failed to capture ${entry.name}: ${error.message}`);
       result.failed++;
-      failed = true;
-    } finally {
-      await closePlayerModal(page);
     }
 
-    if (failed) {
-      try {
-        console.log(`[handedness] Reloading roster page to recover before the next player (${rosterUrl})...`);
-        await page.goto(rosterUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await page.waitForTimeout(1500);
-        await dismissDontMissOutPopup(page);
-      } catch (recoverError) {
-        console.warn(`[handedness] Recovery reload failed: ${recoverError.message}. Continuing anyway — subsequent players may keep failing until the page is reset.`);
-      }
+    // The FanPlayerProfile pane is a full client-side route swap, not a
+    // modal/overlay — there's nothing to "close". Reload straight back to
+    // the roster list before the next player, every time (not just on
+    // failure), so each player starts from a known-clean page state.
+    try {
+      await page.goto(rosterUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(1200);
+      await dismissDontMissOutPopup(page);
+    } catch (recoverError) {
+      console.warn(`[handedness] Reload back to roster failed: ${recoverError.message}. Continuing anyway — subsequent players may fail until the page resets.`);
     }
   }
 
