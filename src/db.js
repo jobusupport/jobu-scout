@@ -1111,6 +1111,22 @@ function upsertPlayerHandedness(teamId, player) {
   }
 }
 
+let _warnedNoGcStatsTable = false;
+function upsertPlayerGcStats(teamId, entry) {
+  if (!_warnedNoGcStatsTable) {
+    console.warn('[db] upsertPlayerGcStats: player_gc_stats only exists in Supabase. Skipping write (local SQLite dev).');
+    _warnedNoGcStatsTable = true;
+  }
+}
+
+let _warnedNoGcSprayTable = false;
+function upsertPlayerGcSprayChart(teamId, entry) {
+  if (!_warnedNoGcSprayTable) {
+    console.warn('[db] upsertPlayerGcSprayChart: player_gc_spray_charts only exists in Supabase. Skipping write (local SQLite dev).');
+    _warnedNoGcSprayTable = true;
+  }
+}
+
 // ─── Exports ──────────────────────────────────────────────────────────────────
 
 module.exports = {
@@ -1152,4 +1168,6 @@ module.exports = {
   getTeamHandedness,
   getExistingHandednessForTeam,
   upsertPlayerHandedness,
+  upsertPlayerGcStats,
+  upsertPlayerGcSprayChart,
 };

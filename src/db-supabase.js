@@ -1,156 +1,160 @@
 'use strict';
 
 /**
- * db.js
- * Voodoo Scout — SQLite Database Layer
+ * db-supabase.js
+ * JoBu Scout — Supabase Database Layer
  *
- * Wraps better-sqlite3 with typed insert/query methods.
- * All writes use prepared statements and run inside transactions.
+ * Drop-in async replacement for db.js.
+ * Mirrors every exported function from db.js but uses Supabase Postgres.
  *
- * Usage:
- *   const db = require('./db');
- *   db.init('./voodoo-scout.db');
- *   const teamId = db.upsertTeam({ teamName: 'James Clemens Jets', ... });
- *   db.insertGame(normalizedGame, teamId);
+ * Activated when USE_SUPABASE=true in environment.
+ * Loaded transparently by db.js — callers don't change.
+ *
+ * All functions are async and return Promises.
+ * pipeline.js wraps calls with runSync() so existing sync callers still work.
  */
 
-const fs   = require('fs');
-const path = require('path');
+const { createClient } = require('@supabase/supabase-js');
 
-let _db = null;  // module-level singleton
-
-function useSupabase() {
-  const explicitUseSupabase =
-    String(process.env.USE_SUPABASE || '').trim().toLowerCase() === 'true';
-
-  const hasSupabaseRuntimeConfig = Boolean(
-    process.env.SUPABASE_URL &&
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-  );
-
-  return explicitUseSupabase ||
-    (process.env.NODE_ENV === 'production' && hasSupabaseRuntimeConfig);
-}
+let _supabase = null;
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
-/**
- * Initialize the database. Runs migrations, returns db instance.
- * Call once at app startup.
- */
-function init(dbPath = './voodoo-scout.db') {
-  // ── Supabase switch ──────────────────────────────────────────────────────
-  // When USE_SUPABASE=true, transparently delegate everything to db-supabase.js.
-  // All callers (pipeline.js, reingest-games.js, etc.) stay completely unchanged.
-  if (useSupabase()) {
-    console.log('[db] USE_SUPABASE = true');
-    console.log('[db] Loading Supabase DB layer');
-    const sbDb = require('./db-supabase');
-    sbDb.init();
-    // Replace every export on this module with the async Supabase version.
-    // pipeline.js will call these via runSync() which handles the Promise.
-    Object.assign(module.exports, sbDb);
-    return sbDb.getDb();
-  }
-  console.log('[db] USE_SUPABASE = false');
-  // ────────────────────────────────────────────────────────────────────────
+function init() {
+  if (_supabase) return _supabase;
 
-  if (_db) return _db;
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-  const Database = require('better-sqlite3');
-  _db = new Database(dbPath, { verbose: null });
-
-  // Performance pragmas
-  _db.pragma('journal_mode = WAL');
-  _db.pragma('foreign_keys = ON');
-  _db.pragma('synchronous = NORMAL');
-
-  // Run base schema migration
-  const migrationPath = path.join(__dirname, '..', 'migrations', '001_initial_schema.sql');
-  if (fs.existsSync(migrationPath)) {
-    const sql = fs.readFileSync(migrationPath, 'utf8');
-    _db.exec(sql);
+  if (!url || !key) {
+    throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment.');
   }
 
-  // Also run 002 if it exists as a separate file
-  const migration002 = path.join(__dirname, '..', 'migrations', '002_advanced_stats.sql');
-  if (fs.existsSync(migration002)) {
-    _db.exec(fs.readFileSync(migration002, 'utf8'));
+  _supabase = createClient(url, key);
+  console.log('[db-supabase] Supabase client initialized.');
+  return _supabase;
+}
+
+async function verifyConnection() {
+  const sb = init();
+  const { error } = await sb
+    .from('teams')
+    .select('id', { count: 'exact', head: true });
+
+  if (error) {
+    console.error('[db-supabase] Connection check failed:', error.message);
+    throw error;
   }
 
-  // Always ensure advanced stats tables exist (inline fallback)
-  _db.exec(`
-    CREATE TABLE IF NOT EXISTS player_advanced_stats (
-      id               INTEGER PRIMARY KEY AUTOINCREMENT,
-      team_id          INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
-      player_name      TEXT    NOT NULL,
-      is_our_team      INTEGER NOT NULL DEFAULT 1,
-      generated_at     TEXT    NOT NULL DEFAULT (datetime('now')),
-      games            INTEGER,
-      total_pitches    INTEGER,
-      gb INTEGER, fb INTEGER, ld INTEGER, batted_balls INTEGER,
-      gb_pct REAL, fb_pct REAL, ld_pct REAL,
-      spray_lf INTEGER, spray_cf INTEGER, spray_rf INTEGER,
-      spray_3b INTEGER, spray_ss INTEGER, spray_2b INTEGER,
-      spray_1b INTEGER, spray_pc INTEGER,
-      spray_lf_pct REAL, spray_cf_pct REAL, spray_rf_pct REAL,
-      spray_3b_pct REAL, spray_ss_pct REAL, spray_2b_pct REAL,
-      spray_1b_pct REAL, spray_pc_pct REAL,
-      risp_ab INTEGER, risp_h INTEGER, ba_risp REAL,
-      swing_decisions TEXT,
-      k_pct REAL, bb_pct REAL,
-      UNIQUE (team_id, player_name, is_our_team)
-    );
-    CREATE TABLE IF NOT EXISTS pitcher_advanced_stats (
-      id               INTEGER PRIMARY KEY AUTOINCREMENT,
-      team_id          INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
-      player_name      TEXT    NOT NULL,
-      is_our_team      INTEGER NOT NULL DEFAULT 1,
-      generated_at     TEXT    NOT NULL DEFAULT (datetime('now')),
-      games INTEGER, total_pitches INTEGER, strikes INTEGER,
-      s_pct REAL, gb INTEGER, fb INTEGER, ld INTEGER,
-      gb_pct REAL, fb_pct REAL, ld_pct REAL, go_ao REAL,
-      so_per7 REAL, bb_per7 REAL, k_pct_bf REAL, bb_pct_bf REAL,
-      p_per_ip REAL, wp INTEGER, bk INTEGER, pik INTEGER,
-      UNIQUE (team_id, player_name, is_our_team)
-    );
-    CREATE INDEX IF NOT EXISTS idx_player_adv_team  ON player_advanced_stats(team_id);
-    CREATE INDEX IF NOT EXISTS idx_pitcher_adv_team ON pitcher_advanced_stats(team_id);
-  `);
-
-  console.log('[db] Schema initialized.');
-
-  // spray_by_count (added for the defensive-alignment grid) postdates the
-  // inline CREATE TABLE IF NOT EXISTS above, which is a no-op on a table
-  // that already exists — so on an existing local DB the column needs an
-  // explicit, idempotent ALTER TABLE. SQLite has no "ADD COLUMN IF NOT
-  // EXISTS", so check pragma_table_info first rather than rerun a raw
-  // ALTER TABLE on every init() (which would throw "duplicate column" on
-  // the second run). This only affects local SQLite — production uses
-  // Supabase/Postgres, which does support ADD COLUMN IF NOT EXISTS; that
-  // migration is applied separately, not through this code path.
-  const playerAdvCols = _db.prepare(`PRAGMA table_info(player_advanced_stats)`).all().map(c => c.name);
-  if (!playerAdvCols.includes('spray_by_count')) {
-    _db.exec(`ALTER TABLE player_advanced_stats ADD COLUMN spray_by_count TEXT;`);
-    console.log('[db] Migrated: added spray_by_count column to player_advanced_stats');
-  }
-
-  // "archived" lets a coach hide an opponent from the dashboard sidebar
-  // without deleting games/stats — same idempotent ALTER TABLE pattern as
-  // spray_by_count above (SQLite has no ADD COLUMN IF NOT EXISTS).
-  const teamCols = _db.prepare(`PRAGMA table_info(teams)`).all().map(c => c.name);
-  if (!teamCols.includes('archived')) {
-    _db.exec(`ALTER TABLE teams ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;`);
-    _db.exec(`CREATE INDEX IF NOT EXISTS idx_teams_archived ON teams(archived);`);
-    console.log('[db] Migrated: added archived column to teams');
-  }
-
-  return _db;
+  console.log('[db-supabase] Connected to Supabase');
+  return true;
 }
 
 function getDb() {
-  if (!_db) throw new Error('Database not initialized. Call db.init() first.');
-  return _db;
+  if (!_supabase) throw new Error('Supabase not initialized. Call db.init() first.');
+  return _supabase;
+}
+
+// ─── Error helper ─────────────────────────────────────────────────────────────
+
+function check(error, context) {
+  if (error) {
+    // Surface duplicate key errors the same way SQLite does so pipeline.js
+    // duplicate-detection logic keeps working unchanged.
+    if (error.code === '23505') {
+      throw new Error(`UNIQUE constraint failed: ${context} — ${error.message}`);
+    }
+    throw new Error(`[db-supabase] ${context}: ${error.message}`);
+  }
+}
+
+// ─── Org helpers ──────────────────────────────────────────────────────────────
+
+const _teamOrgCache = new Map();
+const _tableOrgColumnCache = new Map();
+
+function isMissingColumnError(error, columnName = 'org_id') {
+  if (!error) return false;
+  const message = String(error.message || '').toLowerCase();
+  return message.includes(`column ${columnName}`) && message.includes('does not exist');
+}
+
+async function tableHasOrgId(tableName) {
+  if (_tableOrgColumnCache.has(tableName)) return _tableOrgColumnCache.get(tableName);
+
+  const { error } = await getDb()
+    .from(tableName)
+    .select('org_id', { count: 'exact', head: true })
+    .limit(1);
+
+  if (isMissingColumnError(error, 'org_id')) {
+    _tableOrgColumnCache.set(tableName, false);
+    return false;
+  }
+
+  if (error) {
+    // Do not hide permissions or other real DB issues.
+    check(error, `${tableName} org_id capability check`);
+  }
+
+  _tableOrgColumnCache.set(tableName, true);
+  return true;
+}
+
+async function getOrgIdForTeam(teamId) {
+  const normalizedTeamId = Number(teamId);
+  const cacheKey = Number.isFinite(normalizedTeamId) ? String(normalizedTeamId) : String(teamId || '');
+
+  if (!cacheKey) throw new Error('getOrgIdForTeam requires teamId');
+  if (_teamOrgCache.has(cacheKey)) return _teamOrgCache.get(cacheKey);
+
+  const { data, error } = await getDb()
+    .from('teams')
+    .select('id, org_id')
+    .eq('id', teamId)
+    .maybeSingle();
+
+  check(error, 'getOrgIdForTeam');
+
+  if (!data) throw new Error(`Team ${teamId} not found while resolving org_id`);
+  if (!data.org_id) throw new Error(`Team ${teamId} does not have org_id`);
+
+  _teamOrgCache.set(cacheKey, data.org_id);
+  return data.org_id;
+}
+
+async function getSingleOrgIdFallback() {
+  for (const tableName of ['orgs', 'organizations']) {
+    try {
+      const { data, error } = await getDb().from(tableName).select('id').limit(2);
+      if (isMissingColumnError(error, 'id')) continue;
+      if (error) {
+        const msg = String(error.message || '').toLowerCase();
+        if (msg.includes('could not find the table') || msg.includes('does not exist')) continue;
+        check(error, `${tableName} single-org fallback`);
+      }
+      if (Array.isArray(data) && data.length === 1 && data[0]?.id) return data[0].id;
+    } catch (err) {
+      const msg = String(err.message || '').toLowerCase();
+      if (msg.includes('does not exist') || msg.includes('could not find the table')) continue;
+      throw err;
+    }
+  }
+  return null;
+}
+
+async function resolveOrgIdForTeamUpsert(team) {
+  const provided = normalizeNullable(team.orgId || team.org_id);
+  if (provided) return provided;
+  return await getSingleOrgIdFallback();
+}
+
+async function addOrgIdIfSupported(tableName, payload, orgId) {
+  if (!orgId) return payload;
+  if (tableName === 'games' || await tableHasOrgId(tableName)) {
+    return { org_id: orgId, ...payload };
+  }
+  return payload;
 }
 
 // ─── Teams ────────────────────────────────────────────────────────────────────
@@ -174,6 +178,69 @@ function normalizeNullable(value) {
   return trimmed ? trimmed : null;
 }
 
+function numericOrNull(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed || trimmed === '-' || trimmed.toUpperCase() === 'N/A') return null;
+    const cleaned = trimmed.replace(/,/g, '').replace(/%$/, '');
+    const n = Number(cleaned);
+    return Number.isFinite(n) ? n : null;
+  }
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function numericOrZero(value) {
+  const n = numericOrNull(value);
+  return n === null ? 0 : n;
+}
+
+function serializeRawJsonForTextColumn(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'string') return value.trim() || null;
+  try { return JSON.stringify(value); } catch { return String(value); }
+}
+
+
+function extractGcGameIdFromUrl(value) {
+  const match = String(value || '').match(/\/schedule\/([^/?#]+)/i);
+  return match ? match[1] : '';
+}
+
+function normalizeGcGameIdFromGame(game) {
+  return normalizeNullable(game.gcGameId || game.gc_game_id) || extractGcGameIdFromUrl(game.gcGameUrl || game.gc_game_url) || null;
+}
+
+async function findExistingGameByGcIdentity(sb, orgId, game) {
+  const gcGameId = normalizeGcGameIdFromGame(game);
+  const gcGameUrl = normalizeNullable(game.gcGameUrl || game.gc_game_url);
+
+  if (gcGameId) {
+    const { data, error } = await sb
+      .from('games')
+      .select('id')
+      .eq('org_id', orgId)
+      .eq('gc_game_id', gcGameId)
+      .maybeSingle();
+    check(error, 'findExistingGameByGcIdentity gc_game_id');
+    if (data) return data;
+  }
+
+  if (gcGameUrl) {
+    const { data, error } = await sb
+      .from('games')
+      .select('id')
+      .eq('org_id', orgId)
+      .eq('gc_game_url', gcGameUrl)
+      .maybeSingle();
+    check(error, 'findExistingGameByGcIdentity gc_game_url');
+    if (data) return data;
+  }
+
+  return null;
+}
+
 function inferSeasonYear(input = {}) {
   const direct = input.seasonYear || input.season_year;
   if (direct !== undefined && direct !== null && String(direct).trim() !== '') {
@@ -192,121 +259,131 @@ function inferSeasonYear(input = {}) {
   return null;
 }
 
-function findExistingTeamId(db, params) {
+function getProvidedBoolean(input, camelName, snakeName) {
+  if (Object.prototype.hasOwnProperty.call(input, camelName)) return Boolean(input[camelName]);
+  if (Object.prototype.hasOwnProperty.call(input, snakeName)) return Boolean(input[snakeName]);
+  return null;
+}
+
+function applyOrgScope(query, params) {
+  return params.org_id ? query.eq('org_id', params.org_id) : query;
+}
+
+async function findExistingTeam(sb, params) {
   // Primary identity: team_name + age_group + season_year.
-  if (params.teamName && params.ageGroup && params.seasonYear) {
-    const row = db.prepare(`
-      SELECT id FROM teams
-      WHERE LOWER(TRIM(team_name)) = LOWER(TRIM(?))
-        AND LOWER(TRIM(COALESCE(age_group, ''))) = LOWER(TRIM(?))
-        AND season_year = ?
-      ORDER BY updated_at DESC, id DESC
-      LIMIT 1
-    `).get(params.teamName, params.ageGroup, params.seasonYear);
-    if (row) return row;
+  if (params.team_name && params.age_group && params.season_year) {
+    const { data, error } = await applyOrgScope(sb
+      .from('teams')
+      .select('id')
+      .ilike('team_name', params.team_name)
+      .eq('age_group', params.age_group), params)
+      .eq('season_year', params.season_year)
+      .order('updated_at', { ascending: false })
+      .order('id', { ascending: false })
+      .limit(1);
+    check(error, 'upsertTeam primary lookup');
+    if (data?.[0]) return data[0];
   }
 
   // Fallback identity: team_name + age_group across seasons.
-  if (params.teamName && params.ageGroup) {
-    const row = db.prepare(`
-      SELECT id FROM teams
-      WHERE LOWER(TRIM(team_name)) = LOWER(TRIM(?))
-        AND LOWER(TRIM(COALESCE(age_group, ''))) = LOWER(TRIM(?))
-      ORDER BY season_year DESC, updated_at DESC, id DESC
-      LIMIT 1
-    `).get(params.teamName, params.ageGroup);
-    if (row) return row;
+  if (params.team_name && params.age_group) {
+    const { data, error } = await applyOrgScope(sb
+      .from('teams')
+      .select('id')
+      .ilike('team_name', params.team_name)
+      .eq('age_group', params.age_group), params)
+      .order('season_year', { ascending: false })
+      .order('updated_at', { ascending: false })
+      .order('id', { ascending: false })
+      .limit(1);
+    check(error, 'upsertTeam fallback lookup');
+    if (data?.[0]) return data[0];
   }
 
   // Safety fallback for legacy rows/sheet imports that may not have age/year yet.
   // This is deliberately exact-name only; GC/PG URLs are season pointers, not identity keys.
-  if (params.teamName && (!params.ageGroup || !params.seasonYear)) {
-    const row = db.prepare(`
-      SELECT id FROM teams
-      WHERE LOWER(TRIM(team_name)) = LOWER(TRIM(?))
-      ORDER BY season_year DESC, updated_at DESC, id DESC
-      LIMIT 1
-    `).get(params.teamName);
-    if (row) return row;
+  if (params.team_name && (!params.age_group || !params.season_year)) {
+    const { data, error } = await applyOrgScope(sb
+      .from('teams')
+      .select('id')
+      .ilike('team_name', params.team_name), params)
+      .order('season_year', { ascending: false })
+      .order('updated_at', { ascending: false })
+      .order('id', { ascending: false })
+      .limit(1);
+    check(error, 'upsertTeam legacy name lookup');
+    if (data?.[0]) return data[0];
   }
 
+  // Do not fuzzy-write automatically. Fuzzy matches should be reviewed before identity merge.
   return null;
 }
 
-/**
- * Insert or update a team. Returns the team's DB id.
- */
-function upsertTeam(team) {
-  const db = getDb();
+async function upsertTeam(team) {
+  const sb = getDb();
+  const resolvedOrgId = await resolveOrgIdForTeamUpsert(team);
+
+  const isOurTeam = getProvidedBoolean(team, 'isOurTeam', 'is_our_team');
 
   const params = {
-    teamName:       normalizeTeamName(team.teamName || team.team_name || ''),
-    rawTeamName:    normalizeNullable(team.rawTeamName    || team.raw_team_name),
-    gcSearchName:   normalizeNullable(team.gcSearchName   || team.gc_search_name),
-    gcTeamUrl:      normalizeNullable(team.gcTeamUrl      || team.gc_team_url),
-    pgTeamUrl:      normalizeNullable(team.pgTeamUrl      || team.pg_team_url),
+    org_id:         resolvedOrgId,
+    team_name:      normalizeTeamName(team.teamName       || team.team_name       || ''),
+    raw_team_name:  normalizeNullable(team.rawTeamName    || team.raw_team_name),
+    gc_search_name: normalizeNullable(team.gcSearchName   || team.gc_search_name),
+    gc_team_url:    normalizeNullable(team.gcTeamUrl      || team.gc_team_url),
+    pg_team_url:    normalizeNullable(team.pgTeamUrl      || team.pg_team_url),
     classification: normalizeNullable(team.classification),
-    ageGroup:       normalizeAgeGroup(team.age            || team.age_group),
+    age_group:      normalizeAgeGroup(team.age            || team.age_group),
     city:           normalizeNullable(team.city),
     state:          normalizeNullable(team.state),
-    seasonYear:     inferSeasonYear(team),
-    seasonType:     normalizeNullable(team.seasonType     || team.season_type),
+    season_year:    inferSeasonYear(team),
+    season_type:    normalizeNullable(team.seasonType     || team.season_type),
+    is_our_team:    isOurTeam,
   };
 
-  if (!params.teamName) {
+  if (!params.team_name) {
     throw new Error('upsertTeam requires teamName/team_name');
   }
 
-  const existing = findExistingTeamId(db, params);
+  const existing = await findExistingTeam(sb, params);
 
   if (existing) {
-    // Update existing record. GC/PG URLs are refreshed as season pointers, but they are not identity keys.
-    db.prepare(`
-      UPDATE teams SET
-        team_name      = @teamName,
-        raw_team_name  = COALESCE(@rawTeamName, raw_team_name),
-        gc_search_name = COALESCE(@gcSearchName, gc_search_name),
-        gc_team_url    = COALESCE(@gcTeamUrl, gc_team_url),
-        pg_team_url    = COALESCE(@pgTeamUrl, pg_team_url),
-        classification = COALESCE(@classification, classification),
-        age_group      = COALESCE(@ageGroup, age_group),
-        city           = COALESCE(@city, city),
-        state          = COALESCE(@state, state),
-        season_year    = COALESCE(@seasonYear, season_year),
-        season_type    = COALESCE(@seasonType, season_type),
-        updated_at     = datetime('now')
-      WHERE id = @id
-    `).run({ ...params, id: existing.id });
+    // Update — only send fields that have values. GC/PG URLs are refreshed as season pointers,
+    // but they are intentionally not used as identity keys.
+    const updates = { team_name: params.team_name, updated_at: new Date().toISOString() };
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== null && v !== undefined && k !== 'team_name') updates[k] = v;
+    }
+
+    const { error } = await sb.from('teams').update(updates).eq('id', existing.id);
+    check(error, 'upsertTeam update');
     return existing.id;
   }
 
-  // Insert new record
-  const info = db.prepare(`
-    INSERT INTO teams (
-      team_name, raw_team_name, gc_search_name, gc_team_url, pg_team_url,
-      classification, age_group, city, state, season_year, season_type, updated_at
-    ) VALUES (
-      @teamName, @rawTeamName, @gcSearchName, @gcTeamUrl, @pgTeamUrl,
-      @classification, @ageGroup, @city, @state, @seasonYear, @seasonType,
-      datetime('now')
-    )
-  `).run(params);
-  return info.lastInsertRowid;
+  // Insert new. Default target/scouted teams to false unless explicitly marked as Our Team.
+  const insertPayload = {
+    ...params,
+    is_our_team: params.is_our_team === null ? false : params.is_our_team,
+    updated_at: new Date().toISOString(),
+  };
+
+  const { data, error } = await sb.from('teams').insert(insertPayload).select('id').single();
+  check(error, 'upsertTeam insert');
+  return data.id;
 }
 
-function getTeamByUrl(gcTeamUrl) {
-  return getDb().prepare(`SELECT * FROM teams WHERE gc_team_url = ?`).get(gcTeamUrl);
+async function getTeamByUrl(gcTeamUrl) {
+  const { data, error } = await getDb().from('teams').select('*').eq('gc_team_url', gcTeamUrl).maybeSingle();
+  check(error, 'getTeamByUrl');
+  return data;
 }
 
-function getAllTeams(includeArchived = false) {
-  if (includeArchived) {
-    return getDb().prepare(`SELECT * FROM teams ORDER BY team_name`).all();
-  }
-  return getDb().prepare(`
-    SELECT * FROM teams
-    WHERE archived = 0 OR archived IS NULL
-    ORDER BY team_name
-  `).all();
+async function getAllTeams(includeArchived = false) {
+  let q = getDb().from('teams').select('*').order('team_name');
+  if (!includeArchived) q = q.eq('archived', false);
+  const { data, error } = await q;
+  check(error, 'getAllTeams');
+  return data || [];
 }
 
 /**
@@ -314,825 +391,929 @@ function getAllTeams(includeArchived = false) {
  * pitching_lines, play_events, or advanced stats — all history stays intact.
  * Used when a coach stops playing an opponent but doesn't want to lose data.
  */
-function setTeamArchived(teamId, archived) {
-  getDb().prepare(`UPDATE teams SET archived = ?, updated_at = datetime('now') WHERE id = ?`)
-    .run(archived ? 1 : 0, teamId);
+async function setTeamArchived(teamId, archived) {
+  const { error } = await getDb()
+    .from('teams')
+    .update({ archived: !!archived, updated_at: new Date().toISOString() })
+    .eq('id', teamId);
+  check(error, 'setTeamArchived');
   return true;
 }
 
 // ─── Games ────────────────────────────────────────────────────────────────────
 
-/**
- * Insert a normalized game record. Returns the new game id.
- * Skips insert if gc_game_id already exists (idempotent).
- */
-function insertGame(game) {
-  const db = getDb();
+async function insertGame(game) {
+  const sb = getDb();
+  const orgId = normalizeNullable(game.orgId || game.org_id) || await getOrgIdForTeam(game.teamId);
+  const ourTeamId = game.ourTeamId || game.our_team_id || game.teamId;
+  const opponentId = game.opponentId || game.opponent_id || game.teamId;
+  const gcGameId = normalizeGcGameIdFromGame(game);
 
-  // Check duplicate
-  if (game.gcGameId) {
-    const existing = db.prepare(
-      `SELECT id FROM games WHERE gc_game_id = ?`
-    ).get(game.gcGameId);
-    if (existing) {
-      console.log(`[db] Game already exists: ${game.gcGameId}`);
-      return existing.id;
-    }
+  // Dedup check scoped to the team's org. This protects against duplicate rows
+  // even when an older write had only gc_game_url or the normalized object
+  // did not carry gcGameId cleanly.
+  const existing = await findExistingGameByGcIdentity(sb, orgId, { ...game, gcGameId });
+  if (existing) {
+    console.log(`[db-supabase] Game already exists: ${gcGameId || game.gcGameUrl || existing.id}`);
+    return existing.id;
   }
 
-  const stmt = db.prepare(`
-    INSERT INTO games (
-      team_id, gc_game_id, gc_game_url,
-      game_date, game_time, game_datetime_raw,
-      result, score_us, score_them, opponent_name,
-      location, season_type, json_file, screenshot_file, captured_at
-    ) VALUES (
-      @teamId, @gcGameId, @gcGameUrl,
-      @gameDate, @gameTime, @gameDatetimeRaw,
-      @result, @scoreUs, @scoreThem, @opponentName,
-      @location, @seasonType, @jsonFile, @screenshotFile, @capturedAt
-    )
-  `);
+  const payload = {
+    org_id:            orgId,
+    team_id:           game.teamId,
+    our_team_id:       ourTeamId,
+    opponent_id:       opponentId,
+    gc_game_id:        gcGameId             || null,
+    gc_game_url:       game.gcGameUrl       || null,
+    game_date:         game.gameDate        || null,
+    game_time:         game.gameTime        || null,
+    game_datetime_raw: game.gameDatetimeRaw || null,
+    result:            game.result          || null,
+    score_us:          game.scoreUs         ?? null,
+    score_them:        game.scoreThem       ?? null,
+    opponent_name:     game.opponentName    || null,
+    location:          game.location        || null,
+    season_type:       game.seasonType      || null,
+    json_file:         game.jsonFile        || null,
+    screenshot_file:   game.screenshotFile  || null,
+    captured_at:       game.capturedAt      || new Date().toISOString(),
+  };
 
-  const info = stmt.run({
-    teamId:          game.teamId,
-    gcGameId:        game.gcGameId        || null,
-    gcGameUrl:       game.gcGameUrl       || null,
-    gameDate:        game.gameDate        || null,
-    gameTime:        game.gameTime        || null,
-    gameDatetimeRaw: game.gameDatetimeRaw || null,
-    result:          game.result          || null,
-    scoreUs:         game.scoreUs         ?? null,
-    scoreThem:       game.scoreThem       ?? null,
-    opponentName:    game.opponentName    || null,
-    location:        game.location        || null,
-    seasonType:      game.seasonType      || null,
-    jsonFile:        game.jsonFile        || null,
-    screenshotFile:  game.screenshotFile  || null,
-    capturedAt:      game.capturedAt      || new Date().toISOString(),
-  });
+  const { data, error } = await sb.from('games').insert(payload).select('id').single();
 
-  return info.lastInsertRowid;
+  check(error, 'insertGame');
+  return data.id;
 }
 
-function getGamesByTeam(teamId) {
-  return getDb().prepare(
-    `SELECT * FROM games WHERE team_id = ? ORDER BY game_date DESC`
-  ).all(teamId);
+async function updateExistingGame(gameId, game) {
+  const orgId = normalizeNullable(game.orgId || game.org_id) || await getOrgIdForTeam(game.teamId);
+  const ourTeamId = game.ourTeamId || game.our_team_id || game.teamId;
+  const opponentId = game.opponentId || game.opponent_id || game.teamId;
+  const gcGameId = normalizeGcGameIdFromGame(game);
+  const { error } = await getDb().from('games').update({
+    org_id:            orgId,
+    team_id:           game.teamId,
+    our_team_id:       ourTeamId,
+    opponent_id:       opponentId,
+    gc_game_id:        gcGameId             || null,
+    gc_game_url:       game.gcGameUrl       || null,
+    game_date:         game.gameDate        || null,
+    game_time:         game.gameTime        || null,
+    game_datetime_raw: game.gameDatetimeRaw || null,
+    result:            game.result          || null,
+    score_us:          game.scoreUs         ?? null,
+    score_them:        game.scoreThem       ?? null,
+    opponent_name:     game.opponentName    || null,
+    location:          game.location        || null,
+    season_type:       game.seasonType      || null,
+    json_file:         game.jsonFile        || null,
+    screenshot_file:   game.screenshotFile  || null,
+    captured_at:       game.capturedAt      || new Date().toISOString(),
+  }).eq('id', gameId).eq('org_id', orgId);
+  check(error, 'updateExistingGame');
 }
 
-function getGameById(gameId) {
-  return getDb().prepare(`SELECT * FROM games WHERE id = ?`).get(gameId);
+async function getGamesByTeam(teamId) {
+  const { data, error } = await getDb().from('games').select('*')
+    .eq('team_id', teamId).order('game_date', { ascending: false });
+  check(error, 'getGamesByTeam');
+  return data || [];
+}
+
+/**
+ * Reconstruct game objects in the exact shape stats-engine.js's
+ * processGames() expects — { meta: { gameId }, boxScore: { batting,
+ * pitching }, plays: [{ inning, text }] } — directly from Supabase, with no
+ * dependency on local JSON files ever having existed on disk.
+ *
+ * This works because:
+ *  - batting_lines/pitching_lines.raw_json stores the box score row exactly
+ *    as scraped (including isOurTeam/TeamSide), so JSON.parse(raw_json)
+ *    reproduces the original row verbatim.
+ *  - play_events.description/.inning are the same text/inning fields
+ *    normalizePlayEvent() derived from the original play.text/play.inning,
+ *    so { inning, text: description } reconstructs the original plays[] shape.
+ *
+ * Used by pipeline.js's recalculateTeamStats() so full-season stat
+ * recalculation (swing decisions, spray%, RISP, errors, etc.) works
+ * regardless of which machine originally ran the scrape.
+ */
+async function getGameDataForStatsEngine(teamId) {
+  const sb = getDb();
+
+  const { data: games, error: gamesError } = await sb.from('games')
+    .select('id, game_date, opponent_name, result, score_us, score_them, gc_game_url')
+    .eq('team_id', teamId);
+  check(gamesError, 'getGameDataForStatsEngine games');
+  if (!games || !games.length) return [];
+
+  const gameIds = games.map(g => g.id);
+
+  async function fetchAllRows(makeQuery, context, pageSize = 1000) {
+    const rows = [];
+    let from = 0;
+
+    while (true) {
+      const to = from + pageSize - 1;
+      const { data, error } = await makeQuery().range(from, to);
+      check(error, context);
+
+      const batch = data || [];
+      rows.push(...batch);
+
+      if (batch.length < pageSize) break;
+      from += pageSize;
+    }
+
+    return rows;
+  }
+
+  const [battingRows, pitchingRows, playRows] = await Promise.all([
+    fetchAllRows(
+      () => sb.from('batting_lines')
+        .select('game_id, player_name, team_name_raw, team_side, is_our_team, raw_json')
+        .in('game_id', gameIds),
+      'getGameDataForStatsEngine batting_lines'
+    ),
+    fetchAllRows(
+      () => sb.from('pitching_lines')
+        .select('game_id, player_name, team_name_raw, team_side, is_our_team, raw_json')
+        .in('game_id', gameIds),
+      'getGameDataForStatsEngine pitching_lines'
+    ),
+    fetchAllRows(
+      () => sb.from('play_events')
+        .select('game_id, inning, description, sequence_num, event_type, batter_name, pitcher_name')
+        .in('game_id', gameIds),
+      'getGameDataForStatsEngine play_events'
+    ),
+  ]);
+
+  function parseRawJson(value) {
+    if (!value) return null;
+
+    // Older Supabase rows were written to a TEXT column as JSON.stringify(row.rawJson)
+    // even though row.rawJson was already a JSON string. That produces values like:
+    //   "{\"Player\":\"Smith\", ...}"
+    // Parse repeatedly until we reach the actual object. This keeps old rows usable.
+    let parsed = value;
+    for (let i = 0; i < 3 && typeof parsed === 'string'; i++) {
+      const trimmed = parsed.trim();
+      if (!trimmed) return null;
+      try { parsed = JSON.parse(trimmed); } catch { return null; }
+    }
+
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  }
+
+  function rowForStatsEngine(row) {
+    const parsed = parseRawJson(row.raw_json) || {};
+    return {
+      ...parsed,
+      Player:     parsed.Player || parsed.Name || row.player_name,
+      Name:       parsed.Name || parsed.Player || row.player_name,
+      TeamName:   parsed.TeamName || parsed.teamName || row.team_name_raw || null,
+      TeamSide:   parsed.TeamSide || parsed.teamSide || row.team_side || null,
+      isOurTeam:  row.is_our_team === true,
+    };
+  }
+
+  const battingByGame = {};
+  for (const row of battingRows || []) {
+    if (!battingByGame[row.game_id]) battingByGame[row.game_id] = [];
+    battingByGame[row.game_id].push(rowForStatsEngine(row));
+  }
+
+  const pitchingByGame = {};
+  for (const row of pitchingRows || []) {
+    if (!pitchingByGame[row.game_id]) pitchingByGame[row.game_id] = [];
+    pitchingByGame[row.game_id].push(rowForStatsEngine(row));
+  }
+
+  // Group plays by game, then sort each game's plays by sequence_num — do
+  // NOT rely on Supabase's row order across an .in() query spanning multiple
+  // games, since sequence_num resets per game and a flat order-by would
+  // interleave games incorrectly.
+  const playsByGame = {};
+  for (const row of playRows || []) {
+    if (!playsByGame[row.game_id]) playsByGame[row.game_id] = [];
+    playsByGame[row.game_id].push(row);
+  }
+  for (const gameId of Object.keys(playsByGame)) {
+    playsByGame[gameId].sort((a, b) => (a.sequence_num ?? 0) - (b.sequence_num ?? 0));
+  }
+
+  return games.map(g => ({
+    meta: {
+      gameId: g.id,
+      gameDate: g.game_date || null,
+      opponentName: g.opponent_name || null,
+      result: g.result || null,
+      scoreUs: g.score_us ?? null,
+      scoreThem: g.score_them ?? null,
+      gcGameUrl: g.gc_game_url || null,
+    },
+    boxScore: {
+      batting:  battingByGame[g.id]  || [],
+      pitching: pitchingByGame[g.id] || [],
+    },
+    plays: (playsByGame[g.id] || []).map(row => ({
+      inning: row.inning,
+      text: row.description,
+      eventType: row.event_type || null,
+      batterName: row.batter_name || null,
+      pitcherName: row.pitcher_name || null,
+    })),
+  }));
+}
+
+async function getCompleteGamesByTeam(teamId) {
+  const sb = getDb();
+
+  const { data: games, error: gamesError } = await sb
+    .from('games')
+    .select('id, gc_game_id, gc_game_url, game_date, game_time, captured_at, opponent_name')
+    .eq('team_id', teamId)
+    .order('game_date', { ascending: true })
+    .order('captured_at', { ascending: true });
+  check(gamesError, 'getCompleteGamesByTeam games');
+
+  if (!games || games.length === 0) return [];
+
+  const gameIds = games.map((game) => game.id);
+
+  const [battingRes, pitchingRes, playsRes] = await Promise.all([
+    sb.from('batting_lines').select('game_id').in('game_id', gameIds),
+    sb.from('pitching_lines').select('game_id').in('game_id', gameIds),
+    sb.from('play_events').select('game_id').in('game_id', gameIds),
+  ]);
+
+  check(battingRes.error, 'getCompleteGamesByTeam batting_lines');
+  check(pitchingRes.error, 'getCompleteGamesByTeam pitching_lines');
+  check(playsRes.error, 'getCompleteGamesByTeam play_events');
+
+  const battingGameIds = new Set((battingRes.data || []).map((row) => row.game_id));
+  const pitchingGameIds = new Set((pitchingRes.data || []).map((row) => row.game_id));
+  const playGameIds = new Set((playsRes.data || []).map((row) => row.game_id));
+
+  return games
+    .filter((game) => battingGameIds.has(game.id) && pitchingGameIds.has(game.id) && playGameIds.has(game.id))
+    .map((game) => ({
+      ...game,
+      gcGameId: game.gc_game_id || '',
+      gcGameUrl: game.gc_game_url || '',
+    }));
+}
+
+async function getGameById(gameId) {
+  const { data, error } = await getDb().from('games').select('*').eq('id', gameId).maybeSingle();
+  check(error, 'getGameById');
+  return data;
 }
 
 // ─── Batting Lines ────────────────────────────────────────────────────────────
 
-function insertBattingLines(lines, gameId) {
-  const db = getDb();
+async function insertBattingLines(lines, gameId) {
+  if (!lines.length) return;
 
-  const stmt = db.prepare(`
-    INSERT INTO batting_lines (
-      game_id, team_id, player_name, batting_order, is_our_team, team_side, team_name_raw, position,
-      ab, r, h, rbi, bb, so, avg, obp, slg,
-      doubles, triples, hr, sb, hbp, sac, lob, raw_json
-    ) VALUES (
-      @gameId, @teamId, @playerName, @battingOrder, @isOurTeam, @teamSide, @teamNameRaw, @position,
-      @ab, @r, @h, @rbi, @bb, @so, @avg, @obp, @slg,
-      @doubles, @triples, @hr, @sb, @hbp, @sac, @lob, @rawJson
-    )
-  `);
+  const orgId = normalizeNullable(lines[0].orgId || lines[0].org_id) || await getOrgIdForTeam(lines[0].teamId);
+  const includeOrgId = await tableHasOrgId('batting_lines');
 
-  const insertMany = db.transaction((rows) => {
-    for (const row of rows) {
-      stmt.run({ ...row, gameId });
-    }
+  const rows = lines.map(row => {
+    const payload = {
+      game_id:       gameId,
+      team_id:       row.teamId,
+      player_name:   row.playerName,
+      batting_order: numericOrNull(row.battingOrder),
+      is_our_team:   row.isOurTeam     ? true : false,
+      team_side:     row.teamSide      || null,
+      team_name_raw: row.teamNameRaw   || null,
+      position:      row.position      || null,
+      ab:            numericOrZero(row.ab),
+      r:             numericOrZero(row.r),
+      h:             numericOrZero(row.h),
+      rbi:           numericOrZero(row.rbi),
+      bb:            numericOrZero(row.bb),
+      so:            numericOrZero(row.so),
+      avg:           numericOrNull(row.avg),
+      obp:           numericOrNull(row.obp),
+      slg:           numericOrNull(row.slg),
+      doubles:       numericOrZero(row.doubles),
+      triples:       numericOrZero(row.triples),
+      hr:            numericOrZero(row.hr),
+      sb:            numericOrZero(row.sb),
+      hbp:           numericOrZero(row.hbp),
+      sac:           numericOrZero(row.sac),
+      lob:           numericOrZero(row.lob),
+      raw_json:      serializeRawJsonForTextColumn(row.rawJson),
+    };
+    if (includeOrgId) payload.org_id = orgId;
+    return payload;
   });
 
-  insertMany(lines);
-  console.log(`[db] Inserted ${lines.length} batting line(s) for game ${gameId}`);
+  const { error } = await getDb().from('batting_lines').insert(rows);
+  check(error, 'insertBattingLines');
+  console.log(`[db-supabase] Inserted ${rows.length} batting line(s) for game ${gameId}`);
 }
 
 // ─── Pitching Lines ───────────────────────────────────────────────────────────
 
-function insertPitchingLines(lines, gameId) {
-  const db = getDb();
+async function insertPitchingLines(lines, gameId) {
+  if (!lines.length) return;
 
-  const stmt = db.prepare(`
-    INSERT INTO pitching_lines (
-      game_id, team_id, player_name, is_our_team, team_side, team_name_raw,
-      ip, ip_decimal, bf, pc, strikes,
-      h_allowed, r_allowed, er, bb, so, hr_allowed,
-      era, whip, raw_json
-    ) VALUES (
-      @gameId, @teamId, @playerName, @isOurTeam, @teamSide, @teamNameRaw,
-      @ip, @ipDecimal, @bf, @pc, @strikes,
-      @hAllowed, @rAllowed, @er, @bb, @so, @hrAllowed,
-      @era, @whip, @rawJson
-    )
-  `);
+  const orgId = normalizeNullable(lines[0].orgId || lines[0].org_id) || await getOrgIdForTeam(lines[0].teamId);
+  const includeOrgId = await tableHasOrgId('pitching_lines');
 
-  const insertMany = db.transaction((rows) => {
-    for (const row of rows) {
-      stmt.run({ ...row, gameId });
-    }
+  const rows = lines.map(row => {
+    const payload = {
+      game_id:       gameId,
+      team_id:       row.teamId,
+      player_name:   row.playerName,
+      is_our_team:   row.isOurTeam     ? true : false,
+      team_side:     row.teamSide      || null,
+      team_name_raw: row.teamNameRaw   || null,
+      ip:            row.ip            || null,
+      ip_decimal:    numericOrNull(row.ipDecimal),
+      bf:            numericOrZero(row.bf),
+      pc:            numericOrZero(row.pc),
+      strikes:       numericOrZero(row.strikes),
+      h_allowed:     numericOrZero(row.hAllowed),
+      r_allowed:     numericOrZero(row.rAllowed),
+      er:            numericOrZero(row.er),
+      bb:            numericOrZero(row.bb),
+      so:            numericOrZero(row.so),
+      hr_allowed:    numericOrZero(row.hrAllowed),
+      era:           numericOrNull(row.era),
+      whip:          numericOrNull(row.whip),
+      raw_json:      serializeRawJsonForTextColumn(row.rawJson),
+    };
+    if (includeOrgId) payload.org_id = orgId;
+    return payload;
   });
 
-  insertMany(lines);
-  console.log(`[db] Inserted ${lines.length} pitching line(s) for game ${gameId}`);
+  const { error } = await getDb().from('pitching_lines').insert(rows);
+  check(error, 'insertPitchingLines');
+  console.log(`[db-supabase] Inserted ${rows.length} pitching line(s) for game ${gameId}`);
 }
 
 // ─── Play Events ──────────────────────────────────────────────────────────────
 
-function insertPlayEvents(events, gameId) {
-  const db = getDb();
+async function insertPlayEvents(events, gameId) {
+  if (!events.length) return;
 
-  const stmt = db.prepare(`
-    INSERT INTO play_events (
-      game_id, team_id, sequence_num,
-      inning, inning_num, inning_half,
-      event_type, batter_name, pitcher_name,
-      description, runners_on, outs_before,
-      result_rbi, is_scoring_play
-    ) VALUES (
-      @gameId, @teamId, @sequenceNum,
-      @inning, @inningNum, @inningHalf,
-      @eventType, @batterName, @pitcherName,
-      @description, @runnersOn, @outsBefore,
-      @resultRbi, @isScoringPlay
-    )
-  `);
+  const orgId = normalizeNullable(events[0].orgId || events[0].org_id) || await getOrgIdForTeam(events[0].teamId);
+  const includeOrgId = await tableHasOrgId('play_events');
 
-  const insertMany = db.transaction((rows) => {
-    for (const row of rows) {
-      stmt.run({ ...row, gameId });
-    }
-  });
-
-  insertMany(events);
-  console.log(`[db] Inserted ${events.length} play event(s) for game ${gameId}`);
-}
-
-// ─── Full Game Write (Atomic) ─────────────────────────────────────────────────
-
-/**
- * Write a fully normalized game (from normalizer.js) to the DB atomically.
- * Returns { gameId, batters, pitchers, plays }
- */
-function clearGameDetailRows(gameId) {
-  const db = getDb();
-  db.prepare('DELETE FROM batting_lines WHERE game_id = ?').run(gameId);
-  db.prepare('DELETE FROM pitching_lines WHERE game_id = ?').run(gameId);
-  db.prepare('DELETE FROM play_events WHERE game_id = ?').run(gameId);
-}
-
-function updateExistingGame(gameId, game) {
-  getDb().prepare(`
-    UPDATE games SET
-      team_id = @teamId,
-      gc_game_url = @gcGameUrl,
-      game_date = @gameDate,
-      game_time = @gameTime,
-      game_datetime_raw = @gameDatetimeRaw,
-      result = @result,
-      score_us = @scoreUs,
-      score_them = @scoreThem,
-      opponent_name = @opponentName,
-      location = @location,
-      season_type = @seasonType,
-      json_file = @jsonFile,
-      screenshot_file = @screenshotFile,
-      captured_at = @capturedAt
-    WHERE id = @gameId
-  `).run({
-    gameId,
-    teamId:          game.teamId,
-    gcGameUrl:       game.gcGameUrl       || null,
-    gameDate:        game.gameDate        || null,
-    gameTime:        game.gameTime        || null,
-    gameDatetimeRaw: game.gameDatetimeRaw || null,
-    result:          game.result          || null,
-    scoreUs:         game.scoreUs         ?? null,
-    scoreThem:       game.scoreThem       ?? null,
-    opponentName:    game.opponentName    || null,
-    location:        game.location        || null,
-    seasonType:      game.seasonType      || null,
-    jsonFile:        game.jsonFile        || null,
-    screenshotFile:  game.screenshotFile  || null,
-    capturedAt:      game.capturedAt      || new Date().toISOString(),
-  });
-}
-
-function writeNormalizedGame(normalized) {
-  const db = getDb();
-
-  return db.transaction(() => {
-    const { game, battingLines, pitchingLines, playEvents } = normalized;
-
-    let existing = null;
-    if (game.gcGameId) {
-      existing = db.prepare('SELECT id FROM games WHERE gc_game_id = ?').get(game.gcGameId);
-    }
-
-    const gameId = existing ? existing.id : insertGame(game);
-
-    // Re-ingest must be replace-not-append. Without this, running a side-fix or
-    // reingest can leave both old and corrected rows under the same game.
-    if (existing) {
-      updateExistingGame(gameId, game);
-      clearGameDetailRows(gameId);
-    }
-
-    // Patch gameId into related rows
-    const patchedBatting  = battingLines.map(r  => ({ ...r,  gameId }));
-    const patchedPitching = pitchingLines.map(r => ({ ...r, gameId }));
-    const patchedPlays    = playEvents.map(r    => ({ ...r,  gameId }));
-
-    if (patchedBatting.length)  insertBattingLines(patchedBatting, gameId);
-    if (patchedPitching.length) insertPitchingLines(patchedPitching, gameId);
-    if (patchedPlays.length)    insertPlayEvents(patchedPlays, gameId);
-
-    return {
-      gameId,
-      replaced: Boolean(existing),
-      batters:  patchedBatting.length,
-      pitchers: patchedPitching.length,
-      plays:    patchedPlays.length,
+  const rows = events.map(row => {
+    const payload = {
+      game_id:        gameId,
+      team_id:        row.teamId,
+      sequence_num:   numericOrNull(row.sequenceNum),
+      inning:         row.inning        || null,
+      inning_num:     numericOrNull(row.inningNum),
+      inning_half:    row.inningHalf    || null,
+      event_type:     row.eventType     || null,
+      batter_name:    row.batterName    || null,
+      pitcher_name:   row.pitcherName   || null,
+      description:    row.description   || null,
+      runners_on:     row.runnersOn     || null,
+      outs_before:    numericOrNull(row.outsBefore),
+      result_rbi:     numericOrZero(row.resultRbi),
+      is_scoring_play: row.isScoringPlay ? true : false,
     };
-  })();
+    if (includeOrgId) payload.org_id = orgId;
+    return payload;
+  });
+
+  const { error } = await getDb().from('play_events').insert(rows);
+  check(error, 'insertPlayEvents');
+  console.log(`[db-supabase] Inserted ${rows.length} play event(s) for game ${gameId}`);
 }
 
-// ─── Query Helpers (for AI analysis layer) ───────────────────────────────────
+// ─── Clear game detail rows (for reingest replace) ───────────────────────────
 
-/**
- * Aggregate batting stats for a team across all stored games.
- * Returns one row per player, summed.
- */
-function getTeamBattingAggregates(teamId) {
-  return getDb().prepare(`
-    SELECT
-      0                         AS is_our_team,
-      player_name,
-      COUNT(DISTINCT game_id)  AS games,
-      COALESCE(SUM(ab), 0)      AS total_ab,
-      COALESCE(SUM(h), 0)       AS total_h,
-      COALESCE(SUM(r), 0)       AS total_r,
-      COALESCE(SUM(rbi), 0)     AS total_rbi,
-      COALESCE(SUM(bb), 0)      AS total_bb,
-      COALESCE(SUM(so), 0)      AS total_so,
-      COALESCE(SUM(doubles), 0) AS total_2b,
-      COALESCE(SUM(triples), 0) AS total_3b,
-      COALESCE(SUM(hr), 0)      AS total_hr,
-      COALESCE(SUM(sb), 0)      AS total_sb,
-      COALESCE(SUM(hbp), 0)     AS total_hbp,
-      COALESCE(SUM(sac), 0)     AS total_sac,
-      ROUND(
-        CAST(COALESCE(SUM(h), 0) AS REAL) / NULLIF(COALESCE(SUM(ab), 0), 0), 3
-      )                        AS batting_avg,
-      ROUND(
-        CAST(COALESCE(SUM(h), 0) + COALESCE(SUM(bb), 0) + COALESCE(SUM(hbp), 0) AS REAL)
-        / NULLIF(COALESCE(SUM(ab), 0) + COALESCE(SUM(bb), 0) + COALESCE(SUM(hbp), 0) + COALESCE(SUM(sac), 0), 0), 3
-      )                        AS obp,
-      ROUND(
-        CAST(
-          (COALESCE(SUM(h), 0) - COALESCE(SUM(doubles), 0) - COALESCE(SUM(triples), 0) - COALESCE(SUM(hr), 0))
-          + (2 * COALESCE(SUM(doubles), 0))
-          + (3 * COALESCE(SUM(triples), 0))
-          + (4 * COALESCE(SUM(hr), 0))
-        AS REAL) / NULLIF(COALESCE(SUM(ab), 0), 0), 3
-      )                        AS slg
-    FROM batting_lines
-    WHERE team_id = ?
-      AND is_our_team = 0
-    GROUP BY player_name
-    ORDER BY total_ab DESC
-  `).all(teamId);
+async function clearGameDetailRows(gameId) {
+  const sb = getDb();
+  await sb.from('batting_lines').delete().eq('game_id', gameId);
+  await sb.from('pitching_lines').delete().eq('game_id', gameId);
+  await sb.from('play_events').delete().eq('game_id', gameId);
+}
+
+// ─── Full Atomic Game Write ───────────────────────────────────────────────────
+
+async function writeNormalizedGame(normalized) {
+  const { game, battingLines, pitchingLines, playEvents } = normalized;
+  const orgId = normalizeNullable(game.orgId || game.org_id) || await getOrgIdForTeam(game.teamId);
+  const scopedGame = { ...game, orgId };
+
+  // Check for existing game, scoped to the team's org.
+  const normalizedGcGameId = normalizeGcGameIdFromGame(scopedGame);
+  if (normalizedGcGameId) scopedGame.gcGameId = normalizedGcGameId;
+  const existing = await findExistingGameByGcIdentity(getDb(), orgId, scopedGame);
+
+  const gameId = existing ? existing.id : await insertGame(scopedGame);
+
+  if (existing) {
+    await updateExistingGame(gameId, scopedGame);
+    await clearGameDetailRows(gameId);
+  }
+
+  const patchedBatting  = battingLines.map(r  => ({ ...r, gameId, orgId }));
+  const patchedPitching = pitchingLines.map(r => ({ ...r, gameId, orgId }));
+  const patchedPlays    = playEvents.map(r    => ({ ...r, gameId, orgId }));
+
+  if (patchedBatting.length)  await insertBattingLines(patchedBatting, gameId);
+  if (patchedPitching.length) await insertPitchingLines(patchedPitching, gameId);
+  if (patchedPlays.length)    await insertPlayEvents(patchedPlays, gameId);
+
+  return {
+    gameId,
+    replaced: Boolean(existing),
+    batters:  patchedBatting.length,
+    pitchers: patchedPitching.length,
+    plays:    patchedPlays.length,
+  };
+}
+
+// ─── Query Helpers ────────────────────────────────────────────────────────────
+
+async function getTeamBattingAggregates(teamId) {
+  const { data, error } = await getDb().rpc('get_team_batting_aggregates', { p_team_id: teamId });
+  check(error, 'getTeamBattingAggregates');
+  return data || [];
 }
 
 // Per-game batting_lines rows (player_name + position only) for the scouted
 // team, used to build the Fielding Summary's position breakdown. Not
 // aggregated like the function above — each row is one game's line, since a
 // player's position can vary game to game.
-function getRawBattingLines(teamId) {
-  return getDb().prepare(`
-    SELECT player_name, position
-    FROM batting_lines
-    WHERE team_id = ?
-      AND is_our_team = 0
-  `).all(teamId);
-}
-/**
- * Aggregate pitching stats for a team across all stored games.
- */
-function getTeamPitchingAggregates(teamId) {
-  return getDb().prepare(`
-    SELECT
-      0                                AS is_our_team,
-      player_name,
-      COUNT(DISTINCT game_id)          AS games,
-      SUM(ip_decimal)                  AS total_ip,
-      SUM(bf)                          AS total_bf,
-      SUM(pc)                          AS total_pitches,
-      SUM(h_allowed)                   AS total_h,
-      SUM(r_allowed)                   AS total_r,
-      SUM(er)                          AS total_er,
-      SUM(bb)                          AS total_bb,
-      SUM(so)                          AS total_so,
-      ROUND(
-        CAST(SUM(so) AS REAL) / NULLIF(SUM(bb), 0), 2
-      )                                AS k_bb_ratio,
-      ROUND(
-        9.0 * SUM(er) / NULLIF(SUM(ip_decimal), 0), 2
-      )                                AS era,
-      ROUND(
-        (CAST(SUM(bb) AS REAL) + SUM(h_allowed))
-        / NULLIF(SUM(ip_decimal), 0), 3
-      )                                AS whip,
-      ROUND(
-        CAST(SUM(pc) AS REAL) / NULLIF(SUM(ip_decimal), 0), 1
-      )                                AS pitches_per_ip
-    FROM pitching_lines
-    WHERE team_id = ?
-      AND is_our_team = 0
-    GROUP BY player_name
-    ORDER BY total_ip DESC
-  `).all(teamId);
+async function getRawBattingLines(teamId) {
+  const { data, error } = await getDb().from('batting_lines')
+    .select('player_name, position')
+    .eq('team_id', teamId)
+    .eq('is_our_team', false);
+  check(error, 'getRawBattingLines');
+  return data || [];
 }
 
-function getRecentPitchingLines(teamId) {
-  return getDb().prepare(`
-    SELECT
-      p.player_name,
-      p.is_our_team,
-      p.team_side,
-      p.team_name_raw,
-      p.ip,
-      p.ip_decimal,
-      p.bf,
-      p.pc AS pitch_count,
-      p.strikes,
-      g.game_date,
-      g.game_time,
-      g.game_datetime_raw,
-      g.opponent_name,
-      g.gc_game_id
-    FROM pitching_lines p
-    JOIN games g ON g.id = p.game_id
-    WHERE p.team_id = ?
-      AND p.is_our_team = 0
-      AND g.game_date IS NOT NULL
-    ORDER BY g.game_date DESC, p.player_name
-  `).all(teamId);
+async function getTeamPitchingAggregates(teamId) {
+  const { data, error } = await getDb().rpc('get_team_pitching_aggregates', { p_team_id: teamId });
+  check(error, 'getTeamPitchingAggregates');
+  return data || [];
 }
 
-/**
- * Returns players who appeared (batted OR pitched) for the scouted team
- * in at least MIN_APPEARANCES of the last LAST_N games.
- * Used to filter the report to "likely active roster" players.
- */
-function getActiveRosterPlayers(teamId, lastNGames = 10, minAppearances = 1) {
-  const db = getDb();
+async function getRecentPitchingLines(teamId) {
+  const sb = getDb();
 
-  // Get the IDs of the last N games for this team
-  const recentGameIds = db.prepare(`
-    SELECT DISTINCT g.id
-    FROM games g
-    WHERE g.id IN (
-      SELECT DISTINCT bl.game_id FROM batting_lines bl
-      WHERE bl.team_id = ? AND bl.is_our_team = 0
-      UNION
-      SELECT DISTINCT pl.game_id FROM pitching_lines pl
-      WHERE pl.team_id = ? AND pl.is_our_team = 0
-    )
-    AND g.game_date IS NOT NULL
-    ORDER BY g.game_date DESC
-    LIMIT ?
-  `).all(teamId, teamId, lastNGames).map(r => r.id);
+  // Do not use the legacy RPC here. It has produced rows where every outing
+  // inherits the report date / latest date, which breaks PitchSmart by making
+  // a pitcher appear to throw several historical outings on the same day.
+  // Pull the per-game date directly from games via the game_id relationship.
+  const { data, error } = await sb
+    .from('pitching_lines')
+    .select(`
+      id, game_id, team_id, player_name, is_our_team, team_side, team_name_raw,
+      ip, ip_decimal, bf, pc, strikes, h_allowed, r_allowed, er, bb, so,
+      hr_allowed, era, whip, raw_json,
+      games!inner(game_date, opponent_name)
+    `)
+    .eq('team_id', teamId)
+    .order('game_id', { ascending: false });
 
-  if (!recentGameIds.length) return { players: new Set(), gameCount: 0 };
+  check(error, 'getRecentPitchingLines direct');
 
-  const placeholders = recentGameIds.map(() => '?').join(',');
-
-  // Count appearances per player across batting + pitching lines
-  const rows = db.prepare(`
-    SELECT player_name, COUNT(DISTINCT game_id) AS app_count
-    FROM (
-      SELECT player_name, game_id FROM batting_lines
-      WHERE team_id = ? AND is_our_team = 0 AND game_id IN (${placeholders})
-      UNION ALL
-      SELECT player_name, game_id FROM pitching_lines
-      WHERE team_id = ? AND is_our_team = 0 AND game_id IN (${placeholders})
-    )
-    GROUP BY player_name
-    HAVING COUNT(DISTINCT game_id) >= ?
-  `).all(teamId, ...recentGameIds, teamId, ...recentGameIds, minAppearances);
-
-  return {
-    players: new Set(rows.map(r => r.player_name)),
-    gameCount: recentGameIds.length,
-    totalGamesWindow: lastNGames,
-  };
+  return (data || []).map(row => ({
+    ...row,
+    game_date: row.games?.game_date || null,
+    opponent_name: row.games?.opponent_name || null,
+  }));
 }
 
-function extractJerseyFromRaw(rawJson) {
-  if (!rawJson) return null;
-
-  try {
-    const raw = JSON.parse(rawJson);
-    const direct = raw.Jersey || raw.jersey || raw.Number || raw.number;
-    if (direct !== undefined && direct !== null && String(direct).trim() !== '') {
-      return String(direct).replace(/^#/, '').trim();
-    }
-
-    const info = raw.PlayerInfo || raw.playerInfo || '';
-    const m = String(info).match(/#\s*([A-Za-z0-9-]+)/);
-    if (m) return m[1].trim();
-  } catch {}
-
-  const m = String(rawJson).match(/#\s*([A-Za-z0-9-]+)/);
-  return m ? m[1].trim() : null;
-}
-
-function getTeamJerseyMap(teamId) {
-  const rows = getDb().prepare(`
-    SELECT player_name, raw_json
-    FROM batting_lines
-    WHERE team_id = ? AND is_our_team = 0
-    UNION ALL
-    SELECT player_name, raw_json
-    FROM pitching_lines
-    WHERE team_id = ? AND is_our_team = 0
-  `).all(teamId, teamId);
+async function getTeamJerseyMap(teamId) {
+  const { data, error } = await getDb()
+    .from('batting_lines')
+    .select('player_name, raw_json')
+    .eq('team_id', teamId)
+    .eq('is_our_team', false);
+  check(error, 'getTeamJerseyMap batting');
 
   const map = {};
-  for (const row of rows) {
+  for (const row of (data || [])) {
     if (!row.player_name || map[row.player_name]) continue;
     const jersey = extractJerseyFromRaw(row.raw_json);
     if (jersey) map[row.player_name] = jersey;
   }
+
+  // Also check pitching lines for jersey numbers
+  const { data: pData } = await getDb()
+    .from('pitching_lines')
+    .select('player_name, raw_json')
+    .eq('team_id', teamId)
+    .eq('is_our_team', false);
+
+  for (const row of (pData || [])) {
+    if (!row.player_name || map[row.player_name]) continue;
+    const jersey = extractJerseyFromRaw(row.raw_json);
+    if (jersey) map[row.player_name] = jersey;
+  }
+
   return map;
 }
 
+function extractJerseyFromRaw(rawJson) {
+  if (!rawJson) return null;
+  try {
+    const raw = typeof rawJson === 'string' ? JSON.parse(rawJson) : rawJson;
+    const direct = raw.Jersey || raw.jersey || raw.Number || raw.number;
+    if (direct !== undefined && direct !== null && String(direct).trim() !== '') {
+      return String(direct).replace(/^#/, '').trim();
+    }
+    const info = raw.PlayerInfo || raw.playerInfo || '';
+    const m = String(info).match(/#\s*([A-Za-z0-9-]+)/);
+    if (m) return m[1].trim();
+  } catch {}
+  const m = String(rawJson).match(/#\s*([A-Za-z0-9-]+)/);
+  return m ? m[1].trim() : null;
+}
+
+async function getTeamPlayTendencies(teamId) {
+  const { data, error } = await getDb().rpc('get_team_play_tendencies', { p_team_id: teamId });
+  check(error, 'getTeamPlayTendencies');
+  return data || [];
+}
+
+async function getLatestVerifiedTeamTotals(teamId) {
+  try {
+    const { data, error } = await getDb()
+      .from('derived_team_verified_totals')
+      .select('*')
+      .eq('team_id', teamId)
+      .maybeSingle();
+
+    // The migration may not exist yet on a fresh environment. Do not break
+    // report generation; analyzer.js will fall back to box-score aggregates.
+    if (error) {
+      const msg = String(error.message || '').toLowerCase();
+      if (msg.includes('does not exist') || msg.includes('could not find the table')) return null;
+      check(error, 'getLatestVerifiedTeamTotals');
+    }
+
+    return data || null;
+  } catch (err) {
+    const msg = String(err.message || '').toLowerCase();
+    if (msg.includes('does not exist') || msg.includes('could not find the table')) return null;
+    throw err;
+  }
+}
+
+async function getTeamGameResults(teamId) {
+  const { data, error } = await getDb().from('games')
+    .select('id, game_date, opponent_name, result, score_us, score_them, gc_game_url')
+    .eq('team_id', teamId)
+    .order('game_date', { ascending: false });
+  check(error, 'getTeamGameResults');
+  return data || [];
+}
+
+async function getActiveRosterPlayers(teamId, lastNGames = 10, minAppearances = 1) {
+  const { data, error } = await getDb().rpc('get_active_roster_players', {
+    p_team_id:        teamId,
+    p_last_n_games:   lastNGames,
+    p_min_appearances: minAppearances,
+  });
+  check(error, 'getActiveRosterPlayers');
+
+  const players = new Set((data || []).map(r => r.player_name));
+  return {
+    players,
+    gameCount: data?.[0]?.game_count ?? 0,
+    totalGamesWindow: lastNGames,
+  };
+}
+
 /**
- * Empirical batting-order tendency per player, from actual lineup cards in
- * the last N scouted games (batting_lines.batting_order is captured per
- * game/player at ingest time — see insertBattingLines). This is real data,
- * not an estimate: use it in preference to inferring order from stat roles.
+ * Empirical batting-order tendency per opponent hitter, computed from actual
+ * lineup cards (batting_lines.batting_order) in the last N scouted games —
+ * not an estimate. Supabase-native: no raw SQL, aggregation done in JS since
+ * the row counts here are small (one team's roster x N games).
  */
-function getTeamLineupOrder(teamId, lastNGames = 10) {
-  const db = getDb();
+async function getTeamLineupOrder(teamId, lastNGames = 10) {
+  const sb = getDb();
 
-  const recentGameIds = db.prepare(`
-    SELECT DISTINCT game_id FROM batting_lines
-    WHERE team_id = ? AND is_our_team = 0 AND batting_order IS NOT NULL
-    ORDER BY game_id DESC
-    LIMIT ?
-  `).all(teamId, lastNGames).map(r => r.game_id);
+  const { data: recentGames, error: gamesErr } = await sb
+    .from('games')
+    .select('id')
+    .eq('team_id', teamId)
+    .order('game_date', { ascending: false })
+    .limit(lastNGames);
+  check(gamesErr, 'getTeamLineupOrder games');
 
-  if (!recentGameIds.length) return [];
+  const gameIds = (recentGames || []).map(g => g.id);
+  if (!gameIds.length) return [];
 
-  const placeholders = recentGameIds.map(() => '?').join(',');
+  const { data: lines, error: linesErr } = await sb
+    .from('batting_lines')
+    .select('player_name, batting_order')
+    .eq('team_id', teamId)
+    .eq('is_our_team', false)
+    .in('game_id', gameIds)
+    .not('batting_order', 'is', null)
+    .gt('batting_order', 0);
+  check(linesErr, 'getTeamLineupOrder batting_lines');
 
-  return db.prepare(`
-    SELECT
+  const byPlayer = {};
+  for (const row of (lines || [])) {
+    if (!row.player_name) continue;
+    if (!byPlayer[row.player_name]) byPlayer[row.player_name] = { orders: [], starts: 0 };
+    byPlayer[row.player_name].orders.push(row.batting_order);
+    byPlayer[row.player_name].starts++;
+  }
+
+  const result = Object.entries(byPlayer).map(([player_name, v]) => {
+    const avgOrder = v.orders.reduce((sum, o) => sum + o, 0) / v.orders.length;
+    const counts = {};
+    for (const o of v.orders) counts[o] = (counts[o] || 0) + 1;
+    const mostCommonOrder = Number(
+      Object.entries(counts).sort((a, b) => b[1] - a[1] || Number(a[0]) - Number(b[0]))[0][0]
+    );
+    return {
       player_name,
-      ROUND(AVG(batting_order), 1) AS avg_order,
-      COUNT(*) AS starts,
-      (
-        SELECT batting_order FROM batting_lines bl2
-        WHERE bl2.player_name = bl.player_name
-          AND bl2.team_id = bl.team_id AND bl2.is_our_team = 0
-          AND bl2.game_id IN (${placeholders})
-        GROUP BY batting_order
-        ORDER BY COUNT(*) DESC, batting_order ASC
-        LIMIT 1
-      ) AS most_common_order
-    FROM batting_lines bl
-    WHERE team_id = ? AND is_our_team = 0
-      AND batting_order IS NOT NULL AND batting_order > 0
-      AND game_id IN (${placeholders})
-    GROUP BY player_name
-    ORDER BY avg_order ASC
-  `).all(...recentGameIds, teamId, ...recentGameIds);
+      avg_order: Math.round(avgOrder * 10) / 10,
+      starts: v.starts,
+      most_common_order: mostCommonOrder,
+    };
+  });
+
+  result.sort((a, b) => a.avg_order - b.avg_order);
+  return result;
 }
 
-/**
- * Get play-by-play tendencies: event type distribution for a team.
- */
-function getTeamPlayTendencies(teamId) {
-  return getDb().prepare(`
-    SELECT
-      event_type,
-      COUNT(*)                           AS count,
-      ROUND(
-        100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 1
-      )                                  AS pct
-    FROM play_events
-    WHERE team_id = ?
-      AND event_type != 'unknown'
-      AND event_type != 'end_inning'
-    GROUP BY event_type
-    ORDER BY count DESC
-  `).all(teamId);
-}
+async function getTeamAnalysisBundle(teamId) {
+  const sb = getDb();
 
-/**
- * Get all game results for a team (for win/loss context in AI prompts).
- */
-function getTeamGameResults(teamId) {
-  return getDb().prepare(`
-    SELECT
-      id, game_date, opponent_name,
-      result, score_us, score_them,
-      gc_game_url
-    FROM games
-    WHERE team_id = ?
-    ORDER BY game_date DESC
-  `).all(teamId);
-}
-
-/**
- * Build a full context bundle for AI analysis — one query per team.
- * Returns everything the AI layer needs as a single object.
- */
-function getTeamAnalysisBundle(teamId) {
-  const team      = getDb().prepare(`SELECT * FROM teams WHERE id = ?`).get(teamId);
-  const games     = getTeamGameResults(teamId);
-  const batting   = getTeamBattingAggregates(teamId);
-  const pitching  = getTeamPitchingAggregates(teamId);
-  const tendencies = getTeamPlayTendencies(teamId);
-  const recentPitchingLines = getRecentPitchingLines(teamId);
-  const jerseyMap = getTeamJerseyMap(teamId);
-  const activeRoster = getActiveRosterPlayers(teamId, 10, 1);
-  const lineupOrder = getTeamLineupOrder(teamId, 10);
-
-  // Report convention: when scouting an opponent team's own GC page, that
-  // scouted team's players are stored as is_our_team=0. The teams they faced
-  // are stored as is_our_team=1.
-  const scoutedBattersAdv = getPlayerAdvancedStats(teamId, 0);
-  const facedBattersAdv   = getPlayerAdvancedStats(teamId, 1);
-  const scoutedPitchersAdv = getPitcherAdvancedStats(teamId, 0);
-  const facedPitchersAdv   = getPitcherAdvancedStats(teamId, 1);
-  const rawBattingLines    = getRawBattingLines(teamId);
+  const [
+    teamRes, games, batting, pitching, tendencies,
+    recentPitchingLines, jerseyMap, activeRoster,
+    scoutedBattersAdv, facedBattersAdv, scoutedPitchersAdv, facedPitchersAdv,
+    rawBattingLines, verifiedTotals, lineupOrder,
+  ] = await Promise.all([
+    sb.from('teams').select('*').eq('id', teamId).maybeSingle(),
+    getTeamGameResults(teamId),
+    getTeamBattingAggregates(teamId),
+    getTeamPitchingAggregates(teamId),
+    getTeamPlayTendencies(teamId),
+    getRecentPitchingLines(teamId),
+    getTeamJerseyMap(teamId),
+    getActiveRosterPlayers(teamId, 10, 1),
+    getPlayerAdvancedStats(teamId, 0),
+    getPlayerAdvancedStats(teamId, 1),
+    getPitcherAdvancedStats(teamId, 0),
+    getPitcherAdvancedStats(teamId, 1),
+    getRawBattingLines(teamId),
+    getLatestVerifiedTeamTotals(teamId),
+    getTeamLineupOrder(teamId, 10),
+  ]);
 
   return {
-    team,
+    team:               teamRes.data,
     games,
-    batting,    // scouted team batters only (is_our_team=0)
-    pitching,   // scouted team pitchers only (is_our_team=0)
+    batting,
+    pitching,
     tendencies,
     recentPitchingLines,
     jerseyMap,
-    activeRoster,     // { players: Set<string>, gameCount, totalGamesWindow }
-    lineupOrder,      // real batting-order tendency per player (see getTeamLineupOrder)
-    playerAdvanced:  scoutedBattersAdv,  // advanced batting for scouted team
-    ourPitchers:     scoutedPitchersAdv, // advanced pitching for scouted team
-    oppPitchers:     facedPitchersAdv,   // pitchers from teams the scouted team faced
-    opponentBatters: facedBattersAdv,    // alias used by report.js oppBatMap
-    rawBattingLines,                     // per-game position data for Fielding Summary
+    activeRoster,
+    playerAdvanced:     scoutedBattersAdv,
+    ourPitchers:        scoutedPitchersAdv,
+    oppPitchers:        facedPitchersAdv,
+    opponentBatters:    facedBattersAdv,
+    rawBattingLines,
+    verifiedTotals,
+    lineupOrder,
     meta: {
       gamesAnalyzed: games.length,
       generatedAt:   new Date().toISOString(),
-    }
+    },
   };
+}
+
+// ─── Advanced Stats ───────────────────────────────────────────────────────────
+
+async function upsertPlayerAdvancedStats(teamId, playerName, isOurTeam, stats) {
+  const s  = stats;
+  const sd = s.swingDecisions ? JSON.stringify(s.swingDecisions) : null;
+  const orgId = await getOrgIdForTeam(teamId);
+  const payload = {
+    team_id:     teamId,
+    player_name: playerName,
+    is_our_team: isOurTeam ? true : false,
+    games:         s.games        ?? 0,
+    total_pitches: s.totalPitches ?? 0,
+    gb: s.GB ?? 0, fb: s.FB ?? 0, ld: s.LD ?? 0,
+    batted_balls: (s.GB ?? 0) + (s.FB ?? 0) + (s.LD ?? 0),
+    gb_pct: s.GB_pct ?? null, fb_pct: s.FB_pct ?? null, ld_pct: s.LD_pct ?? null,
+    spray_lf: s.spray?.LF ?? 0,  spray_cf: s.spray?.CF ?? 0,
+    spray_rf: s.spray?.RF ?? 0,  spray_3b: s.spray?.['3B'] ?? 0,
+    spray_ss: s.spray?.SS ?? 0,  spray_2b: s.spray?.['2B'] ?? 0,
+    spray_1b: s.spray?.['1B'] ?? 0, spray_pc: s.spray?.P ?? 0,
+    spray_lf_pct: s.sprayPct?.LF ?? null,  spray_cf_pct: s.sprayPct?.CF ?? null,
+    spray_rf_pct: s.sprayPct?.RF ?? null,  spray_3b_pct: s.sprayPct?.['3B'] ?? null,
+    spray_ss_pct: s.sprayPct?.SS ?? null,  spray_2b_pct: s.sprayPct?.['2B'] ?? null,
+    spray_1b_pct: s.sprayPct?.['1B'] ?? null, spray_pc_pct: s.sprayPct?.P ?? null,
+    risp_ab: s.RISP_AB ?? 0, risp_h: s.RISP_H ?? 0, ba_risp: s.BA_RISP ?? null,
+    swing_decisions: sd,
+    k_pct: s.K_pct ?? null, bb_pct: s.BB_pct ?? null,
+	bunts: s.BUNT ?? 0,
+	errors: s.E ?? 0,
+  };
+  if (await tableHasOrgId('player_advanced_stats')) payload.org_id = orgId;
+
+  const { error } = await getDb().from('player_advanced_stats').upsert(payload, { onConflict: 'team_id,player_name,is_our_team' });
+
+  check(error, 'upsertPlayerAdvancedStats');
+}
+
+async function upsertPitcherAdvancedStats(teamId, playerName, isOurTeam, stats) {
+  const s = stats;
+  const orgId = await getOrgIdForTeam(teamId);
+  const payload = {
+    team_id:      teamId,
+    player_name:  playerName,
+    is_our_team:  isOurTeam ? true : false,
+    games:        s.games        ?? 0,
+    total_pitches: s.totalPitches ?? 0,
+    strikes:      s.strikes      ?? 0,
+    s_pct:        s.S_pct        ?? null,
+    gb: s.GB ?? 0, fb: s.FB ?? 0, ld: s.LD ?? 0,
+    gb_pct: s.GB_pct ?? null, fb_pct: s.FB_pct ?? null, ld_pct: s.LD_pct ?? null,
+    go_ao:    s.GO_AO    ?? null,
+    so_per7:  s.SO_per7  ?? null, bb_per7:   s.BB_per7   ?? null,
+    k_pct_bf: s.K_pct_BF ?? null, bb_pct_bf: s.BB_pct_BF ?? null,
+    p_per_ip: s.P_per_IP ?? null,
+    wp: s.WP ?? 0, bk: s.BK ?? 0, pik: s.PIK ?? 0,
+	errors: s.E ?? 0,
+  };
+  if (await tableHasOrgId('pitcher_advanced_stats')) payload.org_id = orgId;
+
+  const { error } = await getDb().from('pitcher_advanced_stats').upsert(payload, { onConflict: 'team_id,player_name,is_our_team' });
+
+  check(error, 'upsertPitcherAdvancedStats');
+}
+
+async function getPlayerAdvancedStats(teamId, isOurTeam = null) {
+  let q = getDb().from('player_advanced_stats').select('*').eq('team_id', teamId);
+  if (isOurTeam !== null) q = q.eq('is_our_team', isOurTeam ? true : false);
+  const { data, error } = await q.order('player_name');
+  check(error, 'getPlayerAdvancedStats');
+  return data || [];
+}
+
+async function getPitcherAdvancedStats(teamId, isOurTeam = null) {
+  let q = getDb().from('pitcher_advanced_stats').select('*').eq('team_id', teamId);
+  if (isOurTeam !== null) q = q.eq('is_our_team', isOurTeam ? true : false);
+  const { data, error } = await q.order('player_name');
+  check(error, 'getPitcherAdvancedStats');
+  return data || [];
+}
+
+// ─── Handedness ─────────────────────────────────────────────────────────────
+// Scraped from GC "Edit Player" modals (see search-gamechanger-teams.js) into
+// player_handedness. Coverage is partial — most teams have never had this
+// scraped, so callers must treat an empty/missing result as "not tracked for
+// this team" rather than inferring bats/throws from names, stats, or spray
+// charts. bats/throws values are 'L' | 'R' | 'S' (switch) | 'Unknown'.
+async function getTeamHandedness(teamId) {
+  const { data, error } = await getDb()
+    .from('player_handedness')
+    .select('jersey_number, full_name, bats, throws')
+    .eq('team_id', teamId);
+  check(error, 'getTeamHandedness');
+  return (data || []).filter(r => r.full_name);
+}
+
+// Used by scrape-handedness.js to decide which roster rows can be skipped
+// on a re-scrape (jersey_number match, falling back to match_key = last
+// name + first initial). NOTE: unlike getTeamHandedness() above, this
+// intentionally does NOT filter out rows with a missing full_name — a row
+// missing full_name would mean buildMatchKey() has nothing to dedupe
+// against anyway, and dropping it here would just cause that player to be
+// re-captured every run instead of surfacing the gap.
+async function getExistingHandednessForTeam(teamId) {
+  const { data, error } = await getDb()
+    .from('player_handedness')
+    .select('jersey_number, match_key, full_name, bats, throws')
+    .eq('team_id', teamId);
+  check(error, 'getExistingHandednessForTeam');
+  return data || [];
+}
+
+// Upsert one captured player's handedness. Verified against the live schema
+// (Supabase:execute_sql against pg_constraint) on 2026-07-09: the real
+// unique constraint is player_handedness_team_id_jersey_number_key on
+// (team_id, jersey_number) — NOT (team_id, match_key) as originally assumed
+// here. A mismatched onConflict target makes Postgres reject the upsert
+// immediately (it can't validate the ON CONFLICT clause against a
+// nonexistent constraint), regardless of whether an actual conflict would
+// occur — which was silently failing every single write via the try/catch
+// in scrape-handedness.js's capture loop.
+//
+// NOTE: Postgres treats NULL as distinct from NULL for uniqueness purposes,
+// so a player with no jersey_number will never conflict with itself and
+// will insert a fresh row on every re-scrape instead of updating in place.
+// GC roster rows are parsed as "Name, #Number" so this should be rare, but
+// if duplicate rows for the same nameless player start showing up, that's why.
+async function upsertPlayerHandedness(teamId, player = {}) {
+  const payload = {
+    team_id:       teamId,
+    jersey_number: player.jerseyNumber != null ? String(player.jerseyNumber) : null,
+    first_name:    player.firstName || null,
+    last_name:     player.lastName  || null,
+    full_name:     player.fullName  || null,
+    match_key:     player.matchKey  || null,
+    bats:          player.bats      || 'Unknown',
+    throws:        player.throws    || 'Unknown',
+    last_scraped_at: new Date().toISOString(),
+  };
+  const { error } = await getDb()
+    .from('player_handedness')
+    .upsert(payload, { onConflict: 'team_id,jersey_number' });
+  check(error, 'upsertPlayerHandedness');
+}
+
+// ─── GameChanger-native player stats (own-numbers cross-check) ────────────
+// Captured from each opponent player's Stats tab on GameChanger (AG Grid,
+// per-game rows) — NOT merged into player_advanced_stats, which is our own
+// play-by-play-derived computation. Kept as a separate source so the two
+// can be compared later without one silently overwriting the other. `rows`
+// is stored exactly as scraped (per-game, GC's own column set) rather than
+// force-matched to our own game_id — that matching is a fuzzy date/opponent
+// problem to solve later, not part of capture.
+async function upsertPlayerGcStats(teamId, entry = {}) {
+  const payload = {
+    team_id:       teamId,
+    jersey_number: entry.jerseyNumber != null ? String(entry.jerseyNumber) : null,
+    full_name:     entry.fullName  || null,
+    match_key:     entry.matchKey  || null,
+    category:      entry.category,
+    columns:       entry.columns || [],
+    rows:          entry.rows    || [],
+    captured_at:   new Date().toISOString(),
+  };
+  const { error } = await getDb()
+    .from('player_gc_stats')
+    .upsert(payload, { onConflict: 'team_id,jersey_number,category' });
+  check(error, 'upsertPlayerGcStats');
+}
+
+// Batting spray chart captured from GameChanger's own SVG chart — real
+// plotted (x, y) coordinates in the chart's own viewBox space, not a
+// screenshot. outcome is 'hit' | 'out'.
+async function upsertPlayerGcSprayChart(teamId, entry = {}) {
+  const payload = {
+    team_id:       teamId,
+    jersey_number: entry.jerseyNumber != null ? String(entry.jerseyNumber) : null,
+    full_name:     entry.fullName  || null,
+    match_key:     entry.matchKey  || null,
+    category:      entry.category || 'batting',
+    view_box:      entry.viewBox  || null,
+    points:        entry.points   || [],
+    captured_at:   new Date().toISOString(),
+  };
+  const { error } = await getDb()
+    .from('player_gc_spray_charts')
+    .upsert(payload, { onConflict: 'team_id,jersey_number,category' });
+  check(error, 'upsertPlayerGcSprayChart');
 }
 
 // ─── Scouting Reports ─────────────────────────────────────────────────────────
 
-function insertScoutingReport(report) {
-  const stmt = getDb().prepare(`
-    INSERT INTO scouting_reports (
-      team_id, report_type, games_covered,
-      file_path, file_format, recipient_email
-    ) VALUES (
-      @teamId, @reportType, @gamesCovered,
-      @filePath, @fileFormat, @recipientEmail
-    )
-  `);
-
-  const info = stmt.run({
-    teamId:         report.teamId,
-    reportType:     report.reportType     || 'full_scout',
-    gamesCovered:   JSON.stringify(report.gamesCovered || []),
-    filePath:       report.filePath       || null,
-    fileFormat:     report.fileFormat     || 'pdf',
-    recipientEmail: report.recipientEmail || null,
-  });
-
-  return info.lastInsertRowid;
-}
-
-
-// ─── Advanced Stats ───────────────────────────────────────────────────────────
-
-/**
- * Upsert player advanced stats (from stats-engine).
- * One row per team+player+side — updates on re-run.
- */
-function upsertPlayerAdvancedStats(teamId, playerName, isOurTeam, stats) {
-  const db = getDb();
-  const s  = stats;
-
-  const sd = s.swingDecisions ? JSON.stringify(s.swingDecisions) : null;
-
-  // Real spray-zone split by ball-strike count at contact (see
-  // stats-engine.js sprayByCount / sprayPctEarly / sprayPct2K) — stored as
-  // one JSON blob, same pattern as swing_decisions, rather than 14+ new
-  // columns. Requires a migration:
-  //   ALTER TABLE player_advanced_stats ADD COLUMN spray_by_count TEXT;
-  const sprayByCount = (s.sprayPctEarly || s.sprayPct2K)
-    ? JSON.stringify({
-        early:     { pct: s.sprayPctEarly ?? {}, n: s.sprayEarlyN ?? 0 },
-        twoStrike: { pct: s.sprayPct2K    ?? {}, n: s.spray2KN    ?? 0 },
-      })
-    : null;
-
-  db.prepare(`
-    INSERT INTO player_advanced_stats (
-      team_id, player_name, is_our_team,
-      games, total_pitches,
-      gb, fb, ld, batted_balls, gb_pct, fb_pct, ld_pct,
-      spray_lf, spray_cf, spray_rf, spray_3b, spray_ss, spray_2b, spray_1b, spray_pc,
-      spray_lf_pct, spray_cf_pct, spray_rf_pct, spray_3b_pct,
-      spray_ss_pct, spray_2b_pct, spray_1b_pct, spray_pc_pct,
-      spray_by_count,
-      risp_ab, risp_h, ba_risp,
-      swing_decisions, k_pct, bb_pct, errors
-    ) VALUES (
-      @teamId, @playerName, @isOurTeam,
-      @games, @totalPitches,
-      @gb, @fb, @ld, @battedBalls, @gbPct, @fbPct, @ldPct,
-      @sprayLf, @sprayCf, @sprayRf, @spray3b, @spraySs, @spray2b, @spray1b, @sprayPc,
-      @sprayLfPct, @sprayCfPct, @sprayRfPct, @spray3bPct,
-      @spraySsPct, @spray2bPct, @spray1bPct, @sprayPcPct,
-      @sprayByCount,
-      @rispAb, @rispH, @baRisp,
-      @swingDecisions, @kPct, @bbPct, @errors
-    )
-    ON CONFLICT(team_id, player_name, is_our_team) DO UPDATE SET
-      games         = excluded.games,
-      total_pitches = excluded.total_pitches,
-      gb = excluded.gb, fb = excluded.fb, ld = excluded.ld,
-      batted_balls  = excluded.batted_balls,
-      gb_pct = excluded.gb_pct, fb_pct = excluded.fb_pct, ld_pct = excluded.ld_pct,
-      spray_lf = excluded.spray_lf, spray_cf = excluded.spray_cf,
-      spray_rf = excluded.spray_rf, spray_3b = excluded.spray_3b,
-      spray_ss = excluded.spray_ss, spray_2b = excluded.spray_2b,
-      spray_1b = excluded.spray_1b, spray_pc = excluded.spray_pc,
-      spray_lf_pct = excluded.spray_lf_pct, spray_cf_pct = excluded.spray_cf_pct,
-      spray_rf_pct = excluded.spray_rf_pct, spray_3b_pct = excluded.spray_3b_pct,
-      spray_ss_pct = excluded.spray_ss_pct, spray_2b_pct = excluded.spray_2b_pct,
-      spray_1b_pct = excluded.spray_1b_pct, spray_pc_pct = excluded.spray_pc_pct,
-      spray_by_count = excluded.spray_by_count,
-      risp_ab = excluded.risp_ab, risp_h = excluded.risp_h, ba_risp = excluded.ba_risp,
-      swing_decisions = excluded.swing_decisions,
-      k_pct = excluded.k_pct, bb_pct = excluded.bb_pct,
-      errors = excluded.errors,
-      generated_at = datetime('now')
-  `).run({
-    teamId, playerName, isOurTeam: isOurTeam ? 1 : 0,
-    games:        s.games        ?? 0,
-    totalPitches: s.totalPitches ?? 0,
-    gb: s.GB ?? 0, fb: s.FB ?? 0, ld: s.LD ?? 0,
-    battedBalls: (s.GB ?? 0) + (s.FB ?? 0) + (s.LD ?? 0),
-    gbPct: s.GB_pct ?? null, fbPct: s.FB_pct ?? null, ldPct: s.LD_pct ?? null,
-    sprayLf: s.spray?.LF ?? 0,  sprayCf: s.spray?.CF ?? 0,
-    sprayRf: s.spray?.RF ?? 0,  spray3b: s.spray?.['3B'] ?? 0,
-    spraySs: s.spray?.SS ?? 0,  spray2b: s.spray?.['2B'] ?? 0,
-    spray1b: s.spray?.['1B'] ?? 0, sprayPc: s.spray?.P ?? 0,
-    sprayLfPct: s.sprayPct?.LF ?? null,  sprayCfPct: s.sprayPct?.CF ?? null,
-    sprayRfPct: s.sprayPct?.RF ?? null,  spray3bPct: s.sprayPct?.['3B'] ?? null,
-    spraySsPct: s.sprayPct?.SS ?? null,  spray2bPct: s.sprayPct?.['2B'] ?? null,
-    spray1bPct: s.sprayPct?.['1B'] ?? null, sprayPcPct: s.sprayPct?.P ?? null,
-    sprayByCount,
-    rispAb: s.RISP_AB ?? 0, rispH: s.RISP_H ?? 0, baRisp: s.BA_RISP ?? null,
-    swingDecisions: sd,
-    kPct: s.K_pct ?? null, bbPct: s.BB_pct ?? null,
-    errors: s.E ?? 0,
-  });
-}
-
-function upsertPitcherAdvancedStats(teamId, playerName, isOurTeam, stats) {
-  const db = getDb();
-  const s  = stats;
-
-  db.prepare(`
-    INSERT INTO pitcher_advanced_stats (
-      team_id, player_name, is_our_team,
-      games, total_pitches, strikes, s_pct,
-      gb, fb, ld, gb_pct, fb_pct, ld_pct, go_ao,
-      so_per7, bb_per7, k_pct_bf, bb_pct_bf, p_per_ip,
-      wp, bk, pik, errors
-    ) VALUES (
-      @teamId, @playerName, @isOurTeam,
-      @games, @totalPitches, @strikes, @sPct,
-      @gb, @fb, @ld, @gbPct, @fbPct, @ldPct, @goAo,
-      @soPer7, @bbPer7, @kPctBf, @bbPctBf, @pPerIp,
-      @wp, @bk, @pik, @errors
-    )
-    ON CONFLICT(team_id, player_name, is_our_team) DO UPDATE SET
-      games = excluded.games, total_pitches = excluded.total_pitches,
-      strikes = excluded.strikes, s_pct = excluded.s_pct,
-      gb = excluded.gb, fb = excluded.fb, ld = excluded.ld,
-      gb_pct = excluded.gb_pct, fb_pct = excluded.fb_pct, ld_pct = excluded.ld_pct,
-      go_ao = excluded.go_ao,
-      so_per7 = excluded.so_per7, bb_per7 = excluded.bb_per7,
-      k_pct_bf = excluded.k_pct_bf, bb_pct_bf = excluded.bb_pct_bf,
-      p_per_ip = excluded.p_per_ip,
-      wp = excluded.wp, bk = excluded.bk, pik = excluded.pik,
-      errors = excluded.errors,
-      generated_at = datetime('now')
-  `).run({
-    teamId, playerName, isOurTeam: isOurTeam ? 1 : 0,
-    games:        s.games        ?? 0,
-    totalPitches: s.totalPitches ?? 0,
-    strikes:      s.strikes      ?? 0,
-    sPct:    s.S_pct    ?? null,
-    gb: s.GB ?? 0, fb: s.FB ?? 0, ld: s.LD ?? 0,
-    gbPct: s.GB_pct ?? null, fbPct: s.FB_pct ?? null, ldPct: s.LD_pct ?? null,
-    goAo:    s.GO_AO   ?? null,
-    soPer7:  s.SO_per7 ?? null, bbPer7:  s.BB_per7  ?? null,
-    kPctBf:  s.K_pct_BF ?? null, bbPctBf: s.BB_pct_BF ?? null,
-    pPerIp:  s.P_per_IP ?? null,
-    wp: s.WP ?? 0, bk: s.BK ?? 0, pik: s.PIK ?? 0,
-    errors: s.E ?? 0,
-  });
-}
-
-function getPlayerAdvancedStats(teamId, isOurTeam = null) {
-  if (isOurTeam !== null && isOurTeam !== undefined) {
-    return getDb().prepare(`
-      SELECT * FROM player_advanced_stats
-      WHERE team_id = ? AND is_our_team = ?
-      ORDER BY player_name
-    `).all(teamId, isOurTeam);
+async function insertScoutingReport(report) {
+  const payload = {
+    team_id:         report.teamId,
+    report_type:     report.reportType     || 'full_scout',
+    games_covered:   JSON.stringify(report.gamesCovered || []),
+    file_path:       report.filePath       || null,
+    file_format:     report.fileFormat     || 'pdf',
+    recipient_email: report.recipientEmail || null,
+  };
+  if (await tableHasOrgId('scouting_reports')) {
+    payload.org_id = normalizeNullable(report.orgId || report.org_id) || await getOrgIdForTeam(report.teamId);
   }
-  return getDb().prepare(`
-    SELECT * FROM player_advanced_stats
-    WHERE team_id = ?
-    ORDER BY player_name
-  `).all(teamId);
-}
 
-function getPitcherAdvancedStats(teamId, isOurTeam = null) {
-  if (isOurTeam !== null && isOurTeam !== undefined) {
-    return getDb().prepare(`
-      SELECT * FROM pitcher_advanced_stats
-      WHERE team_id = ? AND is_our_team = ?
-      ORDER BY player_name
-    `).all(teamId, isOurTeam);
-  }
-  return getDb().prepare(`
-    SELECT * FROM pitcher_advanced_stats
-    WHERE team_id = ?
-    ORDER BY player_name
-  `).all(teamId);
-}
+  const { data, error } = await getDb().from('scouting_reports').insert(payload).select('id').single();
 
-// player_handedness only exists in the Supabase schema right now (see
-// db-supabase.js). Local SQLite dev has no equivalent table, so this stub
-// just returns "not tracked" rather than throwing.
-function getTeamHandedness(teamId) {
-  return [];
-}
-
-// Same story as getTeamHandedness above — no local table, so nothing to
-// dedupe against. Returning [] means every roster row will look "new" to
-// scrape-handedness.js's skip logic on local SQLite, which is fine: the
-// upsert below is a no-op there anyway, so nothing gets silently lost.
-function getExistingHandednessForTeam(teamId) {
-  return [];
-}
-
-let _warnedNoHandednessTable = false;
-function upsertPlayerHandedness(teamId, player) {
-  if (!_warnedNoHandednessTable) {
-    console.warn('[db] upsertPlayerHandedness: player_handedness only exists in Supabase. Skipping write (local SQLite dev) — run with USE_SUPABASE=true to actually capture handedness.');
-    _warnedNoHandednessTable = true;
-  }
-}
-
-let _warnedNoGcStatsTable = false;
-function upsertPlayerGcStats(teamId, entry) {
-  if (!_warnedNoGcStatsTable) {
-    console.warn('[db] upsertPlayerGcStats: player_gc_stats only exists in Supabase. Skipping write (local SQLite dev).');
-    _warnedNoGcStatsTable = true;
-  }
-}
-
-let _warnedNoGcSprayTable = false;
-function upsertPlayerGcSprayChart(teamId, entry) {
-  if (!_warnedNoGcSprayTable) {
-    console.warn('[db] upsertPlayerGcSprayChart: player_gc_spray_charts only exists in Supabase. Skipping write (local SQLite dev).');
-    _warnedNoGcSprayTable = true;
-  }
+  check(error, 'insertScoutingReport');
+  return data.id;
 }
 
 // ─── Exports ──────────────────────────────────────────────────────────────────
 
 module.exports = {
   init,
+  verifyConnection,
   getDb,
   getRawBattingLines,
+  getGameDataForStatsEngine,
   // Teams
   upsertTeam,
   getTeamByUrl,
@@ -1141,6 +1322,7 @@ module.exports = {
   // Games
   insertGame,
   getGamesByTeam,
+  getCompleteGamesByTeam,
   getGameById,
   // Stats
   insertBattingLines,
