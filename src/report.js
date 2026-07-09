@@ -1580,9 +1580,12 @@ async function buildDocx(analysis, outputPath) {
 function humanizeKey(key) {
   return String(key)
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([a-zA-Z])([0-9])/g, '$1 $2')
+    .replace(/([0-9])([a-zA-Z])/g, '$1 $2')
     .replace(/_/g, ' ')
     .replace(/\b\w/g, c => c.toUpperCase())
-    .trim();
+    .trim()
+    .replace(/\s+/g, ' ');
 }
 
 function isFlatObject(obj) {
@@ -1651,11 +1654,20 @@ async function buildGenericDocx(analysis, outputPath, config = {}) {
   function spacer(size = 100) {
     return new Paragraph({ spacing: { after: size }, children: [new TextRun('')] });
   }
+  // Player/pitcher names in card lists (hitter cards, pitcher cards, opponent
+  // attack cards, defensive alignment cards) — black, not gold, so they read
+  // as names rather than section labels.
+  function cardTitle(text) {
+    return new Paragraph({
+      spacing: { before: 140, after: 60 },
+      children: [new TextRun({ text, bold: true, color: BLACK, size: 20, font: 'Calibri' })],
+    });
+  }
 
   function renderCard(item) {
     const out = [];
     const label = item.name || item.title || null;
-    if (label) out.push(subHeading(String(label)));
+    if (label) out.push(cardTitle(String(label)));
     for (const [k, v] of Object.entries(item)) {
       if (k === 'name' || k === 'title') continue;
       out.push(...renderValue(humanizeKey(k), v, 2));

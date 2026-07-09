@@ -936,117 +936,6 @@ function extractJerseyFromRaw(rawJson) {
   return m ? m[1].trim() : null;
 }
 
-/**
- * Returns every already-captured roster/handedness row for a team, used to
- * diff against a freshly-scraped roster so re-scrapes only visit new
- * players.
- */
-async function getExistingHandednessForTeam(teamId) {
-  const { data, error } = await getDb()
-    .from('player_handedness')
-    .select('id, jersey_number, first_name, last_name, full_name, match_key, bats, throws')
-    .eq('team_id', teamId);
-
-  check(error, 'getExistingHandednessForTeam');
-  return data || [];
-}
-
-/**
- * Insert or update a single player's roster/handedness row.
- * Conflict target is (team_id, jersey_number) — see migration comments for
- * why jersey_number is the primary re-scrape identity key. Players with no
- * jersey number captured will always insert a new row (Postgres treats
- * NULL as distinct in a unique constraint), which is fine: the caller
- * already skipped anyone matched by match_key before getting here.
- */
-async function upsertPlayerHandedness(teamId, player) {
-  const payload = {
-    team_id: teamId,
-    jersey_number: player.jerseyNumber || null,
-    first_name: player.firstName || '',
-    last_name: player.lastName || '',
-    full_name: player.fullName || `${player.firstName || ''} ${player.lastName || ''}`.trim(),
-    match_key: player.matchKey,
-    bats: player.bats || 'Unknown',
-    throws: player.throws || 'Unknown',
-    last_scraped_at: new Date().toISOString(),
-  };
-
-  const { error } = await getDb()
-    .from('player_handedness')
-    .upsert(payload, { onConflict: 'team_id,jersey_number' });
-
-  check(error, 'upsertPlayerHandedness');
-}
-
-function normalizeHandednessRow(row) {
-  return {
-    jerseyNumber: row.jersey_number || null,
-    jersey_number: row.jersey_number || null,
-    firstName: row.first_name || '',
-    lastName: row.last_name || '',
-    fullName: row.full_name || '',
-    full_name: row.full_name || '',
-    matchKey: row.match_key || '',
-    match_key: row.match_key || '',
-    bats: row.bats || 'Unknown',
-    throws: row.throws || 'Unknown',
-  };
-}
-
-/**
- * Builds a jersey-number-first, match-key-fallback lookup out of the raw
- * player_handedness rows. Two players sharing a match_key (same last name
- * + first initial) are NOT silently overwritten — the key is moved into
- * `ambiguousMatchKeys` instead, so callers know to trust only a
- * jersey-number match for those players, and to omit handedness rather
- * than guess when neither is available.
- */
-function buildTeamHandednessLookup(rows) {
-  const normalizedRows = (rows || []).map(normalizeHandednessRow);
-  const byJersey = {};
-  const matchBuckets = {};
-
-  for (const row of normalizedRows) {
-    if (row.jerseyNumber) byJersey[String(row.jerseyNumber)] = row;
-    if (row.matchKey) {
-      if (!matchBuckets[row.matchKey]) matchBuckets[row.matchKey] = [];
-      matchBuckets[row.matchKey].push(row);
-    }
-  }
-
-  const lookup = {
-    rows: normalizedRows,
-    byJersey,
-    byMatchKey: {},
-    ambiguousMatchKeys: {},
-  };
-
-  for (const [matchKey, bucket] of Object.entries(matchBuckets)) {
-    if (bucket.length === 1) {
-      lookup.byMatchKey[matchKey] = bucket[0];
-      // Backward compatibility for any caller still doing handednessMap[matchKey].
-      lookup[matchKey] = bucket[0];
-    } else {
-      lookup.ambiguousMatchKeys[matchKey] = bucket;
-    }
-  }
-
-  return lookup;
-}
-
-/**
- * Used by report.js / analyzer.js to attach bats/throws onto the stats
- * bundle for a scouted team. Returns { rows, byJersey, byMatchKey,
- * ambiguousMatchKeys } — jersey number is the primary, unambiguous
- * identity key; match_key (last name + first initial) is the fallback,
- * except where two players collide on it.
- */
-async function getTeamHandednessMap(teamId) {
-  const rows = await getExistingHandednessForTeam(teamId);
-  return buildTeamHandednessLookup(rows);
-}
-
 async function getTeamPlayTendencies(teamId) {
   const { data, error } = await getDb().rpc('get_team_play_tendencies', { p_team_id: teamId });
   check(error, 'getTeamPlayTendencies');
@@ -1164,7 +1053,7 @@ async function getTeamAnalysisBundle(teamId) {
 
   const [
     teamRes, games, batting, pitching, tendencies,
-    recentPitchingLines, jerseyMap, handednessMap, activeRoster,
+    recentPitchingLines, jerseyMap, activeRoster,
     scoutedBattersAdv, facedBattersAdv, scoutedPitchersAdv, facedPitchersAdv,
     rawBattingLines, verifiedTotals, lineupOrder,
   ] = await Promise.all([
@@ -1175,7 +1064,6 @@ async function getTeamAnalysisBundle(teamId) {
     getTeamPlayTendencies(teamId),
     getRecentPitchingLines(teamId),
     getTeamJerseyMap(teamId),
-    getTeamHandednessMap(teamId),
     getActiveRosterPlayers(teamId, 10, 1),
     getPlayerAdvancedStats(teamId, 0),
     getPlayerAdvancedStats(teamId, 1),
@@ -1194,7 +1082,6 @@ async function getTeamAnalysisBundle(teamId) {
     tendencies,
     recentPitchingLines,
     jerseyMap,
-    handednessMap,
     activeRoster,
     playerAdvanced:     scoutedBattersAdv,
     ourPitchers:        scoutedPitchersAdv,
@@ -1289,6 +1176,21 @@ async function getPitcherAdvancedStats(teamId, isOurTeam = null) {
   return data || [];
 }
 
+// ─── Handedness ─────────────────────────────────────────────────────────────
+// Scraped from GC "Edit Player" modals (see search-gamechanger-teams.js) into
+// player_handedness. Coverage is partial — most teams have never had this
+// scraped, so callers must treat an empty/missing result as "not tracked for
+// this team" rather than inferring bats/throws from names, stats, or spray
+// charts. bats/throws values are 'L' | 'R' | 'S' (switch) | 'Unknown'.
+async function getTeamHandedness(teamId) {
+  const { data, error } = await getDb()
+    .from('player_handedness')
+    .select('jersey_number, full_name, bats, throws')
+    .eq('team_id', teamId);
+  check(error, 'getTeamHandedness');
+  return (data || []).filter(r => r.full_name);
+}
+
 // ─── Scouting Reports ─────────────────────────────────────────────────────────
 
 async function insertScoutingReport(report) {
@@ -1339,9 +1241,6 @@ module.exports = {
   getTeamPitchingAggregates,
   getRecentPitchingLines,
   getTeamJerseyMap,
-  getExistingHandednessForTeam,
-  upsertPlayerHandedness,
-  getTeamHandednessMap,
   getTeamPlayTendencies,
   getTeamGameResults,
   getTeamAnalysisBundle,
@@ -1354,4 +1253,5 @@ module.exports = {
   upsertPitcherAdvancedStats,
   getPlayerAdvancedStats,
   getPitcherAdvancedStats,
+  getTeamHandedness,
 };

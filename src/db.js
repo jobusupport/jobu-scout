@@ -114,24 +114,6 @@ function init(dbPath = './voodoo-scout.db') {
       p_per_ip REAL, wp INTEGER, bk INTEGER, pik INTEGER,
       UNIQUE (team_id, player_name, is_our_team)
     );
-    CREATE TABLE IF NOT EXISTS player_handedness (
-      id               INTEGER PRIMARY KEY AUTOINCREMENT,
-      team_id          INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
-      jersey_number    TEXT,
-      first_name       TEXT NOT NULL,
-      last_name        TEXT NOT NULL,
-      full_name        TEXT NOT NULL,
-      match_key        TEXT NOT NULL,
-      bats             TEXT DEFAULT 'Unknown',
-      throws           TEXT DEFAULT 'Unknown',
-      last_scraped_at  TEXT NOT NULL DEFAULT (datetime('now')),
-      created_at       TEXT NOT NULL DEFAULT (datetime('now')),
-      UNIQUE (team_id, jersey_number)
-    );
-    CREATE INDEX IF NOT EXISTS idx_player_handedness_team_matchkey
-      ON player_handedness(team_id, match_key);
-    CREATE INDEX IF NOT EXISTS idx_player_handedness_team
-      ON player_handedness(team_id);
     CREATE INDEX IF NOT EXISTS idx_player_adv_team  ON player_advanced_stats(team_id);
     CREATE INDEX IF NOT EXISTS idx_pitcher_adv_team ON pitcher_advanced_stats(team_id);
   `);
@@ -790,103 +772,6 @@ function getTeamJerseyMap(teamId) {
   return map;
 }
 
-function getExistingHandednessForTeam(teamId) {
-  return getDb().prepare(`
-    SELECT id, jersey_number, first_name, last_name, full_name, match_key, bats, throws
-    FROM player_handedness
-    WHERE team_id = ?
-  `).all(teamId);
-}
-
-function upsertPlayerHandedness(teamId, player) {
-  const db = getDb();
-  const fullName = player.fullName || `${player.firstName || ''} ${player.lastName || ''}`.trim();
-
-  db.prepare(`
-    INSERT INTO player_handedness
-      (team_id, jersey_number, first_name, last_name, full_name, match_key, bats, throws, last_scraped_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-    ON CONFLICT(team_id, jersey_number) DO UPDATE SET
-      first_name      = excluded.first_name,
-      last_name       = excluded.last_name,
-      full_name       = excluded.full_name,
-      match_key       = excluded.match_key,
-      bats            = excluded.bats,
-      throws          = excluded.throws,
-      last_scraped_at = excluded.last_scraped_at
-  `).run(
-    teamId,
-    player.jerseyNumber || null,
-    player.firstName || '',
-    player.lastName || '',
-    fullName,
-    player.matchKey,
-    player.bats || 'Unknown',
-    player.throws || 'Unknown'
-  );
-}
-
-function normalizeHandednessRow(row) {
-  return {
-    jerseyNumber: row.jersey_number || null,
-    jersey_number: row.jersey_number || null,
-    firstName: row.first_name || '',
-    lastName: row.last_name || '',
-    fullName: row.full_name || '',
-    full_name: row.full_name || '',
-    matchKey: row.match_key || '',
-    match_key: row.match_key || '',
-    bats: row.bats || 'Unknown',
-    throws: row.throws || 'Unknown',
-  };
-}
-
-/**
- * Builds a jersey-number-first, match-key-fallback lookup out of the raw
- * player_handedness rows. Two players sharing a match_key (same last name
- * + first initial) are NOT silently overwritten — the key is moved into
- * `ambiguousMatchKeys` instead, so callers know to trust only a
- * jersey-number match for those players, and to omit handedness rather
- * than guess when neither is available.
- */
-function buildTeamHandednessLookup(rows) {
-  const normalizedRows = (rows || []).map(normalizeHandednessRow);
-  const byJersey = {};
-  const matchBuckets = {};
-
-  for (const row of normalizedRows) {
-    if (row.jerseyNumber) byJersey[String(row.jerseyNumber)] = row;
-    if (row.matchKey) {
-      if (!matchBuckets[row.matchKey]) matchBuckets[row.matchKey] = [];
-      matchBuckets[row.matchKey].push(row);
-    }
-  }
-
-  const lookup = {
-    rows: normalizedRows,
-    byJersey,
-    byMatchKey: {},
-    ambiguousMatchKeys: {},
-  };
-
-  for (const [matchKey, bucket] of Object.entries(matchBuckets)) {
-    if (bucket.length === 1) {
-      lookup.byMatchKey[matchKey] = bucket[0];
-      // Backward compatibility for any caller still doing handednessMap[matchKey].
-      lookup[matchKey] = bucket[0];
-    } else {
-      lookup.ambiguousMatchKeys[matchKey] = bucket;
-    }
-  }
-
-  return lookup;
-}
-
-function getTeamHandednessMap(teamId) {
-  const rows = getExistingHandednessForTeam(teamId);
-  return buildTeamHandednessLookup(rows);
-}
-
 /**
  * Empirical batting-order tendency per player, from actual lineup cards in
  * the last N scouted games (batting_lines.batting_order is captured per
@@ -977,7 +862,6 @@ function getTeamAnalysisBundle(teamId) {
   const tendencies = getTeamPlayTendencies(teamId);
   const recentPitchingLines = getRecentPitchingLines(teamId);
   const jerseyMap = getTeamJerseyMap(teamId);
-  const handednessMap = getTeamHandednessMap(teamId);
   const activeRoster = getActiveRosterPlayers(teamId, 10, 1);
   const lineupOrder = getTeamLineupOrder(teamId, 10);
 
@@ -998,7 +882,6 @@ function getTeamAnalysisBundle(teamId) {
     tendencies,
     recentPitchingLines,
     jerseyMap,
-    handednessMap,
     activeRoster,     // { players: Set<string>, gameCount, totalGamesWindow }
     lineupOrder,      // real batting-order tendency per player (see getTeamLineupOrder)
     playerAdvanced:  scoutedBattersAdv,  // advanced batting for scouted team
@@ -1205,6 +1088,13 @@ function getPitcherAdvancedStats(teamId, isOurTeam = null) {
   `).all(teamId);
 }
 
+// player_handedness only exists in the Supabase schema right now (see
+// db-supabase.js). Local SQLite dev has no equivalent table, so this stub
+// just returns "not tracked" rather than throwing.
+function getTeamHandedness(teamId) {
+  return [];
+}
+
 // ─── Exports ──────────────────────────────────────────────────────────────────
 
 module.exports = {
@@ -1231,9 +1121,6 @@ module.exports = {
   getTeamPitchingAggregates,
   getRecentPitchingLines,
   getTeamJerseyMap,
-  getExistingHandednessForTeam,
-  upsertPlayerHandedness,
-  getTeamHandednessMap,
   getTeamPlayTendencies,
   getTeamGameResults,
   getTeamAnalysisBundle,
@@ -1246,4 +1133,5 @@ module.exports = {
   upsertPitcherAdvancedStats,
   getPlayerAdvancedStats,
   getPitcherAdvancedStats,
+  getTeamHandedness,
 };

@@ -428,6 +428,24 @@ function fmtNum(v, d = 2) {
   return isNaN(n) ? 'N/A' : n.toFixed(d);
 }
 
+// pitching_lines.total_ip (aliased ip_decimal in SQL) stores innings pitched
+// as a true decimal for easy SUM() aggregation — 2/3 of an inning is 0.667,
+// not baseball's standard .2 notation. Interpolating that raw decimal into a
+// prompt reads as "0.67 IP", which doesn't match how a coach writes or reads
+// innings pitched, and has shown up in generated report text (e.g. "Sherwood
+// 0.67 IP") in a way that just reads as confusing/wrong. This converts to
+// standard baseball notation (whole innings + .1 for one out, .2 for two
+// outs) for anything shown to Claude or a coach.
+function fmtIP(v) {
+  if (v == null) return 'N/A';
+  const n = parseFloat(v);
+  if (isNaN(n)) return 'N/A';
+  const whole = Math.floor(n);
+  const outs = Math.round((n - whole) * 3); // 0, 1, or 2 extra outs
+  if (outs >= 3) return `${whole + 1}.0`;
+  return `${whole}.${outs}`;
+}
+
 function safeJson(value, fallback = null) {
   if (value === null || value === undefined) return fallback;
   if (typeof value === 'object') return value;
@@ -595,7 +613,7 @@ function buildAnalysisPrompt(bundle, options = {}) {
   const pitchingStr = pitching.slice(0, 8).map(p => {
     const velo = pitcherVelo[p.player_name];
     const veloNote = velo && velo.veloString ? ` [${velo.veloString}]` : '';
-    return `${p.player_name}: ${p.games}G ${p.total_ip}IP BF:${p.total_bf ?? '?'} ` +
+    return `${p.player_name}: ${p.games}G ${fmtIP(p.total_ip)}IP BF:${p.total_bf ?? '?'} ` +
       `H:${p.total_h} R:${p.total_r} ER:${p.total_er} BB:${p.total_bb} SO:${p.total_so} ` +
       `ERA:${fmtNum(p.era)} WHIP:${fmtNum(p.whip,3)} K/BB:${fmtNum(p.k_bb_ratio)}${veloNote}`;
   }).join('\n');
@@ -662,7 +680,7 @@ Use your knowledge of the location and typical conditions to provide the best fo
   return `Analyze this baseball team and return a complete JSON scouting report.
 
 CRITICAL STAT ACCURACY REQUIREMENT:
-Use VERIFIED TEAM FACTS as the source of truth for all season totals. Do not cite raw play-event counts or all-game event distributions as team stats. If a side-specific tendency is not validated, say it is unavailable.
+Use VERIFIED TEAM FACTS as the source of truth for all season totals. Do not cite raw play-event counts or all-game event distributions as team stats. If a side-specific tendency is not validated, say it is unavailable. Innings pitched (IP) values below are already formatted in standard baseball notation (whole innings, with .1 for one out and .2 for two outs recorded beyond the whole inning) — treat them as-is, do not reinterpret them as true decimals.
 
 TEAM: ${team.team_name}
 CLASSIFICATION: ${team.classification || 'Unknown'} | AGE: ${team.age_group || '?'}U | LOCATION: ${team.city || ''} ${team.state || ''}
@@ -963,6 +981,23 @@ The purpose of a self-scout report is different from an opponent report: it is n
 
 You respond ONLY with valid JSON matching the exact schema requested. No preamble, no markdown, no explanation outside the JSON. Numbers should be numbers, not strings. Use null for unknown values, and an empty array (not null) when a list has no items.`;
 
+// Handedness (bats/throws) is scraped from GC "Edit Player" modals into the
+// player_handedness table, but coverage is partial — most teams have never
+// had it scraped. Format what's actually there, and say plainly when there's
+// nothing, so Claude reports real data instead of guessing handedness from
+// names, stats, or spray-chart proxies (which produced confusing, low-value
+// "Handedness Matchups" output in earlier reports).
+function formatHandednessBlock(rows, teamLabel) {
+  const usable = (rows || []).filter(r => r.bats && r.bats !== 'Unknown');
+  if (!usable.length) {
+    return `${teamLabel}: handedness has not been scraped for this team (player_handedness has no usable rows). Do not guess bats/throws from names, stats, or spray charts — say plainly that handedness data is unavailable for these players.`;
+  }
+  const lines = usable.map(r =>
+    `${r.jersey_number ? `#${r.jersey_number} ` : ''}${r.full_name}: Bats ${r.bats}${r.throws && r.throws !== 'Unknown' ? `, Throws ${r.throws}` : ''}`
+  );
+  return `${teamLabel} (verified, scraped from GameChanger — treat as ground truth):\n${lines.join('\n')}`;
+}
+
 function buildSelfScoutPrompt(bundle, options = {}) {
   const { team, games, meta, playerAdvanced = [], ourPitchers = [] } = bundle;
   const { gameLocation = null, gameDate = null } = options;
@@ -1016,7 +1051,7 @@ function buildSelfScoutPrompt(bundle, options = {}) {
   }).join('\n');
 
   const pitchingStr = pitching.map(p =>
-    `${p.player_name}: ${p.games}G ${p.total_ip}IP BF:${p.total_bf ?? '?'} ` +
+    `${p.player_name}: ${p.games}G ${fmtIP(p.total_ip)}IP BF:${p.total_bf ?? '?'} ` +
     `H:${p.total_h} R:${p.total_r} ER:${p.total_er} BB:${p.total_bb} SO:${p.total_so} ` +
     `ERA:${fmtNum(p.era)} WHIP:${fmtNum(p.whip,3)} K/BB:${fmtNum(p.k_bb_ratio)}`
   ).join('\n');
@@ -1033,7 +1068,7 @@ function buildSelfScoutPrompt(bundle, options = {}) {
   return `Analyze this team's OWN data and return a complete self-scouting JSON report. This is written for the coach of this team, not a report about an opponent.
 
 CRITICAL STAT ACCURACY REQUIREMENT:
-Use VERIFIED TEAM FACTS as the source of truth for all season totals. Do not cite raw play-event counts or all-game event distributions as team stats.
+Use VERIFIED TEAM FACTS as the source of truth for all season totals. Do not cite raw play-event counts or all-game event distributions as team stats. Innings pitched (IP) values below are already in standard baseball notation (.1 = one out, .2 = two outs beyond the whole inning) — use them as-is.
 
 TEAM: ${team.team_name}
 CLASSIFICATION: ${team.classification || 'Unknown'} | AGE: ${team.age_group || '?'}U
@@ -1055,6 +1090,9 @@ ${pitchingStr || 'No pitching data'}
 
 === OUR PITCHING (advanced — S%, SO/7, BB/7, batted ball) ===
 ${advPitchingStr || 'No advanced pitching data'}
+
+=== OUR HANDEDNESS ===
+${formatHandednessBlock(bundle.handedness, 'Our team')}
 
 ${verifiedFactsBlock}
 
@@ -1145,6 +1183,8 @@ async function analyzeSelfScout(teamId, options = {}) {
     throw new Error(`${bundle.team.team_name} has no games yet. Run the scraper first.`);
   }
 
+  bundle.handedness = await db.getTeamHandedness(teamId).catch(() => []);
+
   console.log(`[analyzer] Self-scout team: ${bundle.team.team_name} — ${bundle.meta.gamesAnalyzed} games`);
   console.log(`[analyzer] Sending to Claude (${CLAUDE_MODEL})...`);
 
@@ -1203,7 +1243,7 @@ function buildMatchupPrompt(ourBundle, oppBundle, options = {}) {
   ).join('\n');
 
   const summarizePitching = rows => rows.map(p =>
-    `${p.player_name}: ${p.games}G ${p.total_ip}IP BF:${p.total_bf ?? '?'} H:${p.total_h} R:${p.total_r} ER:${p.total_er} ` +
+    `${p.player_name}: ${p.games}G ${fmtIP(p.total_ip)}IP BF:${p.total_bf ?? '?'} H:${p.total_h} R:${p.total_r} ER:${p.total_er} ` +
     `BB:${p.total_bb} SO:${p.total_so} ERA:${fmtNum(p.era)} WHIP:${fmtNum(p.whip,3)} K/BB:${fmtNum(p.k_bb_ratio)}`
   ).join('\n');
 
@@ -1226,7 +1266,7 @@ function buildMatchupPrompt(ourBundle, oppBundle, options = {}) {
 
   return `Build a matchup game plan comparing OUR team against our next OPPONENT. Return a complete JSON report.
 
-CRITICAL STAT ACCURACY REQUIREMENT: Use the box-score aggregates below as the source of truth for season totals on both sides. Do not invent numbers for either team.
+CRITICAL STAT ACCURACY REQUIREMENT: Use the box-score aggregates below as the source of truth for season totals on both sides. Do not invent numbers for either team. Innings pitched (IP) values are already in standard baseball notation (.1 = one out, .2 = two outs beyond the whole inning) — use them as-is.
 
 === OUR TEAM: ${ourTeam.team_name} ===
 GAMES ANALYZED: ${ourBundle.meta.gamesAnalyzed}
@@ -1252,6 +1292,10 @@ ${summarizeAdvPitching(oppBundle.ourPitchers) || 'No advanced pitching data'}
 
 === OUR PITCHSMART / RECENT USAGE ===
 ${pitchSmartStr}
+
+=== HANDEDNESS ===
+${formatHandednessBlock(ourBundle.handedness, 'Our team')}
+${formatHandednessBlock(oppBundle.handedness, 'Opponent')}
 
 ${coachContextBlock}
 Return this EXACT JSON schema — fill every field, null/empty-array if truly unknown. This must read as one game plan, not two reports stapled together:
@@ -1293,7 +1337,7 @@ Return this EXACT JSON schema — fill every field, null/empty-array if truly un
     { "name": "string", "riskLevel": "high|medium|low", "pitchingPlan": ["string"] }
   ],
   "handednessMatchups": {
-    "notes": ["string — platoon advantages worth using, or empty array if handedness data is unavailable"]
+    "notes": ["string — if the HANDEDNESS section above has verified bats/throws for either team, use it directly to call out real platoon advantages (e.g. \"their RHP Watt vs our LHH Erwin favors us away\"). If a team's handedness is marked unavailable above, say so in ONE plain sentence for that team (e.g. \"Handedness has not been scraped for Bulls Baseball Lybarger 14U yet.\") and do not speculate about bats/throws from names, stats, or spray charts. Empty array only if neither team has any notes worth making."]
   },
   "baserunningMatchup": {
     "canWeRunOnThem": "string", "canTheyRunOnUs": "string", "whoShouldSteal": ["name"], "notes": "1-2 sentences"
@@ -1303,7 +1347,7 @@ Return this EXACT JSON schema — fill every field, null/empty-array if truly un
     "teamPriority": ["string"]
   },
   "situationalPlan": {
-    "runnerOn1st0Outs": "string", "runnerOn2ndLessThan2Outs": "string", "twoOutsRunnersOn": "string", "lateInnings": "string"
+    "runnerOnFirstNoOuts": "string", "runnerOnSecondLessThanTwoOuts": "string", "twoOutsRunnersOn": "string", "lateInnings": "string"
   },
   "doNotLetThisBeatUs": ["string", "string", "string"],
   "lineupRecommendation": {
@@ -1332,6 +1376,11 @@ async function analyzeMatchup(ourTeamId, opponentTeamId, options = {}) {
   if (!oppBundle || !oppBundle.team) throw new Error(`No team found with id: ${opponentTeamId}`);
   if (ourBundle.meta.gamesAnalyzed === 0) throw new Error(`${ourBundle.team.team_name} has no games yet.`);
   if (oppBundle.meta.gamesAnalyzed === 0) throw new Error(`${oppBundle.team.team_name} has no games yet. Scout them first.`);
+
+  [ourBundle.handedness, oppBundle.handedness] = await Promise.all([
+    db.getTeamHandedness(ourTeamId).catch(() => []),
+    db.getTeamHandedness(opponentTeamId).catch(() => []),
+  ]);
 
   console.log(`[analyzer] Our team: ${ourBundle.team.team_name} (${ourBundle.meta.gamesAnalyzed}g) vs Opponent: ${oppBundle.team.team_name} (${oppBundle.meta.gamesAnalyzed}g)`);
   console.log(`[analyzer] Sending to Claude (${CLAUDE_MODEL})...`);
