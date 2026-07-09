@@ -6,6 +6,8 @@ const path = require("path");
 const sharp = require("sharp");
 const { getTeamsFromGoogleSheet } = require("./read-teams-from-sheet");
 const pipeline = require("./pipeline");
+const db = require("./db");
+const { captureTeamHandedness } = require("./scrape-handedness");
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -19,6 +21,19 @@ const GC_GAME_EXTRACTION_TIMEOUT_MS = Math.max(30000, Number(process.env.GC_GAME
 const GC_GAME_DB_WRITE_TIMEOUT_MS = Math.max(30000, Number(process.env.GC_GAME_DB_WRITE_TIMEOUT_MS || 90000));
 const GC_PLAYS_EXTRACTION_TIMEOUT_MS = Math.max(15000, Number(process.env.GC_PLAYS_EXTRACTION_TIMEOUT_MS || 60000));
 const GC_SKIP_PLAYS = process.env.GC_SKIP_PLAYS === 'true';
+
+// Handedness capture (see scrape-handedness.js). Runs once per opponent team
+// after that team's completed games have been captured. Off by default is
+// NOT the intent here — this defaults ON — but GC_SKIP_HANDEDNESS=true lets
+// you disable it for a faster run while iterating on other parts of the
+// scraper. GC_HANDEDNESS_FORCE_REFRESH=true re-captures every roster player
+// instead of skipping ones already in player_handedness. GC_MY_TEAM_URL
+// overrides the "our team" GC URL lookup (see getMyTeamGcUrl below) — set
+// this if the DB lookup by is_our_team can't find a row yet.
+const GC_SKIP_HANDEDNESS = process.env.GC_SKIP_HANDEDNESS === 'true';
+const GC_HANDEDNESS_FORCE_REFRESH = process.env.GC_HANDEDNESS_FORCE_REFRESH === 'true';
+const GC_MY_TEAM_URL_ENV = process.env.GC_MY_TEAM_URL || '';
+
 const TEAM_URLS_FILE = path.join(OUTPUT_DIR, "Team URLs.txt");
 const DB_PATH = path.join(__dirname, "..", "voodoo-scout.db");
 
@@ -156,6 +171,80 @@ function sanitizeFileNameCompact(value) {
 
 function ensureDirectory(dirPath) {
   if (!fs.existsSync(dirPath)) fs.mkdirSync(dirPath, { recursive: true });
+}
+
+// ─── Handedness capture wiring ─────────────────────────────────────────────
+
+let _cachedMyTeamGcUrl = null;
+let _myTeamGcUrlLookupFailed = false;
+
+/**
+ * Resolve OUR team's GameChanger URL — scrape-handedness.js needs this as
+ * the starting point to navigate Our Team -> Opponents -> <opponent> ->
+ * Roster. GC_MY_TEAM_URL env var wins if set; otherwise looks up the
+ * teams row with is_our_team = true and uses its gc_team_url.
+ */
+async function getMyTeamGcUrl() {
+  if (GC_MY_TEAM_URL_ENV) return GC_MY_TEAM_URL_ENV;
+  if (_cachedMyTeamGcUrl) return _cachedMyTeamGcUrl;
+  if (_myTeamGcUrlLookupFailed) return '';
+
+  try {
+    const teams = await Promise.resolve(db.getAllTeams());
+    const ourTeam = Array.isArray(teams) ? teams.find((t) => t.is_our_team) : null;
+    if (ourTeam && ourTeam.gc_team_url) {
+      _cachedMyTeamGcUrl = ourTeam.gc_team_url;
+      return _cachedMyTeamGcUrl;
+    }
+    console.warn('[handedness] No is_our_team=true row with a gc_team_url found in the DB. Set GC_MY_TEAM_URL in .env to enable handedness capture.');
+  } catch (error) {
+    console.warn(`[handedness] Could not look up our team's GC URL: ${error.message}`);
+  }
+  _myTeamGcUrlLookupFailed = true;
+  return '';
+}
+
+/**
+ * Best-effort wrapper around scrape-handedness.js's captureTeamHandedness.
+ * Never throws — a handedness-capture failure must not take down the game
+ * scrape for this team. Skipped entirely for OUR own team (the module
+ * navigates Our Team -> Opponents -> <team>, which only makes sense for
+ * opponents) and for the "team" env-var shim used by GC_TEST_TEAM_CONTAINS
+ * runs when GC_MY_TEAM_URL/DB lookup can't resolve our own team URL.
+ */
+async function captureHandednessForTeam(page, team, teamId) {
+  if (GC_SKIP_HANDEDNESS) {
+    console.log('[handedness] Skipping (GC_SKIP_HANDEDNESS=true).');
+    return;
+  }
+  if (team.isOurTeam || team.is_our_team) {
+    console.log('[handedness] Skipping — this is our own team, not an opponent.');
+    return;
+  }
+
+  const myTeamGcUrl = await getMyTeamGcUrl();
+  if (!myTeamGcUrl) {
+    console.warn('[handedness] Skipping — no GC URL available for our own team (see warning above).');
+    return;
+  }
+
+  console.log('');
+  console.log(`[handedness] Capturing batting/throwing hand for "${team.teamName}" roster...`);
+  try {
+    const result = await captureTeamHandedness({
+      page,
+      myTeamGcUrl,
+      opponentTeamName: team.teamName,
+      teamId,
+      db,
+      forceRefresh: GC_HANDEDNESS_FORCE_REFRESH,
+    });
+    console.log(`[handedness] "${team.teamName}": captured ${result.captured}, skipped ${result.skipped}, failed ${result.failed}.`);
+  } catch (error) {
+    console.error(`[handedness] Capture failed for "${team.teamName}": ${error.message}`);
+    console.error(error.stack || '');
+    console.error('[handedness] Continuing — this does not block game data capture.');
+  }
 }
 
 
@@ -2876,6 +2965,11 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId) {
       console.warn('');
     }
   }
+
+  // ── Handedness capture ────────────────────────────────────────────────────
+  // Runs after games are done so a handedness failure never costs us the
+  // game data we already captured. See captureHandednessForTeam above.
+  await captureHandednessForTeam(page, team, teamId);
 
   return true;
 }

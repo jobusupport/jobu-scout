@@ -1191,6 +1191,47 @@ async function getTeamHandedness(teamId) {
   return (data || []).filter(r => r.full_name);
 }
 
+// Used by scrape-handedness.js to decide which roster rows can be skipped
+// on a re-scrape (jersey_number match, falling back to match_key = last
+// name + first initial). NOTE: unlike getTeamHandedness() above, this
+// intentionally does NOT filter out rows with a missing full_name — a row
+// missing full_name would mean buildMatchKey() has nothing to dedupe
+// against anyway, and dropping it here would just cause that player to be
+// re-captured every run instead of surfacing the gap.
+async function getExistingHandednessForTeam(teamId) {
+  const { data, error } = await getDb()
+    .from('player_handedness')
+    .select('jersey_number, match_key, full_name, bats, throws')
+    .eq('team_id', teamId);
+  check(error, 'getExistingHandednessForTeam');
+  return data || [];
+}
+
+// Upsert one captured player's handedness. onConflict target assumes a
+// unique constraint on (team_id, match_key) — CONFIRM this constraint
+// actually exists on player_handedness before relying on this (check with
+// Supabase:list_tables verbose:true or information_schema.table_constraints).
+// If the real constraint is on (team_id, jersey_number) instead, change
+// onConflict below to match — a mismatched onConflict target makes Postgres
+// throw on the very first upsert rather than silently doing the wrong thing.
+async function upsertPlayerHandedness(teamId, player = {}) {
+  const payload = {
+    team_id:       teamId,
+    jersey_number: player.jerseyNumber != null ? String(player.jerseyNumber) : null,
+    first_name:    player.firstName || null,
+    last_name:     player.lastName  || null,
+    full_name:     player.fullName  || null,
+    match_key:     player.matchKey  || null,
+    bats:          player.bats      || 'Unknown',
+    throws:        player.throws    || 'Unknown',
+    updated_at:    new Date().toISOString(),
+  };
+  const { error } = await getDb()
+    .from('player_handedness')
+    .upsert(payload, { onConflict: 'team_id,match_key' });
+  check(error, 'upsertPlayerHandedness');
+}
+
 // ─── Scouting Reports ─────────────────────────────────────────────────────────
 
 async function insertScoutingReport(report) {
@@ -1254,4 +1295,6 @@ module.exports = {
   getPlayerAdvancedStats,
   getPitcherAdvancedStats,
   getTeamHandedness,
+  getExistingHandednessForTeam,
+  upsertPlayerHandedness,
 };

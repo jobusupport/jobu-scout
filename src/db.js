@@ -1095,6 +1095,22 @@ function getTeamHandedness(teamId) {
   return [];
 }
 
+// Same story as getTeamHandedness above — no local table, so nothing to
+// dedupe against. Returning [] means every roster row will look "new" to
+// scrape-handedness.js's skip logic on local SQLite, which is fine: the
+// upsert below is a no-op there anyway, so nothing gets silently lost.
+function getExistingHandednessForTeam(teamId) {
+  return [];
+}
+
+let _warnedNoHandednessTable = false;
+function upsertPlayerHandedness(teamId, player) {
+  if (!_warnedNoHandednessTable) {
+    console.warn('[db] upsertPlayerHandedness: player_handedness only exists in Supabase. Skipping write (local SQLite dev) — run with USE_SUPABASE=true to actually capture handedness.');
+    _warnedNoHandednessTable = true;
+  }
+}
+
 // ─── Exports ──────────────────────────────────────────────────────────────────
 
 module.exports = {
@@ -1134,4 +1150,6 @@ module.exports = {
   getPlayerAdvancedStats,
   getPitcherAdvancedStats,
   getTeamHandedness,
+  getExistingHandednessForTeam,
+  upsertPlayerHandedness,
 };
