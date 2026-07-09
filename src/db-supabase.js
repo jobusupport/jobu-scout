@@ -1207,13 +1207,21 @@ async function getExistingHandednessForTeam(teamId) {
   return data || [];
 }
 
-// Upsert one captured player's handedness. onConflict target assumes a
-// unique constraint on (team_id, match_key) — CONFIRM this constraint
-// actually exists on player_handedness before relying on this (check with
-// Supabase:list_tables verbose:true or information_schema.table_constraints).
-// If the real constraint is on (team_id, jersey_number) instead, change
-// onConflict below to match — a mismatched onConflict target makes Postgres
-// throw on the very first upsert rather than silently doing the wrong thing.
+// Upsert one captured player's handedness. Verified against the live schema
+// (Supabase:execute_sql against pg_constraint) on 2026-07-09: the real
+// unique constraint is player_handedness_team_id_jersey_number_key on
+// (team_id, jersey_number) — NOT (team_id, match_key) as originally assumed
+// here. A mismatched onConflict target makes Postgres reject the upsert
+// immediately (it can't validate the ON CONFLICT clause against a
+// nonexistent constraint), regardless of whether an actual conflict would
+// occur — which was silently failing every single write via the try/catch
+// in scrape-handedness.js's capture loop.
+//
+// NOTE: Postgres treats NULL as distinct from NULL for uniqueness purposes,
+// so a player with no jersey_number will never conflict with itself and
+// will insert a fresh row on every re-scrape instead of updating in place.
+// GC roster rows are parsed as "Name, #Number" so this should be rare, but
+// if duplicate rows for the same nameless player start showing up, that's why.
 async function upsertPlayerHandedness(teamId, player = {}) {
   const payload = {
     team_id:       teamId,
@@ -1224,11 +1232,11 @@ async function upsertPlayerHandedness(teamId, player = {}) {
     match_key:     player.matchKey  || null,
     bats:          player.bats      || 'Unknown',
     throws:        player.throws    || 'Unknown',
-    updated_at:    new Date().toISOString(),
+    last_scraped_at: new Date().toISOString(),
   };
   const { error } = await getDb()
     .from('player_handedness')
-    .upsert(payload, { onConflict: 'team_id,match_key' });
+    .upsert(payload, { onConflict: 'team_id,jersey_number' });
   check(error, 'upsertPlayerHandedness');
 }
 
