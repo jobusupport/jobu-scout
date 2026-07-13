@@ -1,0 +1,9 @@
+Team: BPA Mississippi 2030
+URL: https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1068052
+Failed At: 2026-06-03T02:32:14.721Z
+Reason: page.waitForTimeout: Target page, context or browser has been closed
+
+{
+  "current_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=83079&orgteamid=258364&team=1068052&Year=2026",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\BPA Mississippi 2030\\error\\error-page.png"
+}

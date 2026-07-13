@@ -1,0 +1,9 @@
+Team: Power Baseball Gulf South - Scout
+URL: https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=32108&orgteamid=255642&team=1035696&year=2026
+Failed At: 2026-06-04T19:02:27.780Z
+Reason: page.waitForTimeout: Target page, context or browser has been closed
+
+{
+  "current_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=32108&orgteamid=255642&team=1035696&year=2026",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\Power Baseball Gulf South - Scout\\error\\error-page.png"
+}

@@ -1,0 +1,19 @@
+Team: TPL 14U National
+URL: Not found
+Failed At: 2026-06-02T23:21:38.152Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "TPL 14U National(1-2-1 in 2026)",
+    "teamName": "TPL 14U National",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "",
+    "classification": "14AAA",
+    "from": "Birmingham, AL",
+    "city": "Birmingham, AL",
+    "state": "",
+    "status": ""
+  }
+}

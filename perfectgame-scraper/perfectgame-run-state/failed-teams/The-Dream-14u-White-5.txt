@@ -1,0 +1,12 @@
+Team: The Dream 14u White
+URL: https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1019515
+Failed At: 2026-06-20T17:43:27.845Z
+Reason: page.goto: net::ERR_INTERNET_DISCONNECTED at https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1019515
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1019515", waiting until "domcontentloaded"[22m
+
+
+{
+  "current_url": "chrome-error://chromewebdata/",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\The Dream 14u White\\error\\error-page.png"
+}

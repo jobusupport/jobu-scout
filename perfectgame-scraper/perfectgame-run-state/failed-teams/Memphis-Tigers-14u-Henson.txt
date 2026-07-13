@@ -1,0 +1,19 @@
+Team: Memphis Tigers 14u- Henson
+URL: Not found
+Failed At: 2026-06-02T23:12:54.142Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "Memphis Tigers 14u- Henson(17-10-0 in 2026)",
+    "teamName": "Memphis Tigers 14u- Henson",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/KLJPPcppgNVk",
+    "classification": "14Major",
+    "from": "Memphis, TN",
+    "city": "Memphis, TN",
+    "state": "",
+    "status": ""
+  }
+}

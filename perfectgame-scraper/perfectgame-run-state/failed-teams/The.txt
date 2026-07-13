@@ -1,0 +1,9 @@
+Team: The
+URL: https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1019515
+Failed At: 2026-06-18T14:21:45.434Z
+Reason: page.waitForTimeout: Target page, context or browser has been closed
+
+{
+  "current_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=34541&orgteamid=259925&team=1019515&Year=2026",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\The\\error\\error-page.png"
+}

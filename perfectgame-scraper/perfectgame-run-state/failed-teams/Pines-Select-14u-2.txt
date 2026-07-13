@@ -1,0 +1,19 @@
+Team: Pines Select 14u
+URL: Not found
+Failed At: 2026-06-02T23:14:11.254Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "Pines Select 14u(6-1-0 in 2026)",
+    "teamName": "Pines Select 14u",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/8Sf7Hx9ey30v",
+    "classification": "14Major",
+    "from": "Birmingham, AL",
+    "city": "Birmingham, AL",
+    "state": "",
+    "status": ""
+  }
+}

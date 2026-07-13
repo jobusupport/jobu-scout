@@ -1,0 +1,9 @@
+Team: Hawaii Elite 2G National 14U
+URL: https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1054973
+Failed At: 2026-06-21T18:26:01.432Z
+Reason: page.waitForTimeout: Target page, context or browser has been closed
+
+{
+  "current_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=33791&orgteamid=281030&team=1054973&Year=2026",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\Hawaii Elite 2G National 14U\\error\\error-page.png"
+}

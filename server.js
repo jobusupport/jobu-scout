@@ -79,7 +79,7 @@ const ROOT = __dirname;
 const DB_PATH     = path.join(ROOT, 'voodoo-scout.db');
 const REPORTS_DIR = process.env.REPORTS_DIR || path.join(ROOT, 'reports');
 const PG_ROOT     = process.env.PG_OUTPUT_ROOT ||
-  path.join(ROOT, '..', 'perfectgame-scraper', 'output');
+  path.join(ROOT, 'perfectgame-scraper', 'output');
 
 app.use(express.json());
 app.use('/reports', express.static(REPORTS_DIR));
@@ -780,7 +780,7 @@ app.post('/api/run/pg-scraper', requireAuth, async (req, res) => {
   const id = createJob(`PG Scraper — ${team.team_name}`);
   appendLog(id, `Starting Perfect Game scraper for: ${team.team_name}`);
   spawnJob(id, 'node', ['perfectgame-scraper.js', team.pg_team_url || '', team.team_name],
-    path.join(ROOT, '..', 'perfectgame-scraper'));
+    path.join(ROOT, 'perfectgame-scraper'));
   res.json({ jobId: id });
 });
 
@@ -857,7 +857,7 @@ app.post('/api/run/full-pipeline', requireAuth, async (req, res) => {
   const team = (await getTeams(req)).find(t => t.id == teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
   const id      = createJob(`Full Pipeline — ${team.team_name}`);
-  const pgRoot  = path.join(ROOT, '..', 'perfectgame-scraper');
+  const pgRoot  = path.join(ROOT, 'perfectgame-scraper');
   const noGC    = !team.gc_team_url && await hasGameUrls(team.id);
   const runStep = makeRunStep(id);
   appendLog(id, `Running full pipeline for: ${team.team_name}`);
@@ -929,7 +929,7 @@ app.post('/api/run/all-pg', requireAuth, async (req, res) => {
   const teams   = (await getTeams(req)).filter(t => t.pg_team_url);
   if (!teams.length) return res.status(400).json({ error: 'No teams with PG URLs' });
   const id      = createJob(`PG Scrape All (${teams.length} teams)`);
-  const pgRoot  = path.join(ROOT, '..', 'perfectgame-scraper');
+  const pgRoot  = path.join(ROOT, 'perfectgame-scraper');
   const runStep = makeRunStep(id);
   appendLog(id, `Queuing PG scrape for ${teams.length} team(s)...`);
   (async () => {

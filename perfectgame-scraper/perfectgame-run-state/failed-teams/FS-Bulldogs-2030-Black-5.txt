@@ -1,0 +1,9 @@
+Team: FS Bulldogs 2030 (Black)
+URL: https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1046906
+Failed At: 2026-06-21T16:55:24.629Z
+Reason: page.waitForTimeout: Target page, context or browser has been closed
+
+{
+  "current_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=51116&orgteamid=263796&team=1046906&Year=2026",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\FS Bulldogs 2030 (Black)\\error\\error-page.png"
+}

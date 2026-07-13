@@ -1,0 +1,19 @@
+Team: 5 Star Mafia 14u Black
+URL: Not found
+Failed At: 2026-06-02T23:14:11.227Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "5 Star Mafia 14u Black(19-3-0 in 2026)",
+    "teamName": "5 Star Mafia 14u Black",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/UCxPX8DNRYo4",
+    "classification": "14Major",
+    "from": "Salisbury, NC",
+    "city": "Salisbury, NC",
+    "state": "",
+    "status": ""
+  }
+}

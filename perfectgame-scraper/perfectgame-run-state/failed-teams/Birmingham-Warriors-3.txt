@@ -1,0 +1,12 @@
+Team: Birmingham Warriors
+URL: https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1127437
+Failed At: 2026-06-21T06:10:21.768Z
+Reason: page.goto: net::ERR_INTERNET_DISCONNECTED at https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1127437
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1127437", waiting until "domcontentloaded"[22m
+
+
+{
+  "current_url": "chrome-error://chromewebdata/",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\Birmingham Warriors\\error\\error-page.png"
+}

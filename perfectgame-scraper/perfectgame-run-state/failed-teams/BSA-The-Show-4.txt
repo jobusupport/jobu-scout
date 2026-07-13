@@ -1,0 +1,19 @@
+Team: BSA-The Show
+URL: Not found
+Failed At: 2026-06-02T23:22:16.188Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "BSA-The Show (7-2-2 in 2026)",
+    "teamName": "BSA-The Show",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/JxL3O8rc7ZQ6",
+    "classification": "14Major",
+    "from": "Carrollton, GA",
+    "city": "Carrollton, GA",
+    "state": "",
+    "status": ""
+  }
+}

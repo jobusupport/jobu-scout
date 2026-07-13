@@ -1,0 +1,12 @@
+Team: The Dream 14u White
+URL: https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1019515
+Failed At: 2026-06-20T18:23:08.549Z
+Reason: page.goto: Timeout 60000ms exceeded.
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1019515", waiting until "domcontentloaded"[22m
+
+
+{
+  "current_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=34541&orgteamid=259925&team=1019515&Year=2026",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\The Dream 14u White\\error\\error-page.png"
+}

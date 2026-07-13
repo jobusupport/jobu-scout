@@ -1,0 +1,12 @@
+Team: Hawaii Elite 2G National 14U
+URL: https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1054973
+Failed At: 2026-06-20T17:43:09.224Z
+Reason: page.goto: net::ERR_INTERNET_DISCONNECTED at https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1054973
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1054973", waiting until "domcontentloaded"[22m
+
+
+{
+  "current_url": "chrome-error://chromewebdata/",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\Hawaii Elite 2G National 14U\\error\\error-page.png"
+}

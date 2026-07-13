@@ -1,0 +1,9 @@
+Team: TPL 14U National
+URL: https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1122811
+Failed At: 2026-06-07T02:07:56.110Z
+Reason: page.waitForTimeout: Target page, context or browser has been closed
+
+{
+  "current_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=13018&orgteamid=274610&team=1122811&Year=2026",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\TPL 14U National\\error\\error-page.png"
+}

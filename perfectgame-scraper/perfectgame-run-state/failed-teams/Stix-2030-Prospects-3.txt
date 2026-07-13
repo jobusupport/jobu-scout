@@ -1,0 +1,19 @@
+Team: Stix 2030 Prospects
+URL: Not found
+Failed At: 2026-06-02T23:21:38.142Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "Stix 2030 Prospects(18-6-0 in 2026)",
+    "teamName": "Stix 2030 Prospects",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/ufOXIm8hNhpg",
+    "classification": "14Major",
+    "from": "Southlake, TX",
+    "city": "Southlake, TX",
+    "state": "",
+    "status": ""
+  }
+}

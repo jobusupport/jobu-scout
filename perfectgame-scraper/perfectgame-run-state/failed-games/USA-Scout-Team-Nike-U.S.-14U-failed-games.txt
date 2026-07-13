@@ -1,0 +1,16 @@
+[2026-06-21T19:18:56.537Z] Team USA Scout Team Nike U.S. 14U | GameID 1428377 | https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1428377 | page.goto: net::ERR_NAME_NOT_RESOLVED at https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1428377
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1428377", waiting until "domcontentloaded"[22m
+
+[2026-06-21T19:18:58.219Z] Team USA Scout Team Nike U.S. 14U | GameID 1428393 | https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1428393 | page.goto: net::ERR_NAME_NOT_RESOLVED at https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1428393
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1428393", waiting until "domcontentloaded"[22m
+
+[2026-06-21T19:19:03.431Z] Team USA Scout Team Nike U.S. 14U | GameID 1501114 | https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1501114 | page.goto: net::ERR_NAME_NOT_RESOLVED at https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1501114
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1501114", waiting until "domcontentloaded"[22m
+
+[2026-06-21T19:22:22.357Z] Team USA Scout Team Nike U.S. 14U | GameID 1513861 | https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1513861 | page.goto: net::ERR_INTERNET_DISCONNECTED at https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1513861
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1513861", waiting until "domcontentloaded"[22m
+

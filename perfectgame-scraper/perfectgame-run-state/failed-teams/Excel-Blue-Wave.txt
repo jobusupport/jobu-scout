@@ -1,0 +1,19 @@
+Team: Excel Blue Wave
+URL: Not found
+Failed At: 2026-06-02T23:12:54.139Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "Excel Blue Wave(3-3-1 in 2026)",
+    "teamName": "Excel Blue Wave",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/J2P7WS9zrlCR",
+    "classification": "14Major",
+    "from": "Oxford, AL",
+    "city": "Oxford, AL",
+    "state": "",
+    "status": ""
+  }
+}

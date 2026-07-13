@@ -1,0 +1,19 @@
+Team: South Charlotte Panthers 2030 Marucci
+URL: Not found
+Failed At: 2026-06-02T23:21:38.140Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "South Charlotte Panthers 2030 Marucci(17-4-0 in 2026)",
+    "teamName": "South Charlotte Panthers 2030 Marucci",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/NTRWQg2ksk16",
+    "classification": "14Major",
+    "from": "Charlotte, NC",
+    "city": "Charlotte, NC",
+    "state": "",
+    "status": ""
+  }
+}

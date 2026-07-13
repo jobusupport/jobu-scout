@@ -1,0 +1,19 @@
+Team: The Dream 14u White
+URL: Not found
+Failed At: 2026-06-02T23:12:54.157Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "The Dream 14u White(12-23-0 in 2026)",
+    "teamName": "The Dream 14u White",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/jGV87vJT2vZX",
+    "classification": "14AAA",
+    "from": "Kennesaw, GA",
+    "city": "Kennesaw, GA",
+    "state": "",
+    "status": ""
+  }
+}

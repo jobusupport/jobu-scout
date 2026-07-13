@@ -1,0 +1,16 @@
+Perfect Game Startup Team Load Report
+====================================
+Generated: 2026-07-13T20:25:06.939Z
+Source type: single-team-command-line
+Source: https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=25375&orgteamid=254655&team=1128931&Year=2026
+Raw rows: 1
+Queued teams: 1
+Skipped rows: 0
+Warning rows: 0
+First queued team:  (row 1)
+
+Queued teams:
+  Row 1: (blank) | status=blank | url=https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=25375&orgteamid=254655&team=1128931&Year=2026
+
+Skipped rows:
+  none

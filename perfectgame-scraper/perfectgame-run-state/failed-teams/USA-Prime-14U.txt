@@ -1,0 +1,9 @@
+Team: USA Prime 14U
+URL: https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1046968
+Failed At: 2026-06-21T16:59:08.277Z
+Reason: page.waitForTimeout: Target page, context or browser has been closed
+
+{
+  "current_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=19967&orgteamid=263882&team=1046968&Year=2026",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\USA Prime 14U\\error\\error-page.png"
+}

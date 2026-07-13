@@ -1,0 +1,19 @@
+Team: Baseball Portal - TRW
+URL: Not found
+Failed At: 2026-06-02T23:14:11.229Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "Baseball Portal - TRW (13-10-0 in 2026)",
+    "teamName": "Baseball Portal - TRW",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/CvPTdkl0YnAi",
+    "classification": "14Major",
+    "from": "Birmingham, AL",
+    "city": "Birmingham, AL",
+    "state": "",
+    "status": ""
+  }
+}

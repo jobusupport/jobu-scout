@@ -1,0 +1,16 @@
+{
+  "started_at": "2026-07-13T20:25:41.565Z",
+  "retry_passes_configured": 1,
+  "retry_attempts": [
+    {
+      "timestamp": "2026-07-13T20:25:41.566Z",
+      "pass": 1,
+      "pass_summary": true,
+      "attempted": 0,
+      "recovered": 0
+    }
+  ],
+  "recovered_count": 0,
+  "still_failed_count": 0,
+  "finished_at": "2026-07-13T20:25:41.566Z"
+}

@@ -1,0 +1,12 @@
+Team: Performance Baseball 14U Black
+URL: https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1104342
+Failed At: 2026-06-20T17:45:56.651Z
+Reason: page.goto: net::ERR_INTERNET_DISCONNECTED at https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1104342
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1104342", waiting until "domcontentloaded"[22m
+
+
+{
+  "current_url": "chrome-error://chromewebdata/",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\Performance Baseball 14U Black\\error\\error-page.png"
+}

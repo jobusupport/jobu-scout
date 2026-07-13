@@ -1,0 +1,9 @@
+Team: USA Prime Southeast Scout 14U
+URL: https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=998484
+Failed At: 2026-07-13T20:22:15.230Z
+Reason: page.waitForTimeout: Target page, context or browser has been closed
+
+{
+  "current_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=76967&orgteamid=263639&team=998484&Year=2026",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\USA Prime Southeast Scout 14U\\error\\error-page.png"
+}

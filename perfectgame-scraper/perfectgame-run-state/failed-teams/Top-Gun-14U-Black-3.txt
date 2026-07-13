@@ -1,0 +1,19 @@
+Team: Top Gun 14U Black
+URL: Not found
+Failed At: 2026-06-02T23:21:38.151Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "Top Gun 14U Black(2-2-0 in 2026)",
+    "teamName": "Top Gun 14U Black",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "",
+    "classification": "14Major",
+    "from": "Oxford, AL",
+    "city": "Oxford, AL",
+    "state": "",
+    "status": ""
+  }
+}

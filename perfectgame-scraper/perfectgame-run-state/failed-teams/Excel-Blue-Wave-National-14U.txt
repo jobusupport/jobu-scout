@@ -1,0 +1,9 @@
+Team: Excel Blue Wave National 14U
+URL: https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=1538&orgteamid=274060&Year=2026
+Failed At: 2026-06-12T20:30:34.173Z
+Reason: page.waitForTimeout: Target page, context or browser has been closed
+
+{
+  "current_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=1538&orgteamid=274060&Year=2026",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\Excel Blue Wave National 14U\\error\\error-page.png"
+}

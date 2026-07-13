@@ -1,0 +1,19 @@
+Team: Beehive Scout
+URL: Not found
+Failed At: 2026-06-02T23:14:11.231Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "Beehive Scout (6-1-0 in 2026)",
+    "teamName": "Beehive Scout",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/V86aSRT3AU9T",
+    "classification": "14Major",
+    "from": "Auburn, AL",
+    "city": "Auburn, AL",
+    "state": "",
+    "status": ""
+  }
+}

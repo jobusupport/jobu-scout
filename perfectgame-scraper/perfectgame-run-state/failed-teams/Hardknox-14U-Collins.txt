@@ -1,0 +1,12 @@
+Team: Hardknox 14U Collins
+URL: https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=85378&orgteamid=263242&team=1056420&Year=2026
+Failed At: 2026-06-12T22:32:14.939Z
+Reason: page.goto: net::ERR_NAME_NOT_RESOLVED at https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=85378&orgteamid=263242&team=1056420&Year=2026
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=85378&orgteamid=263242&team=1056420&Year=2026", waiting until "domcontentloaded"[22m
+
+
+{
+  "current_url": "chrome-error://chromewebdata/",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\Hardknox 14U Collins\\error\\error-page.png"
+}

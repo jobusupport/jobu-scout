@@ -1,0 +1,1 @@
+[2026-06-11T04:00:40.315Z] Team Birmingham Stars | GameID 1343943 | https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1343943 | page.waitForTimeout: Target page, context or browser has been closed

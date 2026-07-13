@@ -1,0 +1,21 @@
+Team: Canes PA 14U
+URL: Not found
+Failed At: 2026-07-13T20:22:15.246Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "Canes PA 14U",
+    "teamName": "Canes PA 14U",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/6x6ATKanT391",
+    "classification": "Major14",
+    "from": "Export, PA",
+    "city": "Export, PA",
+    "state": "",
+    "status": "",
+    "source_row_number": 5,
+    "source_index": 4
+  }
+}

@@ -1,0 +1,9 @@
+Team: Vestavia Baseball Club
+URL: https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=85485&orgteamid=264156&Year=2026
+Failed At: 2026-06-12T20:35:23.390Z
+Reason: page.goto: Target page, context or browser has been closed
+
+{
+  "current_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=85485&orgteamid=264156&Year=2026",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\Vestavia Baseball Club\\error\\error-page.png"
+}

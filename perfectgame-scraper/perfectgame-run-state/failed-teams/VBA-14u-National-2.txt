@@ -1,0 +1,19 @@
+Team: VBA 14u National
+URL: Not found
+Failed At: 2026-06-02T23:14:11.279Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "VBA 14u National(1-2-0 in 2026)",
+    "teamName": "VBA 14u National",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "",
+    "classification": "14Major",
+    "from": "Huntsville, AL",
+    "city": "Huntsville, AL",
+    "state": "",
+    "status": ""
+  }
+}

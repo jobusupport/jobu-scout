@@ -1,0 +1,19 @@
+Team: EBC 14u-Holmes
+URL: Not found
+Failed At: 2026-06-02T23:21:38.128Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "EBC 14u-Holmes(21-8-0 in 2026)",
+    "teamName": "EBC 14u-Holmes",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/V6FZc6SC9T6X",
+    "classification": "14Major",
+    "from": "Rossville, TN",
+    "city": "Rossville, TN",
+    "state": "",
+    "status": ""
+  }
+}

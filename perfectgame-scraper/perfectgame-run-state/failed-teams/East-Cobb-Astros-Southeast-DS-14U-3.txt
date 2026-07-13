@@ -1,0 +1,19 @@
+Team: East Cobb Astros Southeast DS 14U
+URL: Not found
+Failed At: 2026-06-02T23:21:38.126Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "East Cobb Astros Southeast DS 14U(4-4-0 in 2026)",
+    "teamName": "East Cobb Astros Southeast DS 14U",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/hUNIaczxJi3q",
+    "classification": "14Major",
+    "from": "Oxford, AL",
+    "city": "Oxford, AL",
+    "state": "",
+    "status": ""
+  }
+}

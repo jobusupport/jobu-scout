@@ -1,0 +1,12 @@
+[2026-06-21T18:24:15.097Z] Team Hawaii Elite 2G National 14U | GameID 1411693 | https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1411693 | page.goto: Timeout 60000ms exceeded.
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1411693", waiting until "domcontentloaded"[22m
+
+[2026-06-21T18:25:16.257Z] Team Hawaii Elite 2G National 14U | GameID 1411695 | https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1411695 | page.goto: Timeout 60000ms exceeded.
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1411695", waiting until "domcontentloaded"[22m
+
+[2026-06-21T18:26:01.425Z] Team Hawaii Elite 2G National 14U | GameID 1498136 | https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1498136 | page.goto: net::ERR_ABORTED; maybe frame was detached?
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1498136", waiting until "domcontentloaded"[22m
+

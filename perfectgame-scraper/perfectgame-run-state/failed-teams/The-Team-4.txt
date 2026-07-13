@@ -1,0 +1,19 @@
+Team: The Team
+URL: Not found
+Failed At: 2026-06-02T23:22:16.219Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "The Team(18-16-1 in 2026)",
+    "teamName": "The Team",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/c83GXK5GrLDa",
+    "classification": "14AAA",
+    "from": "Birmingham, AL",
+    "city": "Birmingham, AL",
+    "state": "",
+    "status": ""
+  }
+}

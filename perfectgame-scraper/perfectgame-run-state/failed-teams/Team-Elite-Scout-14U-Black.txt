@@ -1,0 +1,19 @@
+Team: Team Elite Scout 14U Black
+URL: Not found
+Failed At: 2026-06-02T23:12:54.156Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "Team Elite Scout 14U Black(13-6-1 in 2026)",
+    "teamName": "Team Elite Scout 14U Black",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/M8WlSAi0HFZo",
+    "classification": "14Major",
+    "from": "Auburn, GA",
+    "city": "Auburn, GA",
+    "state": "",
+    "status": ""
+  }
+}

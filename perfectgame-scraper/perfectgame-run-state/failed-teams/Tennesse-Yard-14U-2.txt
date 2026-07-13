@@ -1,0 +1,8 @@
+Team: Tennesse Yard 14U
+URL: https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=10248&orgteamid=255417&Year=2026
+Failed At: 2026-06-29T21:18:41.079Z
+Reason: No Final games with BOX link found on expanded schedule.
+
+{
+  "current_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=10248&orgteamid=255417&Year=2026"
+}

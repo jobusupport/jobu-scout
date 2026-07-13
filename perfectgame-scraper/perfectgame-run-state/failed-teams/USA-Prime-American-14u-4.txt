@@ -1,0 +1,19 @@
+Team: USA Prime American 14u
+URL: Not found
+Failed At: 2026-06-02T23:22:16.224Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "USA Prime American 14u(8-2-0 in 2026)",
+    "teamName": "USA Prime American 14u",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "",
+    "classification": "14Major",
+    "from": "Carrollton, TX",
+    "city": "Carrollton, TX",
+    "state": "",
+    "status": ""
+  }
+}

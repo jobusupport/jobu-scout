@@ -1,0 +1,31 @@
+{
+  "generated_at": "2026-07-13T20:25:06.939Z",
+  "source_type": "single-team-command-line",
+  "source": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=25375&orgteamid=254655&team=1128931&Year=2026",
+  "raw_row_count": 1,
+  "queued_count": 1,
+  "skipped_count": 0,
+  "warning_count": 0,
+  "first_queued_team": {
+    "row": 1,
+    "team_name": "",
+    "raw_team_name": "",
+    "status": "",
+    "pg_team_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=25375&orgteamid=254655&team=1128931&Year=2026",
+    "cached_or_final_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=25375&orgteamid=254655&team=1128931&Year=2026",
+    "warnings": []
+  },
+  "queued_teams": [
+    {
+      "row": 1,
+      "team_name": "",
+      "raw_team_name": "",
+      "status": "",
+      "pg_team_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=25375&orgteamid=254655&team=1128931&Year=2026",
+      "cached_or_final_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=25375&orgteamid=254655&team=1128931&Year=2026",
+      "warnings": []
+    }
+  ],
+  "skipped_rows": [],
+  "warning_rows": []
+}

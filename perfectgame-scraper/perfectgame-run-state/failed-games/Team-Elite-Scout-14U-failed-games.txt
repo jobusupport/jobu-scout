@@ -1,0 +1,1 @@
+[2026-06-03T03:16:31.600Z] Team Team Elite Scout 14U | GameID 1324819 | https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1324819 | Clicked Pitch By Pitch tab, but pitch-by-pitch content was not verified. Debug screenshot: C:\playwright-projects\perfectgame-scraper\perfectgame-run-state\logs\pitch-by-pitch-not-verified-1780456590609.png

@@ -1,0 +1,19 @@
+Team: Coastal National
+URL: Not found
+Failed At: 2026-06-02T23:21:38.121Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "Coastal National(1-2-0 in 2026)",
+    "teamName": "Coastal National",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/iiKPTcEpjjdw",
+    "classification": "14Major",
+    "from": "Chapin, SC",
+    "city": "Chapin, SC",
+    "state": "",
+    "status": ""
+  }
+}

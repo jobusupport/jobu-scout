@@ -1,0 +1,19 @@
+Team: US Nationals Scout
+URL: Not found
+Failed At: 2026-06-02T23:21:38.153Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "US Nationals Scout (27-12-1 in 2026)",
+    "teamName": "US Nationals Scout",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "",
+    "classification": "14Major",
+    "from": "Fenton, MO",
+    "city": "Fenton, MO",
+    "state": "",
+    "status": ""
+  }
+}

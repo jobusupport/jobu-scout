@@ -14,7 +14,7 @@ const fs   = require('fs');
 const path = require('path');
 
 const PG_OUTPUT_ROOT = process.env.PG_OUTPUT_ROOT ||
-  path.join(__dirname, '..', '..', 'perfectgame-scraper', 'output');
+  path.join(__dirname, '..', 'perfectgame-scraper', 'output');
 
 function toNum(v) {
   const n = parseFloat(String(v || '').replace(/[^\d.-]/g, ''));

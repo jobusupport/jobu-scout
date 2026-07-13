@@ -1,0 +1,19 @@
+Team: The Yard 14U
+URL: Not found
+Failed At: 2026-06-02T23:22:16.220Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "The Yard 14U(22-4-0 in 2026)",
+    "teamName": "The Yard 14U",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/htG16H2XB6F5",
+    "classification": "14Major",
+    "from": "Cleveland, TN",
+    "city": "Cleveland, TN",
+    "state": "",
+    "status": ""
+  }
+}

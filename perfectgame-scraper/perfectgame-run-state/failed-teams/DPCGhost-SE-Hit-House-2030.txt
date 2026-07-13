@@ -1,0 +1,12 @@
+Team: DPC/Ghost SE Hit House 2030
+URL: https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1094219
+Failed At: 2026-06-20T17:46:15.257Z
+Reason: page.goto: net::ERR_INTERNET_DISCONNECTED at https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1094219
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1094219", waiting until "domcontentloaded"[22m
+
+
+{
+  "current_url": "chrome-error://chromewebdata/",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\DPCGhost SE Hit House 2030\\error\\error-page.png"
+}

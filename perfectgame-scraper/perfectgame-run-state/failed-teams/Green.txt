@@ -1,0 +1,12 @@
+Team: Green
+URL: Austin
+Failed At: 2026-06-20T17:03:17.410Z
+Reason: page.goto: Protocol error (Page.navigate): Cannot navigate to invalid URL
+Call log:
+[2m  - navigating to "Austin", waiting until "domcontentloaded"[22m
+
+
+{
+  "current_url": "about:blank",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\Green\\error\\error-page.png"
+}

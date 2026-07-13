@@ -1,0 +1,19 @@
+Team: BPA Mississippi 2030
+URL: Not found
+Failed At: 2026-06-02T23:21:38.116Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "BPA Mississippi 2030(17-5-0 in 2026)",
+    "teamName": "BPA Mississippi 2030",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/CFaNRqdV8wE5",
+    "classification": "14Major",
+    "from": "Oxford, MS",
+    "city": "Oxford, MS",
+    "state": "",
+    "status": ""
+  }
+}

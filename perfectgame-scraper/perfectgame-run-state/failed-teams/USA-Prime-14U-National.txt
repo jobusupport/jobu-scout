@@ -1,0 +1,12 @@
+Team: USA Prime 14U National
+URL: https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1046968
+Failed At: 2026-06-20T17:43:46.465Z
+Reason: page.goto: net::ERR_INTERNET_DISCONNECTED at https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1046968
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1046968", waiting until "domcontentloaded"[22m
+
+
+{
+  "current_url": "chrome-error://chromewebdata/",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\USA Prime 14U National\\error\\error-page.png"
+}

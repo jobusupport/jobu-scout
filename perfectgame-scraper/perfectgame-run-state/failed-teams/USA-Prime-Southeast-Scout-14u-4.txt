@@ -1,0 +1,19 @@
+Team: USA Prime Southeast Scout 14u
+URL: Not found
+Failed At: 2026-06-02T23:22:16.225Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "USA Prime Southeast Scout 14u(10-6-1 in 2026)",
+    "teamName": "USA Prime Southeast Scout 14u",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "",
+    "classification": "14Major",
+    "from": "Birmingham, AL",
+    "city": "Birmingham, AL",
+    "state": "",
+    "status": ""
+  }
+}

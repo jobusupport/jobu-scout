@@ -1,0 +1,12 @@
+Team: MAFIA 14u Black
+URL: https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1009154
+Failed At: 2026-06-21T06:10:37.035Z
+Reason: page.goto: net::ERR_INTERNET_DISCONNECTED at https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1009154
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1009154", waiting until "domcontentloaded"[22m
+
+
+{
+  "current_url": "chrome-error://chromewebdata/",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\MAFIA 14u Black\\error\\error-page.png"
+}

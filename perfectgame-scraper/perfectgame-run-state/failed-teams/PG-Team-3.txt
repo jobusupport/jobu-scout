@@ -1,0 +1,8 @@
+Team: PG Team
+URL: https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=49029
+Failed At: 2026-06-13T03:25:03.524Z
+Reason: No Final games with BOX link found on expanded schedule.
+
+{
+  "current_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=49029&orgteamid=0&Year=2026"
+}

@@ -1,0 +1,12 @@
+Team: STL Legacy 14u - Kranawetter
+URL: https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1031271
+Failed At: 2026-06-20T17:45:19.455Z
+Reason: page.goto: net::ERR_INTERNET_DISCONNECTED at https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1031271
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1031271", waiting until "domcontentloaded"[22m
+
+
+{
+  "current_url": "chrome-error://chromewebdata/",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\STL Legacy 14u - Kranawetter\\error\\error-page.png"
+}

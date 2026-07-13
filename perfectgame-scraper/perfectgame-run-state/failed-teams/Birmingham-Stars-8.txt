@@ -1,0 +1,9 @@
+Team: Birmingham Stars
+URL: https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1007542
+Failed At: 2026-06-11T04:00:40.333Z
+Reason: page.waitForTimeout: Target page, context or browser has been closed
+
+{
+  "current_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=27855&orgteamid=258109&team=1007542&Year=2026",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\Birmingham Stars\\error\\error-page.png"
+}

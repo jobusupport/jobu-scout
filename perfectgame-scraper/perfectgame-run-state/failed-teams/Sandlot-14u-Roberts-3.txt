@@ -1,0 +1,19 @@
+Team: Sandlot 14u-Roberts
+URL: Not found
+Failed At: 2026-06-02T23:21:38.136Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "Sandlot 14u-Roberts(5-4-0 in 2026)",
+    "teamName": "Sandlot 14u-Roberts",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/GkK1fq3EpFgd",
+    "classification": "14Major",
+    "from": "Catoosa, OK",
+    "city": "Catoosa, OK",
+    "state": "",
+    "status": ""
+  }
+}

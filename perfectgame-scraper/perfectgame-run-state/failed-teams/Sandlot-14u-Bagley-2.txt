@@ -1,0 +1,19 @@
+Team: Sandlot 14u-Bagley
+URL: Not found
+Failed At: 2026-06-02T23:14:11.255Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "Sandlot 14u-Bagley(6-3-0 in 2026)",
+    "teamName": "Sandlot 14u-Bagley",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/KFkZfDRhfuoB",
+    "classification": "14Major",
+    "from": "Broken Arrow, OK",
+    "city": "Broken Arrow, OK",
+    "state": "",
+    "status": ""
+  }
+}

@@ -1,0 +1,19 @@
+Team: TBT National NOLA
+URL: Not found
+Failed At: 2026-06-02T23:21:38.143Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "TBT National NOLA (15-5-1 in 2026)",
+    "teamName": "TBT National NOLA",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/OSO6co7Grrhc",
+    "classification": "14Major",
+    "from": "Harvey, LA",
+    "city": "Harvey, LA",
+    "state": "",
+    "status": ""
+  }
+}

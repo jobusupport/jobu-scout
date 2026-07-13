@@ -1,0 +1,21 @@
+Team: WOW Factor King
+URL: Not found
+Failed At: 2026-07-13T20:22:15.244Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "WOW Factor King",
+    "teamName": "WOW Factor King",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/fs80AkFWn2Qk",
+    "classification": "Major14",
+    "from": "",
+    "city": "",
+    "state": "",
+    "status": "",
+    "source_row_number": 4,
+    "source_index": 3
+  }
+}

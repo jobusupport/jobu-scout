@@ -1,0 +1,1 @@
+const D = require('better-sqlite3'); const d = new D('voodoo-scout.db'); const tables = ['teams','games','batting_lines','pitching_lines','play_events','player_advanced_stats','pitcher_advanced_stats']; for (const t of tables) { console.log('\n--- ' + t + ' ---'); console.log(JSON.stringify(d.prepare('PRAGMA table_info(' + t + ')').all(), null, 2)); }

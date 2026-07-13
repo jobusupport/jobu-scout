@@ -1,0 +1,19 @@
+Team: East Cobb Astros 14U
+URL: Not found
+Failed At: 2026-06-02T23:22:16.193Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "East Cobb Astros 14U(42-6-1 in 2026)",
+    "teamName": "East Cobb Astros 14U",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/hUNIaczxJi3q",
+    "classification": "14Major",
+    "from": "Marietta, GA",
+    "city": "Marietta, GA",
+    "state": "",
+    "status": ""
+  }
+}

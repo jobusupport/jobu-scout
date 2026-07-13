@@ -1,0 +1,4 @@
+[2026-06-02T23:37:12.657Z] Team 5 Star Mafia 14u Black | GameID 1305845 | https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1305845 | page.goto: Timeout 60000ms exceeded.
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1305845", waiting until "domcontentloaded"[22m
+

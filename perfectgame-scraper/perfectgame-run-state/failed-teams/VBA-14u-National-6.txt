@@ -1,0 +1,12 @@
+Team: VBA 14u National
+URL: https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1010659
+Failed At: 2026-06-20T18:27:00.890Z
+Reason: page.goto: net::ERR_ABORTED; maybe frame was detached?
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1010659", waiting until "domcontentloaded"[22m
+
+
+{
+  "current_url": "about:blank",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\VBA 14u National\\error\\error-page.png"
+}

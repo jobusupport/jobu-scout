@@ -1,0 +1,12 @@
+Team: Rawlings Tigers 14U Scout
+URL: https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1007311
+Failed At: 2026-06-20T17:45:38.056Z
+Reason: page.goto: net::ERR_INTERNET_DISCONNECTED at https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1007311
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1007311", waiting until "domcontentloaded"[22m
+
+
+{
+  "current_url": "chrome-error://chromewebdata/",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\Rawlings Tigers 14U Scout\\error\\error-page.png"
+}

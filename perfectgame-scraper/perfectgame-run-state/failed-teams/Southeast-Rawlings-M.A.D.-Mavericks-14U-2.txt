@@ -1,0 +1,19 @@
+Team: Southeast Rawlings M.A.D. Mavericks 14U
+URL: Not found
+Failed At: 2026-06-02T23:14:11.262Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "Southeast Rawlings M.A.D. Mavericks 14U(13-9-0 in 2026)",
+    "teamName": "Southeast Rawlings M.A.D. Mavericks 14U",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "",
+    "classification": "14Major",
+    "from": "Franklin, TN",
+    "city": "Franklin, TN",
+    "state": "",
+    "status": ""
+  }
+}

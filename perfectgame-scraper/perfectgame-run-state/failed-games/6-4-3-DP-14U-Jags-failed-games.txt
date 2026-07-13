@@ -1,0 +1,1 @@
+[2026-06-28T20:10:13.664Z] Team 6-4-3 DP 14U Jags | GameID 1514132 | https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1514132 | Clicked Pitch By Pitch tab, but pitch-by-pitch content was not verified. Debug screenshot: C:\playwright-projects\perfectgame-scraper\perfectgame-run-state\logs\pitch-by-pitch-not-verified-1782677412600.png

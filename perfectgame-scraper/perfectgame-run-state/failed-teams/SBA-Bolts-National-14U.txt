@@ -1,0 +1,19 @@
+Team: SBA Bolts National 14U
+URL: Not found
+Failed At: 2026-06-02T23:12:54.149Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "SBA Bolts National 14U(12-5-0 in 2026)",
+    "teamName": "SBA Bolts National 14U",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/TJxzZSSpKw9O",
+    "classification": "14Major",
+    "from": "Charlotte, NC",
+    "city": "Charlotte, NC",
+    "state": "",
+    "status": ""
+  }
+}

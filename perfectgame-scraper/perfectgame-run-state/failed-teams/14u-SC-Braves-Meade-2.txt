@@ -1,0 +1,12 @@
+Team: 14u SC Braves Meade
+URL: https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1033853
+Failed At: 2026-06-20T21:10:36.887Z
+Reason: page.goto: Timeout 60000ms exceeded.
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/events/Tournaments/Teams/Default.aspx?team=1033853", waiting until "domcontentloaded"[22m
+
+
+{
+  "current_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=4023&orgteamid=266642&team=1033853&Year=2026",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\14u SC Braves Meade\\error\\error-page.png"
+}

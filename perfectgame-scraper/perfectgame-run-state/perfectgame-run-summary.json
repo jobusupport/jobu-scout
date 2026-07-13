@@ -1,0 +1,71 @@
+{
+  "success": true,
+  "captured_at": "2026-07-13T20:25:41.566Z",
+  "team_count": 1,
+  "successful_count": 0,
+  "failed_count": 1,
+  "failed_game_count": 0,
+  "retry_summary": {
+    "started_at": "2026-07-13T20:25:41.565Z",
+    "retry_passes_configured": 1,
+    "retry_attempts": [
+      {
+        "timestamp": "2026-07-13T20:25:41.566Z",
+        "pass": 1,
+        "pass_summary": true,
+        "attempted": 0,
+        "recovered": 0
+      }
+    ],
+    "recovered_count": 0,
+    "still_failed_count": 0,
+    "finished_at": "2026-07-13T20:25:41.566Z"
+  },
+  "startup_report": {
+    "generated_at": "2026-07-13T20:25:06.939Z",
+    "source_type": "single-team-command-line",
+    "source": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=25375&orgteamid=254655&team=1128931&Year=2026",
+    "raw_row_count": 1,
+    "queued_count": 1,
+    "skipped_count": 0,
+    "warning_count": 0,
+    "first_queued_team": {
+      "row": 1,
+      "team_name": "",
+      "raw_team_name": "",
+      "status": "",
+      "pg_team_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=25375&orgteamid=254655&team=1128931&Year=2026",
+      "cached_or_final_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=25375&orgteamid=254655&team=1128931&Year=2026",
+      "warnings": []
+    },
+    "queued_teams": [
+      {
+        "row": 1,
+        "team_name": "",
+        "raw_team_name": "",
+        "status": "",
+        "pg_team_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=25375&orgteamid=254655&team=1128931&Year=2026",
+        "cached_or_final_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=25375&orgteamid=254655&team=1128931&Year=2026",
+        "warnings": []
+      }
+    ],
+    "skipped_rows": [],
+    "warning_rows": []
+  },
+  "logs": {
+    "startup_report_json": "C:\\playwright-projects\\perfectgame-scraper\\perfectgame-run-state\\logs\\startup-team-load-report.json",
+    "startup_report_txt": "C:\\playwright-projects\\perfectgame-scraper\\perfectgame-run-state\\logs\\startup-team-load-report.txt",
+    "capture_failures_jsonl": "C:\\playwright-projects\\perfectgame-scraper\\perfectgame-run-state\\logs\\capture-failures.jsonl",
+    "capture_failures_txt": "C:\\playwright-projects\\perfectgame-scraper\\perfectgame-run-state\\logs\\capture-failures.txt",
+    "retry_summary": "C:\\playwright-projects\\perfectgame-scraper\\perfectgame-run-state\\logs\\retry-summary.json"
+  },
+  "results": [
+    {
+      "success": false,
+      "team_name": "",
+      "source_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=25375&orgteamid=254655&team=1128931&Year=2026",
+      "error": "page.waitForTimeout: Target page, context or browser has been closed",
+      "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\unknown-team\\error\\error-page.png"
+    }
+  ]
+}

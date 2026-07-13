@@ -1,0 +1,19 @@
+Team: BC Athletics 14u
+URL: Not found
+Failed At: 2026-06-02T23:14:11.230Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "BC Athletics 14u(4-3-1 in 2026)",
+    "teamName": "BC Athletics 14u",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/T8e3n97KwSN9",
+    "classification": "14Major",
+    "from": "Knoxville, TN",
+    "city": "Knoxville, TN",
+    "state": "",
+    "status": ""
+  }
+}

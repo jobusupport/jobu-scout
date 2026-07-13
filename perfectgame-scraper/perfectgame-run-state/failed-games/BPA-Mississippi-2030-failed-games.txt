@@ -1,0 +1,9 @@
+[2026-06-03T02:24:30.994Z] Team BPA Mississippi 2030 | GameID 1307615 | https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1307615 | page.goto: Timeout 60000ms exceeded.
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1307615", waiting until "domcontentloaded"[22m
+
+[2026-06-03T02:25:32.160Z] Team BPA Mississippi 2030 | GameID 1307618 | https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1307618 | page.goto: Timeout 60000ms exceeded.
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1307618", waiting until "domcontentloaded"[22m
+
+[2026-06-03T02:32:14.576Z] Team BPA Mississippi 2030 | GameID 1342965 | https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1342965 | page.waitForTimeout: Target page, context or browser has been closed

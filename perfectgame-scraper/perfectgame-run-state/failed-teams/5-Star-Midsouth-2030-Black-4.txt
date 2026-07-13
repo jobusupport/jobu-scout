@@ -1,0 +1,19 @@
+Team: 5 Star Midsouth 2030 Black
+URL: Not found
+Failed At: 2026-06-02T23:22:16.181Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "5 Star Midsouth 2030 Black(7-8-0 in 2026)",
+    "teamName": "5 Star Midsouth 2030 Black",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/7FWAWYOhHibB",
+    "classification": "14Major",
+    "from": "Mount Juliet, TN",
+    "city": "Mount Juliet, TN",
+    "state": "",
+    "status": ""
+  }
+}

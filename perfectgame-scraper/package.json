@@ -1,0 +1,27 @@
+{
+  "name": "perfectgame-scraper",
+  "version": "1.0.0",
+  "description": "",
+  "main": "perfectgame-scraper.js",
+  "type": "commonjs",
+  "scripts": {
+    "save-perfectgame-session": "node save-perfectgame-session.js",
+    "save-session": "node save-perfectgame-session.js",
+    "login": "node save-perfectgame-session.js",
+    "perfectgame-scraper": "node perfectgame-scraper.js",
+    "scrape": "node perfectgame-scraper.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "playwright": "^1.60.0",
+    "sharp": "^0.34.5",
+    "sqlite3": "^6.0.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.60.0",
+    "@types/node": "^25.7.0"
+  }
+}

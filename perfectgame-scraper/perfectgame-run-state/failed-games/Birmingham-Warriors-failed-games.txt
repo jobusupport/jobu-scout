@@ -1,0 +1,4 @@
+[2026-06-04T19:21:22.445Z] Team Birmingham Warriors | GameID 1489317 | https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1489317 | page.goto: Timeout 60000ms exceeded.
+Call log:
+[2m  - navigating to "https://www.perfectgame.org/DiamondKast/Game.aspx?gameid=1489317", waiting until "domcontentloaded"[22m
+

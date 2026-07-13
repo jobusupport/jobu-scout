@@ -1,0 +1,9 @@
+Team: Unknown
+URL: https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=25375&orgteamid=254655&team=1128931&Year=2026
+Failed At: 2026-07-13T20:25:41.564Z
+Reason: page.waitForTimeout: Target page, context or browser has been closed
+
+{
+  "current_url": "https://www.perfectgame.org/PGBA/Team/default.aspx?orgid=25375&orgteamid=254655&team=1128931&Year=2026",
+  "screenshot": "C:\\playwright-projects\\perfectgame-scraper\\output\\unknown-team\\error\\error-page.png"
+}

@@ -1,0 +1,19 @@
+Team: Team Elite Scout 14U
+URL: Not found
+Failed At: 2026-06-02T23:12:54.155Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "Team Elite Scout 14U(21-0-0 in 2026)",
+    "teamName": "Team Elite Scout 14U",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/2YwrRZTxg0VR",
+    "classification": "14Major",
+    "from": "Atlanta, GA",
+    "city": "Atlanta, GA",
+    "state": "",
+    "status": ""
+  }
+}

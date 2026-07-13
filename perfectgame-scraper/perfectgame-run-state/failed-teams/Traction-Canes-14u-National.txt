@@ -1,0 +1,19 @@
+Team: Traction Canes 14u National
+URL: Not found
+Failed At: 2026-06-02T23:12:54.162Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "Traction Canes 14u National(16-7-0 in 2026)",
+    "teamName": "Traction Canes 14u National",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "",
+    "classification": "14Major",
+    "from": "Baton Rouge, LA",
+    "city": "Baton Rouge, LA",
+    "state": "",
+    "status": ""
+  }
+}

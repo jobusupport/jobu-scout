@@ -1,0 +1,19 @@
+Team: EBC 14u - Gold
+URL: Not found
+Failed At: 2026-06-02T23:21:38.127Z
+Reason: No Perfect Game team URL found in input or Team URLs.txt cache.
+
+{
+  "team": {
+    "rawTeamName": "EBC 14u - Gold(24-8-1 in 2026)",
+    "teamName": "EBC 14u - Gold",
+    "pgTeamUrl": "",
+    "gcSearchName": "",
+    "gcTeamUrl": "https://web.gc.com/teams/K7IiGUsQYMl4",
+    "classification": "14Major",
+    "from": "Germantown, TN",
+    "city": "Germantown, TN",
+    "state": "",
+    "status": ""
+  }
+}
