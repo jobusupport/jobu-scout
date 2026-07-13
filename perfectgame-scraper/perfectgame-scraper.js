@@ -4013,6 +4013,12 @@ async function captureTeamStatsTables(page, teamDir, teamName) {
   }
 
   console.log("Stats grid found. Capturing batting/pitching standard, advanced, and batted-ball tables...");
+  const rosterResult = await extractRosterData(page);
+fs.writeFileSync(
+  path.join(teamDir, `${safeTeam}-roster.json`),
+  JSON.stringify({ team: teamName, captured_at: new Date().toISOString(), ...rosterResult }, null, 2),
+  "utf8"
+);
 
   const statsData = await extractAllStatsTables(page, statsTablesDir, teamName);
 
