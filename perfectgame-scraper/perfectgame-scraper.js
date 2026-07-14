@@ -6,6 +6,7 @@ const sharp = require("sharp");
 const { chromium } = require("playwright");
 const { scrapeTeamSprayData } = require("./pg-spray-scraper");
 const { buildTeamSprayData }  = require("./gc-spray-engine");
+const { extractDiamondKastPitchByPitch } = require("./extractDiamondKastPitchByPitch");
 // For SQLite access (gc-spray-engine needs the GC database):
 const sqlite3 = require("sqlite3").verbose();
 const GC_DB_PATH = process.env.GC_DB_PATH ||
@@ -3943,10 +3944,31 @@ async function captureGameBoxAndPitchByPitch(context, teamPage, game, gamesDir, 
       const pitchJsonPath = path.join(gameDir, `${boxMeta.pitchByPitchBaseName}.json`);
       fs.writeFileSync(pitchJsonPath, JSON.stringify({ game_id: game.gameId, plays }, null, 2), "utf8");
 
+      // Structured, pitch-level extraction (speed/type/call per pitch, chronological
+      // order, correct batting team per at-bat) — used for pitcher fatigue and
+      // strikeout pitch-sequence analysis. boxMeta.teamA/teamB come from the
+      // linescore, which lists the visiting team first and home team second.
+      const structuredAtBats = await extractDiamondKastPitchByPitch(boxPage, {
+        awayTeam: boxMeta.teamA,
+        homeTeam: boxMeta.teamB,
+      });
+      const structuredJsonPath = path.join(
+        gameDir,
+        `${boxMeta.pitchByPitchBaseName}-structured.json`
+      );
+      fs.writeFileSync(
+        structuredJsonPath,
+        JSON.stringify({ game_id: game.gameId, awayTeam: boxMeta.teamA, homeTeam: boxMeta.teamB, atBats: structuredAtBats }, null, 2),
+        "utf8"
+      );
+      console.log(`Extracted ${structuredAtBats.length} structured at-bats (${structuredAtBats.reduce((s, ab) => s + ab.pitches.length, 0)} pitches) for game ${game.gameId}: ${structuredJsonPath}`);
+
       pitchResult = {
         captured:    plays.length > 0,
         play_count:  plays.length,
         file:        pitchJsonPath,
+        structured_file: structuredJsonPath,
+        structured_at_bat_count: structuredAtBats.length,
       };
 
       if (!pitchResult.captured) {
