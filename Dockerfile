@@ -20,7 +20,7 @@ RUN npx playwright install chromium --with-deps
 COPY . .
 
 # perfectgame-scraper/ has its own package.json (sqlite3, playwright, sharp,
-# dotenv) that is NOT covered by the root `npm install` above — without this,
+# dotenv) that is not covered by the root `npm install` above — without this,
 # require('sqlite3') fails on Railway even though it's correctly declared,
 # because it never gets installed into any node_modules the container has.
 #
