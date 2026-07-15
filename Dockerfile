@@ -25,7 +25,7 @@ COPY . .
 # because it never gets installed into any node_modules the container has.
 #
 # npm_config_build_from_source=true forces sqlite3's native binding to
-# compile against THIS container's actual glibc (Ubuntu 22.04 / GLIBC 2.35)
+# compile against this container's actual glibc (Ubuntu 22.04 / GLIBC 2.35)
 # rather than downloading a prebuilt .node binary — sqlite3's default
 # prebuilt binaries are built against a newer glibc (2.38+) and fail to
 # load here with ERR_DLOPEN_FAILED / "GLIBC_2.38 not found".
