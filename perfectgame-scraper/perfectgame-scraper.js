@@ -60,7 +60,9 @@ const TEAMS_CSV =
 // Put this in the Perfect Game .env too, or run this scraper from a folder whose .env already has it.
 const GOOGLE_SHEET_CSV_URL = process.env.GOOGLE_SHEET_CSV_URL || "";
 
-const HEADLESS = String(process.env.PG_HEADLESS || "false").toLowerCase() === "true";
+const HEADLESS = process.env.NODE_ENV === 'production'
+  ? true
+  : String(process.env.PG_HEADLESS || "false").toLowerCase() === "true";
 const FORCE_REFRESH = String(process.env.PG_FORCE_REFRESH || "false").toLowerCase() === "true";
 
 const TARGET_YEAR = process.env.PG_TARGET_YEAR || "2026";
