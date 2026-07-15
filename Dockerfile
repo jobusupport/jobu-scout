@@ -6,7 +6,7 @@ WORKDIR /app
 # native modules (sqlite3) can compile from source instead of relying on
 # prebuilt binaries that may target a newer glibc than this base image has.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends libreoffice build-essential python3 \
+  && apt-get install -y --no-install-recommends libreoffice build-essential python3 libvips-dev \
   && rm -rf /var/lib/apt/lists/*
 
 COPY package*.json ./
