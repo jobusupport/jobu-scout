@@ -29,7 +29,9 @@ COPY . .
 # rather than downloading a prebuilt .node binary — sqlite3's default
 # prebuilt binaries are built against a newer glibc (2.38+) and fail to
 # load here with ERR_DLOPEN_FAILED / "GLIBC_2.38 not found".
-RUN cd perfectgame-scraper && npm_config_build_from_source=true npm install --omit=dev
+RUN cd perfectgame-scraper \
+  && npm install --omit=dev \
+  && npm_config_build_from_source=true npm rebuild sqlite3 --build-from-source
 
 ENV LIBREOFFICE_PATH=/usr/bin/soffice
 
