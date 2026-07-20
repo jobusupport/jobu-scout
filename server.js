@@ -627,6 +627,92 @@ async function requireAuth(req, res, next) {
 
 // ── Auth routes ──────────────────────────────────────────────────────────────
 
+// POST /api/auth/signup  { email, password, orgName, tier?, interval? }
+// Creates a brand-new org + its first (admin) user. The org is always created
+// on the free plan — for a paid tier this kicks off a Stripe Checkout Session
+// and the org is upgraded by the existing webhook handler once payment
+// actually completes, so paid features are never granted before payment.
+//
+// The new user's email is auto-confirmed at creation (no verification email)
+// since the project has no custom SMTP configured yet and Supabase's default
+// mailer isn't reliable for real delivery — see scripts/check-email-delivery.js.
+app.post('/api/auth/signup', async (req, res) => {
+  if (!HAS_SUPABASE_CONFIG) {
+    return res.status(500).json({ error: 'Supabase auth is not configured on the server' });
+  }
+  const { email, password, orgName } = req.body || {};
+  const tier = req.body?.tier || 'free';
+  const interval = req.body?.interval;
+
+  if (!email || !password || !orgName) {
+    return res.status(400).json({ error: 'email, password, and orgName are required' });
+  }
+  if (String(password).length < 8) {
+    return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+  }
+  if (!['free', 'coach', 'organization'].includes(tier)) {
+    return res.status(400).json({ error: "tier must be 'free', 'coach', or 'organization'" });
+  }
+  if (tier !== 'free' && !priceIdFor(tier, interval)) {
+    return res.status(400).json({ error: "interval must be 'month' or 'year' for a paid tier" });
+  }
+
+  let userId = null;
+  let orgId = null;
+  try {
+    const { data: userData, error: userError } = await adminClient.auth.admin.createUser({
+      email, password, email_confirm: true,
+    });
+    if (userError) {
+      const status = /already registered|already exists/i.test(userError.message) ? 409 : 400;
+      return res.status(status).json({ error: userError.message });
+    }
+    userId = userData.user.id;
+
+    const slug = `${slugify(orgName)}-${userId.slice(0, 6)}`;
+    const { data: org, error: orgError } = await adminClient.from('organizations').insert({
+      name: orgName,
+      slug,
+      contact_email: email,
+      plan: 'free',
+      ...limitsColumnsForTier('free'),
+    }).select('id, name').single();
+    if (orgError) throw orgError;
+    orgId = org.id;
+
+    const { error: memberError } = await adminClient.from('org_members').insert({
+      org_id: orgId, user_id: userId, role: 'admin', accepted_at: new Date().toISOString(),
+    });
+    if (memberError) throw memberError;
+
+    const anonClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+    const { data: signInData, error: signInError } = await anonClient.auth.signInWithPassword({ email, password });
+    if (signInError) throw signInError;
+
+    let checkoutUrl = null;
+    if (tier !== 'free') {
+      checkoutUrl = await startCheckoutForOrg({
+        orgId, orgName: org.name, email, existingCustomerId: null, tier, interval, origin: requestOrigin(req),
+      });
+    }
+
+    res.json({
+      ok: true,
+      accessToken: signInData.session.access_token,
+      refreshToken: signInData.session.refresh_token,
+      expiresAt: signInData.session.expires_at,
+      user: { id: signInData.user.id, email: signInData.user.email },
+      checkoutUrl,
+    });
+  } catch (err) {
+    console.error('[auth/signup]', err);
+    // Best-effort cleanup so a mid-signup failure doesn't leave an orphaned org/user behind.
+    if (orgId) await adminClient.from('organizations').delete().eq('id', orgId).catch(() => {});
+    if (userId) await adminClient.auth.admin.deleteUser(userId).catch(() => {});
+    res.status(err.statusCode || 500).json({ error: err.message });
+  }
+});
+
 // POST /api/auth/login  { email, password }
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
@@ -728,6 +814,46 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
 function requestOrigin(req) {
   return APP_URL || `${req.protocol}://${req.get('host')}`;
+}
+
+// Creates (or reuses) a Stripe customer for the org and starts a subscription
+// Checkout Session. Shared by the in-app upgrade flow and signup.
+async function startCheckoutForOrg({ orgId, orgName, email, existingCustomerId, tier, interval, origin }) {
+  const priceId = priceIdFor(tier, interval);
+  if (!priceId) {
+    const err = new Error("tier must be 'coach' or 'organization' and interval must be 'month' or 'year'");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  let customerId = existingCustomerId;
+  if (!customerId) {
+    const customer = await stripe.customers.create({
+      email,
+      name: orgName,
+      metadata: { org_id: orgId },
+    });
+    customerId = customer.id;
+    await adminClient.from('organizations').update({ stripe_customer_id: customerId }).eq('id', orgId);
+  }
+
+  const session = await stripe.checkout.sessions.create({
+    mode: 'subscription',
+    customer: customerId,
+    line_items: [{ price: priceId, quantity: 1 }],
+    success_url: `${origin}/?billing=success`,
+    cancel_url: `${origin}/?billing=cancel`,
+    metadata: { org_id: orgId, plan_tier: tier },
+    subscription_data: { metadata: { org_id: orgId, plan_tier: tier } },
+  });
+  return session.url;
+}
+
+function slugify(name) {
+  return String(name).toLowerCase().trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60) || 'org';
 }
 
 // API versions 2023-08-16+ moved current_period_end off the top-level
@@ -872,10 +998,6 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
 app.post('/api/billing/create-checkout-session', requireAuth, requireOrgAdmin, async (req, res) => {
   if (!stripe) return res.status(500).json({ error: 'Stripe is not configured on the server' });
   const { tier, interval } = req.body || {};
-  const priceId = priceIdFor(tier, interval);
-  if (!priceId) {
-    return res.status(400).json({ error: "tier must be 'coach' or 'organization' and interval must be 'month' or 'year'" });
-  }
   try {
     const orgId = req._orgId;
     const org = await maybeSingleSafe(
@@ -883,31 +1005,14 @@ app.post('/api/billing/create-checkout-session', requireAuth, requireOrgAdmin, a
     );
     if (!org) return res.status(404).json({ error: 'Organization not found' });
 
-    let customerId = org.stripe_customer_id;
-    if (!customerId) {
-      const customer = await stripe.customers.create({
-        email: req.user.email,
-        name: org.name,
-        metadata: { org_id: orgId },
-      });
-      customerId = customer.id;
-      await adminClient.from('organizations').update({ stripe_customer_id: customerId }).eq('id', orgId);
-    }
-
-    const origin = requestOrigin(req);
-    const session = await stripe.checkout.sessions.create({
-      mode: 'subscription',
-      customer: customerId,
-      line_items: [{ price: priceId, quantity: 1 }],
-      success_url: `${origin}/?billing=success`,
-      cancel_url: `${origin}/?billing=cancel`,
-      metadata: { org_id: orgId, plan_tier: tier },
-      subscription_data: { metadata: { org_id: orgId, plan_tier: tier } },
+    const url = await startCheckoutForOrg({
+      orgId, orgName: org.name, email: req.user.email, existingCustomerId: org.stripe_customer_id,
+      tier, interval, origin: requestOrigin(req),
     });
-    res.json({ url: session.url });
+    res.json({ url });
   } catch (err) {
     console.error('[billing/create-checkout-session]', err);
-    res.status(500).json({ error: err.message });
+    res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
 
