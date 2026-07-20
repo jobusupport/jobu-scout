@@ -48,6 +48,10 @@ const fs        = require('fs');
 const { spawn } = require('child_process');
 let SQLiteDatabase = null;
 
+// ── Stripe ───────────────────────────────────────────────────────────────────
+const { stripe, priceIdFor, tierForPriceId } = require('./src/stripe');
+const APP_URL = process.env.APP_URL || null;
+
 // ── Supabase ─────────────────────────────────────────────────────────────────
 const { createClient } = require('@supabase/supabase-js');
 
@@ -81,7 +85,10 @@ const REPORTS_DIR = process.env.REPORTS_DIR || path.join(ROOT, 'reports');
 const PG_ROOT     = process.env.PG_OUTPUT_ROOT ||
   path.join(ROOT, 'perfectgame-scraper', 'output');
 
-app.use(express.json());
+app.set('trust proxy', true);
+app.use(express.json({
+  verify: (req, res, buf) => { req.rawBody = buf; },
+}));
 app.use('/reports', express.static(REPORTS_DIR));
 app.use(express.static(path.join(ROOT, 'dashboard')));
 
@@ -577,6 +584,28 @@ async function assertTeamInRequestOrg(req, teamId) {
   if (!data) throw new Error('Team not found for this organization.');
 }
 
+async function getRequestOrgRole(req, orgId) {
+  if (!USE_SUPABASE || !req.user?.id) return null;
+  const member = await maybeSingleSafe(
+    adminClient.from('org_members').select('role').eq('org_id', orgId).eq('user_id', req.user.id).limit(1)
+  );
+  return member?.role || null;
+}
+
+async function requireOrgAdmin(req, res, next) {
+  try {
+    const orgId = await getRequestOrgId(req);
+    const role = await getRequestOrgRole(req, orgId);
+    if (role !== 'admin') {
+      return res.status(403).json({ error: 'Only an organization admin can manage billing.' });
+    }
+    req._orgId = orgId;
+    next();
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+}
+
 // ── Auth middleware ──────────────────────────────────────────────────────────
 async function requireAuth(req, res, next) {
   const header = req.headers.authorization;
@@ -651,6 +680,232 @@ app.post('/api/auth/refresh', async (req, res) => {
     refreshToken: data.session.refresh_token,
     expiresAt:    data.session.expires_at,
   });
+});
+
+// ── Billing (Stripe) ───────────────────────────────────────────────────────────
+
+function requestOrigin(req) {
+  return APP_URL || `${req.protocol}://${req.get('host')}`;
+}
+
+async function findOrgIdFromStripeIds({ orgIdHint, customerId, subscriptionId }) {
+  if (orgIdHint) return orgIdHint;
+  if (subscriptionId) {
+    const row = await maybeSingleSafe(
+      adminClient.from('organizations').select('id').eq('stripe_subscription_id', subscriptionId).limit(1)
+    );
+    if (row?.id) return row.id;
+  }
+  if (customerId) {
+    const row = await maybeSingleSafe(
+      adminClient.from('organizations').select('id').eq('stripe_customer_id', customerId).limit(1)
+    );
+    if (row?.id) return row.id;
+  }
+  return null;
+}
+
+// GET /api/billing/status
+app.get('/api/billing/status', requireAuth, async (req, res) => {
+  try {
+    const orgId = await getRequestOrgId(req);
+    const role = await getRequestOrgRole(req, orgId);
+    const org = await maybeSingleSafe(
+      adminClient.from('organizations')
+        .select('plan, subscription_status, plan_expires_at, stripe_customer_id, max_opponent_teams, max_reports_per_month, max_users')
+        .eq('id', orgId).limit(1)
+    );
+    if (!org) return res.status(404).json({ error: 'Organization not found' });
+    res.json({
+      plan: org.plan,
+      subscriptionStatus: org.subscription_status,
+      planExpiresAt: org.plan_expires_at,
+      hasBillingAccount: !!org.stripe_customer_id,
+      limits: {
+        maxOpponentTeams: org.max_opponent_teams,
+        maxReportsPerMonth: org.max_reports_per_month,
+        maxUsers: org.max_users,
+      },
+      canManageBilling: role === 'admin',
+    });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// POST /api/billing/create-checkout-session  { tier: 'coach'|'organization', interval: 'month'|'year' }
+app.post('/api/billing/create-checkout-session', requireAuth, requireOrgAdmin, async (req, res) => {
+  if (!stripe) return res.status(500).json({ error: 'Stripe is not configured on the server' });
+  const { tier, interval } = req.body || {};
+  const priceId = priceIdFor(tier, interval);
+  if (!priceId) {
+    return res.status(400).json({ error: "tier must be 'coach' or 'organization' and interval must be 'month' or 'year'" });
+  }
+  try {
+    const orgId = req._orgId;
+    const org = await maybeSingleSafe(
+      adminClient.from('organizations').select('id, name, stripe_customer_id').eq('id', orgId).limit(1)
+    );
+    if (!org) return res.status(404).json({ error: 'Organization not found' });
+
+    let customerId = org.stripe_customer_id;
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: req.user.email,
+        name: org.name,
+        metadata: { org_id: orgId },
+      });
+      customerId = customer.id;
+      await adminClient.from('organizations').update({ stripe_customer_id: customerId }).eq('id', orgId);
+    }
+
+    const origin = requestOrigin(req);
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      customer: customerId,
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: `${origin}/?billing=success`,
+      cancel_url: `${origin}/?billing=cancel`,
+      metadata: { org_id: orgId, plan_tier: tier },
+      subscription_data: { metadata: { org_id: orgId, plan_tier: tier } },
+    });
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error('[billing/create-checkout-session]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/billing/create-portal-session
+app.post('/api/billing/create-portal-session', requireAuth, requireOrgAdmin, async (req, res) => {
+  if (!stripe) return res.status(500).json({ error: 'Stripe is not configured on the server' });
+  try {
+    const orgId = req._orgId;
+    const org = await maybeSingleSafe(
+      adminClient.from('organizations').select('stripe_customer_id').eq('id', orgId).limit(1)
+    );
+    if (!org?.stripe_customer_id) {
+      return res.status(400).json({ error: 'This organization has no billing account yet. Subscribe to a plan first.' });
+    }
+    const session = await stripe.billingPortal.sessions.create({
+      customer: org.stripe_customer_id,
+      return_url: requestOrigin(req),
+    });
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error('[billing/create-portal-session]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/webhooks/stripe — Stripe signature verification requires the raw body,
+// captured via the express.json() `verify` hook above (req.rawBody).
+app.post('/api/webhooks/stripe', async (req, res) => {
+  if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
+    return res.status(500).send('Stripe webhook is not configured on the server');
+  }
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.rawBody, req.headers['stripe-signature'], process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('[webhooks/stripe] signature verification failed:', err.message);
+    return res.status(400).send(`Webhook signature verification failed: ${err.message}`);
+  }
+
+  try {
+    const { error: insertError } = await adminClient
+      .from('stripe_webhook_events')
+      .insert({ id: event.id, type: event.type });
+    if (insertError) {
+      // Unique violation means we already processed this event ID — ack and skip.
+      if (insertError.code === '23505') return res.json({ received: true, deduped: true });
+      throw insertError;
+    }
+
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        if (session.mode === 'subscription' && session.subscription) {
+          const orgId = await findOrgIdFromStripeIds({
+            orgIdHint: session.metadata?.org_id,
+            customerId: session.customer,
+          });
+          if (orgId) {
+            const subscription = await stripe.subscriptions.retrieve(session.subscription);
+            const tier = tierForPriceId(subscription.items.data[0]?.price?.id) || session.metadata?.plan_tier || 'coach';
+            await adminClient.from('organizations').update({
+              plan: tier,
+              stripe_customer_id: session.customer,
+              stripe_subscription_id: subscription.id,
+              subscription_status: subscription.status,
+              plan_expires_at: new Date(subscription.current_period_end * 1000).toISOString(),
+            }).eq('id', orgId);
+          } else {
+            console.error('[webhooks/stripe] checkout.session.completed: could not resolve org_id', session.id);
+          }
+        }
+        break;
+      }
+
+      case 'customer.subscription.updated': {
+        const subscription = event.data.object;
+        const orgId = await findOrgIdFromStripeIds({
+          orgIdHint: subscription.metadata?.org_id,
+          customerId: subscription.customer,
+          subscriptionId: subscription.id,
+        });
+        if (orgId) {
+          const tier = tierForPriceId(subscription.items.data[0]?.price?.id);
+          await adminClient.from('organizations').update({
+            ...(tier ? { plan: tier } : {}),
+            stripe_subscription_id: subscription.id,
+            subscription_status: subscription.status,
+            plan_expires_at: new Date(subscription.current_period_end * 1000).toISOString(),
+          }).eq('id', orgId);
+        } else {
+          console.error('[webhooks/stripe] customer.subscription.updated: could not resolve org_id', subscription.id);
+        }
+        break;
+      }
+
+      case 'customer.subscription.deleted': {
+        const subscription = event.data.object;
+        const orgId = await findOrgIdFromStripeIds({
+          orgIdHint: subscription.metadata?.org_id,
+          customerId: subscription.customer,
+          subscriptionId: subscription.id,
+        });
+        if (orgId) {
+          await adminClient.from('organizations').update({
+            plan: 'free',
+            stripe_subscription_id: null,
+            subscription_status: 'canceled',
+            plan_expires_at: null,
+          }).eq('id', orgId);
+        } else {
+          console.error('[webhooks/stripe] customer.subscription.deleted: could not resolve org_id', subscription.id);
+        }
+        break;
+      }
+
+      case 'invoice.payment_failed': {
+        const invoice = event.data.object;
+        const orgId = await findOrgIdFromStripeIds({ customerId: invoice.customer });
+        if (orgId) {
+          await adminClient.from('organizations').update({ subscription_status: 'past_due' }).eq('id', orgId);
+        }
+        break;
+      }
+
+      default:
+        break;
+    }
+
+    res.json({ received: true });
+  } catch (err) {
+    console.error('[webhooks/stripe] handler error:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── API ─────────────────────────────────────────────────────────────────────

@@ -6,7 +6,7 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-	"postinstall": "npx playwright install chromium --with-deps",
+    "postinstall": "npx playwright install chromium --with-deps",
     "test": "echo \"Error: no test specified\" && exit 1",
     "login": "node src/login-gamechanger.js",
     "teams": "node src/test-read-teams.js",
@@ -27,7 +27,8 @@
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "playwright": "^1.60.0",
-    "sharp": "^0.34.5"
+    "sharp": "^0.34.5",
+    "stripe": "^22.3.1"
   },
   "devDependencies": {
     "@playwright/test": "^1.60.0"
