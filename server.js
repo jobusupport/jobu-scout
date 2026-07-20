@@ -49,7 +49,7 @@ const { spawn } = require('child_process');
 let SQLiteDatabase = null;
 
 // ── Stripe ───────────────────────────────────────────────────────────────────
-const { stripe, priceIdFor, tierForPriceId } = require('./src/stripe');
+const { stripe, priceIdFor, tierForPriceId, limitsColumnsForTier } = require('./src/stripe');
 const APP_URL = process.env.APP_URL || null;
 
 // ── Supabase ─────────────────────────────────────────────────────────────────
@@ -712,6 +712,50 @@ async function findOrgIdFromStripeIds({ orgIdHint, customerId, subscriptionId })
   return null;
 }
 
+function startOfCurrentMonthIso() {
+  const d = new Date();
+  d.setUTCDate(1);
+  d.setUTCHours(0, 0, 0, 0);
+  return d.toISOString();
+}
+
+// Checks the org's monthly quota for a report type against usage recorded in
+// the `reports` table, then records this generation. Throws (with
+// .statusCode = 403) when the quota is already used up.
+async function enforceReportQuota(req, { reportType, limitColumn, title, linkedTeamId }) {
+  if (!USE_SUPABASE) return;
+  const orgId = await getRequestOrgId(req);
+
+  const org = await maybeSingleSafe(
+    adminClient.from('organizations').select(limitColumn).eq('id', orgId).limit(1)
+  );
+  const limit = org?.[limitColumn] ?? 0;
+
+  const { count, error: countError } = await adminClient
+    .from('reports')
+    .select('id', { count: 'exact', head: true })
+    .eq('org_id', orgId)
+    .eq('report_type', reportType)
+    .gte('created_at', startOfCurrentMonthIso());
+  if (countError) throw countError;
+
+  if ((count || 0) >= limit) {
+    const label = reportType.replace('_', '-');
+    const err = new Error(`Monthly limit reached: ${limit} ${label} report${limit === 1 ? '' : 's'}/mo on your current plan. Upgrade your plan for more.`);
+    err.statusCode = 403;
+    throw err;
+  }
+
+  const { error: insertError } = await adminClient.from('reports').insert({
+    org_id: orgId,
+    created_by: req.user?.id || null,
+    linked_team_id: linkedTeamId || null,
+    report_type: reportType,
+    title,
+  });
+  if (insertError) throw insertError;
+}
+
 // GET /api/billing/status
 app.get('/api/billing/status', requireAuth, async (req, res) => {
   try {
@@ -719,10 +763,25 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
     const role = await getRequestOrgRole(req, orgId);
     const org = await maybeSingleSafe(
       adminClient.from('organizations')
-        .select('plan, subscription_status, plan_expires_at, stripe_customer_id, max_opponent_teams, max_reports_per_month, max_users')
+        .select('plan, subscription_status, plan_expires_at, stripe_customer_id, max_opponent_teams, max_reports_per_month, max_self_scout_reports_per_month, max_matchup_reports_per_month, max_users')
         .eq('id', orgId).limit(1)
     );
     if (!org) return res.status(404).json({ error: 'Organization not found' });
+
+    const monthStart = startOfCurrentMonthIso();
+    const countSince = async (query) => {
+      const { count, error } = await query;
+      if (error) throw error;
+      return count || 0;
+    };
+    const [opponentTeams, scoutingUsed, selfScoutUsed, matchupUsed, userCount] = await Promise.all([
+      countSince(adminClient.from('teams').select('id', { count: 'exact', head: true }).eq('org_id', orgId).eq('is_our_team', false).eq('archived', false)),
+      countSince(adminClient.from('reports').select('id', { count: 'exact', head: true }).eq('org_id', orgId).eq('report_type', 'opponent').gte('created_at', monthStart)),
+      countSince(adminClient.from('reports').select('id', { count: 'exact', head: true }).eq('org_id', orgId).eq('report_type', 'self_scout').gte('created_at', monthStart)),
+      countSince(adminClient.from('reports').select('id', { count: 'exact', head: true }).eq('org_id', orgId).eq('report_type', 'matchup').gte('created_at', monthStart)),
+      countSince(adminClient.from('org_members').select('id', { count: 'exact', head: true }).eq('org_id', orgId)),
+    ]);
+
     res.json({
       plan: org.plan,
       subscriptionStatus: org.subscription_status,
@@ -731,7 +790,16 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
       limits: {
         maxOpponentTeams: org.max_opponent_teams,
         maxReportsPerMonth: org.max_reports_per_month,
+        maxSelfScoutReportsPerMonth: org.max_self_scout_reports_per_month,
+        maxMatchupReportsPerMonth: org.max_matchup_reports_per_month,
         maxUsers: org.max_users,
+      },
+      usage: {
+        opponentTeams,
+        scoutingReportsThisMonth: scoutingUsed,
+        selfScoutReportsThisMonth: selfScoutUsed,
+        matchupReportsThisMonth: matchupUsed,
+        userCount,
       },
       canManageBilling: role === 'admin',
     });
@@ -845,6 +913,7 @@ app.post('/api/webhooks/stripe', async (req, res) => {
               stripe_subscription_id: subscription.id,
               subscription_status: subscription.status,
               plan_expires_at: subscriptionPeriodEnd(subscription),
+              ...limitsColumnsForTier(tier),
             }).eq('id', orgId);
           } else {
             console.error('[webhooks/stripe] checkout.session.completed: could not resolve org_id', session.id);
@@ -863,7 +932,7 @@ app.post('/api/webhooks/stripe', async (req, res) => {
         if (orgId) {
           const tier = tierForPriceId(subscription.items.data[0]?.price?.id);
           await adminClient.from('organizations').update({
-            ...(tier ? { plan: tier } : {}),
+            ...(tier ? { plan: tier, ...limitsColumnsForTier(tier) } : {}),
             stripe_subscription_id: subscription.id,
             subscription_status: subscription.status,
             plan_expires_at: subscriptionPeriodEnd(subscription),
@@ -887,6 +956,7 @@ app.post('/api/webhooks/stripe', async (req, res) => {
             stripe_subscription_id: null,
             subscription_status: 'canceled',
             plan_expires_at: null,
+            ...limitsColumnsForTier('free'),
           }).eq('id', orgId);
         } else {
           console.error('[webhooks/stripe] customer.subscription.deleted: could not resolve org_id', subscription.id);
@@ -1082,7 +1152,13 @@ app.post('/api/run/report', requireAuth, async (req, res) => {
   const { teamId } = req.body;
   const team = (await getTeams(req)).find(t => t.id == teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
-  const id = createJob(`Report — ${team.team_name}`);
+  const title = `Report — ${team.team_name}`;
+  try {
+    await enforceReportQuota(req, { reportType: 'opponent', limitColumn: 'max_reports_per_month', title, linkedTeamId: team.id });
+  } catch (err) {
+    return res.status(err.statusCode || 500).json({ error: err.message });
+  }
+  const id = createJob(title);
   appendLog(id, `Generating scouting report for: ${team.team_name}`);
   if (req.body.gameLocation) appendLog(id, `Game location: ${req.body.gameLocation}`);
   if (req.body.gameTime)     appendLog(id, `Game time: ${req.body.gameTime}`);
@@ -1095,6 +1171,11 @@ app.post('/api/run/report', requireAuth, async (req, res) => {
 
 // POST /api/run/self-scout  { gameLocation?, gameDate?, gameTime?, humanObservations?, customPrompt?, ourTeamId? }
 app.post('/api/run/self-scout', requireAuth, async (req, res) => {
+  try {
+    await enforceReportQuota(req, { reportType: 'self_scout', limitColumn: 'max_self_scout_reports_per_month', title: 'Self-Scout Report', linkedTeamId: req.body.ourTeamId });
+  } catch (err) {
+    return res.status(err.statusCode || 500).json({ error: err.message });
+  }
   const id = createJob('Self-Scout Report');
   appendLog(id, 'Generating self-scout report for our own team');
   const env = buildReportContextEnv({ ...req.body, gameScope: 'self' });
@@ -1109,6 +1190,11 @@ app.post('/api/run/matchup', requireAuth, async (req, res) => {
   const { teamId } = req.body;
   const team = (await getTeams(req)).find(t => t.id == teamId);
   if (!team) return res.status(404).json({ error: 'Opponent team not found' });
+  try {
+    await enforceReportQuota(req, { reportType: 'matchup', limitColumn: 'max_matchup_reports_per_month', title: `Matchup — ${team.team_name}`, linkedTeamId: team.id });
+  } catch (err) {
+    return res.status(err.statusCode || 500).json({ error: err.message });
+  }
   const id = createJob(`Matchup — ${team.team_name}`);
   appendLog(id, `Generating matchup report: our team vs ${team.team_name}`);
   const env = buildReportContextEnv({ ...req.body, gameScope: 'matchup' });
@@ -1122,6 +1208,11 @@ app.post('/api/run/full-pipeline', requireAuth, async (req, res) => {
   const { teamId, gameLocation, gameDate } = req.body;
   const team = (await getTeams(req)).find(t => t.id == teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
+  try {
+    await enforceReportQuota(req, { reportType: 'opponent', limitColumn: 'max_reports_per_month', title: `Report — ${team.team_name}`, linkedTeamId: team.id });
+  } catch (err) {
+    return res.status(err.statusCode || 500).json({ error: err.message });
+  }
   const id      = createJob(`Full Pipeline — ${team.team_name}`);
   const pgRoot  = path.join(ROOT, 'perfectgame-scraper');
   const noGC    = !team.gc_team_url && await hasGameUrls(team.id);
@@ -1224,10 +1315,17 @@ app.post('/api/run/all-reports', requireAuth, async (req, res) => {
   const runStep = makeRunStep(id);
   appendLog(id, `Generating reports for ${teams.length} team(s)...`);
   (async () => {
-    let done = 0, failed = 0;
+    let done = 0, failed = 0, quotaHit = false;
     for (const team of teams) {
       if (jobs[id]?.status !== 'running') break;
       appendLog(id, `\n── [${done+failed+1}/${teams.length}] ${team.team_name} ──`);
+      try {
+        await enforceReportQuota(req, { reportType: 'opponent', limitColumn: 'max_reports_per_month', title: `Report — ${team.team_name}`, linkedTeamId: team.id });
+      } catch (err) {
+        appendLog(id, `✗ Stopping: ${err.message}`);
+        quotaHit = true;
+        break;
+      }
       try {
         await runStep('node', ['src/generate-report.js', team.team_name], ROOT);
         appendLog(id, `✓ ${team.team_name} done`); done++;
@@ -1235,7 +1333,7 @@ app.post('/api/run/all-reports', requireAuth, async (req, res) => {
         appendLog(id, `✗ ${team.team_name} failed: ${err.message}`); failed++;
       }
     }
-    finishJob(id, failed === 0, 0);
+    finishJob(id, failed === 0 && !quotaHit, 0);
     appendLog(id, `\n── Complete: ${done} succeeded, ${failed} failed ──`);
   })();
   res.json({ jobId: id });
@@ -1354,6 +1452,25 @@ app.post('/api/teams/add', requireAuth, async (req, res) => {
         return res.status(409).json({
           error: `"${teamName}" already exists in this organization (id ${existing.id})`,
         });
+      }
+
+      if (!isOurTeam) {
+        const org = await maybeSingleSafe(
+          adminClient.from('organizations').select('max_opponent_teams').eq('id', orgId).limit(1)
+        );
+        const { count, error: countError } = await adminClient
+          .from('teams')
+          .select('id', { count: 'exact', head: true })
+          .eq('org_id', orgId)
+          .eq('is_our_team', false)
+          .eq('archived', false);
+        if (countError) throw countError;
+        const limit = org?.max_opponent_teams ?? 0;
+        if ((count || 0) >= limit) {
+          return res.status(403).json({
+            error: `Opponent team limit reached: ${limit} on your current plan. Upgrade your plan or archive an existing team to add more.`,
+          });
+        }
       }
 
       const { data, error } = await adminClient
