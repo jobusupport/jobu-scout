@@ -12,7 +12,11 @@ const { createClient } = require('@supabase/supabase-js');
 
 async function main() {
   const email = process.argv[2];
-  if (!email) { console.error('Usage: node scripts/check-email-delivery.js <email>'); process.exit(1); }
+  if (!email) {
+    console.error('Usage: node scripts/check-email-delivery.js <email>');
+    process.exitCode = 1;
+    return;
+  }
 
   const anon = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
   const { error } = await anon.auth.resetPasswordForEmail(email, {
@@ -27,7 +31,8 @@ async function main() {
       console.log('customers will never receive reset emails until custom SMTP is set up:');
       console.log('https://supabase.com/docs/guides/auth/auth-smtp');
     }
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 
   console.log(`OK — Supabase accepted the send request for ${email}.`);
