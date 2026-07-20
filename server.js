@@ -682,6 +682,42 @@ app.post('/api/auth/refresh', async (req, res) => {
   });
 });
 
+// POST /api/auth/forgot-password  { email }
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'email is required' });
+  if (!HAS_SUPABASE_CONFIG) {
+    return res.status(500).json({ error: 'Supabase auth is not configured on the server' });
+  }
+  const anonClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+  const redirectTo = `${requestOrigin(req)}/?reset=1`;
+  const { error } = await anonClient.auth.resetPasswordForEmail(email, { redirectTo });
+  // Always report success — don't reveal whether an account exists for this email.
+  if (error) console.error('[auth/forgot-password]', error.message);
+  res.json({ ok: true, message: 'If an account exists for that email, a reset link has been sent.' });
+});
+
+// POST /api/auth/reset-password  { accessToken, newPassword }
+app.post('/api/auth/reset-password', async (req, res) => {
+  const { accessToken, newPassword } = req.body || {};
+  if (!accessToken || !newPassword) {
+    return res.status(400).json({ error: 'accessToken and newPassword are required' });
+  }
+  if (String(newPassword).length < 8) {
+    return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+  }
+  if (!adminClient) {
+    return res.status(500).json({ error: 'Supabase auth is not configured on the server' });
+  }
+  const { data, error } = await adminClient.auth.getUser(accessToken);
+  if (error || !data?.user) {
+    return res.status(401).json({ error: 'Reset link is invalid or has expired. Request a new one.' });
+  }
+  const { error: updateError } = await adminClient.auth.admin.updateUserById(data.user.id, { password: newPassword });
+  if (updateError) return res.status(400).json({ error: updateError.message });
+  res.json({ ok: true });
+});
+
 // ── Billing (Stripe) ───────────────────────────────────────────────────────────
 
 function requestOrigin(req) {
@@ -719,29 +755,40 @@ function startOfCurrentMonthIso() {
   return d.toISOString();
 }
 
-// Checks the org's monthly quota for a report type against usage recorded in
-// the `reports` table, then records this generation. Throws (with
+// Checks the org's quota for a report type against usage recorded in the
+// `reports` table, then records this generation. Throws (with
 // .statusCode = 403) when the quota is already used up.
+//
+// Free-tier orgs get a one-time (lifetime) allotment rather than a monthly
+// one — the count never resets — so the quota window is only bounded to the
+// current calendar month for paid tiers.
 async function enforceReportQuota(req, { reportType, limitColumn, title, linkedTeamId }) {
   if (!USE_SUPABASE) return;
   const orgId = await getRequestOrgId(req);
 
   const org = await maybeSingleSafe(
-    adminClient.from('organizations').select(limitColumn).eq('id', orgId).limit(1)
+    adminClient.from('organizations').select(`plan, ${limitColumn}`).eq('id', orgId).limit(1)
   );
   const limit = org?.[limitColumn] ?? 0;
+  const isLifetime = org?.plan === 'free';
 
-  const { count, error: countError } = await adminClient
+  let query = adminClient
     .from('reports')
     .select('id', { count: 'exact', head: true })
     .eq('org_id', orgId)
-    .eq('report_type', reportType)
-    .gte('created_at', startOfCurrentMonthIso());
+    .eq('report_type', reportType);
+  if (!isLifetime) query = query.gte('created_at', startOfCurrentMonthIso());
+
+  const { count, error: countError } = await query;
   if (countError) throw countError;
 
   if ((count || 0) >= limit) {
     const label = reportType.replace('_', '-');
-    const err = new Error(`Monthly limit reached: ${limit} ${label} report${limit === 1 ? '' : 's'}/mo on your current plan. Upgrade your plan for more.`);
+    const err = new Error(
+      isLifetime
+        ? `Lifetime limit reached: ${limit} ${label} report${limit === 1 ? '' : 's'} on the free plan. Upgrade your plan for more.`
+        : `Monthly limit reached: ${limit} ${label} report${limit === 1 ? '' : 's'}/mo on your current plan. Upgrade your plan for more.`
+    );
     err.statusCode = 403;
     throw err;
   }
@@ -768,17 +815,23 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
     );
     if (!org) return res.status(404).json({ error: 'Organization not found' });
 
+    const isLifetime = org.plan === 'free';
     const monthStart = startOfCurrentMonthIso();
     const countSince = async (query) => {
       const { count, error } = await query;
       if (error) throw error;
       return count || 0;
     };
+    const reportCount = (reportType) => {
+      let q = adminClient.from('reports').select('id', { count: 'exact', head: true }).eq('org_id', orgId).eq('report_type', reportType);
+      if (!isLifetime) q = q.gte('created_at', monthStart);
+      return countSince(q);
+    };
     const [opponentTeams, scoutingUsed, selfScoutUsed, matchupUsed, userCount] = await Promise.all([
       countSince(adminClient.from('teams').select('id', { count: 'exact', head: true }).eq('org_id', orgId).eq('is_our_team', false).eq('archived', false)),
-      countSince(adminClient.from('reports').select('id', { count: 'exact', head: true }).eq('org_id', orgId).eq('report_type', 'opponent').gte('created_at', monthStart)),
-      countSince(adminClient.from('reports').select('id', { count: 'exact', head: true }).eq('org_id', orgId).eq('report_type', 'self_scout').gte('created_at', monthStart)),
-      countSince(adminClient.from('reports').select('id', { count: 'exact', head: true }).eq('org_id', orgId).eq('report_type', 'matchup').gte('created_at', monthStart)),
+      reportCount('opponent'),
+      reportCount('self_scout'),
+      reportCount('matchup'),
       countSince(adminClient.from('org_members').select('id', { count: 'exact', head: true }).eq('org_id', orgId)),
     ]);
 
@@ -787,6 +840,7 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
       subscriptionStatus: org.subscription_status,
       planExpiresAt: org.plan_expires_at,
       hasBillingAccount: !!org.stripe_customer_id,
+      reportLimitsAreLifetime: isLifetime,
       limits: {
         maxOpponentTeams: org.max_opponent_teams,
         maxReportsPerMonth: org.max_reports_per_month,
