@@ -688,6 +688,13 @@ function requestOrigin(req) {
   return APP_URL || `${req.protocol}://${req.get('host')}`;
 }
 
+// API versions 2023-08-16+ moved current_period_end off the top-level
+// Subscription object and onto each subscription item.
+function subscriptionPeriodEnd(subscription) {
+  const seconds = subscription.current_period_end ?? subscription.items?.data?.[0]?.current_period_end;
+  return seconds ? new Date(seconds * 1000).toISOString() : null;
+}
+
 async function findOrgIdFromStripeIds({ orgIdHint, customerId, subscriptionId }) {
   if (orgIdHint) return orgIdHint;
   if (subscriptionId) {
@@ -813,14 +820,13 @@ app.post('/api/webhooks/stripe', async (req, res) => {
   }
 
   try {
-    const { error: insertError } = await adminClient
-      .from('stripe_webhook_events')
-      .insert({ id: event.id, type: event.type });
-    if (insertError) {
-      // Unique violation means we already processed this event ID — ack and skip.
-      if (insertError.code === '23505') return res.json({ received: true, deduped: true });
-      throw insertError;
-    }
+    // Check-then-process-then-record: the dedupe row is only written after
+    // processing succeeds, so a mid-processing crash lets Stripe's retry
+    // reprocess the event instead of silently deduping a half-applied one.
+    const already = await maybeSingleSafe(
+      adminClient.from('stripe_webhook_events').select('id').eq('id', event.id).limit(1)
+    );
+    if (already) return res.json({ received: true, deduped: true });
 
     switch (event.type) {
       case 'checkout.session.completed': {
@@ -838,7 +844,7 @@ app.post('/api/webhooks/stripe', async (req, res) => {
               stripe_customer_id: session.customer,
               stripe_subscription_id: subscription.id,
               subscription_status: subscription.status,
-              plan_expires_at: new Date(subscription.current_period_end * 1000).toISOString(),
+              plan_expires_at: subscriptionPeriodEnd(subscription),
             }).eq('id', orgId);
           } else {
             console.error('[webhooks/stripe] checkout.session.completed: could not resolve org_id', session.id);
@@ -860,7 +866,7 @@ app.post('/api/webhooks/stripe', async (req, res) => {
             ...(tier ? { plan: tier } : {}),
             stripe_subscription_id: subscription.id,
             subscription_status: subscription.status,
-            plan_expires_at: new Date(subscription.current_period_end * 1000).toISOString(),
+            plan_expires_at: subscriptionPeriodEnd(subscription),
           }).eq('id', orgId);
         } else {
           console.error('[webhooks/stripe] customer.subscription.updated: could not resolve org_id', subscription.id);
@@ -900,6 +906,11 @@ app.post('/api/webhooks/stripe', async (req, res) => {
       default:
         break;
     }
+
+    const { error: insertError } = await adminClient
+      .from('stripe_webhook_events')
+      .insert({ id: event.id, type: event.type });
+    if (insertError && insertError.code !== '23505') throw insertError;
 
     res.json({ received: true });
   } catch (err) {
