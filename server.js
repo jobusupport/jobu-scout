@@ -692,8 +692,14 @@ app.post('/api/auth/forgot-password', async (req, res) => {
   const anonClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
   const redirectTo = `${requestOrigin(req)}/?reset=1`;
   const { error } = await anonClient.auth.resetPasswordForEmail(email, { redirectTo });
-  // Always report success — don't reveal whether an account exists for this email.
-  if (error) console.error('[auth/forgot-password]', error.message);
+  // Supabase silently no-ops (no error) for an email with no matching account,
+  // so there's no enumeration risk in surfacing a real error here — any error
+  // means the send itself failed (rate limit, unauthorized address, SMTP
+  // misconfiguration), which the caller needs to know about.
+  if (error) {
+    console.error('[auth/forgot-password]', error.message);
+    return res.status(502).json({ error: `Could not send reset email: ${error.message}` });
+  }
   res.json({ ok: true, message: 'If an account exists for that email, a reset link has been sent.' });
 });
 
