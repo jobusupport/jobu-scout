@@ -13,7 +13,9 @@
     "search-teams": "node src/search-gamechanger-teams.js",
     "save-gamechanger-session": "node src/login-gamechanger-session.js",
     "collect-gamechanger-screenshots": "node src/collect-gamechanger-screenshots.js",
-    "generate-report": "node src/generate-report.js"
+    "generate-report": "node src/generate-report.js",
+    "build:dashboard": "node scripts/build-dashboard.js",
+    "build:dashboard:check": "node scripts/build-dashboard.js --check"
   },
   "keywords": [],
   "author": "",
