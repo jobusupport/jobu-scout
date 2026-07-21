@@ -1,4 +1,5 @@
 .env
+.claude/settings.local.json
 node_modules/
 output/
 voodoo-scout.db
