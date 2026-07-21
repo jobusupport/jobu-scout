@@ -1176,6 +1176,22 @@ async function getPitcherAdvancedStats(teamId, isOurTeam = null) {
   return data || [];
 }
 
+// ─── Roster ──────────────────────────────────────────────────────────────────
+// Manually maintained roster (My Team > Roster tab). Table may not exist yet
+// on an older Supabase project that hasn't had the players migration applied
+// — treat that as "no roster maintained" rather than failing the report.
+async function getTeamRoster(teamId) {
+  const { data, error } = await getDb()
+    .from('roster_players')
+    .select('id, first_name, last_name, jersey_number, handedness, positions, is_pickup, availability_status, unavailable_until, injury_return_date')
+    .eq('team_id', teamId);
+  if (error) {
+    if (String(error.message || '').toLowerCase().includes('does not exist')) return [];
+    check(error, 'getTeamRoster');
+  }
+  return data || [];
+}
+
 // ─── Handedness ─────────────────────────────────────────────────────────────
 // Scraped from GC "Edit Player" modals (see search-gamechanger-teams.js) into
 // player_handedness. Coverage is partial — most teams have never had this
@@ -1340,6 +1356,7 @@ module.exports = {
   getTeamAnalysisBundle,
   getActiveRosterPlayers,
   getTeamLineupOrder,
+  getTeamRoster,
   // Reports
   insertScoutingReport,
   // Advanced stats

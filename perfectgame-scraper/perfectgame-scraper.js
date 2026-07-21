@@ -601,7 +601,7 @@ function writeStartupReport(report) {
 
   console.log("");
   console.log("=================================================");
-  console.log("Perfect Game Startup Team Load Report");
+  console.log("PSP Startup Team Load Report");
   console.log("=================================================");
   console.log(`Source type: ${report.source_type}`);
   console.log(`Source: ${report.source}`);
@@ -650,11 +650,11 @@ async function captureAndBuildSprayData(page, context, teamName, teamDir) {
 
   // ── Phase A: PG spray chart scraping (authenticated browser) ──────────────
   try {
-    console.log(`[Spray] Starting PG spray chart scrape for ${teamName}...`);
+    console.log(`[Spray] Starting PSP spray chart analysis for ${teamName}...`);
     pgSprayData = await scrapeTeamSprayData(page, context, teamName, teamDir);
-    console.log(`[Spray] PG spray complete: ${pgSprayData.players.length} players captured`);
+    console.log(`[Spray] PSP spray complete: ${pgSprayData.players.length} players captured`);
   } catch (err) {
-    console.error(`[Spray] PG spray scrape failed for ${teamName}: ${err.message}`);
+    console.error(`[Spray] PSP spray analysis failed for ${teamName}: ${err.message}`);
     // Non-fatal: continue to GC phase even if PG spray fails
     pgSprayData = { team: teamName, players: [], roster: [], errors: [err.message] };
   }
@@ -667,21 +667,21 @@ async function captureAndBuildSprayData(page, context, teamName, teamDir) {
       else resolve(d);
     });
   }).catch((err) => {
-    console.error(`[Spray] Cannot open GC database at ${GC_DB_PATH}: ${err.message}`);
+    console.error(`[Spray] Cannot open PSG database at ${GC_DB_PATH}: ${err.message}`);
     return null;
   });
 
   if (!db) {
-    console.warn(`[Spray] GC database unavailable — heat maps and discrepancy report skipped`);
+    console.warn(`[Spray] PSG database unavailable — heat maps and discrepancy report skipped`);
     return { pgSprayData, gcSprayData: null };
   }
 
   let gcResult = null;
   try {
     gcResult = await buildTeamSprayData(db, teamName, pgSprayData, teamDir);
-    console.log(`[Spray] GC spray engine complete: ${gcResult.gcSprayData.playerCount} players, ${gcResult.discrepancyCount} discrepancies`);
+    console.log(`[Spray] PSG spray engine complete: ${gcResult.gcSprayData.playerCount} players, ${gcResult.discrepancyCount} discrepancies`);
   } catch (err) {
-    console.error(`[Spray] GC spray engine failed for ${teamName}: ${err.message}`);
+    console.error(`[Spray] PSG spray engine failed for ${teamName}: ${err.message}`);
   } finally {
     await new Promise((resolve) => db.close(resolve)).catch(() => {});
   }
@@ -731,7 +731,7 @@ async function fetchTextWithRetry(url, options = {}) {
 async function getTeamsFromGoogleSheet() {
   if (!GOOGLE_SHEET_CSV_URL) return [];
 
-  console.log("Reading Perfect Game teams from the same Google Sheet CSV used by GameChanger...");
+  console.log("Reading PSP teams from the same Google Sheet CSV used by PSG...");
 
   const csvText = await fetchTextWithRetry(GOOGLE_SHEET_CSV_URL, {
     attempts: PG_GOOGLE_SHEET_FETCH_ATTEMPTS,
@@ -4011,7 +4011,7 @@ async function captureTeamStatsTables(page, teamDir, teamName) {
   ensureDirectory(statsTablesDir);
   if (PG_KEEP_DEBUG) ensureDirectory(debugDir);
 
-  console.log("Capturing requested Perfect Game stats tables...");
+  console.log("Capturing requested PSP stats tables...");
 
   await handlePageInterruptions(page);
   await safeHideFloatingJunk(page);
@@ -4022,7 +4022,7 @@ async function captureTeamStatsTables(page, teamDir, teamName) {
   const grid = await getStatsGrid(page, "Batting Stats");
 
   if (!grid) {
-    console.log("No visible DiamondKast stats table found after selecting Batting / Standard.");
+    console.log("No visible PSP stats table found after selecting Batting / Standard.");
 
     if (PG_KEEP_DEBUG) {
       await page.screenshot({
@@ -4689,7 +4689,7 @@ function deduplicateTeams(teams) {
   if (!teams.length) {
     console.error(JSON.stringify({
       success: false,
-      error: `No team URL was supplied. The scraper checked GOOGLE_SHEET_CSV_URL and ${TEAMS_CSV}, but no teams were found. Use the same published Google Sheet CSV URL as the GameChanger scraper, or create teams.csv.`
+      error: `No team URL was supplied. This job checked GOOGLE_SHEET_CSV_URL and ${TEAMS_CSV}, but no teams were found. Use the same published Google Sheet CSV URL used for PSG, or create teams.csv.`
     }, null, 2));
 
     process.exit(1);

@@ -79,7 +79,7 @@ async function listTeams() {
   const teams = await db.getAllTeams();
 
   if (!Array.isArray(teams) || !teams.length) {
-    console.log('\nNo teams in database yet. Run the scraper first.\n');
+    console.log('\nNo teams in database yet. Run team analysis first.\n');
     return;
   }
 
@@ -247,7 +247,7 @@ async function main() {
     const teams = await db.getAllTeams();
 
     if (!Array.isArray(teams) || !teams.length) {
-      console.log('\nNo teams in database. Run the scraper first.\n');
+      console.log('\nNo teams in database. Run team analysis first.\n');
       return;
     }
 

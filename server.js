@@ -1311,10 +1311,10 @@ app.post('/api/run/gc-scraper', requireAuth, resolveSupportSession, blockWriteDu
   await assertOrgActive(req);
   const team = (await getTeams(req)).find(t => t.id == req.body.teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
-  const id = createJob(`GC Scraper — ${team.team_name}`);
-  appendLog(id, `Starting GameChanger scraper for: ${team.team_name}`);
+  const id = createJob(`PSG Analysis — ${team.team_name}`);
+  appendLog(id, `Starting PSG analysis for: ${team.team_name}`);
   if (!team.gc_team_url && await hasGameUrls(team.id)) {
-    appendLog(id, `No team URL — scraping via individual game URLs`);
+    appendLog(id, `No team URL — analyzing via individual game URLs`);
     spawnJob(id, 'node', ['src/scrape-game-urls.js', `"${cleanTeamName(team.team_name)}"`], ROOT);
   } else {
     const env = {};
@@ -1330,8 +1330,8 @@ app.post('/api/run/pg-scraper', requireAuth, resolveSupportSession, blockWriteDu
   await assertOrgActive(req);
   const team = (await getTeams(req)).find(t => t.id == req.body.teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
-  const id = createJob(`PG Scraper — ${team.team_name}`);
-  appendLog(id, `Starting Perfect Game scraper for: ${team.team_name}`);
+  const id = createJob(`PSP Analysis — ${team.team_name}`);
+  appendLog(id, `Starting PSP analysis for: ${team.team_name}`);
   spawnJob(id, 'node', ['perfectgame-scraper.js', team.pg_team_url || '', team.team_name],
     path.join(ROOT, 'perfectgame-scraper'));
   res.json({ jobId: id });
@@ -1440,10 +1440,10 @@ app.post('/api/run/full-pipeline', requireAuth, resolveSupportSession, blockWrit
   const noGC    = !team.gc_team_url && await hasGameUrls(team.id);
   const runStep = makeRunStep(id);
   appendLog(id, `Running full pipeline for: ${team.team_name}`);
-  appendLog(id, `Steps: GC Scrape → PG Scrape → Reingest → Generate Report`);
+  appendLog(id, `Steps: PSG Analysis → PSP Analysis → Reingest → Generate Report`);
   (async () => {
     try {
-      appendLog(id, '── Step 1/4: GameChanger Scraper ──');
+      appendLog(id, '── Step 1/4: PSG Analysis ──');
       if (noGC) {
         await runStep('node', ['src/scrape-game-urls.js', `"${cleanTeamName(team.team_name)}"`], ROOT);
       } else {
@@ -1452,7 +1452,7 @@ app.post('/api/run/full-pipeline', requireAuth, resolveSupportSession, blockWrit
         gcEnv.GC_TEST_TEAM_CONTAINS = team.gc_search_name || team.team_name;
         await runStep('node', ['src/search-gamechanger-teams.js'], ROOT, gcEnv);
       }
-      appendLog(id, '── Step 2/4: Perfect Game Scraper ──');
+      appendLog(id, '── Step 2/4: PSP Analysis ──');
       await runStep('node', ['perfectgame-scraper.js', team.pg_team_url || '', team.team_name], pgRoot);
       appendLog(id, '── Step 3/4: Reingest & Stats ──');
       await runStep('node', ['reingest-games.js', team.team_name], ROOT);
@@ -1476,9 +1476,9 @@ app.post('/api/run/all-gc', requireAuth, resolveSupportSession, blockWriteDuring
   const teamsWithUrlFlags = await Promise.all(allTeams.map(async t => ({ ...t, _hasGameUrls: await hasGameUrls(t.id) })));
   const teams   = teamsWithUrlFlags.filter(t => t.gc_team_url || t._hasGameUrls);
   if (!teams.length) return res.status(400).json({ error: 'No teams with GC URLs or game URLs' });
-  const id      = createJob(`GC Scrape All (${teams.length} teams)`);
+  const id      = createJob(`PSG Analysis — All (${teams.length} teams)`);
   const runStep = makeRunStep(id);
-  appendLog(id, `Queuing GC scrape for ${teams.length} team(s)...`);
+  appendLog(id, `Queuing PSG analysis for ${teams.length} team(s)...`);
   (async () => {
     let done = 0, failed = 0;
     for (const team of teams) {
@@ -1509,10 +1509,10 @@ app.post('/api/run/all-pg', requireAuth, resolveSupportSession, blockWriteDuring
   await assertOrgActive(req);
   const teams   = (await getTeams(req)).filter(t => t.pg_team_url);
   if (!teams.length) return res.status(400).json({ error: 'No teams with PG URLs' });
-  const id      = createJob(`PG Scrape All (${teams.length} teams)`);
+  const id      = createJob(`PSP Analysis — All (${teams.length} teams)`);
   const pgRoot  = path.join(ROOT, 'perfectgame-scraper');
   const runStep = makeRunStep(id);
-  appendLog(id, `Queuing PG scrape for ${teams.length} team(s)...`);
+  appendLog(id, `Queuing PSP analysis for ${teams.length} team(s)...`);
   (async () => {
     let done = 0, failed = 0;
     for (const team of teams) {
@@ -1653,6 +1653,224 @@ app.delete('/api/teams/:id/game-urls/:urlId', requireAuth, resolveSupportSession
     db.prepare(`DELETE FROM team_game_urls WHERE id = ? AND team_id = ?`).run(req.params.urlId, req.params.id);
     db.close();
     res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Team Roster (Players) ───────────────────────────────────────────────────
+function normalizePositions(value) {
+  const parts = Array.isArray(value) ? value : String(value || '').split(',');
+  return parts.map(v => String(v).trim()).filter(Boolean).join(',');
+}
+
+app.get('/api/teams/:id/players', requireAuth, resolveSupportSession, async (req, res) => {
+  try {
+    if (USE_SUPABASE) {
+      await assertTeamInRequestOrg(req, req.params.id);
+      const { data, error } = await adminClient
+        .from('roster_players')
+        .select('*')
+        .eq('team_id', req.params.id)
+        .order('last_name');
+      if (error) throw error;
+      return res.json(data || []);
+    }
+
+    const db   = getDb();
+    const rows = db.prepare(`SELECT * FROM roster_players WHERE team_id = ? ORDER BY last_name, first_name`).all(req.params.id);
+    db.close();
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/teams/:id/players', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+  const { firstName, lastName, jerseyNumber, handedness, positions, isPickup, availabilityStatus, unavailableUntil, injuryReturnDate } = req.body;
+  if (!firstName || !lastName) return res.status(400).json({ error: 'firstName and lastName are required' });
+  if (availabilityStatus !== undefined && !['available', 'unavailable', 'injured'].includes(availabilityStatus)) {
+    return res.status(400).json({ error: 'availabilityStatus must be available, unavailable, or injured' });
+  }
+  const status = availabilityStatus || 'available';
+
+  try {
+    if (USE_SUPABASE) {
+      await assertTeamInRequestOrg(req, req.params.id);
+      const { data, error } = await adminClient
+        .from('roster_players')
+        .insert({
+          team_id: req.params.id,
+          first_name: firstName.trim(),
+          last_name: lastName.trim(),
+          jersey_number: jerseyNumber ? String(jerseyNumber).trim() : null,
+          handedness: handedness || null,
+          positions: normalizePositions(positions),
+          is_pickup: !!isPickup,
+          availability_status: status,
+          unavailable_until: status === 'unavailable' ? (unavailableUntil || null) : null,
+          injury_return_date: status === 'injured' ? (injuryReturnDate || null) : null,
+        })
+        .select('id')
+        .single();
+      if (error) throw error;
+      return res.json({ ok: true, id: data.id });
+    }
+
+    const db   = new (getSQLiteDatabase())(DB_PATH);
+    const info = db.prepare(`
+      INSERT INTO roster_players (team_id, first_name, last_name, jersey_number, handedness, positions, is_pickup, availability_status, unavailable_until, injury_return_date)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      req.params.id, firstName.trim(), lastName.trim(),
+      jerseyNumber ? String(jerseyNumber).trim() : null,
+      handedness || null, normalizePositions(positions), isPickup ? 1 : 0,
+      status,
+      status === 'unavailable' ? (unavailableUntil || null) : null,
+      status === 'injured' ? (injuryReturnDate || null) : null
+    );
+    db.close();
+    res.json({ ok: true, id: info.lastInsertRowid });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/teams/:id/players/:playerId', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+  const { firstName, lastName, jerseyNumber, handedness, positions, isPickup, availabilityStatus, unavailableUntil, injuryReturnDate } = req.body;
+  if (availabilityStatus !== undefined && !['available', 'unavailable', 'injured'].includes(availabilityStatus)) {
+    return res.status(400).json({ error: 'availabilityStatus must be available, unavailable, or injured' });
+  }
+
+  try {
+    if (USE_SUPABASE) {
+      await assertTeamInRequestOrg(req, req.params.id);
+      const updates = {};
+      if (firstName !== undefined)    updates.first_name    = firstName.trim();
+      if (lastName !== undefined)     updates.last_name     = lastName.trim();
+      if (jerseyNumber !== undefined) updates.jersey_number = jerseyNumber ? String(jerseyNumber).trim() : null;
+      if (handedness !== undefined)   updates.handedness    = handedness || null;
+      if (positions !== undefined)    updates.positions     = normalizePositions(positions);
+      if (isPickup !== undefined)     updates.is_pickup     = !!isPickup;
+      if (availabilityStatus !== undefined) {
+        updates.availability_status = availabilityStatus;
+        updates.unavailable_until   = availabilityStatus === 'unavailable' ? (unavailableUntil || null) : null;
+        updates.injury_return_date  = availabilityStatus === 'injured'     ? (injuryReturnDate || null) : null;
+      }
+      const { error } = await adminClient.from('roster_players').update(updates).eq('id', req.params.playerId).eq('team_id', req.params.id);
+      if (error) throw error;
+      return res.json({ ok: true });
+    }
+
+    const db       = new (getSQLiteDatabase())(DB_PATH);
+    const existing = db.prepare(`SELECT * FROM roster_players WHERE id = ? AND team_id = ?`).get(req.params.playerId, req.params.id);
+    if (!existing) { db.close(); return res.status(404).json({ error: 'Player not found' }); }
+
+    const next = {
+      first_name:          firstName !== undefined ? firstName.trim() : existing.first_name,
+      last_name:           lastName !== undefined ? lastName.trim() : existing.last_name,
+      jersey_number:       jerseyNumber !== undefined ? (jerseyNumber ? String(jerseyNumber).trim() : null) : existing.jersey_number,
+      handedness:          handedness !== undefined ? (handedness || null) : existing.handedness,
+      positions:           positions !== undefined ? normalizePositions(positions) : existing.positions,
+      is_pickup:           isPickup !== undefined ? (isPickup ? 1 : 0) : existing.is_pickup,
+      availability_status: availabilityStatus !== undefined ? availabilityStatus : existing.availability_status,
+      unavailable_until:   existing.unavailable_until,
+      injury_return_date:  existing.injury_return_date,
+    };
+    if (availabilityStatus !== undefined) {
+      next.unavailable_until  = availabilityStatus === 'unavailable' ? (unavailableUntil || null) : null;
+      next.injury_return_date = availabilityStatus === 'injured'     ? (injuryReturnDate || null) : null;
+    }
+
+    db.prepare(`
+      UPDATE roster_players SET
+        first_name = ?, last_name = ?, jersey_number = ?, handedness = ?, positions = ?,
+        is_pickup = ?, availability_status = ?, unavailable_until = ?, injury_return_date = ?,
+        updated_at = datetime('now')
+      WHERE id = ? AND team_id = ?
+    `).run(
+      next.first_name, next.last_name, next.jersey_number, next.handedness, next.positions,
+      next.is_pickup, next.availability_status, next.unavailable_until, next.injury_return_date,
+      req.params.playerId, req.params.id
+    );
+    db.close();
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/teams/:id/players/:playerId', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+  try {
+    if (USE_SUPABASE) {
+      await assertTeamInRequestOrg(req, req.params.id);
+      const { error } = await adminClient.from('roster_players').delete().eq('id', req.params.playerId).eq('team_id', req.params.id);
+      if (error) throw error;
+      return res.json({ ok: true });
+    }
+
+    const db = new (getSQLiteDatabase())(DB_PATH);
+    db.prepare(`DELETE FROM roster_players WHERE id = ? AND team_id = ?`).run(req.params.playerId, req.params.id);
+    db.close();
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Seeds the roster from player names already captured by PSG analysis (distinct
+// player_name values on this team's own side of batting/pitching lines), so a
+// coach doesn't have to retype a whole lineup by hand. Skips anyone whose
+// first+last name already exists on the roster; jersey/handedness/positions
+// are left blank for the coach to fill in via edit.
+app.post('/api/teams/:id/players/seed-from-games', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+  try {
+    let existingNames, distinctNames;
+
+    if (USE_SUPABASE) {
+      await assertTeamInRequestOrg(req, req.params.id);
+      const { data: existing, error: exErr } = await adminClient
+        .from('roster_players').select('first_name,last_name').eq('team_id', req.params.id);
+      if (exErr) throw exErr;
+      existingNames = new Set((existing || []).map(p => `${p.first_name} ${p.last_name}`.trim().toLowerCase()));
+
+      const [{ data: bat, error: batErr }, { data: pit, error: pitErr }] = await Promise.all([
+        adminClient.from('batting_lines').select('player_name').eq('team_id', req.params.id).eq('is_our_team', false),
+        adminClient.from('pitching_lines').select('player_name').eq('team_id', req.params.id).eq('is_our_team', false),
+      ]);
+      if (batErr) throw batErr;
+      if (pitErr) throw pitErr;
+      distinctNames = [...new Set([...(bat || []), ...(pit || [])].map(r => r.player_name).filter(Boolean))];
+    } else {
+      const db = getDb();
+      const existing = db.prepare(`SELECT first_name, last_name FROM roster_players WHERE team_id = ?`).all(req.params.id);
+      existingNames = new Set(existing.map(p => `${p.first_name} ${p.last_name}`.trim().toLowerCase()));
+      const rows = db.prepare(`
+        SELECT DISTINCT player_name FROM batting_lines WHERE team_id = ? AND is_our_team = 0
+        UNION
+        SELECT DISTINCT player_name FROM pitching_lines WHERE team_id = ? AND is_our_team = 0
+      `).all(req.params.id, req.params.id);
+      distinctNames = rows.map(r => r.player_name).filter(Boolean);
+      db.close();
+    }
+
+    const toAdd = [];
+    for (const rawName of distinctNames) {
+      const trimmed = rawName.trim();
+      if (!trimmed || existingNames.has(trimmed.toLowerCase())) continue;
+      const parts     = trimmed.split(/\s+/);
+      const lastName  = parts.length > 1 ? parts.pop() : parts[0];
+      const firstName = parts.length ? parts.join(' ') : lastName;
+      toAdd.push({ firstName, lastName });
+      existingNames.add(trimmed.toLowerCase());
+    }
+
+    if (!toAdd.length) return res.json({ ok: true, added: 0 });
+
+    if (USE_SUPABASE) {
+      const { error } = await adminClient.from('roster_players').insert(
+        toAdd.map(p => ({ team_id: req.params.id, first_name: p.firstName, last_name: p.lastName }))
+      );
+      if (error) throw error;
+    } else {
+      const db   = new (getSQLiteDatabase())(DB_PATH);
+      const stmt = db.prepare(`INSERT INTO roster_players (team_id, first_name, last_name) VALUES (?, ?, ?)`);
+      const insertMany = db.transaction(rows => { for (const r of rows) stmt.run(req.params.id, r.firstName, r.lastName); });
+      insertMany(toAdd);
+      db.close();
+    }
+
+    res.json({ ok: true, added: toAdd.length });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 

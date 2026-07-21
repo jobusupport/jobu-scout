@@ -126,14 +126,14 @@ function saveTeamUrlCache(cache) {
 function getKnownTeamUrl(team, teamUrlCache) {
   const sheetUrl = normalizeTeamUrl(team.gcTeamUrl);
   if (sheetUrl) {
-    console.log(`Found GC Team URL in spreadsheet: ${sheetUrl}`);
+    console.log(`Found PSG Team URL in spreadsheet: ${sheetUrl}`);
     return sheetUrl;
   }
   const keys = getTeamCacheKeys(team);
   for (const key of keys) {
     const cachedUrl = normalizeTeamUrl(teamUrlCache.get(key));
     if (cachedUrl) {
-      console.log(`Found GC Team URL in Team URLs.txt cache: ${cachedUrl}`);
+      console.log(`Found PSG Team URL in Team URLs.txt cache: ${cachedUrl}`);
       return cachedUrl;
     }
   }
@@ -200,7 +200,7 @@ async function captureHandednessForTeam(page, team, teamId, resolvedTeamUrl) {
     return;
   }
   if (!resolvedTeamUrl) {
-    console.warn(`[handedness] Skipping "${team.teamName}" — no resolved GC team URL was passed through from the game-capture step.`);
+    console.warn(`[handedness] Skipping "${team.teamName}" — no resolved PSG team URL was passed through from the game-capture step.`);
     return;
   }
 
@@ -409,10 +409,10 @@ async function safeClick(page, locator, description = "element") {
 async function submitTeamSearch(page, team, searchTerm) {
   console.log("");
   console.log("====================================");
-  console.log(`Searching GameChanger for: ${searchTerm}`);
+  console.log(`Searching PSG for: ${searchTerm}`);
   console.log(`Raw spreadsheet name: ${team.rawTeamName}`);
   console.log(`Clean team name: ${team.teamName}`);
-  console.log(`GC search name: ${team.gcSearchName || "Not provided"}`);
+  console.log(`PSG search name: ${team.gcSearchName || "Not provided"}`);
   console.log(`Classification: ${team.classification || "Not provided"}`);
   console.log(`Target age: ${team.age || "Not provided"}`);
   console.log(`Target From/city: ${team.from || team.city || "Not provided"}`);
@@ -822,7 +822,7 @@ async function openSchedulePage(page, label = 'team page') {
 
   const directScheduleUrl = await findScheduleUrlOnCurrentPage(page);
   if (directScheduleUrl) {
-    console.log(`[gc] Opening schedule URL directly: ${directScheduleUrl}`);
+    console.log(`[psg] Opening schedule URL directly: ${directScheduleUrl}`);
     await page.goto(directScheduleUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
     try {
       await page.waitForLoadState('networkidle', { timeout: 15000 });
@@ -835,7 +835,7 @@ async function openSchedulePage(page, label = 'team page') {
     return true;
   }
 
-  console.log('[gc] No direct schedule href found. Falling back to clicking the Schedule tab.');
+  console.log('[psg] No direct schedule href found. Falling back to clicking the Schedule tab.');
   return await clickScheduleTab(page);
 }
 
@@ -947,7 +947,7 @@ async function selectChronologicalPlaysOrder(page) {
   try {
     await reverseChronologicalText.waitFor({ state: "visible", timeout: 4000 });
     console.log('"Reverse Chronological" is visible.');
-    console.log('Clicking it to switch plays into Chronological order...');
+    console.log('Clicking it to switch plays into sequential order...');
     await reverseChronologicalText.click();
     await page.waitForTimeout(2000);
     await dismissDontMissOutPopup(page);
@@ -1314,9 +1314,9 @@ async function clickCompletedGameFromScheduleByIndex(page, targetIndex) {
 
       console.log(`Found completed game #${targetIndex + 1}: ${scheduleMeta.scoreText || scoreText}`);
       if (scheduleMeta.gameDate) {
-        console.log(`[gc] Schedule date captured for game #${targetIndex + 1}: ${scheduleMeta.gameDate}`);
+        console.log(`[psg] Schedule date captured for game #${targetIndex + 1}: ${scheduleMeta.gameDate}`);
       } else {
-        console.warn(`[gc] Could not capture schedule date for game #${targetIndex + 1}. Card text: ${scheduleMeta.cardText || '(none)'}`);
+        console.warn(`[psg] Could not capture schedule date for game #${targetIndex + 1}. Card text: ${scheduleMeta.cardText || '(none)'}`);
       }
 
       try {
@@ -1657,15 +1657,15 @@ async function extractGameDateFromCurrentPage(page, label = 'current page') {
     for (const candidate of candidates || []) {
       const normalized = normalizeScheduleDateText(candidate.text);
       if (normalized) {
-        console.log(`[gc] Date candidate from ${label}: ${normalized} | ${candidate.text}`);
+        console.log(`[psg] Date candidate from ${label}: ${normalized} | ${candidate.text}`);
         return { gameDate: normalized, dateText: candidate.text };
       }
     }
 
-    console.warn(`[gc] No usable date found on ${label}.`);
+    console.warn(`[psg] No usable date found on ${label}.`);
     return { gameDate: null, dateText: '' };
   } catch (error) {
-    console.warn(`[gc] Could not extract date from ${label}: ${error.message}`);
+    console.warn(`[psg] Could not extract date from ${label}: ${error.message}`);
     return { gameDate: null, dateText: '' };
   }
 }
@@ -2109,7 +2109,7 @@ async function extractAllPlaysByIncrementalScroll(page, maxScrolls = 60) {
     scrollHeight: el.scrollHeight,
     clientHeight: el.clientHeight,
   }));
-  console.log(`[gc][diag] Scroll container: <${scrollInfo.tag} id="${scrollInfo.id}" class="${scrollInfo.className}"> scrollHeight=${scrollInfo.scrollHeight} clientHeight=${scrollInfo.clientHeight}`);
+  console.log(`[psg][diag] Scroll container: <${scrollInfo.tag} id="${scrollInfo.id}" class="${scrollInfo.className}"> scrollHeight=${scrollInfo.scrollHeight} clientHeight=${scrollInfo.clientHeight}`);
 
   // Position the mouse over the scroll container before dispatching wheel
   // events — page.mouse.wheel() scrolls whatever element is under the
@@ -2119,7 +2119,7 @@ async function extractAllPlaysByIncrementalScroll(page, maxScrolls = 60) {
   if (box) {
     await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
   } else {
-    console.warn('[gc][diag] Could not get bounding box for scroll container — wheel events may not land on the right element.');
+    console.warn('[psg][diag] Could not get bounding box for scroll container — wheel events may not land on the right element.');
   }
 
   const seenKey = new Set();
@@ -2139,7 +2139,7 @@ async function extractAllPlaysByIncrementalScroll(page, maxScrolls = 60) {
   };
 
   const initialNewCount = await captureCurrentlyVisible();
-  console.log(`[gc][diag] Step 0 (pre-scroll): +${initialNewCount} new plays, total=${accumulated.length}`);
+  console.log(`[psg][diag] Step 0 (pre-scroll): +${initialNewCount} new plays, total=${accumulated.length}`);
 
   let stableStepsInARow = 0;
 
@@ -2156,7 +2156,7 @@ async function extractAllPlaysByIncrementalScroll(page, maxScrolls = 60) {
       (el) => el.scrollTop + el.clientHeight >= el.scrollHeight - 2
     );
 
-    console.log(`[gc][diag] Step ${i + 1}: scrollHeight ${prevHeight}→${newHeight}, +${newCount} new plays, total=${accumulated.length}, reachedBottom=${reachedBottom}`);
+    console.log(`[psg][diag] Step ${i + 1}: scrollHeight ${prevHeight}→${newHeight}, +${newCount} new plays, total=${accumulated.length}, reachedBottom=${reachedBottom}`);
 
     if (newCount === 0 && newHeight === prevHeight) {
       stableStepsInARow++;
@@ -2178,7 +2178,7 @@ async function extractPlays(page) {
   console.log("Extracting play-by-play from DOM...");
 
   if (GC_SKIP_PLAYS) {
-    console.warn('[gc] GC_SKIP_PLAYS=true — skipping play-by-play extraction for this repair run.');
+    console.warn('[psg] GC_SKIP_PLAYS=true — skipping play-by-play extraction for this repair run.');
     return [];
   }
 
@@ -2193,7 +2193,7 @@ async function extractPlays(page) {
       .replace(/\/lineup\/?$/, "/plays");
 
     if (playsUrl !== currentUrl) {
-      console.log(`[gc] Navigating directly to plays URL: ${playsUrl}`);
+      console.log(`[psg] Navigating directly to plays URL: ${playsUrl}`);
       await page.goto(playsUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
       try { await page.waitForLoadState("networkidle", { timeout: 10000 }); } catch {}
       await page.waitForTimeout(1500);
@@ -2202,14 +2202,14 @@ async function extractPlays(page) {
       await clickTabByName(page, "Plays");
     }
   } catch (error) {
-    console.warn(`[gc] Could not open Plays page. Continuing without play-by-play: ${error.message}`);
+    console.warn(`[psg] Could not open Plays page. Continuing without play-by-play: ${error.message}`);
     return [];
   }
 
   try {
     await withTimeout(selectChronologicalPlaysOrder(page), 12000, 'selectChronologicalPlaysOrder');
   } catch (error) {
-    console.warn(`[gc] Could not switch Plays order. Continuing with visible order: ${error.message}`);
+    console.warn(`[psg] Could not switch Plays order. Continuing with visible order: ${error.message}`);
   }
 
   try {
@@ -2222,7 +2222,7 @@ async function extractPlays(page) {
     console.log(`  Extracted ${plays.length} play-by-play events`);
     return plays;
   } catch (error) {
-    console.warn(`[gc] Play extraction failed. Continuing without play-by-play: ${error.message}`);
+    console.warn(`[psg] Play extraction failed. Continuing without play-by-play: ${error.message}`);
     return [];
   }
 }
@@ -2264,9 +2264,9 @@ async function extractGameData(page, team, scheduleMeta = null) {
     else if (recapPageDate.gameDate) resolvedGameDateSource = 'recap page';
     else if (scheduleGameMeta.gameDate) resolvedGameDateSource = 'schedule card';
     else resolvedGameDateSource = 'game header';
-    console.log(`[gc] Resolved game date: ${resolvedGameDate} (${resolvedGameDateSource})`);
+    console.log(`[psg] Resolved game date: ${resolvedGameDate} (${resolvedGameDateSource})`);
   } else {
-    console.warn(`[gc] Could not resolve game date for ${gameId || gameUrl}`);
+    console.warn(`[psg] Could not resolve game date for ${gameId || gameUrl}`);
   }
 
   // Cross-check: if the schedule card disagrees with the per-game page date,
@@ -2275,7 +2275,7 @@ async function extractGameData(page, team, scheduleMeta = null) {
   // logs even though we don't block on it.
   const perGamePageDate = boxScorePageDate.gameDate || recapPageDate.gameDate || null;
   if (perGamePageDate && scheduleGameMeta.gameDate && perGamePageDate !== scheduleGameMeta.gameDate) {
-    console.warn(`[gc] DATE MISMATCH for ${gameId || gameUrl}: schedule card said ${scheduleGameMeta.gameDate}, ` +
+    console.warn(`[psg] DATE MISMATCH for ${gameId || gameUrl}: schedule card said ${scheduleGameMeta.gameDate}, ` +
       `per-game page said ${perGamePageDate}. Using ${perGamePageDate}. If this repeats across many games in one run, ` +
       `the schedule-card date extraction is likely broken for this team's page layout.`);
   }
@@ -2288,7 +2288,7 @@ async function extractGameData(page, team, scheduleMeta = null) {
       'extractPlays'
     );
   } catch (error) {
-    console.warn(`[gc] Play extraction timed out/failed. Continuing with box score only: ${error.message}`);
+    console.warn(`[psg] Play extraction timed out/failed. Continuing with box score only: ${error.message}`);
     plays = [];
   }
 
@@ -2419,13 +2419,13 @@ function dbGameMatchesPageGame(dbGames, gameId, gameUrl) {
     if (!matched) return false;
 
     if (process.env.GC_REPROCESS_ALL_COMPLETED_GAMES === 'true') {
-      console.log(`[gc] Repair mode active. Reprocessing existing DB game: ${dbGameId || dbUrlGameId || dbUrl}`);
+      console.log(`[psg] Repair mode active. Reprocessing existing DB game: ${dbGameId || dbUrlGameId || dbUrl}`);
       return false;
     }
 
     const dbGameDate = game.gameDate || game.game_date || null;
     if (!dbGameDate && process.env.GC_REPAIR_MISSING_GAME_DATES !== 'false') {
-      console.log(`[gc] Existing DB game is missing game_date. Reprocessing to repair: ${dbGameId || dbUrlGameId || dbUrl}`);
+      console.log(`[psg] Existing DB game is missing game_date. Reprocessing to repair: ${dbGameId || dbUrlGameId || dbUrl}`);
       return false;
     }
 
@@ -2461,7 +2461,7 @@ function shouldForceReprocessDbGame(dbGame) {
 
 async function loadKnownCompleteDbGames(teamId) {
   if (!pipeline.getKnownCompleteGamesForTeam) {
-    console.log('[gc] DB completed-game lookup is not available. Falling back to schedule scan.');
+    console.log('[psg] DB completed-game lookup is not available. Falling back to schedule scan.');
     return [];
   }
 
@@ -2477,8 +2477,8 @@ async function loadKnownCompleteDbGames(teamId) {
 async function chooseIncrementalStartIndex(page, teamId, completedGameCount, knownDbGames) {
   const dbCompleteCount = knownDbGames.length;
 
-  console.log(`[gc] Complete games in DB for this team: ${dbCompleteCount}`);
-  console.log(`[gc] Completed games visible on GameChanger: ${completedGameCount}`);
+  console.log(`[psg] Complete games in DB for this team: ${dbCompleteCount}`);
+  console.log(`[psg] Completed games visible on PSG: ${completedGameCount}`);
 
   // Reliability-first default:
   // Counts alone are not safe because the DB can contain a non-contiguous set of games
@@ -2488,31 +2488,31 @@ async function chooseIncrementalStartIndex(page, teamId, completedGameCount, kno
   // every game already complete in the DB by GameChanger game id.
   if (process.env.GC_INCREMENTAL_FAST_START !== 'true') {
     if (dbCompleteCount === 0) {
-      console.log('[gc] No completed games found in DB. Starting at GameChanger completed game #1.');
+      console.log('[psg] No completed games found in DB. Starting at PSG completed game #1.');
     } else {
-      console.log('[gc] Safe reconciliation mode: scanning from GameChanger game #1 and skipping games already complete in DB.');
-      console.log('[gc] To re-enable count-based fast start, set GC_INCREMENTAL_FAST_START=true.');
+      console.log('[psg] Safe reconciliation mode: scanning from PSG game #1 and skipping games already complete in DB.');
+      console.log('[psg] To re-enable count-based fast start, set GC_INCREMENTAL_FAST_START=true.');
     }
     return 0;
   }
 
-  console.log('[gc] GC_INCREMENTAL_FAST_START=true. Attempting count-based boundary check.');
+  console.log('[psg] GC_INCREMENTAL_FAST_START=true. Attempting count-based boundary check.');
 
   if (dbCompleteCount === 0) {
-    console.log('[gc] No completed games found in DB. Starting at GameChanger completed game #1.');
+    console.log('[psg] No completed games found in DB. Starting at PSG completed game #1.');
     return 0;
   }
 
   if (completedGameCount <= dbCompleteCount) {
-    console.log('[gc] DB has at least as many complete games as GameChanger shows, but fast-start mode still verifies the boundary.');
+    console.log('[psg] DB has at least as many complete games as PSG shows, but fast-start mode still verifies the boundary.');
   }
 
   const verifyIndex = Math.min(dbCompleteCount - 1, completedGameCount - 1);
-  console.log(`[gc] Incremental scrape check: verifying GameChanger game #${verifyIndex + 1} is already in DB...`);
+  console.log(`[psg] Incremental analysis check: verifying PSG game #${verifyIndex + 1} is already in DB...`);
 
   const opened = await clickCompletedGameFromScheduleByIndex(page, verifyIndex);
   if (!opened) {
-    console.log('[gc] Could not open the DB boundary game. Falling back to a full schedule scan.');
+    console.log('[psg] Could not open the DB boundary game. Falling back to a full schedule scan.');
     return 0;
   }
 
@@ -2520,27 +2520,27 @@ async function chooseIncrementalStartIndex(page, teamId, completedGameCount, kno
   const verifyGameId = extractGameIdFromUrl(verifyUrl);
   const matchesDb = dbGameMatchesPageGame(knownDbGames, verifyGameId, verifyUrl);
 
-  console.log(`[gc] Boundary GameChanger game id: ${verifyGameId || '(none)'}`);
-  console.log(`[gc] Boundary game is in DB: ${matchesDb ? 'YES' : 'NO'}`);
+  console.log(`[psg] Boundary PSG game id: ${verifyGameId || '(none)'}`);
+  console.log(`[psg] Boundary game is in DB: ${matchesDb ? 'YES' : 'NO'}`);
 
   const returned = await clickBackToSchedule(page);
   if (!returned) {
-    console.log('[gc] Could not return to schedule after DB boundary check. Falling back to current page handling.');
+    console.log('[psg] Could not return to schedule after DB boundary check. Falling back to current page handling.');
     return 0;
   }
 
   if (matchesDb && completedGameCount > dbCompleteCount) {
     const startIndex = dbCompleteCount;
-    console.log(`[gc] Incremental scrape confirmed. Starting with new GameChanger game #${startIndex + 1}.`);
+    console.log(`[psg] Incremental analysis confirmed. Starting with new PSG game #${startIndex + 1}.`);
     return startIndex;
   }
 
   if (matchesDb && completedGameCount <= dbCompleteCount) {
-    console.log('[gc] Boundary matched, but counts suggest there may be no new games. Running a full duplicate-check scan to verify no gaps.');
+    console.log('[psg] Boundary matched, but counts suggest there may be no new games. Running a full duplicate-check scan to verify no gaps.');
     return 0;
   }
 
-  console.log('[gc] DB boundary did not match the GameChanger schedule. The DB set is non-contiguous. Falling back to a full scan with DB duplicate checks.');
+  console.log('[psg] DB boundary did not match the PSG schedule. The DB set is non-contiguous. Falling back to a full scan with DB duplicate checks.');
   return 0;
 }
 
@@ -2597,18 +2597,18 @@ async function writeFailedGameCaptureReport(page, team, gameIndex, phase, error,
     lines.push('-----');
     lines.push(getErrorMessage(error));
     fs.writeFileSync(txtPath, lines.join('\n'), 'utf8');
-    console.log(`[gc] Wrote failed game report: ${txtPath}`);
+    console.log(`[psg] Wrote failed game report: ${txtPath}`);
 
     try {
       if (page && !page.isClosed()) {
         await page.screenshot({ path: pngPath, fullPage: true, timeout: 15000 });
-        console.log(`[gc] Wrote failed game screenshot: ${pngPath}`);
+        console.log(`[psg] Wrote failed game screenshot: ${pngPath}`);
       }
     } catch (screenshotError) {
-      console.log(`[gc] Could not capture failure screenshot: ${screenshotError.message}`);
+      console.log(`[psg] Could not capture failure screenshot: ${screenshotError.message}`);
     }
   } catch (reportError) {
-    console.log(`[gc] Could not write failed game report: ${reportError.message}`);
+    console.log(`[psg] Could not write failed game report: ${reportError.message}`);
   }
 }
 
@@ -2625,19 +2625,19 @@ async function returnToScheduleSafely(page, scheduleUrl, label = 'return to sche
     const returned = await clickBackToSchedule(page);
     if (returned) return true;
   } catch (error) {
-    console.log(`[gc] Back-to-schedule click failed during ${label}: ${error.message}`);
+    console.log(`[psg] Back-to-schedule click failed during ${label}: ${error.message}`);
   }
 
   if (scheduleUrl) {
     try {
-      console.log(`[gc] Reloading schedule URL after ${label}: ${scheduleUrl}`);
+      console.log(`[psg] Reloading schedule URL after ${label}: ${scheduleUrl}`);
       await page.goto(scheduleUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
       try { await page.waitForLoadState('networkidle', { timeout: 15000 }); } catch {}
       await page.waitForTimeout(1500);
       await dismissDontMissOutPopup(page);
       return true;
     } catch (error) {
-      console.log(`[gc] Schedule reload failed during ${label}: ${error.message}`);
+      console.log(`[psg] Schedule reload failed during ${label}: ${error.message}`);
     }
   }
 
@@ -2657,7 +2657,7 @@ async function processOneCompletedGame(page, team, teamId, gameIndex, manifest, 
   // stuck on recap pages and avoids relying on the fragile "Back to Schedule" link.
   const preOpenDbMatch = findMatchingDbGame(knownDbGames, entryGameId, entryHref);
   if (preOpenDbMatch && !shouldForceReprocessDbGame(preOpenDbMatch)) {
-    console.log(`[gc] Skipping game already complete in DB without opening page: ${entryGameId || entryHref}`);
+    console.log(`[psg] Skipping game already complete in DB without opening page: ${entryGameId || entryHref}`);
     return { status: 'skipped_db', gameId: entryGameId, gameUrl: entryHref };
   }
 
@@ -2670,7 +2670,7 @@ async function processOneCompletedGame(page, team, teamId, gameIndex, manifest, 
 
     console.log('');
     console.log(`Opening completed game #${gameIndex + 1} directly from captured schedule URL...`);
-    console.log(`[gc] Schedule card: ${scheduleEntry?.scoreText || ''} | ${scheduleEntry?.gameDate || 'NO DATE'} | ${entryGameId || entryHref}`);
+    console.log(`[psg] Schedule card: ${scheduleEntry?.scoreText || ''} | ${scheduleEntry?.gameDate || 'NO DATE'} | ${entryGameId || entryHref}`);
 
     await withTimeout(
       page.goto(entryHref, { waitUntil: 'domcontentloaded', timeout: 60000 }),
@@ -2699,17 +2699,17 @@ async function processOneCompletedGame(page, team, teamId, gameIndex, manifest, 
     gameScheduleMeta = { ...openedMeta, openedUrl: gameUrl, openedGameId: gameId };
   }
 
-  console.log(`[gc] Opened GameChanger game #${gameIndex + 1}: ${gameId || gameUrl}`);
+  console.log(`[psg] Opened PSG game #${gameIndex + 1}: ${gameId || gameUrl}`);
 
   phase = 'db-duplicate-check';
   const dbMatch = findMatchingDbGame(knownDbGames, gameId, gameUrl);
   if (dbMatch && !shouldForceReprocessDbGame(dbMatch)) {
-    console.log(`[gc] Skipping game already complete in DB: ${gameId || gameUrl}`);
+    console.log(`[psg] Skipping game already complete in DB: ${gameId || gameUrl}`);
     return { status: 'skipped_db', gameId, gameUrl };
   }
 
   if (dbMatch && shouldForceReprocessDbGame(dbMatch)) {
-    console.log(`[gc] Reprocessing existing DB game because it is incomplete or repair mode is enabled: ${gameId || gameUrl}`);
+    console.log(`[psg] Reprocessing existing DB game because it is incomplete or repair mode is enabled: ${gameId || gameUrl}`);
   }
 
   phase = 'manifest-duplicate-check';
@@ -2719,7 +2719,7 @@ async function processOneCompletedGame(page, team, teamId, gameIndex, manifest, 
   }
 
   if (isGameAlreadyProcessed(manifest.processedGames, gameId)) {
-    console.log(`[gc] Manifest contains this game, but DB does not show it as complete. Re-scraping: ${gameId || gameUrl}`);
+    console.log(`[psg] Manifest contains this game, but DB does not show it as complete. Re-analyzing: ${gameId || gameUrl}`);
   }
 
   phase = 'extract-game-data';
@@ -2742,10 +2742,10 @@ async function processOneCompletedGame(page, team, teamId, gameIndex, manifest, 
   if (captureResult.gameData && captureResult.gameData.meta) {
     captureResult.gameData.meta.isOpponentTeam = ingestAsScoutedOpponent;
   }
-  console.log(`[gc] Ingest side mode: ${ingestAsScoutedOpponent ? 'scouted opponent/team stored as is_our_team=0' : 'self-scout/our team stored as is_our_team=1'}`);
+  console.log(`[psg] Ingest side mode: ${ingestAsScoutedOpponent ? 'scouted opponent/team stored as is_our_team=0' : 'self-scout/our team stored as is_our_team=1'}`);
 
   phase = 'db-write';
-  console.log('[gc] Writing extracted game to DB...');
+  console.log('[psg] Writing extracted game to DB...');
   const dbWriteResult = await withTimeout(
     pipeline.processExtractResult(captureResult, teamId),
     GC_GAME_DB_WRITE_TIMEOUT_MS,
@@ -2754,12 +2754,12 @@ async function processOneCompletedGame(page, team, teamId, gameIndex, manifest, 
 
   if (!dbWriteResult || dbWriteResult.success === false) {
     const error = dbWriteResult?.error || 'unknown error';
-    console.warn(`[gc] DB write did not complete cleanly: ${error}`);
-    console.warn('[gc] Not marking this game as processed because the DB write failed.');
+    console.warn(`[psg] DB write did not complete cleanly: ${error}`);
+    console.warn('[psg] Not marking this game as processed because the DB write failed.');
     throw new Error(`DB write failed for completed game #${gameIndex + 1}: ${error}`);
   }
 
-  console.log('[gc] DB write complete.');
+  console.log('[psg] DB write complete.');
 
   phase = 'manifest-update';
   if (!isGameAlreadyProcessed(manifest.processedGames, gameId)) {
@@ -2794,10 +2794,10 @@ async function processOneCompletedGame(page, team, teamId, gameIndex, manifest, 
 async function captureAllCompletedGamesFromSchedule(page, team, teamId, resolvedTeamUrl) {
   console.log('');
   console.log('Starting completed-game capture loop...');
-  console.log(`[gc] Per-game retry limit: ${GC_GAME_MAX_ATTEMPTS}`);
-  console.log(`[gc] Extraction timeout: ${GC_GAME_EXTRACTION_TIMEOUT_MS}ms`);
-  console.log(`[gc] DB write timeout: ${GC_GAME_DB_WRITE_TIMEOUT_MS}ms`);
-  console.log(`[gc] Plays extraction timeout: ${GC_PLAYS_EXTRACTION_TIMEOUT_MS}ms${GC_SKIP_PLAYS ? ' (GC_SKIP_PLAYS=true)' : ''}`);
+  console.log(`[psg] Per-game retry limit: ${GC_GAME_MAX_ATTEMPTS}`);
+  console.log(`[psg] Extraction timeout: ${GC_GAME_EXTRACTION_TIMEOUT_MS}ms`);
+  console.log(`[psg] DB write timeout: ${GC_GAME_DB_WRITE_TIMEOUT_MS}ms`);
+  console.log(`[psg] Plays extraction timeout: ${GC_PLAYS_EXTRACTION_TIMEOUT_MS}ms${GC_SKIP_PLAYS ? ' (GC_SKIP_PLAYS=true)' : ''}`);
 
   const teamDir = getTeamOutputDir(team);
   const manifest = loadProcessedGames(teamDir);
@@ -2815,7 +2815,7 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId, resolved
       'getVisibleCompletedGameCount'
     );
   } catch (error) {
-    console.error(`[gc] Could not count completed games on schedule: ${error.message}`);
+    console.error(`[psg] Could not count completed games on schedule: ${error.message}`);
     await writeFailedGameCaptureReport(page, team, 0, 'count-completed-games', error, { scheduleUrl });
     const recovered = await returnToScheduleSafely(page, scheduleUrl, 'count completed games recovery');
     if (!recovered) throw error;
@@ -2823,7 +2823,7 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId, resolved
   }
 
   console.log(`Visible completed games on schedule: ${completedGameCount}`);
-  console.log(`[gc] Complete games in DB for this team: ${knownDbGames.length}`);
+  console.log(`[psg] Complete games in DB for this team: ${knownDbGames.length}`);
 
   let scheduleEntries = [];
   try {
@@ -2833,16 +2833,16 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId, resolved
       'getVisibleCompletedGameEntries'
     );
   } catch (error) {
-    console.warn(`[gc] Could not capture schedule entries up front: ${error.message}`);
+    console.warn(`[psg] Could not capture schedule entries up front: ${error.message}`);
     scheduleEntries = [];
   }
 
   const directEntries = scheduleEntries.filter((entry) => entry.href || entry.gameId);
   if (directEntries.length) {
     completedGameCount = directEntries.length;
-    console.log(`[gc] Captured ${directEntries.length} completed schedule entries with direct game URLs.`);
+    console.log(`[psg] Captured ${directEntries.length} completed schedule entries with direct game URLs.`);
   } else {
-    console.warn('[gc] Could not capture direct game URLs from the schedule. Falling back to click-by-index mode.');
+    console.warn('[psg] Could not capture direct game URLs from the schedule. Falling back to click-by-index mode.');
   }
 
   if (completedGameCount === 0) {
@@ -2850,9 +2850,9 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId, resolved
     return true;
   }
 
-  console.log('[gc] Resume mode: starting at the end of the GameChanger schedule and walking forward.');
-  console.log('[gc] Each game is skipped only when that exact GameChanger game id is already complete in the DB.');
-  console.log('[gc] Direct URL mode avoids fragile Back-to-Schedule navigation after skipped games.');
+  console.log('[psg] Resume mode: starting at the end of the PSG schedule and walking forward.');
+  console.log('[psg] Each game is skipped only when that exact PSG game id is already complete in the DB.');
+  console.log('[psg] Direct URL mode avoids fragile Back-to-Schedule navigation after skipped games.');
 
   const scheduleIndexes = buildResumeOrderedScheduleIndexes(completedGameCount);
 
@@ -2869,7 +2869,7 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId, resolved
 
     while (attempt <= GC_GAME_MAX_ATTEMPTS && !finishedThisIndex) {
       console.log('');
-      console.log(`[gc] Processing completed game #${gameIndex + 1} of ${completedGameCount} (attempt ${attempt}/${GC_GAME_MAX_ATTEMPTS})...`);
+      console.log(`[psg] Processing completed game #${gameIndex + 1} of ${completedGameCount} (attempt ${attempt}/${GC_GAME_MAX_ATTEMPTS})...`);
       try {
         const result = await processOneCompletedGame(page, team, teamId, gameIndex, manifest, knownDbGames, scheduleUrl, scheduleEntry);
         lastStatus = result.status;
@@ -2881,13 +2881,13 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId, resolved
         finishedThisIndex = true;
       } catch (error) {
         lastStatus = error.message;
-        console.error(`[gc] Error processing completed game #${gameIndex + 1} attempt ${attempt}: ${error.message}`);
+        console.error(`[psg] Error processing completed game #${gameIndex + 1} attempt ${attempt}: ${error.message}`);
         console.error(getErrorMessage(error));
         await writeFailedGameCaptureReport(page, team, gameIndex, `attempt-${attempt}`, error, { scheduleUrl });
 
         if (attempt >= GC_GAME_MAX_ATTEMPTS) {
           failures.push({ gameNumber: gameIndex + 1, error: error.message });
-          console.warn(`[gc] Giving up on completed game #${gameIndex + 1} after ${GC_GAME_MAX_ATTEMPTS} attempt(s). Continuing to the next game.`);
+          console.warn(`[psg] Giving up on completed game #${gameIndex + 1} after ${GC_GAME_MAX_ATTEMPTS} attempt(s). Continuing to the next game.`);
           finishedThisIndex = true;
         }
       } finally {
@@ -2895,7 +2895,7 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId, resolved
           const returned = await returnToScheduleSafely(page, scheduleUrl, `game #${gameIndex + 1} attempt ${attempt}`);
           if (!returned) {
             const err = new Error(`Could not return to schedule after game #${gameIndex + 1} attempt ${attempt}. Last status: ${lastStatus || 'unknown'}`);
-            console.error(`[gc] ${err.message}`);
+            console.error(`[psg] ${err.message}`);
             await writeFailedGameCaptureReport(page, team, gameIndex, `return-to-schedule-attempt-${attempt}`, err, { scheduleUrl });
             if (attempt >= GC_GAME_MAX_ATTEMPTS) {
               failures.push({ gameNumber: gameIndex + 1, error: err.message });
@@ -2911,10 +2911,10 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId, resolved
 
   console.log('No more completed games to process for this team.');
   if (failures.length) {
-    console.warn(`[gc] Completed schedule scan with ${failures.length} failed game(s). Failed games were not marked processed and will be retried on the next run.`);
-    for (const f of failures) console.warn(`[gc] Failed game #${f.gameNumber}: ${f.status || f.error}`);
+    console.warn(`[psg] Completed schedule scan with ${failures.length} failed game(s). Failed games were not marked processed and will be retried on the next run.`);
+    for (const f of failures) console.warn(`[psg] Failed game #${f.gameNumber}: ${f.status || f.error}`);
   }
-  console.log(`[gc] Summary: processed=${processed.length}, skipped=${skipped.length}, failed=${failures.length}`);
+  console.log(`[psg] Summary: processed=${processed.length}, skipped=${skipped.length}, failed=${failures.length}`);
 
   // ── Date-collapse integrity check ─────────────────────────────────────────
   // If this run processed several games and they all landed on the same
@@ -2930,12 +2930,12 @@ async function captureAllCompletedGamesFromSchedule(page, team, teamId, resolved
     if (distinctDates.size === 1 && distinctOpponents.size > 2) {
       console.warn('');
       console.warn('##################################################################');
-      console.warn('[gc] DATE INTEGRITY WARNING: all ' + datedGames.length + ' games processed in this ' +
+      console.warn('[psg] DATE INTEGRITY WARNING: all ' + datedGames.length + ' games processed in this ' +
         'run for "' + (team.teamName || 'this team') + '" resolved to the same game_date (' +
         [...distinctDates][0] + ') against ' + distinctOpponents.size + ' different opponents.');
-      console.warn('[gc] This is almost certainly wrong (a team cannot realistically play that many ' +
+      console.warn('[psg] This is almost certainly wrong (a team cannot realistically play that many ' +
         'different opponents in one day) and will corrupt PitchSmart pitcher-availability data.');
-      console.warn('[gc] Do NOT trust this team\'s dates until re-scraped. See date-resolution logic in ' +
+      console.warn('[psg] Do NOT trust this team\'s dates until re-analyzed. See date-resolution logic in ' +
         'extractGameData / getVisibleCompletedGameEntries / clickCompletedGameFromScheduleByIndex.');
       console.warn('##################################################################');
       console.warn('');
@@ -2984,7 +2984,7 @@ async function processTeamFromKnownUrl(page, team, teamId, knownTeamUrl, teamUrl
   if (!url) return false;
 
   console.log("");
-  console.log("Known GameChanger Team URL found. Skipping search.");
+  console.log("Known PSG Team URL found. Skipping search.");
   console.log(`Team: ${team.teamName}`);
   console.log(`URL: ${url}`);
 
@@ -3017,13 +3017,13 @@ async function processTeam(page, team, teamNumber, totalTeams, teamUrlCache) {
   console.log("################################################################################");
 
   // ── NEW: register/fetch team in DB ──
-  console.log("[gc] Ensuring team exists in DB...");
+  console.log("[psg] Ensuring team exists in DB...");
   const teamId = await withTimeout(
     pipeline.ensureTeam(team),
     30000,
     "pipeline.ensureTeam"
   );
-  console.log(`[gc] DB team id: ${teamId}`);
+  console.log(`[psg] DB team id: ${teamId}`);
 
   const knownTeamUrl = getKnownTeamUrl(team, teamUrlCache);
 
@@ -3064,7 +3064,7 @@ async function processTeam(page, team, teamNumber, totalTeams, teamUrlCache) {
   }
 
   console.log("");
-  console.log(`No confident GameChanger team match found for: ${team.teamName}`);
+  console.log(`No confident PSG team match found for: ${team.teamName}`);
   console.log("Writing failure report and moving on to the next team.");
   await writeFailedMatchReport(team, searchTerms, debugInfo);
   return false;
@@ -3133,7 +3133,7 @@ async function main() {
   // ── NEW: initialize pipeline / database ──
   pipeline.init(DB_PATH);
   console.log(`Voodoo Scout DB: ${DB_PATH}`);
-  console.log(`Accepted GameChanger seasons: ${getAcceptedSeasonLabel()}`);
+  console.log(`Accepted PSG seasons: ${getAcceptedSeasonLabel()}`);
   console.log(`Screenshot fallback: ${SCREENSHOT_FALLBACK ? "ON" : "OFF (structured extraction only)"}`);
 
 console.log('[browser] Launching Chromium...');
@@ -3188,7 +3188,7 @@ try {
 if (require.main === module) {
   main().catch((error) => {
     console.error("");
-    console.error("GameChanger team search failed:");
+    console.error("PSG team search failed:");
     console.error(error.message);
     console.error(error.stack);
     console.error("");
@@ -3244,7 +3244,7 @@ console.log('[browser] Chromium launched successfully.');
   const teamUrlCache = loadTeamUrlCache();
 
   try {
-    console.log(`Accepted GameChanger seasons: ${getAcceptedSeasonLabel()}`);
+    console.log(`Accepted PSG seasons: ${getAcceptedSeasonLabel()}`);
     console.log(`Screenshot fallback: ${SCREENSHOT_FALLBACK ? "ON" : "OFF (structured extraction only)"}`);
     await processTeam(page, team, 1, 1, teamUrlCache);
   } finally {

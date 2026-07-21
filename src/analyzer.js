@@ -970,7 +970,7 @@ async function analyzeTeam(teamId, options = {}) {
     throw new Error(`${bundle.team.team_name} has no games yet. Run the scraper first.`);
   }
 
-  console.log(`[analyzer] Sending to Claude (${CLAUDE_MODEL})...`);
+  console.log(`[analyzer] Sending to Jobu (${CLAUDE_MODEL})...`);
 
   const analysis = await callClaude(SYSTEM_PROMPT, buildAnalysisPrompt(bundle, options));
   const pitchSmart = computePitchSmartEligibility(bundle, options);
@@ -1066,10 +1066,47 @@ function formatHandednessBlock(rows, teamLabel) {
   return `${teamLabel} (verified, scraped from GameChanger — treat as ground truth):\n${lines.join('\n')}`;
 }
 
+// ─── Roster (My Team > Roster tab: availability/injury/pickup) ─────────────
+// A player counts as "currently injured" if their status is 'injured' and
+// either no return date has been set yet (TBD) or the return date is still
+// in the future. A past return date is treated as recovered without
+// requiring the coach to manually flip the status back.
+function isPlayerCurrentlyInjured(rosterEntry) {
+  if (!rosterEntry || rosterEntry.availability_status !== 'injured') return false;
+  if (!rosterEntry.injury_return_date) return true;
+  return new Date(`${rosterEntry.injury_return_date}T00:00:00`).getTime() > Date.now();
+}
+
+function buildRosterLookup(roster = []) {
+  const map = new Map();
+  for (const entry of roster) {
+    const fullName = `${entry.first_name || ''} ${entry.last_name || ''}`.trim().toLowerCase();
+    if (fullName) map.set(fullName, entry);
+  }
+  return map;
+}
+
+// Excludes currently-injured players from OUR team's own stat rows and tags
+// pickup players' names so the AI notes them separately in the report,
+// per the roster maintained on the My Team > Roster tab. Only ever applied
+// to arrays of our own team's players, never an opponent's.
+function applyRosterToPlayerRows(rows, roster) {
+  if (!roster || !roster.length) return rows || [];
+  const lookup = buildRosterLookup(roster);
+  return (rows || [])
+    .filter(row => !isPlayerCurrentlyInjured(lookup.get(String(row.player_name || '').trim().toLowerCase())))
+    .map(row => {
+      const entry = lookup.get(String(row.player_name || '').trim().toLowerCase());
+      return entry?.is_pickup ? { ...row, player_name: `${row.player_name} (pickup player)` } : row;
+    });
+}
+
 function buildSelfScoutPrompt(bundle, options = {}) {
-  const { team, games, meta, playerAdvanced = [], ourPitchers = [] } = bundle;
+  const { team, games, meta, playerAdvanced: playerAdvancedRaw = [], ourPitchers: ourPitchersRaw = [] } = bundle;
   const { gameLocation = null, gameDate = null } = options;
   const coachContextBlock = buildCoachContextBlock(options);
+  const playerAdvanced = applyRosterToPlayerRows(playerAdvancedRaw, bundle.roster);
+  const ourPitchers     = applyRosterToPlayerRows(ourPitchersRaw, bundle.roster);
 
   // IMPORTANT: despite the name, self-scout reads the SAME side as the
   // opponent report (`!b.is_our_team`), not the opposite side. Teams in this
@@ -1083,12 +1120,12 @@ function buildSelfScoutPrompt(bundle, options = {}) {
   // across 21 different opponents at is_our_team=true. Only flip this if a
   // team was deliberately ingested with GAME_INVERT_TEAM_SIDE=true at scrape
   // time (options.invertTeamSide === true) — see analyzeSelfScout below.
-  const batting  = options.invertTeamSide === true
+  const batting  = applyRosterToPlayerRows(options.invertTeamSide === true
     ? (bundle.batting  || []).filter(b => b.is_our_team)
-    : (bundle.batting  || []).filter(b => !b.is_our_team);
-  const pitching = options.invertTeamSide === true
+    : (bundle.batting  || []).filter(b => !b.is_our_team), bundle.roster);
+  const pitching = applyRosterToPlayerRows(options.invertTeamSide === true
     ? (bundle.pitching || []).filter(p => p.is_our_team)
-    : (bundle.pitching || []).filter(p => !p.is_our_team);
+    : (bundle.pitching || []).filter(p => !p.is_our_team), bundle.roster);
 
   const wins   = games.filter(g => g.result === 'W').length;
   const losses = games.filter(g => g.result === 'L').length;
@@ -1248,13 +1285,14 @@ async function analyzeSelfScout(teamId, options = {}) {
   const bundle = await pipeline.getTeamBundle(teamId);
   if (!bundle || !bundle.team) throw new Error(`No team found with id: ${teamId}`);
   if (bundle.meta.gamesAnalyzed === 0) {
-    throw new Error(`${bundle.team.team_name} has no games yet. Run the scraper first.`);
+    throw new Error(`${bundle.team.team_name} has no games yet. Run PSG analysis first.`);
   }
 
   bundle.handedness = await db.getTeamHandedness(teamId).catch(() => []);
+  bundle.roster     = await db.getTeamRoster(teamId).catch(() => []);
 
   console.log(`[analyzer] Self-scout team: ${bundle.team.team_name} — ${bundle.meta.gamesAnalyzed} games`);
-  console.log(`[analyzer] Sending to Claude (${CLAUDE_MODEL})...`);
+  console.log(`[analyzer] Sending to Jobu (${CLAUDE_MODEL})...`);
 
   const analysis = await callClaude(SELF_SCOUT_SYSTEM_PROMPT, buildSelfScoutPrompt(bundle, options));
 
@@ -1296,14 +1334,16 @@ function buildMatchupPrompt(ourBundle, oppBundle, options = {}) {
   // Same fix as buildSelfScoutPrompt: our own team's data sits on the
   // is_our_team=false side unless it was deliberately ingested inverted.
   const ourInverted = options.invertOurTeamSide === true;
-  const ourBatting  = ourInverted
+  const ourBatting  = applyRosterToPlayerRows(ourInverted
     ? (ourBundle.batting  || []).filter(b => b.is_our_team)
-    : (ourBundle.batting  || []).filter(b => !b.is_our_team);
-  const ourPitching = ourInverted
+    : (ourBundle.batting  || []).filter(b => !b.is_our_team), ourBundle.roster);
+  const ourPitching = applyRosterToPlayerRows(ourInverted
     ? (ourBundle.pitching || []).filter(p => p.is_our_team)
-    : (ourBundle.pitching || []).filter(p => !p.is_our_team);
+    : (ourBundle.pitching || []).filter(p => !p.is_our_team), ourBundle.roster);
   const oppBatting  = (oppBundle.batting  || []).filter(b => !b.is_our_team);
   const oppPitching = (oppBundle.pitching || []).filter(p => !p.is_our_team);
+  const ourPlayerAdvanced = applyRosterToPlayerRows(ourBundle.playerAdvanced, ourBundle.roster);
+  const ourPitchersAdv    = applyRosterToPlayerRows(ourBundle.ourPitchers, ourBundle.roster);
 
   const summarizeBatting = rows => rows.map(b =>
     `${b.player_name}: ${b.games}G ${b.total_ab}AB ${b.total_h}H ${b.total_2b ?? 0}2B ${b.total_3b ?? 0}3B ${b.total_hr ?? 0}HR ` +
@@ -1341,11 +1381,11 @@ GAMES ANALYZED: ${ourBundle.meta.gamesAnalyzed}
 OUR BATTING:
 ${summarizeBatting(ourBatting) || 'No batting data'}
 OUR BATTING (advanced):
-${summarizeAdvBatting(ourBundle.playerAdvanced) || 'No advanced batting data'}
+${summarizeAdvBatting(ourPlayerAdvanced) || 'No advanced batting data'}
 OUR PITCHING:
 ${summarizePitching(ourPitching) || 'No pitching data'}
 OUR PITCHING (advanced):
-${summarizeAdvPitching(ourBundle.ourPitchers) || 'No advanced pitching data'}
+${summarizeAdvPitching(ourPitchersAdv) || 'No advanced pitching data'}
 
 === OPPONENT: ${oppTeam.team_name} (${oppTeam.classification || 'Unknown'} | ${oppTeam.age_group || '?'}U) ===
 GAMES ANALYZED: ${oppBundle.meta.gamesAnalyzed}
@@ -1449,9 +1489,10 @@ async function analyzeMatchup(ourTeamId, opponentTeamId, options = {}) {
     db.getTeamHandedness(ourTeamId).catch(() => []),
     db.getTeamHandedness(opponentTeamId).catch(() => []),
   ]);
+  ourBundle.roster = await db.getTeamRoster(ourTeamId).catch(() => []);
 
   console.log(`[analyzer] Our team: ${ourBundle.team.team_name} (${ourBundle.meta.gamesAnalyzed}g) vs Opponent: ${oppBundle.team.team_name} (${oppBundle.meta.gamesAnalyzed}g)`);
-  console.log(`[analyzer] Sending to Claude (${CLAUDE_MODEL})...`);
+  console.log(`[analyzer] Sending to Jobu (${CLAUDE_MODEL})...`);
 
   const analysis = await callClaude(MATCHUP_SYSTEM_PROMPT, buildMatchupPrompt(ourBundle, oppBundle, options));
 

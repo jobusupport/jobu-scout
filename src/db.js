@@ -1088,6 +1088,20 @@ function getPitcherAdvancedStats(teamId, isOurTeam = null) {
   `).all(teamId);
 }
 
+// Manually maintained roster (My Team > Roster tab): name, jersey,
+// handedness, positions, availability/injury status, pickup-player flag.
+// See migrations/003_players.js.
+function getTeamRoster(teamId) {
+  const rows = getDb().prepare(`
+    SELECT id, first_name, last_name, jersey_number, handedness, positions,
+           is_pickup, availability_status, unavailable_until, injury_return_date
+    FROM roster_players
+    WHERE team_id = ?
+    ORDER BY last_name, first_name
+  `).all(teamId);
+  return rows.map(r => ({ ...r, is_pickup: !!r.is_pickup }));
+}
+
 // player_handedness only exists in the Supabase schema right now (see
 // db-supabase.js). Local SQLite dev has no equivalent table, so this stub
 // just returns "not tracked" rather than throwing.
@@ -1158,6 +1172,7 @@ module.exports = {
   getTeamAnalysisBundle,
   getActiveRosterPlayers,
   getTeamLineupOrder,
+  getTeamRoster,
   // Reports
   insertScoutingReport,
   // Advanced stats
