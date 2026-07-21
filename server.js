@@ -66,6 +66,13 @@ const adminClient = HAS_SUPABASE_CONFIG
   ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
   : null;
 
+// ── Admin panel ──────────────────────────────────────────────────────────────
+const createAdminRouter = require('./src/admin-api');
+const {
+  resolveSupportSession,
+  blockWriteDuringReadOnlySupport,
+} = require('./src/admin-lib');
+
 let pipelineDb = null;
 if (USE_SUPABASE) {
   pipelineDb = require('./src/db');
@@ -91,6 +98,12 @@ app.use(express.json({
 }));
 app.use('/reports', express.static(REPORTS_DIR));
 app.use(express.static(path.join(ROOT, 'dashboard')));
+
+// Admin panel — a separate, hand-written static page (not run through the
+// dashboard bundler). Auth/authorization is re-verified client-side against
+// GET /api/admin/status before it renders anything, and every /api/admin/*
+// route independently requires requireAuth + requireJobuAdmin server-side.
+app.get(['/admin', '/admin/*splat'], (req, res) => res.sendFile(path.join(ROOT, 'admin', 'index.html')));
 
 // ── Job store ───────────────────────────────────────────────────────────────
 const jobs = {};
@@ -584,6 +597,27 @@ async function assertTeamInRequestOrg(req, teamId) {
   if (!data) throw new Error('Team not found for this organization.');
 }
 
+// Blocks resource-consuming actions (report generation, scraper runs) for a
+// suspended/cancelled org. Scoped to the /api/run/* trigger endpoints only —
+// browsing existing data on a suspended org is intentionally still allowed
+// in this pass (a full suspended-account UX is a deliberate follow-up).
+async function assertOrgActive(req) {
+  if (!USE_SUPABASE) return;
+  const orgId = await getRequestOrgId(req);
+  const org = await maybeSingleSafe(
+    adminClient.from('organizations').select('status').eq('id', orgId).limit(1)
+  );
+  if (org && org.status !== 'active') {
+    const err = new Error(
+      org.status === 'suspended'
+        ? 'This account is suspended. Contact support@jobuscout.com for help.'
+        : 'This account is no longer active. Contact support@jobuscout.com for help.'
+    );
+    err.statusCode = 403;
+    throw err;
+  }
+}
+
 async function getRequestOrgRole(req, orgId) {
   if (!USE_SUPABASE || !req.user?.id) return null;
   const member = await maybeSingleSafe(
@@ -624,6 +658,8 @@ async function requireAuth(req, res, next) {
   req.jwt  = jwt;
   next();
 }
+
+app.use('/api/admin', createAdminRouter({ requireAuth }));
 
 // ── Auth routes ──────────────────────────────────────────────────────────────
 
@@ -895,7 +931,8 @@ function startOfCurrentMonthIso() {
 // one — the count never resets — so the quota window is only bounded to the
 // current calendar month for paid tiers.
 async function enforceReportQuota(req, { reportType, limitColumn, title, linkedTeamId }) {
-  if (!USE_SUPABASE) return;
+  if (!USE_SUPABASE) return null;
+  await assertOrgActive(req);
   const orgId = await getRequestOrgId(req);
 
   const org = await maybeSingleSafe(
@@ -925,14 +962,27 @@ async function enforceReportQuota(req, { reportType, limitColumn, title, linkedT
     throw err;
   }
 
-  const { error: insertError } = await adminClient.from('reports').insert({
+  const { data: inserted, error: insertError } = await adminClient.from('reports').insert({
     org_id: orgId,
     created_by: req.user?.id || null,
     linked_team_id: linkedTeamId || null,
     report_type: reportType,
     title,
-  });
+  }).select('id').single();
   if (insertError) throw insertError;
+  return { reportId: inserted.id, orgId };
+}
+
+// Env vars consumed by src/analyzer.js's callClaude() to attribute AI usage
+// events to the right tenant/report — the report-generation script runs as a
+// spawned child process, so this is passed the same way GAME_LOCATION etc.
+// already are (see buildReportContextEnv above), not via a function param.
+function buildUsageEnv(req, quota) {
+  const env = {};
+  if (req.user?.id) env.JOBU_USAGE_USER_ID = req.user.id;
+  if (quota?.orgId) env.JOBU_USAGE_ORG_ID = quota.orgId;
+  if (quota?.reportId) env.JOBU_USAGE_REPORT_ID = quota.reportId;
+  return env;
 }
 
 // GET /api/billing/status
@@ -1169,7 +1219,7 @@ app.get('/api/debug/auth', (req, res) => {
   res.json({ authPath, exists, cwd, storageContents, appContents });
 });
 
-app.get('/api/teams', requireAuth, async (req, res) => {
+app.get('/api/teams', requireAuth, resolveSupportSession, async (req, res) => {
   try {
     const includeArchived = req.query.includeArchived === 'true';
     const rawTeams = await getTeams(req, includeArchived);
@@ -1191,7 +1241,7 @@ app.get('/api/teams', requireAuth, async (req, res) => {
 });
 
 
-app.get('/api/teams/:id/summary', requireAuth, async (req, res) => {
+app.get('/api/teams/:id/summary', requireAuth, resolveSupportSession, async (req, res) => {
   try {
     if (USE_SUPABASE) await assertTeamInRequestOrg(req, req.params.id);
     res.json(await getTeamSummary(req.params.id));
@@ -1201,7 +1251,7 @@ app.get('/api/teams/:id/summary', requireAuth, async (req, res) => {
   }
 });
 
-app.get('/api/reports', requireAuth, (req, res) => res.json(getReports()));
+app.get('/api/reports', requireAuth, resolveSupportSession, (req, res) => res.json(getReports()));
 
 app.get('/api/jobs/:id', requireAuth, (req, res) => {
   const job = jobs[req.params.id];
@@ -1257,7 +1307,8 @@ app.post('/api/jobs/:id/stop', (req, res) => {
 });
 
 // POST /api/run/gc-scraper
-app.post('/api/run/gc-scraper', requireAuth, async (req, res) => {
+app.post('/api/run/gc-scraper', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+  await assertOrgActive(req);
   const team = (await getTeams(req)).find(t => t.id == req.body.teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
   const id = createJob(`GC Scraper — ${team.team_name}`);
@@ -1275,7 +1326,8 @@ app.post('/api/run/gc-scraper', requireAuth, async (req, res) => {
 });
 
 // POST /api/run/pg-scraper
-app.post('/api/run/pg-scraper', requireAuth, async (req, res) => {
+app.post('/api/run/pg-scraper', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+  await assertOrgActive(req);
   const team = (await getTeams(req)).find(t => t.id == req.body.teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
   const id = createJob(`PG Scraper — ${team.team_name}`);
@@ -1286,7 +1338,8 @@ app.post('/api/run/pg-scraper', requireAuth, async (req, res) => {
 });
 
 // POST /api/run/reingest
-app.post('/api/run/reingest', requireAuth, async (req, res) => {
+app.post('/api/run/reingest', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+  await assertOrgActive(req);
   const team  = req.body.teamId ? (await getTeams(req)).find(t => t.id == req.body.teamId) : null;
   const label = team ? `Reingest — ${team.team_name}` : 'Reingest — All Teams';
   const id    = createJob(label);
@@ -1313,13 +1366,14 @@ function buildReportContextEnv(body = {}) {
 }
 
 // POST /api/run/report  { teamId, gameLocation?, gameDate?, gameTime?, humanObservations?, gameScope?, customPrompt? }
-app.post('/api/run/report', requireAuth, async (req, res) => {
+app.post('/api/run/report', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
   const { teamId } = req.body;
   const team = (await getTeams(req)).find(t => t.id == teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
   const title = `Report — ${team.team_name}`;
+  let quota;
   try {
-    await enforceReportQuota(req, { reportType: 'opponent', limitColumn: 'max_reports_per_month', title, linkedTeamId: team.id });
+    quota = await enforceReportQuota(req, { reportType: 'opponent', limitColumn: 'max_reports_per_month', title, linkedTeamId: team.id });
   } catch (err) {
     return res.status(err.statusCode || 500).json({ error: err.message });
   }
@@ -1329,21 +1383,22 @@ app.post('/api/run/report', requireAuth, async (req, res) => {
   if (req.body.gameTime)     appendLog(id, `Game time: ${req.body.gameTime}`);
   if (req.body.humanObservations) appendLog(id, `Coach observations provided (${req.body.humanObservations.length} chars)`);
   if (req.body.customPrompt)      appendLog(id, `Custom prompt provided (${req.body.customPrompt.length} chars)`);
-  const env = buildReportContextEnv(req.body);
+  const env = { ...buildReportContextEnv(req.body), ...buildUsageEnv(req, quota) };
   spawnJob(id, 'node', ['src/generate-report.js', team.team_name], ROOT, env);
   res.json({ jobId: id });
 });
 
 // POST /api/run/self-scout  { gameLocation?, gameDate?, gameTime?, humanObservations?, customPrompt?, ourTeamId? }
-app.post('/api/run/self-scout', requireAuth, async (req, res) => {
+app.post('/api/run/self-scout', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+  let quota;
   try {
-    await enforceReportQuota(req, { reportType: 'self_scout', limitColumn: 'max_self_scout_reports_per_month', title: 'Self-Scout Report', linkedTeamId: req.body.ourTeamId });
+    quota = await enforceReportQuota(req, { reportType: 'self_scout', limitColumn: 'max_self_scout_reports_per_month', title: 'Self-Scout Report', linkedTeamId: req.body.ourTeamId });
   } catch (err) {
     return res.status(err.statusCode || 500).json({ error: err.message });
   }
   const id = createJob('Self-Scout Report');
   appendLog(id, 'Generating self-scout report for our own team');
-  const env = buildReportContextEnv({ ...req.body, gameScope: 'self' });
+  const env = { ...buildReportContextEnv({ ...req.body, gameScope: 'self' }), ...buildUsageEnv(req, quota) };
   if (req.body.ourTeamId) env.OUR_TEAM_ID = req.body.ourTeamId;
   spawnJob(id, 'node', ['src/generate-report.js', '--self-scout'], ROOT, env);
   res.json({ jobId: id });
@@ -1351,30 +1406,32 @@ app.post('/api/run/self-scout', requireAuth, async (req, res) => {
 
 // POST /api/run/matchup  { teamId, gameLocation?, gameDate?, gameTime?, humanObservations?, customPrompt?, ourTeamId? }
 // teamId is the OPPONENT team we're building the matchup game plan against.
-app.post('/api/run/matchup', requireAuth, async (req, res) => {
+app.post('/api/run/matchup', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
   const { teamId } = req.body;
   const team = (await getTeams(req)).find(t => t.id == teamId);
   if (!team) return res.status(404).json({ error: 'Opponent team not found' });
+  let quota;
   try {
-    await enforceReportQuota(req, { reportType: 'matchup', limitColumn: 'max_matchup_reports_per_month', title: `Matchup — ${team.team_name}`, linkedTeamId: team.id });
+    quota = await enforceReportQuota(req, { reportType: 'matchup', limitColumn: 'max_matchup_reports_per_month', title: `Matchup — ${team.team_name}`, linkedTeamId: team.id });
   } catch (err) {
     return res.status(err.statusCode || 500).json({ error: err.message });
   }
   const id = createJob(`Matchup — ${team.team_name}`);
   appendLog(id, `Generating matchup report: our team vs ${team.team_name}`);
-  const env = buildReportContextEnv({ ...req.body, gameScope: 'matchup' });
+  const env = { ...buildReportContextEnv({ ...req.body, gameScope: 'matchup' }), ...buildUsageEnv(req, quota) };
   if (req.body.ourTeamId) env.OUR_TEAM_ID = req.body.ourTeamId;
   spawnJob(id, 'node', ['src/generate-report.js', '--matchup', team.team_name], ROOT, env);
   res.json({ jobId: id });
 });
 
 // POST /api/run/full-pipeline  { teamId, gameLocation?, gameDate?, gameTime?, humanObservations?, gameScope?, customPrompt? }
-app.post('/api/run/full-pipeline', requireAuth, async (req, res) => {
+app.post('/api/run/full-pipeline', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
   const { teamId, gameLocation, gameDate } = req.body;
   const team = (await getTeams(req)).find(t => t.id == teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
+  let quota;
   try {
-    await enforceReportQuota(req, { reportType: 'opponent', limitColumn: 'max_reports_per_month', title: `Report — ${team.team_name}`, linkedTeamId: team.id });
+    quota = await enforceReportQuota(req, { reportType: 'opponent', limitColumn: 'max_reports_per_month', title: `Report — ${team.team_name}`, linkedTeamId: team.id });
   } catch (err) {
     return res.status(err.statusCode || 500).json({ error: err.message });
   }
@@ -1400,7 +1457,7 @@ app.post('/api/run/full-pipeline', requireAuth, async (req, res) => {
       appendLog(id, '── Step 3/4: Reingest & Stats ──');
       await runStep('node', ['reingest-games.js', team.team_name], ROOT);
       appendLog(id, '── Step 4/4: Generate Report ──');
-      const reportEnv = buildReportContextEnv(req.body);
+      const reportEnv = { ...buildReportContextEnv(req.body), ...buildUsageEnv(req, quota) };
       await runStep('node', ['src/generate-report.js', team.team_name], ROOT, reportEnv);
       finishJob(id, true, 0);
       appendLog(id, `✓ Pipeline complete for ${team.team_name}`);
@@ -1413,7 +1470,8 @@ app.post('/api/run/full-pipeline', requireAuth, async (req, res) => {
 });
 
 // POST /api/run/all-gc — scrape all teams GC
-app.post('/api/run/all-gc', requireAuth, async (req, res) => {
+app.post('/api/run/all-gc', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+  await assertOrgActive(req);
   const allTeams = await getTeams(req);
   const teamsWithUrlFlags = await Promise.all(allTeams.map(async t => ({ ...t, _hasGameUrls: await hasGameUrls(t.id) })));
   const teams   = teamsWithUrlFlags.filter(t => t.gc_team_url || t._hasGameUrls);
@@ -1447,7 +1505,8 @@ app.post('/api/run/all-gc', requireAuth, async (req, res) => {
 });
 
 // POST /api/run/all-pg — scrape all teams PG
-app.post('/api/run/all-pg', requireAuth, async (req, res) => {
+app.post('/api/run/all-pg', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+  await assertOrgActive(req);
   const teams   = (await getTeams(req)).filter(t => t.pg_team_url);
   if (!teams.length) return res.status(400).json({ error: 'No teams with PG URLs' });
   const id      = createJob(`PG Scrape All (${teams.length} teams)`);
@@ -1473,7 +1532,7 @@ app.post('/api/run/all-pg', requireAuth, async (req, res) => {
 });
 
 // POST /api/run/all-reports — generate reports for all teams with games
-app.post('/api/run/all-reports', requireAuth, async (req, res) => {
+app.post('/api/run/all-reports', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
   const teams   = (await getTeams(req)).filter(t => t.game_count > 0);
   if (!teams.length) return res.status(400).json({ error: 'No teams with game data' });
   const id      = createJob(`Reports All (${teams.length} teams)`);
@@ -1484,15 +1543,16 @@ app.post('/api/run/all-reports', requireAuth, async (req, res) => {
     for (const team of teams) {
       if (jobs[id]?.status !== 'running') break;
       appendLog(id, `\n── [${done+failed+1}/${teams.length}] ${team.team_name} ──`);
+      let quota;
       try {
-        await enforceReportQuota(req, { reportType: 'opponent', limitColumn: 'max_reports_per_month', title: `Report — ${team.team_name}`, linkedTeamId: team.id });
+        quota = await enforceReportQuota(req, { reportType: 'opponent', limitColumn: 'max_reports_per_month', title: `Report — ${team.team_name}`, linkedTeamId: team.id });
       } catch (err) {
         appendLog(id, `✗ Stopping: ${err.message}`);
         quotaHit = true;
         break;
       }
       try {
-        await runStep('node', ['src/generate-report.js', team.team_name], ROOT);
+        await runStep('node', ['src/generate-report.js', team.team_name], ROOT, buildUsageEnv(req, quota));
         appendLog(id, `✓ ${team.team_name} done`); done++;
       } catch (err) {
         appendLog(id, `✗ ${team.team_name} failed: ${err.message}`); failed++;
@@ -1508,20 +1568,20 @@ app.post('/api/run/all-reports', requireAuth, async (req, res) => {
 app.get('/', (req, res) => res.sendFile(path.join(ROOT, 'dashboard', 'index.html')));
 
 // ── Team Games ───────────────────────────────────────────────────────────────
-app.get('/api/teams/:id/games', requireAuth, async (req, res) => {
+app.get('/api/teams/:id/games', requireAuth, resolveSupportSession, async (req, res) => {
   try {
     res.json(await getTeamGames(req.params.id));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── Team Game URLs ───────────────────────────────────────────────────────────
-app.get('/api/teams/:id/game-urls', requireAuth, async (req, res) => {
+app.get('/api/teams/:id/game-urls', requireAuth, resolveSupportSession, async (req, res) => {
   try {
     res.json(await getTeamGameUrls(req.params.id));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/teams/:id/game-urls', requireAuth, async (req, res) => {
+app.post('/api/teams/:id/game-urls', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
   const { gc_game_url, label = '', box_side = 'away' } = req.body;
   if (!['away','home'].includes(box_side)) return res.status(400).json({ error: 'box_side must be away or home' });
   try {
@@ -1545,7 +1605,7 @@ app.post('/api/teams/:id/game-urls', requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.put('/api/teams/:id/game-urls/:urlId', requireAuth, async (req, res) => {
+app.put('/api/teams/:id/game-urls/:urlId', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
   const { gc_game_url, label, box_side } = req.body;
   try {
     if (USE_SUPABASE) {
@@ -1576,7 +1636,7 @@ app.put('/api/teams/:id/game-urls/:urlId', requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete('/api/teams/:id/game-urls/:urlId', requireAuth, async (req, res) => {
+app.delete('/api/teams/:id/game-urls/:urlId', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
   try {
     if (USE_SUPABASE) {
       await assertTeamInRequestOrg(req, req.params.id);
@@ -1597,7 +1657,7 @@ app.delete('/api/teams/:id/game-urls/:urlId', requireAuth, async (req, res) => {
 });
 
 // ── Add Team ─────────────────────────────────────────────────────────────────
-app.post('/api/teams/add', requireAuth, async (req, res) => {
+app.post('/api/teams/add', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
   const { teamName, gcTeamUrl, pgTeamUrl, isOurTeam, seasonYear, seasonType } = req.body;
   if (!teamName) return res.status(400).json({ error: 'teamName is required' });
 
@@ -1671,7 +1731,7 @@ app.post('/api/teams/add', requireAuth, async (req, res) => {
 
 
 // ── Edit / Remove Team ───────────────────────────────────────────────────────
-app.put('/api/teams/:id', requireAuth, async (req, res) => {
+app.put('/api/teams/:id', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
   const { teamName, gcTeamUrl, pgTeamUrl, seasonYear, seasonType } = req.body;
   const teamId = req.params.id;
 
@@ -1731,7 +1791,7 @@ app.put('/api/teams/:id', requireAuth, async (req, res) => {
   }
 });
 
-app.delete('/api/teams/:id', requireAuth, async (req, res) => {
+app.delete('/api/teams/:id', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
   const teamId = req.params.id;
 
   try {
@@ -1777,7 +1837,7 @@ app.delete('/api/teams/:id', requireAuth, async (req, res) => {
 // Archive (soft-hide) or restore a team without touching games/stats.
 // This is what the dashboard's "×" button calls now instead of DELETE —
 // DELETE remains available but stays blocked whenever games are attached.
-app.patch('/api/teams/:id/archive', requireAuth, async (req, res) => {
+app.patch('/api/teams/:id/archive', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
   const teamId = req.params.id;
   const archived = req.body?.archived !== false; // default true
 
@@ -1807,7 +1867,7 @@ app.patch('/api/teams/:id/archive', requireAuth, async (req, res) => {
 });
 
 // ── Sync Google Sheet ────────────────────────────────────────────────────────
-app.post('/api/settings/sheet', requireAuth, async (req, res) => {
+app.post('/api/settings/sheet', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
   const { csvUrl, replace = false } = req.body;
   if (!csvUrl || !csvUrl.includes('output=csv')) {
     return res.status(400).json({ error: 'Must be a published Google Sheet CSV URL (must contain output=csv)' });

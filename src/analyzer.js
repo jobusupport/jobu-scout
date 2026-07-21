@@ -9,11 +9,50 @@ const { getPGDataForTeam } = require('./pg-reader');
 
 const db       = require('./db');
 const pipeline = require('./pipeline');
+const { adminClient } = require('./supabase');
 
 const CLAUDE_MODEL = 'claude-sonnet-4-6';
 const MAX_TOKENS   = 20000;
 const API_URL      = 'https://api.anthropic.com/v1/messages';
 const API_KEY      = process.env.ANTHROPIC_API_KEY || '';
+
+// Static $/million-token price table for AI cost tracking (admin panel Usage
+// page). Approximate Sonnet-tier pricing — there's no official Anthropic
+// programmatic credit-balance endpoint to reconcile against (see
+// platform_settings.last_verified_credit_balance_usd for the manually
+// verified figure instead). Update here if pricing changes.
+const CLAUDE_PRICE_PER_MILLION_TOKENS_USD = {
+  'claude-sonnet-4-6': { input: 3, output: 15 },
+  default:             { input: 3, output: 15 },
+};
+
+function estimateClaudeCostUsd(model, inputTokens, outputTokens) {
+  const rates = CLAUDE_PRICE_PER_MILLION_TOKENS_USD[model] || CLAUDE_PRICE_PER_MILLION_TOKENS_USD.default;
+  return (inputTokens / 1e6) * rates.input + (outputTokens / 1e6) * rates.output;
+}
+
+// Best-effort AI usage event recorder — a logging failure must never break
+// report generation. Reads tenant/report context from env vars set by
+// server.js (buildUsageEnv) when this runs as a spawned child process; falls
+// back to null org/report attribution for CLI-only invocations.
+async function recordAiUsageEvent({ model, inputTokens, outputTokens, success, errorMessage, durationMs }) {
+  try {
+    await adminClient.from('ai_usage_events').insert({
+      org_id: process.env.JOBU_USAGE_ORG_ID || null,
+      user_id: process.env.JOBU_USAGE_USER_ID || null,
+      report_id: process.env.JOBU_USAGE_REPORT_ID || null,
+      model,
+      input_tokens: inputTokens || 0,
+      output_tokens: outputTokens || 0,
+      estimated_cost_usd: estimateClaudeCostUsd(model, inputTokens || 0, outputTokens || 0),
+      success,
+      error_message: errorMessage || null,
+      duration_ms: durationMs,
+    });
+  } catch (err) {
+    console.error('[analyzer] failed to record ai_usage_events row:', err.message);
+  }
+}
 
 // ─── PitchSmart Rules (USA Baseball) ──────────────────────────────────────────
 // Source: USA Baseball PitchSmart guidelines
@@ -382,31 +421,60 @@ function parseClaudeJson(text) {
 async function callClaude(systemPrompt, userPrompt) {
   if (!API_KEY) throw new Error('ANTHROPIC_API_KEY not set in .env');
 
-  const response = await fetch(API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type':      'application/json',
-      'x-api-key':         API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model:      CLAUDE_MODEL,
-      max_tokens: MAX_TOKENS,
-      system:     systemPrompt,
-      messages:   [{ role: 'user', content: userPrompt }],
-    }),
-  });
+  const startedAt = Date.now();
+  let usage = null;
+  try {
+    const response = await fetch(API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type':      'application/json',
+        'x-api-key':         API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model:      CLAUDE_MODEL,
+        max_tokens: MAX_TOKENS,
+        system:     systemPrompt,
+        messages:   [{ role: 'user', content: userPrompt }],
+      }),
+    });
 
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`Claude API error ${response.status}: ${err}`);
+    if (!response.ok) {
+      const errText = await response.text();
+      await recordAiUsageEvent({
+        model: CLAUDE_MODEL, inputTokens: 0, outputTokens: 0, success: false,
+        errorMessage: `HTTP ${response.status}: ${errText}`.slice(0, 2000),
+        durationMs: Date.now() - startedAt,
+      });
+      throw new Error(`Claude API error ${response.status}: ${errText}`);
+    }
+
+    const data = await response.json();
+    usage = data.usage || {};
+    const text = (data.content || [])
+      .filter(b => b.type === 'text').map(b => b.text).join('');
+
+    const result = parseClaudeJson(text);
+    await recordAiUsageEvent({
+      model: CLAUDE_MODEL,
+      inputTokens: usage.input_tokens,
+      outputTokens: usage.output_tokens,
+      success: true,
+      durationMs: Date.now() - startedAt,
+    });
+    return result;
+  } catch (err) {
+    // Parse/JSON failures land here too (usage may already be known from a
+    // successful HTTP call) — still record the attempt for cost tracking.
+    if (usage) {
+      await recordAiUsageEvent({
+        model: CLAUDE_MODEL, inputTokens: usage.input_tokens, outputTokens: usage.output_tokens,
+        success: false, errorMessage: String(err.message || err).slice(0, 2000),
+        durationMs: Date.now() - startedAt,
+      });
+    }
+    throw err;
   }
-
-  const data = await response.json();
-  const text = (data.content || [])
-    .filter(b => b.type === 'text').map(b => b.text).join('');
-
-  return parseClaudeJson(text);
 }
 
 // ─── Prompt Builders ──────────────────────────────────────────────────────────

@@ -1,0 +1,1062 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Jobu Scout — Admin</title>
+<style>
+  :root {
+    --navy: #0c121c; --blue: #101a27; --accent: #c79a45; --accent-hover: #d6aa54;
+    --red: #c43b32; --red-hover: #d4453b; --green: #3ea76f; --gray: #9aa4b4;
+    --light: #f4f0e6; --card: #0e1622; --panel: #101a27; --border: #1d2838;
+    --line-strong: #233044; --text: #ece7da; --muted: #7d8799;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { height:100%; }
+  body {
+    background:var(--navy); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    font-size:14px; display:flex; min-height:100vh;
+  }
+  a { color:inherit; }
+  button { font-family:inherit; cursor:pointer; }
+  input, select, textarea { font-family:inherit; font-size:13px; background:var(--panel); border:1px solid var(--border); color:var(--text); border-radius:6px; padding:7px 9px; }
+  input:focus, select:focus, textarea:focus { outline:1px solid var(--accent); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th { text-align:left; color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.04em; padding:8px 10px; border-bottom:1px solid var(--line-strong); white-space:nowrap; }
+  td { padding:9px 10px; border-bottom:1px solid var(--border); vertical-align:middle; }
+  tr:hover td { background:rgba(255,255,255,0.02); }
+  .btn { border:1px solid var(--border); background:var(--panel); color:var(--text); border-radius:6px; padding:6px 12px; font-size:12.5px; }
+  .btn:hover { border-color:var(--accent); }
+  .btn-primary { background:var(--accent); border-color:var(--accent); color:#1a1305; font-weight:600; }
+  .btn-primary:hover { background:var(--accent-hover); }
+  .btn-danger { border-color:var(--red); color:var(--red); }
+  .btn-danger:hover { background:var(--red); color:#fff; }
+  .btn-sm { padding:4px 9px; font-size:12px; }
+  .btn:disabled { opacity:.5; cursor:not-allowed; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:16px; }
+  .muted { color:var(--muted); }
+  .pill { display:inline-block; padding:2px 8px; border-radius:20px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.03em; }
+  .pill-active, .pill-done, .pill-ready { background:rgba(62,167,111,0.15); color:var(--green); }
+  .pill-suspended, .pill-failed, .pill-error { background:rgba(196,59,50,0.15); color:#e2685f; }
+  .pill-cancelled, .pill-pending, .pill-queued { background:rgba(154,164,180,0.15); color:var(--gray); }
+  .pill-generating, .pill-running { background:rgba(199,154,69,0.18); color:var(--accent); }
+  #sidebar {
+    width:210px; flex-shrink:0; background:var(--blue); border-right:1px solid var(--border);
+    display:flex; flex-direction:column; padding:16px 0;
+  }
+  #sidebar .brand { padding:0 18px 16px; font-family:Georgia,serif; letter-spacing:1px; color:var(--accent); font-size:15px; border-bottom:1px solid var(--border); margin-bottom:10px; }
+  #sidebar .brand small { display:block; color:var(--muted); font-family:-apple-system,sans-serif; font-size:10px; letter-spacing:.08em; margin-top:2px; }
+  #sidebar nav a {
+    display:flex; align-items:center; gap:9px; padding:9px 18px; text-decoration:none; color:var(--gray); font-size:13px; border-left:3px solid transparent;
+  }
+  #sidebar nav a:hover { color:var(--text); background:rgba(255,255,255,0.03); }
+  #sidebar nav a.active { color:var(--accent); border-left-color:var(--accent); background:rgba(199,154,69,0.08); }
+  #sidebar .back-to-app { margin:14px 18px 0; }
+  #main { flex:1; min-width:0; display:flex; flex-direction:column; }
+  #topbar { display:flex; align-items:center; gap:12px; padding:14px 24px; border-bottom:1px solid var(--border); }
+  #topbar h1 { font-size:16px; font-weight:600; }
+  #topbar .crumb { color:var(--muted); font-size:12px; }
+  #topbar .spacer { flex:1; }
+  #topbar .who { font-size:12px; color:var(--muted); }
+  #content { flex:1; overflow-y:auto; padding:22px 24px 60px; }
+  .grid { display:grid; gap:14px; }
+  .grid-metrics { grid-template-columns:repeat(auto-fill, minmax(170px, 1fr)); }
+  .metric-card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:14px 16px; }
+  .metric-card .label { font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin-bottom:6px; }
+  .metric-card .value { font-size:22px; font-weight:700; }
+  .metric-card .sub { font-size:11.5px; color:var(--muted); margin-top:4px; }
+  .section-title { font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--gray); margin:26px 0 10px; }
+  .section-title:first-child { margin-top:0; }
+  .toolbar { display:flex; gap:8px; align-items:center; margin-bottom:14px; flex-wrap:wrap; }
+  .toolbar input[type=search], .toolbar input[type=text] { min-width:220px; }
+  .empty-state { text-align:center; padding:40px 20px; color:var(--muted); }
+  .error-banner { background:rgba(196,59,50,0.12); border:1px solid var(--red); color:#e2685f; padding:10px 14px; border-radius:8px; margin-bottom:14px; font-size:13px; }
+  .loading { padding:40px; text-align:center; color:var(--muted); }
+  .pagination { display:flex; gap:8px; align-items:center; justify-content:flex-end; margin-top:12px; font-size:12.5px; color:var(--muted); }
+  .modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.55); display:flex; align-items:center; justify-content:center; z-index:500; padding:16px; }
+  .modal { background:var(--card); border:1px solid var(--line-strong); border-radius:12px; padding:22px; width:100%; max-width:440px; }
+  .modal h3 { font-size:15px; margin-bottom:12px; }
+  .modal .field { margin-bottom:12px; display:flex; flex-direction:column; gap:5px; }
+  .modal .field label { font-size:12px; color:var(--muted); }
+  .modal .field input, .modal .field select, .modal .field textarea { width:100%; }
+  .modal-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:16px; }
+  .tabs { display:flex; gap:4px; border-bottom:1px solid var(--border); margin-bottom:16px; flex-wrap:wrap; }
+  .tabs button { background:none; border:none; color:var(--muted); padding:9px 14px; font-size:13px; border-bottom:2px solid transparent; }
+  .tabs button.active { color:var(--accent); border-bottom-color:var(--accent); }
+  .kv { display:grid; grid-template-columns:150px 1fr; gap:8px 14px; font-size:13px; }
+  .kv .k { color:var(--muted); }
+  .toggle { position:relative; width:36px; height:20px; display:inline-block; }
+  .toggle input { opacity:0; width:0; height:0; }
+  .toggle .track { position:absolute; inset:0; background:var(--border); border-radius:20px; transition:.15s; }
+  .toggle .track:before { content:''; position:absolute; width:14px; height:14px; left:3px; top:3px; background:var(--muted); border-radius:50%; transition:.15s; }
+  .toggle input:checked + .track { background:rgba(62,167,111,0.3); }
+  .toggle input:checked + .track:before { transform:translateX(16px); background:var(--green); }
+  .full-center { min-height:100vh; width:100%; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:10px; }
+  code { background:var(--panel); padding:1px 5px; border-radius:4px; font-size:12px; }
+  @media (max-width: 760px) {
+    body { flex-direction:column; }
+    #sidebar { width:100%; flex-direction:row; overflow-x:auto; padding:8px; }
+    #sidebar .brand, #sidebar .back-to-app { display:none; }
+    #sidebar nav { display:flex; }
+    #sidebar nav a { border-left:none; border-bottom:3px solid transparent; padding:8px 12px; white-space:nowrap; }
+    #sidebar nav a.active { border-left-color:transparent; border-bottom-color:var(--accent); }
+    #content { padding:16px; }
+  }
+</style>
+</head>
+<body>
+<div id="root">
+  <div class="full-center"><div class="loading">Loading…</div></div>
+</div>
+
+<script>
+'use strict';
+
+// ── Shared session (same localStorage key/shape as the customer dashboard) ──
+const AUTH_KEY = 'vs_auth';
+function getSession() {
+  try { return JSON.parse(localStorage.getItem(AUTH_KEY)); } catch (e) { return null; }
+}
+const SUPPORT_SESSION_KEY = 'jobuSupportSession';
+
+const NAV = [
+  { path: '/admin', label: 'Dashboard', match: p => p === '/admin' },
+  { path: '/admin/customers', label: 'Customers', match: p => p.startsWith('/admin/customers') },
+  { path: '/admin/reports', label: 'Reports', match: p => p === '/admin/reports' },
+  { path: '/admin/usage', label: 'Usage', match: p => p === '/admin/usage' },
+  { path: '/admin/system-health', label: 'System Health', match: p => p === '/admin/system-health' },
+  { path: '/admin/billing', label: 'Billing', match: p => p === '/admin/billing' },
+  { path: '/admin/feature-flags', label: 'Feature Flags', match: p => p === '/admin/feature-flags' },
+  { path: '/admin/audit', label: 'Audit Log', match: p => p === '/admin/audit' },
+  { path: '/admin/settings', label: 'Settings', match: p => p === '/admin/settings' },
+];
+
+let CURRENT_ROLE = null;
+
+// ── API helper ───────────────────────────────────────────────────────────────
+async function apiFetch(path, opts = {}) {
+  const session = getSession();
+  const headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
+  if (session?.accessToken) headers.Authorization = 'Bearer ' + session.accessToken;
+  const res = await fetch(path, Object.assign({}, opts, { headers }));
+  if (res.status === 401) {
+    window.location.href = '/';
+    throw new Error('Session expired');
+  }
+  let body = null;
+  try { body = await res.json(); } catch (e) {}
+  if (!res.ok) throw new Error((body && body.error) || ('Request failed (' + res.status + ')'));
+  return body;
+}
+
+function qs(params) {
+  const p = new URLSearchParams();
+  Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== null && v !== '') p.set(k, v); });
+  const s = p.toString();
+  return s ? ('?' + s) : '';
+}
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+function fmtMoney(n) { return '$' + (Number(n) || 0).toFixed(2); }
+function fmtInt(n) { return (Number(n) || 0).toLocaleString(); }
+function fmtDate(s) { if (!s) return '—'; const d = new Date(s); return isNaN(d) ? '—' : d.toLocaleString(); }
+function fmtDateOnly(s) { if (!s) return '—'; const d = new Date(s); return isNaN(d) ? '—' : d.toLocaleDateString(); }
+function pillClass(status) { return 'pill pill-' + String(status || '').toLowerCase().replace(/[^a-z]/g, ''); }
+
+// ── Layout / routing ─────────────────────────────────────────────────────────
+function renderShell() {
+  const session = getSession();
+  document.getElementById('root').innerHTML = `
+    <div id="sidebar">
+      <div class="brand">JOBU SCOUT<small>PLATFORM ADMIN</small></div>
+      <nav id="sidebarNav"></nav>
+      <div style="flex:1"></div>
+      <div class="back-to-app"><a href="/" class="btn" style="display:block;text-align:center">&larr; Back to App</a></div>
+    </div>
+    <div id="main">
+      <div id="topbar">
+        <h1 id="pageTitle">Dashboard</h1>
+        <span class="crumb" id="pageCrumb"></span>
+        <div class="spacer"></div>
+        <span class="who">${esc(session?.user?.email || '')}${CURRENT_ROLE ? ' · ' + esc(CURRENT_ROLE) : ''}</span>
+      </div>
+      <div id="content"><div class="loading">Loading…</div></div>
+    </div>
+  `;
+  document.body.addEventListener('click', e => {
+    const a = e.target.closest('a[data-link]');
+    if (a) { e.preventDefault(); navigate(a.getAttribute('href')); }
+  });
+  window.addEventListener('popstate', router);
+  renderNav();
+}
+
+function renderNav() {
+  const el = document.getElementById('sidebarNav');
+  if (!el) return;
+  const path = window.location.pathname;
+  el.innerHTML = NAV.map(item =>
+    `<a href="${item.path}" data-link class="${item.match(path) ? 'active' : ''}">${esc(item.label)}</a>`
+  ).join('');
+}
+
+function navigate(path) {
+  history.pushState(null, '', path);
+  router();
+}
+
+function setTitle(title, crumb) {
+  document.getElementById('pageTitle').textContent = title;
+  document.getElementById('pageCrumb').textContent = crumb || '';
+}
+
+async function router() {
+  renderNav();
+  const content = document.getElementById('content');
+  const path = window.location.pathname;
+  const m = path.match(/^\/admin\/customers\/([^/]+)$/);
+  try {
+    if (path === '/admin' || path === '/admin/') return renderDashboard(content);
+    if (path === '/admin/customers') return renderCustomers(content);
+    if (m) return renderCustomerDetail(content, m[1]);
+    if (path === '/admin/reports') return renderReports(content);
+    if (path === '/admin/usage') return renderUsage(content);
+    if (path === '/admin/system-health') return renderSystemHealth(content);
+    if (path === '/admin/billing') return renderBilling(content);
+    if (path === '/admin/feature-flags') return renderFeatureFlags(content);
+    if (path === '/admin/audit') return renderAuditLog(content);
+    if (path === '/admin/settings') return renderSettings(content);
+    setTitle('Not Found');
+    content.innerHTML = `<div class="empty-state">No admin page at <code>${esc(path)}</code>. <a href="/admin" data-link>Go to Dashboard</a></div>`;
+  } catch (err) {
+    setTitle('Error');
+    content.innerHTML = `<div class="error-banner">${esc(err.message)}</div>`;
+  }
+}
+
+// ── Small UI helpers ─────────────────────────────────────────────────────────
+function openModal(html) {
+  const wrap = document.createElement('div');
+  wrap.className = 'modal-overlay';
+  wrap.innerHTML = `<div class="modal">${html}</div>`;
+  wrap.addEventListener('click', e => { if (e.target === wrap) wrap.remove(); });
+  document.body.appendChild(wrap);
+  return wrap;
+}
+
+function reasonModal({ title, message, confirmLabel = 'Confirm', danger = false, extraFieldsHtml = '', onConfirm }) {
+  const modal = openModal(`
+    <h3>${esc(title)}</h3>
+    ${message ? `<p class="muted" style="font-size:13px;margin-bottom:12px">${esc(message)}</p>` : ''}
+    ${extraFieldsHtml}
+    <div class="field">
+      <label>Reason (required)</label>
+      <textarea id="modalReason" rows="3" placeholder="Why are you making this change?"></textarea>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" id="modalCancel">Cancel</button>
+      <button class="btn ${danger ? 'btn-danger' : 'btn-primary'}" id="modalConfirm">${esc(confirmLabel)}</button>
+    </div>
+  `);
+  modal.querySelector('#modalCancel').onclick = () => modal.remove();
+  modal.querySelector('#modalConfirm').onclick = async () => {
+    const reason = modal.querySelector('#modalReason').value.trim();
+    if (!reason) { modal.querySelector('#modalReason').style.borderColor = 'var(--red)'; return; }
+    const btn = modal.querySelector('#modalConfirm');
+    btn.disabled = true; btn.textContent = 'Working…';
+    try {
+      await onConfirm(reason, modal);
+      modal.remove();
+    } catch (err) {
+      btn.disabled = false; btn.textContent = confirmLabel;
+      let errEl = modal.querySelector('.modal-err');
+      if (!errEl) {
+        errEl = document.createElement('div');
+        errEl.className = 'error-banner modal-err';
+        errEl.style.marginTop = '10px';
+        modal.querySelector('.modal-actions').before(errEl);
+      }
+      errEl.textContent = err.message;
+    }
+  };
+  return modal;
+}
+
+function paginationControls(total, page, pageSize, onChange) {
+  const pages = Math.max(Math.ceil(total / pageSize), 1);
+  const div = document.createElement('div');
+  div.className = 'pagination';
+  div.innerHTML = `
+    <span>${fmtInt(total)} total &middot; page ${page} of ${pages}</span>
+    <button class="btn btn-sm" ${page <= 1 ? 'disabled' : ''} id="pgPrev">&larr; Prev</button>
+    <button class="btn btn-sm" ${page >= pages ? 'disabled' : ''} id="pgNext">Next &rarr;</button>
+  `;
+  div.querySelector('#pgPrev').onclick = () => onChange(page - 1);
+  div.querySelector('#pgNext').onclick = () => onChange(page + 1);
+  return div;
+}
+
+// ── Dashboard ────────────────────────────────────────────────────────────────
+async function renderDashboard(content) {
+  setTitle('Dashboard');
+  content.innerHTML = '<div class="loading">Loading metrics…</div>';
+  const m = await apiFetch('/api/admin/dashboard');
+
+  const alerts = [];
+  if (m.customers_over_limit_reports > 0) alerts.push(`${m.customers_over_limit_reports} customer(s) are over their monthly report limit.`);
+  else if (m.customers_over_80pct_reports > 0) alerts.push(`${m.customers_over_80pct_reports} customer(s) are above 80% of their monthly report limit.`);
+  if (m.reports_failed_24h > 0) alerts.push(`${m.reports_failed_24h} report(s) failed in the last 24 hours (${(m.report_failure_rate_24h * 100).toFixed(0)}% failure rate).`);
+  if (m.scrape_jobs_failing_24h > 0) alerts.push(`${m.scrape_jobs_failing_24h} scrape job(s) failed in the last 24 hours.`);
+  if (m.queue_depth > 10) alerts.push(`Queue depth is elevated: ${m.queue_depth} item(s) waiting.`);
+  if (m.suspended_tenants > 0) alerts.push(`${m.suspended_tenants} tenant(s) are currently suspended.`);
+
+  content.innerHTML = `
+    ${alerts.length ? `<div class="section-title">Alerts</div><div class="card" style="margin-bottom:20px">${alerts.map(a => `<div style="padding:6px 0;border-bottom:1px solid var(--border);font-size:13px">&#9888; ${esc(a)}</div>`).join('')}</div>` : ''}
+
+    <div class="section-title">Tenants</div>
+    <div class="grid grid-metrics">
+      ${metricCard('Total tenants', fmtInt(m.total_tenants))}
+      ${metricCard('Active', fmtInt(m.active_tenants))}
+      ${metricCard('Free plan', fmtInt(m.free_plan_tenants), 'no formal "trial" state exists yet')}
+      ${metricCard('Suspended', fmtInt(m.suspended_tenants))}
+      ${metricCard('Cancelled', fmtInt(m.cancelled_tenants))}
+      ${metricCard('Total users', fmtInt(m.total_users))}
+    </div>
+
+    <div class="section-title">Reports</div>
+    <div class="grid grid-metrics">
+      ${metricCard('Today', fmtInt(m.reports_today))}
+      ${metricCard('This month', fmtInt(m.reports_this_month))}
+      ${metricCard('Queued', fmtInt(m.reports_queued))}
+      ${metricCard('Failed (24h)', fmtInt(m.reports_failed_24h))}
+      ${metricCard('Failure rate (24h)', (m.report_failure_rate_24h * 100).toFixed(1) + '%')}
+      ${metricCard('Avg duration', m.avg_report_duration_seconds != null ? Math.round(m.avg_report_duration_seconds) + 's' : '—')}
+    </div>
+
+    <div class="section-title">Scraping</div>
+    <div class="grid grid-metrics">
+      ${metricCard('Running', fmtInt(m.scrape_jobs_running))}
+      ${metricCard('Failing (24h)', fmtInt(m.scrape_jobs_failing_24h))}
+      ${metricCard('Queued', fmtInt(m.scrape_jobs_queued))}
+      ${metricCard('Queue depth', fmtInt(m.queue_depth))}
+    </div>
+
+    <div class="section-title">Claude / AI cost</div>
+    <div class="grid grid-metrics">
+      ${metricCard('Tokens (month) — in', fmtInt(m.ai_input_tokens_month))}
+      ${metricCard('Tokens (month) — out', fmtInt(m.ai_output_tokens_month))}
+      ${metricCard('Cost today', fmtMoney(m.ai_cost_today_usd))}
+      ${metricCard('Cost this month', fmtMoney(m.ai_cost_month_usd))}
+      ${metricCard('Avg cost / report', fmtMoney(m.avg_ai_cost_per_report_usd))}
+      ${metricCard('Projected month-end', fmtMoney(m.projected_month_end_ai_cost_usd))}
+    </div>
+
+    <div class="section-title">Recent admin actions</div>
+    <div class="card">
+      ${(m.recent_admin_actions || []).length ? `
+        <table><tbody>
+          ${m.recent_admin_actions.map(a => `
+            <tr>
+              <td class="muted" style="white-space:nowrap">${fmtDate(a.created_at)}</td>
+              <td>${esc(a.admin_email || '')}</td>
+              <td>${esc(a.action)}</td>
+              <td class="muted">${esc(a.reason || '')}</td>
+            </tr>
+          `).join('')}
+        </tbody></table>
+      ` : `<div class="empty-state">No admin actions recorded yet.</div>`}
+    </div>
+  `;
+}
+function metricCard(label, value, sub) {
+  return `<div class="metric-card"><div class="label">${esc(label)}</div><div class="value">${value}</div>${sub ? `<div class="sub">${esc(sub)}</div>` : ''}</div>`;
+}
+
+// ── Customers list ───────────────────────────────────────────────────────────
+let customersState = { search: '', status: '', plan: '', page: 1, pageSize: 25 };
+
+async function renderCustomers(content) {
+  setTitle('Customers');
+  content.innerHTML = `
+    <div class="toolbar">
+      <input type="search" id="custSearch" placeholder="Search name, slug, or email…" value="${esc(customersState.search)}">
+      <select id="custStatus">
+        <option value="">All statuses</option>
+        <option value="active">Active</option>
+        <option value="suspended">Suspended</option>
+        <option value="cancelled">Cancelled</option>
+      </select>
+      <select id="custPlan">
+        <option value="">All plans</option>
+        <option value="free">Free</option>
+        <option value="coach">Coach</option>
+        <option value="organization">Organization</option>
+      </select>
+    </div>
+    <div id="custTableWrap" class="card"><div class="loading">Loading…</div></div>
+  `;
+  content.querySelector('#custStatus').value = customersState.status;
+  content.querySelector('#custPlan').value = customersState.plan;
+
+  let debounce;
+  content.querySelector('#custSearch').addEventListener('input', e => {
+    clearTimeout(debounce);
+    debounce = setTimeout(() => { customersState.search = e.target.value; customersState.page = 1; loadCustomers(); }, 300);
+  });
+  content.querySelector('#custStatus').addEventListener('change', e => { customersState.status = e.target.value; customersState.page = 1; loadCustomers(); });
+  content.querySelector('#custPlan').addEventListener('change', e => { customersState.plan = e.target.value; customersState.page = 1; loadCustomers(); });
+
+  await loadCustomers();
+}
+
+async function loadCustomers() {
+  const wrap = document.getElementById('custTableWrap');
+  if (!wrap) return;
+  wrap.innerHTML = '<div class="loading">Loading…</div>';
+  const data = await apiFetch('/api/admin/customers' + qs({
+    search: customersState.search, status: customersState.status, plan: customersState.plan,
+    page: customersState.page, pageSize: customersState.pageSize,
+  }));
+  if (!data.customers.length) {
+    wrap.innerHTML = '<div class="empty-state">No customers match these filters.</div>';
+    return;
+  }
+  const table = document.createElement('div');
+  table.innerHTML = `
+    <table>
+      <thead><tr>
+        <th>Organization</th><th>Plan</th><th>Status</th><th>Users</th><th>Teams</th>
+        <th>Reports (period)</th><th>AI cost (period)</th><th>Created</th>
+      </tr></thead>
+      <tbody>
+        ${data.customers.map(c => `
+          <tr style="cursor:pointer" data-org="${c.id}">
+            <td><strong>${esc(c.name)}</strong><br><span class="muted" style="font-size:11.5px">${esc(c.contact_email || c.slug)}</span></td>
+            <td>${esc(c.plan)}</td>
+            <td><span class="${pillClass(c.status)}">${esc(c.status)}</span></td>
+            <td>${fmtInt(c.member_count)}</td>
+            <td>${fmtInt(c.team_count)}</td>
+            <td>${fmtInt(c.reports_this_period)} / ${c.max_reports_per_month >= 999999 ? '∞' : fmtInt(c.max_reports_per_month)}</td>
+            <td>${fmtMoney(c.ai_cost_this_period_usd)}</td>
+            <td class="muted">${fmtDateOnly(c.created_at)}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+  `;
+  table.querySelectorAll('tr[data-org]').forEach(row => {
+    row.addEventListener('click', () => navigate('/admin/customers/' + row.dataset.org));
+  });
+  wrap.innerHTML = '';
+  wrap.appendChild(table);
+  wrap.appendChild(paginationControls(data.total, data.page, data.pageSize, p => { customersState.page = p; loadCustomers(); }));
+}
+
+// ── Customer detail ──────────────────────────────────────────────────────────
+const METRIC_LABELS = {
+  max_opponent_teams: 'Opponent teams',
+  max_reports_per_month: 'Reports / month',
+  max_users: 'User seats',
+  max_self_scout_reports_per_month: 'Self-scout reports / month',
+  max_matchup_reports_per_month: 'Matchup reports / month',
+};
+
+let customerDetailTab = 'overview';
+
+async function renderCustomerDetail(content, orgId) {
+  content.innerHTML = '<div class="loading">Loading customer…</div>';
+  const data = await apiFetch('/api/admin/customers/' + orgId);
+  const org = data.organization;
+  setTitle(org.name, 'Customers / ' + org.name);
+
+  const tabs = ['overview', 'users', 'teams', 'reports', 'usage', 'support', 'activity'];
+  content.innerHTML = `
+    <div class="toolbar" style="justify-content:space-between">
+      <div style="display:flex;gap:8px;align-items:center">
+        <span class="${pillClass(org.status)}">${esc(org.status)}</span>
+        <span class="muted">Plan: ${esc(org.plan)}</span>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn" id="btnViewAs">View as Customer</button>
+        <button class="btn" id="btnStatus">Change Status</button>
+      </div>
+    </div>
+    <div class="tabs">
+      ${tabs.map(t => `<button data-tab="${t}" class="${t === customerDetailTab ? 'active' : ''}">${t[0].toUpperCase() + t.slice(1)}</button>`).join('')}
+    </div>
+    <div id="tabContent"></div>
+  `;
+
+  content.querySelectorAll('.tabs button').forEach(btn => {
+    btn.onclick = () => { customerDetailTab = btn.dataset.tab; renderCustomerDetail(content, orgId); };
+  });
+
+  content.querySelector('#btnViewAs').onclick = () => {
+    reasonModal({
+      title: 'View as ' + org.name,
+      message: 'Opens a read-only support session scoped to this tenant. Expires automatically in 30 minutes.',
+      confirmLabel: 'Start Support Session',
+      onConfirm: async reason => {
+        const res = await apiFetch('/api/admin/support-sessions', {
+          method: 'POST', body: JSON.stringify({ orgId, reason }),
+        });
+        sessionStorage.setItem(SUPPORT_SESSION_KEY, JSON.stringify(res));
+        window.location.href = '/';
+      },
+    });
+  };
+
+  content.querySelector('#btnStatus').onclick = () => {
+    const options = ['active', 'suspended', 'cancelled'].filter(s => s !== org.status);
+    reasonModal({
+      title: 'Change status for ' + org.name,
+      danger: true,
+      confirmLabel: 'Apply',
+      extraFieldsHtml: `
+        <div class="field"><label>New status</label>
+          <select id="modalStatus">${options.map(o => `<option value="${o}">${o}</option>`).join('')}</select>
+        </div>`,
+      onConfirm: async (reason, modal) => {
+        const status = modal.querySelector('#modalStatus').value;
+        await apiFetch('/api/admin/customers/' + orgId + '/status', { method: 'POST', body: JSON.stringify({ status, reason }) });
+        renderCustomerDetail(content, orgId);
+      },
+    });
+  };
+
+  const tabEl = content.querySelector('#tabContent');
+  renderCustomerTab(tabEl, customerDetailTab, org, data, orgId);
+}
+
+function renderCustomerTab(el, tab, org, data, orgId) {
+  if (tab === 'overview') {
+    el.innerHTML = `
+      <div class="grid" style="grid-template-columns:1fr 1fr;gap:16px">
+        <div class="card">
+          <div class="section-title" style="margin-top:0">Details</div>
+          <div class="kv">
+            <div class="k">Tenant ID</div><div><code>${esc(org.id)}</code></div>
+            <div class="k">Slug</div><div>${esc(org.slug)}</div>
+            <div class="k">Contact</div><div>${esc(org.contact_email || '—')}</div>
+            <div class="k">Plan</div><div>${esc(org.plan)}</div>
+            <div class="k">Status</div><div><span class="${pillClass(org.status)}">${esc(org.status)}</span></div>
+            <div class="k">Subscription</div><div>${esc(org.subscription_status || '—')}</div>
+            <div class="k">Created</div><div>${fmtDate(org.created_at)}</div>
+            <div class="k">Last successful scrape</div><div>${fmtDate(org.last_successful_scrape_at)}</div>
+            <div class="k">Last report</div><div>${org.last_report_status ? `<span class="${pillClass(org.last_report_status)}">${esc(org.last_report_status)}</span> ${fmtDate(org.last_report_at)}` : '—'}</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="section-title" style="margin-top:0">Totals</div>
+          <div class="kv">
+            <div class="k">Reports (all-time)</div><div>${fmtInt(org.reports_total)}</div>
+            <div class="k">AI cost (all-time)</div><div>${fmtMoney(org.ai_cost_total_usd)}</div>
+            <div class="k">AI cost (this period)</div><div>${fmtMoney(org.ai_cost_this_period_usd)}</div>
+          </div>
+          <button class="btn" id="btnCopySummary" style="margin-top:14px">Copy Support Summary</button>
+        </div>
+      </div>
+
+      <div class="section-title">Entitlements & overrides</div>
+      <div class="card">
+        <table>
+          <thead><tr><th>Metric</th><th>Current value</th><th></th></tr></thead>
+          <tbody>
+            ${Object.keys(METRIC_LABELS).map(key => `
+              <tr>
+                <td>${esc(METRIC_LABELS[key])}</td>
+                <td>${org[key] >= 999999 ? 'Unlimited' : fmtInt(org[key])}</td>
+                <td style="text-align:right">
+                  <button class="btn btn-sm" data-override="${key}">Edit</button>
+                  <button class="btn btn-sm" data-restore="${key}">Restore Default</button>
+                </td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+
+      ${data.overrides.length ? `
+        <div class="section-title">Override history</div>
+        <div class="card">
+          <table>
+            <thead><tr><th>Metric</th><th>Previous</th><th>New</th><th>Reason</th><th>When</th></tr></thead>
+            <tbody>
+              ${data.overrides.map(o => `
+                <tr>
+                  <td>${esc(METRIC_LABELS[o.metric_key] || o.metric_key)}</td>
+                  <td>${o.previous_value ?? '—'}</td>
+                  <td>${o.is_unlimited ? 'Unlimited' : o.override_value}</td>
+                  <td class="muted">${esc(o.reason)}</td>
+                  <td class="muted">${fmtDate(o.created_at)}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      ` : ''}
+    `;
+
+    el.querySelector('#btnCopySummary').onclick = () => {
+      const summary = [
+        `Customer: ${org.name}`,
+        `Plan: ${org.plan}`,
+        `Status: ${org.status}`,
+        `Usage: ${org.reports_this_period} of ${org.max_reports_per_month >= 999999 ? 'unlimited' : org.max_reports_per_month} reports this period`,
+        `Last successful scrape: ${fmtDate(org.last_successful_scrape_at)}`,
+        `Last report: ${org.last_report_status || 'none'} (${fmtDate(org.last_report_at)})`,
+        `AI cost this period: ${fmtMoney(org.ai_cost_this_period_usd)}`,
+        `Billing status: ${org.subscription_status || 'n/a'}`,
+      ].join('\n');
+      navigator.clipboard?.writeText(summary);
+      el.querySelector('#btnCopySummary').textContent = 'Copied!';
+      setTimeout(() => { el.querySelector('#btnCopySummary').textContent = 'Copy Support Summary'; }, 1500);
+    };
+
+    el.querySelectorAll('[data-override]').forEach(btn => {
+      btn.onclick = () => {
+        const key = btn.dataset.override;
+        reasonModal({
+          title: 'Override ' + METRIC_LABELS[key],
+          confirmLabel: 'Apply Override',
+          extraFieldsHtml: `
+            <div class="field"><label>New value</label><input type="number" min="0" id="modalValue" value="${org[key] >= 999999 ? '' : org[key]}" placeholder="e.g. 25"></div>
+            <div class="field"><label><input type="checkbox" id="modalUnlimited" style="width:auto"> Unlimited</label></div>
+            <div class="field"><label>Expires (optional)</label><input type="date" id="modalExpires"></div>
+          `,
+          onConfirm: async (reason, modal) => {
+            const isUnlimited = modal.querySelector('#modalUnlimited').checked;
+            const value = modal.querySelector('#modalValue').value;
+            const expiresAt = modal.querySelector('#modalExpires').value || null;
+            if (!isUnlimited && value === '') throw new Error('Enter a value or check Unlimited.');
+            await apiFetch('/api/admin/customers/' + orgId + '/overrides', {
+              method: 'POST',
+              body: JSON.stringify({ metricKey: key, value: isUnlimited ? null : Number(value), isUnlimited, expiresAt, reason }),
+            });
+            renderCustomerDetail(document.getElementById('content'), orgId);
+          },
+        });
+      };
+    });
+    el.querySelectorAll('[data-restore]').forEach(btn => {
+      btn.onclick = () => {
+        const key = btn.dataset.restore;
+        reasonModal({
+          title: 'Restore plan default for ' + METRIC_LABELS[key],
+          confirmLabel: 'Restore Default',
+          onConfirm: async reason => {
+            await apiFetch('/api/admin/customers/' + orgId + '/overrides', {
+              method: 'POST',
+              body: JSON.stringify({ metricKey: key, action: 'restore_default', reason }),
+            });
+            renderCustomerDetail(document.getElementById('content'), orgId);
+          },
+        });
+      };
+    });
+
+  } else if (tab === 'users') {
+    el.innerHTML = `<div class="card"><table>
+      <thead><tr><th>Email</th><th>Role</th><th>Accepted</th><th>Joined</th></tr></thead>
+      <tbody>${data.members.length ? data.members.map(m => `
+        <tr><td>${esc(m.email || m.user_id)}</td><td>${esc(m.role)}</td><td>${m.accepted_at ? 'Yes' : 'Pending'}</td><td class="muted">${fmtDateOnly(m.created_at)}</td></tr>
+      `).join('') : `<tr><td colspan="4" class="empty-state">No members yet.</td></tr>`}</tbody>
+    </table></div>`;
+
+  } else if (tab === 'teams') {
+    el.innerHTML = `<div class="card"><table>
+      <thead><tr><th>Team</th><th>Type</th><th>Archived</th><th>Created</th></tr></thead>
+      <tbody>${data.teams.length ? data.teams.map(t => `
+        <tr><td>${esc(t.team_name)}</td><td>${t.is_our_team ? 'Our team' : 'Opponent'}</td><td>${t.archived ? 'Yes' : 'No'}</td><td class="muted">${fmtDateOnly(t.created_at)}</td></tr>
+      `).join('') : `<tr><td colspan="4" class="empty-state">No teams yet.</td></tr>`}</tbody>
+    </table></div>`;
+
+  } else if (tab === 'reports') {
+    el.innerHTML = `<div class="card"><table>
+      <thead><tr><th>Title</th><th>Type</th><th>Status</th><th>Generated</th><th>Error</th></tr></thead>
+      <tbody>${data.reports.length ? data.reports.map(r => `
+        <tr><td>${esc(r.title)}</td><td>${esc(r.report_type)}</td><td><span class="${pillClass(r.status)}">${esc(r.status)}</span></td><td class="muted">${fmtDate(r.generated_at || r.created_at)}</td><td class="muted">${esc(r.error_message || '')}</td></tr>
+      `).join('') : `<tr><td colspan="5" class="empty-state">No reports yet.</td></tr>`}</tbody>
+    </table></div>`;
+
+  } else if (tab === 'usage') {
+    el.innerHTML = `<div class="card"><table>
+      <thead><tr><th>Source</th><th>Status</th><th>Games found</th><th>Games ingested</th><th>Ran</th><th>Error</th></tr></thead>
+      <tbody>${data.scrapeJobs.length ? data.scrapeJobs.map(s => `
+        <tr><td>${esc(s.source)}</td><td><span class="${pillClass(s.status)}">${esc(s.status)}</span></td><td>${fmtInt(s.games_found)}</td><td>${fmtInt(s.games_ingested)}</td><td class="muted">${fmtDate(s.started_at || s.created_at)}</td><td class="muted">${esc(s.error_message || '')}</td></tr>
+      `).join('') : `<tr><td colspan="6" class="empty-state">No scrape jobs yet.</td></tr>`}</tbody>
+    </table></div>`;
+
+  } else if (tab === 'support') {
+    el.innerHTML = `
+      <div class="card">
+        <div class="section-title" style="margin-top:0">Add internal note</div>
+        <textarea id="noteText" rows="3" style="width:100%" placeholder="Visible to Jobu Scout staff only"></textarea>
+        <button class="btn btn-primary" id="btnAddNote" style="margin-top:8px">Add Note</button>
+      </div>
+      <div class="section-title">Notes</div>
+      <div class="card">
+        ${data.notes.length ? data.notes.map(n => `
+          <div style="padding:8px 0;border-bottom:1px solid var(--border)">
+            <div style="font-size:13px">${esc(n.note)}</div>
+            <div class="muted" style="font-size:11px;margin-top:2px">${fmtDate(n.created_at)}</div>
+          </div>
+        `).join('') : `<div class="empty-state">No notes yet.</div>`}
+      </div>
+    `;
+    el.querySelector('#btnAddNote').onclick = async () => {
+      const note = el.querySelector('#noteText').value.trim();
+      if (!note) return;
+      await apiFetch('/api/admin/customers/' + orgId + '/notes', { method: 'POST', body: JSON.stringify({ note }) });
+      renderCustomerDetail(document.getElementById('content'), orgId);
+    };
+
+  } else if (tab === 'activity') {
+    el.innerHTML = `<div class="card"><table>
+      <thead><tr><th>When</th><th>Admin</th><th>Action</th><th>Reason</th></tr></thead>
+      <tbody>${data.auditLog.length ? data.auditLog.map(a => `
+        <tr><td class="muted">${fmtDate(a.created_at)}</td><td>${esc(a.admin_email || '')}</td><td>${esc(a.action)}</td><td class="muted">${esc(a.reason || '')}</td></tr>
+      `).join('') : `<tr><td colspan="4" class="empty-state">No activity yet.</td></tr>`}</tbody>
+    </table></div>`;
+  }
+}
+
+// ── Reports ──────────────────────────────────────────────────────────────────
+let reportsState = { orgId: '', status: '', reportType: '', page: 1, pageSize: 25 };
+
+async function renderReports(content) {
+  setTitle('Reports');
+  content.innerHTML = `
+    <div class="toolbar">
+      <select id="repStatus">
+        <option value="">All statuses</option>
+        <option value="pending">Pending</option>
+        <option value="generating">Generating</option>
+        <option value="ready">Ready</option>
+        <option value="failed">Failed</option>
+      </select>
+      <select id="repType">
+        <option value="">All types</option>
+        <option value="opponent">Opponent</option>
+        <option value="self_scout">Self-scout</option>
+        <option value="matchup">Matchup</option>
+      </select>
+    </div>
+    <div id="repTableWrap" class="card"><div class="loading">Loading…</div></div>
+  `;
+  content.querySelector('#repStatus').onchange = e => { reportsState.status = e.target.value; reportsState.page = 1; loadReports(); };
+  content.querySelector('#repType').onchange = e => { reportsState.reportType = e.target.value; reportsState.page = 1; loadReports(); };
+  await loadReports();
+}
+
+async function loadReports() {
+  const wrap = document.getElementById('repTableWrap');
+  if (!wrap) return;
+  wrap.innerHTML = '<div class="loading">Loading…</div>';
+  const data = await apiFetch('/api/admin/reports' + qs(reportsState));
+  if (!data.reports.length) { wrap.innerHTML = '<div class="empty-state">No reports match these filters.</div>'; return; }
+  const table = document.createElement('div');
+  table.innerHTML = `
+    <table>
+      <thead><tr><th>Customer</th><th>Title</th><th>Type</th><th>Status</th><th>Model</th><th>Requested</th></tr></thead>
+      <tbody>
+        ${data.reports.map(r => `
+          <tr>
+            <td>${r.orgId || r.org_id ? `<a href="/admin/customers/${r.org_id}" data-link>${esc(r.orgName || r.org_id)}</a>` : '—'}</td>
+            <td>${esc(r.title)}</td>
+            <td>${esc(r.report_type)}</td>
+            <td><span class="${pillClass(r.status)}">${esc(r.status)}</span></td>
+            <td class="muted">${esc(r.ai_model || '—')}</td>
+            <td class="muted">${fmtDate(r.created_at)}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+  `;
+  wrap.innerHTML = '';
+  wrap.appendChild(table);
+  wrap.appendChild(paginationControls(data.total, data.page, data.pageSize, p => { reportsState.page = p; loadReports(); }));
+}
+
+// ── Usage / AI cost ──────────────────────────────────────────────────────────
+async function renderUsage(content) {
+  setTitle('Usage');
+  content.innerHTML = '<div class="loading">Loading…</div>';
+  const data = await apiFetch('/api/admin/usage?days=30');
+  content.innerHTML = `
+    <div class="grid grid-metrics">
+      ${metricCard('Cost (30d)', fmtMoney(data.totals.costUsd))}
+      ${metricCard('Input tokens (30d)', fmtInt(data.totals.inputTokens))}
+      ${metricCard('Output tokens (30d)', fmtInt(data.totals.outputTokens))}
+      ${metricCard('Failed-call cost (30d)', fmtMoney(data.totals.failedCostUsd))}
+      ${metricCard('AI calls (30d)', fmtInt(data.totals.eventCount))}
+    </div>
+
+    <div class="section-title">Cost by model</div>
+    <div class="card">
+      ${data.byModel.length ? `<table><thead><tr><th>Model</th><th>Calls</th><th>Input tokens</th><th>Output tokens</th><th>Cost</th></tr></thead><tbody>
+        ${data.byModel.map(m => `<tr><td>${esc(m.model)}</td><td>${fmtInt(m.count)}</td><td>${fmtInt(m.inputTokens)}</td><td>${fmtInt(m.outputTokens)}</td><td>${fmtMoney(m.cost)}</td></tr>`).join('')}
+      </tbody></table>` : `<div class="empty-state">No AI usage recorded in the last 30 days.</div>`}
+    </div>
+
+    <div class="section-title">Highest-cost tenants</div>
+    <div class="card">
+      ${data.byOrg.length ? `<table><thead><tr><th>Tenant</th><th>Calls</th><th>Cost</th></tr></thead><tbody>
+        ${data.byOrg.slice(0, 20).map(o => `<tr><td>${o.orgId ? `<a href="/admin/customers/${o.orgId}" data-link>${esc(o.orgName)}</a>` : esc(o.orgName)}</td><td>${fmtInt(o.count)}</td><td>${fmtMoney(o.cost)}</td></tr>`).join('')}
+      </tbody></table>` : `<div class="empty-state">No AI usage recorded in the last 30 days.</div>`}
+    </div>
+
+    <div class="section-title">Cost by day</div>
+    <div class="card">
+      ${data.byDay.length ? `<table><thead><tr><th>Day</th><th>Calls</th><th>Cost</th></tr></thead><tbody>
+        ${data.byDay.slice().reverse().map(d => `<tr><td>${esc(d.day)}</td><td>${fmtInt(d.count)}</td><td>${fmtMoney(d.cost)}</td></tr>`).join('')}
+      </tbody></table>` : `<div class="empty-state">No AI usage recorded in the last 30 days.</div>`}
+    </div>
+  `;
+}
+
+// ── System health ────────────────────────────────────────────────────────────
+async function renderSystemHealth(content) {
+  setTitle('System Health');
+  content.innerHTML = '<div class="loading">Loading…</div>';
+  const data = await apiFetch('/api/admin/system-health');
+  content.innerHTML = `
+    <div class="section-title" style="margin-top:0">Running scrapes (${data.runningScrapes.length})</div>
+    <div class="card">${data.runningScrapes.length ? `<table><thead><tr><th>Source</th><th>Started</th></tr></thead><tbody>
+      ${data.runningScrapes.map(s => `<tr><td>${esc(s.source)}</td><td class="muted">${fmtDate(s.started_at)}</td></tr>`).join('')}
+    </tbody></table>` : `<div class="empty-state">Nothing running.</div>`}</div>
+
+    <div class="section-title">Recently failed scrapes (${data.failingScrapes.length})</div>
+    <div class="card">${data.failingScrapes.length ? `<table><thead><tr><th>Source</th><th>Error</th><th>When</th></tr></thead><tbody>
+      ${data.failingScrapes.map(s => `<tr><td>${esc(s.source)}</td><td class="muted">${esc(s.error_message || '')}</td><td class="muted">${fmtDate(s.finished_at)}</td></tr>`).join('')}
+    </tbody></table>` : `<div class="empty-state">No recent failures.</div>`}</div>
+
+    <div class="section-title">Queued reports (${data.queuedReports.length})</div>
+    <div class="card">${data.queuedReports.length ? `<table><thead><tr><th>Title</th><th>Type</th><th>Queued</th></tr></thead><tbody>
+      ${data.queuedReports.map(r => `<tr><td>${esc(r.title)}</td><td>${esc(r.report_type)}</td><td class="muted">${fmtDate(r.created_at)}</td></tr>`).join('')}
+    </tbody></table>` : `<div class="empty-state">Nothing queued.</div>`}</div>
+
+    <div class="section-title">Recently failed reports (${data.failedReports.length})</div>
+    <div class="card">${data.failedReports.length ? `<table><thead><tr><th>Title</th><th>Error</th><th>When</th></tr></thead><tbody>
+      ${data.failedReports.map(r => `<tr><td>${esc(r.title)}</td><td class="muted">${esc(r.error_message || '')}</td><td class="muted">${fmtDate(r.updated_at)}</td></tr>`).join('')}
+    </tbody></table>` : `<div class="empty-state">No recent failures.</div>`}</div>
+
+    <div class="section-title">Tenants without a recent successful scrape</div>
+    <div class="card">${data.staleScrapeOrgs.length ? `<table><thead><tr><th>Tenant</th><th>Last successful scrape</th></tr></thead><tbody>
+      ${data.staleScrapeOrgs.map(o => `<tr><td><a href="/admin/customers/${o.id}" data-link>${esc(o.name)}</a></td><td class="muted">${o.last_successful_scrape_at ? fmtDate(o.last_successful_scrape_at) : 'Never'}</td></tr>`).join('')}
+    </tbody></table>` : `<div class="empty-state">All tenants have a recent successful scrape.</div>`}</div>
+  `;
+}
+
+// ── Billing ──────────────────────────────────────────────────────────────────
+async function renderBilling(content) {
+  setTitle('Billing');
+  content.innerHTML = '<div class="loading">Loading…</div>';
+  const data = await apiFetch('/api/admin/customers?pageSize=100');
+  const stripeMode = 'test'; // this project's STRIPE_SECRET_KEY is a test-mode (rk_test_) key
+  content.innerHTML = `
+    <p class="muted" style="margin-bottom:14px">Stripe remains the source of truth for payment status. This is a read-only view of what's synced to <code>organizations</code>; plan/trial changes happen from the customer detail page. Deeper billing actions (cancel-at-period-end, invoice history) are deferred — open the customer directly in Stripe for those.</p>
+    <div class="card">
+      <table>
+        <thead><tr><th>Organization</th><th>Plan</th><th>Status</th><th>Subscription</th><th>Stripe customer</th></tr></thead>
+        <tbody>
+          ${data.customers.map(c => `
+            <tr>
+              <td><a href="/admin/customers/${c.id}" data-link>${esc(c.name)}</a></td>
+              <td>${esc(c.plan)}</td>
+              <td><span class="${pillClass(c.status)}">${esc(c.status)}</span></td>
+              <td>${esc(c.subscription_status || '—')}</td>
+              <td>${c.stripe_customer_id ? `<a href="https://dashboard.stripe.com/${stripeMode}/customers/${esc(c.stripe_customer_id)}" target="_blank" rel="noopener">${esc(c.stripe_customer_id)}</a>` : '—'}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+// ── Feature flags ────────────────────────────────────────────────────────────
+async function renderFeatureFlags(content) {
+  setTitle('Feature Flags');
+  content.innerHTML = '<div class="loading">Loading…</div>';
+  const data = await apiFetch('/api/admin/feature-flags');
+  content.innerHTML = `
+    <div class="card" style="margin-bottom:20px">
+      <div class="section-title" style="margin-top:0">New flag</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <input id="ffKey" placeholder="key (e.g. beta_ai_model)">
+        <input id="ffName" placeholder="Display name">
+        <input id="ffDesc" placeholder="Description (optional)" style="flex:1;min-width:180px">
+        <button class="btn btn-primary" id="ffCreate">Create</button>
+      </div>
+    </div>
+    <div class="card">
+      ${data.flags.length ? `<table>
+        <thead><tr><th>Key</th><th>Name</th><th>Global</th><th>Plans</th></tr></thead>
+        <tbody>
+          ${data.flags.map(f => `
+            <tr>
+              <td><code>${esc(f.key)}</code></td>
+              <td>${esc(f.name)}<br><span class="muted" style="font-size:11.5px">${esc(f.description || '')}</span></td>
+              <td><label class="toggle"><input type="checkbox" data-flag="${f.key}" ${f.is_globally_enabled ? 'checked' : ''}><span class="track"></span></label></td>
+              <td class="muted">${(f.enabled_plans || []).join(', ') || '—'}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>` : `<div class="empty-state">No feature flags yet.</div>`}
+    </div>
+  `;
+  content.querySelector('#ffCreate').onclick = async () => {
+    const key = content.querySelector('#ffKey').value.trim();
+    const name = content.querySelector('#ffName').value.trim();
+    const description = content.querySelector('#ffDesc').value.trim();
+    if (!key || !name) return;
+    await apiFetch('/api/admin/feature-flags', { method: 'POST', body: JSON.stringify({ key, name, description }) });
+    renderFeatureFlags(content);
+  };
+  content.querySelectorAll('[data-flag]').forEach(cb => {
+    cb.onchange = async () => {
+      reasonModal({
+        title: (cb.checked ? 'Enable' : 'Disable') + ' ' + cb.dataset.flag + ' globally?',
+        confirmLabel: 'Confirm',
+        onConfirm: async reason => {
+          await apiFetch('/api/admin/feature-flags/' + cb.dataset.flag, {
+            method: 'PUT', body: JSON.stringify({ isGloballyEnabled: cb.checked, reason }),
+          });
+        },
+      });
+      cb.onchange = null; // avoid double-fire while modal is open; page reload not required
+    };
+  });
+}
+
+// ── Audit log ────────────────────────────────────────────────────────────────
+let auditState = { orgId: '', adminId: '', action: '', page: 1, pageSize: 50 };
+
+async function renderAuditLog(content) {
+  setTitle('Audit Log');
+  content.innerHTML = `
+    <div class="toolbar">
+      <input id="auditAction" placeholder="Filter by action (e.g. entitlement_overridden)">
+      <button class="btn" id="auditFilter">Filter</button>
+    </div>
+    <div id="auditWrap" class="card"><div class="loading">Loading…</div></div>
+  `;
+  content.querySelector('#auditFilter').onclick = () => {
+    auditState.action = content.querySelector('#auditAction').value.trim();
+    auditState.page = 1;
+    loadAudit();
+  };
+  await loadAudit();
+}
+
+async function loadAudit() {
+  const wrap = document.getElementById('auditWrap');
+  if (!wrap) return;
+  wrap.innerHTML = '<div class="loading">Loading…</div>';
+  const data = await apiFetch('/api/admin/audit-log' + qs(auditState));
+  if (!data.entries.length) { wrap.innerHTML = '<div class="empty-state">No audit entries match these filters.</div>'; return; }
+  const table = document.createElement('div');
+  table.innerHTML = `
+    <table>
+      <thead><tr><th>When</th><th>Admin</th><th>Action</th><th>Resource</th><th>Reason</th></tr></thead>
+      <tbody>
+        ${data.entries.map(a => `
+          <tr>
+            <td class="muted" style="white-space:nowrap">${fmtDate(a.created_at)}</td>
+            <td>${esc(a.admin_email || '')}</td>
+            <td>${esc(a.action)}</td>
+            <td class="muted">${esc(a.resource_type || '')} ${a.resource_id ? esc(a.resource_id).slice(0, 8) : ''}</td>
+            <td class="muted">${esc(a.reason || '')}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+  `;
+  wrap.innerHTML = '';
+  wrap.appendChild(table);
+  wrap.appendChild(paginationControls(data.total, data.page, data.pageSize, p => { auditState.page = p; loadAudit(); }));
+}
+
+// ── Settings ─────────────────────────────────────────────────────────────────
+async function renderSettings(content) {
+  setTitle('Settings');
+  content.innerHTML = '<div class="loading">Loading…</div>';
+  const { settings: s } = await apiFetch('/api/admin/settings');
+  content.innerHTML = `
+    <div class="card" style="max-width:520px">
+      <div class="field" style="margin-bottom:14px"><label class="muted" style="font-size:12px">Monthly AI budget (USD)</label><br><input type="number" step="0.01" id="setBudget" value="${s.monthly_ai_budget_usd ?? ''}"></div>
+      <div class="field" style="margin-bottom:14px"><label class="muted" style="font-size:12px">Hard AI spend limit (USD)</label><br><input type="number" step="0.01" id="setHardLimit" value="${s.hard_ai_spend_limit_usd ?? ''}"></div>
+      <div class="field" style="margin-bottom:14px"><label class="muted" style="font-size:12px">At hard ceiling</label><br>
+        <select id="setCeilingAction">
+          <option value="alert_only" ${s.budget_ceiling_action === 'alert_only' ? 'selected' : ''}>Alert only</option>
+          <option value="block_new_ai_jobs" ${s.budget_ceiling_action === 'block_new_ai_jobs' ? 'selected' : ''}>Block new AI jobs</option>
+        </select>
+      </div>
+      <div class="field" style="margin-bottom:14px"><label><input type="checkbox" id="setMaintenance" style="width:auto" ${s.maintenance_mode ? 'checked' : ''}> Maintenance mode</label></div>
+      <hr style="border-color:var(--border);margin:16px 0">
+      <div class="field" style="margin-bottom:6px"><label class="muted" style="font-size:12px">Last verified Anthropic balance (USD) — manually maintained</label><br><input type="number" step="0.01" id="setBalance" placeholder="Enter after checking the Anthropic Console"></div>
+      <div class="muted" style="font-size:11.5px;margin-bottom:14px">
+        ${s.last_verified_credit_balance_usd != null ? `Last set to ${fmtMoney(s.last_verified_credit_balance_usd)} on ${fmtDate(s.credit_balance_verified_at)}.` : 'Never manually verified.'}
+        No official Anthropic balance API is used here — this is a manual, labeled entry only.
+      </div>
+      <button class="btn btn-primary" id="setSave">Save Settings</button>
+      <span id="setSaveMsg" class="muted" style="margin-left:10px;font-size:12px"></span>
+    </div>
+  `;
+  content.querySelector('#setSave').onclick = () => {
+    reasonModal({
+      title: 'Save platform settings',
+      confirmLabel: 'Save',
+      onConfirm: async reason => {
+        const body = {
+          reason,
+          monthly_ai_budget_usd: numOrNull(content.querySelector('#setBudget').value),
+          hard_ai_spend_limit_usd: numOrNull(content.querySelector('#setHardLimit').value),
+          budget_ceiling_action: content.querySelector('#setCeilingAction').value,
+          maintenance_mode: content.querySelector('#setMaintenance').checked,
+        };
+        const balance = content.querySelector('#setBalance').value;
+        if (balance !== '') body.last_verified_credit_balance_usd = numOrNull(balance);
+        await apiFetch('/api/admin/settings', { method: 'PUT', body: JSON.stringify(body) });
+        renderSettings(content);
+      },
+    });
+  };
+}
+function numOrNull(v) { return v === '' || v == null ? null : Number(v); }
+
+// ── Boot ─────────────────────────────────────────────────────────────────────
+function renderForbidden() {
+  document.getElementById('root').innerHTML = `
+    <div class="full-center">
+      <div class="card" style="max-width:420px;text-align:center">
+        <h2 style="margin-bottom:10px">403 — Not authorized</h2>
+        <p class="muted" style="font-size:13px;margin-bottom:16px">This account does not have Jobu Scout platform-admin access.</p>
+        <a href="/" class="btn btn-primary" style="display:inline-block">Back to Jobu Scout</a>
+      </div>
+    </div>
+  `;
+}
+
+(async function boot() {
+  const session = getSession();
+  if (!session?.accessToken) { window.location.href = '/'; return; }
+  try {
+    const status = await apiFetch('/api/admin/status');
+    if (!status.isAdmin) { renderForbidden(); return; }
+    CURRENT_ROLE = status.role;
+  } catch (e) {
+    renderForbidden();
+    return;
+  }
+  renderShell();
+  router();
+})();
+</script>
+</body>
+</html>
