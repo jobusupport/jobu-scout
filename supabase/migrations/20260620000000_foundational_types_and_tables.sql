@@ -1,4 +1,4 @@
--- Foundational schema baseline (Slice 1 branch-validation follow-up), part 1 of 5.
+-- Foundational schema baseline (Slice 1 branch-validation follow-up), part 1 of 6.
 -- See supabase/README.md for the full explanation of why this exists.
 -- Reconstructed via read-only introspection (Supabase list_tables +
 -- information_schema/pg_catalog queries), NOT a pg_dump/db push output.

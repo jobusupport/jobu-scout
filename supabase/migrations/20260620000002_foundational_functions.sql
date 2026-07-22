@@ -1,13 +1,16 @@
--- Foundational schema baseline (Slice 1 branch-validation follow-up), part 2 of 5.
+-- Foundational schema baseline (Slice 1 branch-validation follow-up), part 2 of 6.
 -- See supabase/README.md for the full explanation of why this exists.
 -- Reconstructed via read-only introspection (Supabase list_tables +
 -- information_schema/pg_catalog queries), NOT a pg_dump/db push output.
 
--- All 11 Jobu-Scout-owned functions in the public schema. Excludes
--- admin_dashboard_metrics (owned by the already-tracked
--- admin_dashboard_metrics_fn migration) and every pg_trgm-internal C
--- function (those come from the pg_trgm extension itself, created in
--- file 1 -- reimplementing them here would be redundant and wrong).
+-- 11 Jobu-Scout-owned foundational functions, plus admin_dashboard_metrics
+-- (originally owned by the separately-tracked admin_dashboard_metrics_fn
+-- migration -- included here now that a real Preview Branch replay proved
+-- Supabase doesn't pull in migrations that exist only in the parent
+-- project's tracked history, not files in this repo). Excludes every
+-- pg_trgm-internal C function (those come from the pg_trgm extension
+-- itself, created in file 1 -- reimplementing them here would be
+-- redundant and wrong).
 
 CREATE OR REPLACE FUNCTION public.auth_user_org_ids()
  RETURNS SETOF uuid
@@ -327,3 +330,96 @@ BEGIN
   END LOOP;
 END;
 $function$;
+
+-- ── Tracked-migration function (admin_dashboard_metrics_fn) ────────────────
+-- Reads from admin_audit_log, ai_usage_events, scrape_jobs, reports,
+-- organizations, org_members -- all now created by this point (file 1 +
+-- 20260620000001_tracked_migration_replay_objects.sql, which this file's
+-- migration number now correctly runs after).
+CREATE OR REPLACE FUNCTION public.admin_dashboard_metrics()
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+declare
+  v_reports_this_month int;
+  v_ai_cost_month numeric;
+  v_ai_cost_today numeric;
+  v_days_elapsed numeric;
+  v_days_in_month numeric;
+  v_failed_24h int;
+  v_finished_24h int;
+  result jsonb;
+begin
+  select count(*) into v_reports_this_month from reports where created_at >= date_trunc('month', now());
+  select coalesce(sum(estimated_cost_usd), 0) into v_ai_cost_month from ai_usage_events where created_at >= date_trunc('month', now());
+  select coalesce(sum(estimated_cost_usd), 0) into v_ai_cost_today from ai_usage_events where created_at >= current_date;
+  select count(*) into v_failed_24h from reports where status = 'failed' and updated_at >= now() - interval '24 hours';
+  select count(*) into v_finished_24h from reports where status in ('ready','failed') and updated_at >= now() - interval '24 hours';
+
+  v_days_elapsed := greatest(extract(day from now() - date_trunc('month', now())) + 1, 1);
+  v_days_in_month := extract(day from (date_trunc('month', now()) + interval '1 month - 1 day'));
+
+  select jsonb_build_object(
+    'total_tenants', (select count(*) from organizations),
+    'active_tenants', (select count(*) from organizations where status = 'active'),
+    'free_plan_tenants', (select count(*) from organizations where plan = 'free'),
+    'suspended_tenants', (select count(*) from organizations where status = 'suspended'),
+    'cancelled_tenants', (select count(*) from organizations where status = 'cancelled'),
+    'total_users', (select count(*) from org_members where accepted_at is not null),
+
+    'reports_today', (select count(*) from reports where created_at >= current_date),
+    'reports_this_month', v_reports_this_month,
+    'reports_queued', (select count(*) from reports where status in ('pending','generating')),
+    'reports_failed_24h', v_failed_24h,
+    'report_failure_rate_24h', case when v_finished_24h = 0 then 0 else round(v_failed_24h::numeric / v_finished_24h, 4) end,
+    'avg_report_duration_seconds', (
+      select round(avg(extract(epoch from (generated_at - created_at)))::numeric, 1)
+      from reports
+      where status = 'ready' and generated_at is not null and created_at >= now() - interval '30 days'
+    ),
+
+    'scrape_jobs_running', (select count(*) from scrape_jobs where status = 'running'),
+    'scrape_jobs_failing_24h', (select count(*) from scrape_jobs where status = 'failed' and created_at >= now() - interval '24 hours'),
+    'scrape_jobs_queued', (select count(*) from scrape_jobs where status = 'pending'),
+
+    'ai_input_tokens_month', (select coalesce(sum(input_tokens), 0) from ai_usage_events where created_at >= date_trunc('month', now())),
+    'ai_output_tokens_month', (select coalesce(sum(output_tokens), 0) from ai_usage_events where created_at >= date_trunc('month', now())),
+    'ai_cost_month_usd', v_ai_cost_month,
+    'ai_cost_today_usd', v_ai_cost_today,
+    'avg_ai_cost_per_report_usd', case when v_reports_this_month = 0 then 0 else round(v_ai_cost_month / v_reports_this_month, 4) end,
+    'projected_month_end_ai_cost_usd', round((v_ai_cost_month / v_days_elapsed) * v_days_in_month, 2),
+
+    'customers_over_80pct_reports', (
+      select count(*) from organizations o
+      where o.max_reports_per_month > 0
+        and (select count(*) from reports r where r.org_id = o.id and r.created_at >= date_trunc('month', now())) >= 0.8 * o.max_reports_per_month
+    ),
+    'customers_over_limit_reports', (
+      select count(*) from organizations o
+      where o.max_reports_per_month > 0
+        and (select count(*) from reports r where r.org_id = o.id and r.created_at >= date_trunc('month', now())) > o.max_reports_per_month
+    ),
+
+    'queue_depth', (select count(*) from reports where status in ('pending','generating')) + (select count(*) from scrape_jobs where status = 'pending'),
+
+    'recent_admin_actions', (
+      select coalesce(jsonb_agg(row_to_json(x)), '[]'::jsonb) from (
+        select id, admin_email, action, resource_type, resource_id, org_id, reason, created_at
+        from admin_audit_log order by created_at desc limit 10
+      ) x
+    )
+  ) into result;
+
+  return result;
+end;
+$function$;
+
+-- ── Tracked-migration grant change (tighten_is_jobu_admin_grants) ──────────
+-- Verified against production's current grants (information_schema.
+-- routine_privileges), not guessed: authenticated/postgres/service_role can
+-- execute is_jobu_admin(); anon (the default PUBLIC grant a new SQL
+-- function otherwise gets) cannot.
+revoke execute on function public.is_jobu_admin(uuid) from public;
+grant execute on function public.is_jobu_admin(uuid) to authenticated, service_role;

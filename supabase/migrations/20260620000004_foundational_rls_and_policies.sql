@@ -1,4 +1,4 @@
--- Foundational schema baseline (Slice 1 branch-validation follow-up), part 4 of 5.
+-- Foundational schema baseline (Slice 1 branch-validation follow-up), part 4 of 6.
 -- See supabase/README.md for the full explanation of why this exists.
 -- Reconstructed via read-only introspection (Supabase list_tables +
 -- information_schema/pg_catalog queries), NOT a pg_dump/db push output.
@@ -172,3 +172,54 @@ create policy "teams_update" on public."teams"
   using ((org_id IN ( SELECT org_members.org_id
    FROM org_members
   WHERE ((org_members.user_id = auth.uid()) AND (org_members.role = ANY (ARRAY['admin'::org_role, 'coach'::org_role])) AND (org_members.accepted_at IS NOT NULL)))));
+
+-- ── RLS for tracked-migration tables ─────────────────────────────────────
+-- All 12 have rls_enabled=true in production. 5 of them (platform_admins,
+-- player_handedness, player_gc_stats, player_gc_spray_charts,
+-- roster_players) have zero policies -- same fail-closed-to-service-role-
+-- only pattern as 11 of the 21 foundational tables.
+alter table public."platform_admins" enable row level security;
+alter table public."admin_audit_log" enable row level security;
+alter table public."org_entitlement_overrides" enable row level security;
+alter table public."org_support_notes" enable row level security;
+alter table public."admin_support_sessions" enable row level security;
+alter table public."ai_usage_events" enable row level security;
+alter table public."feature_flags" enable row level security;
+alter table public."platform_settings" enable row level security;
+alter table public."player_handedness" enable row level security;
+alter table public."player_gc_stats" enable row level security;
+alter table public."player_gc_spray_charts" enable row level security;
+alter table public."roster_players" enable row level security;
+
+create policy "admin_audit_log_select_admin" on public."admin_audit_log"
+  for SELECT
+  using (is_jobu_admin());
+
+create policy "admin_support_sessions_select_admin" on public."admin_support_sessions"
+  for SELECT
+  using (is_jobu_admin());
+
+create policy "ai_usage_events_select_admin" on public."ai_usage_events"
+  for SELECT
+  using (is_jobu_admin());
+
+create policy "feature_flags_select_authenticated" on public."feature_flags"
+  for SELECT
+  using ((auth.uid() IS NOT NULL));
+
+create policy "feature_flags_write_admin" on public."feature_flags"
+  for ALL
+  using (is_jobu_admin())
+  with check (is_jobu_admin());
+
+create policy "org_entitlement_overrides_select_admin" on public."org_entitlement_overrides"
+  for SELECT
+  using (is_jobu_admin());
+
+create policy "org_support_notes_select_admin" on public."org_support_notes"
+  for SELECT
+  using (is_jobu_admin());
+
+create policy "platform_settings_select_admin" on public."platform_settings"
+  for SELECT
+  using (is_jobu_admin());

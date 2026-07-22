@@ -1,4 +1,4 @@
--- Foundational schema baseline (Slice 1 branch-validation follow-up), part 5 of 5.
+-- Foundational schema baseline (Slice 1 branch-validation follow-up), part 5 of 6.
 -- See supabase/README.md for the full explanation of why this exists.
 -- Reconstructed via read-only introspection (Supabase list_tables +
 -- information_schema/pg_catalog queries), NOT a pg_dump/db push output.
@@ -12,6 +12,10 @@ create trigger trg_players_updated_at before update on public."players" for each
 create trigger trg_profiles_updated_at before update on public."profiles" for each row execute function set_updated_at();
 create trigger trg_reports_updated_at before update on public."reports" for each row execute function set_updated_at();
 create trigger trg_teams_updated_at before update on public."teams" for each row execute function set_updated_at();
+
+-- ── Triggers on tracked-migration tables ────────────────────────────────
+create trigger feature_flags_set_updated_at before update on public."feature_flags" for each row execute function set_updated_at();
+create trigger platform_settings_set_updated_at before update on public."platform_settings" for each row execute function set_updated_at();
 
 -- on_auth_user_created is on auth.users (Supabase-managed schema), not
 -- public -- included because Jobu Scout's own handle_new_user() function
@@ -35,7 +39,9 @@ exception when duplicate_object then null; end $$;
 
 -- ── Grants ──────────────────────────────────────────────────────────────
 -- Verified via information_schema.role_table_grants: every foundational
--- table already receives Supabase's standard full grant set (anon,
--- authenticated, service_role) automatically -- confirmed uniform across
--- all but one object in the entire project (an already-tracked admin
--- view, out of scope here). No custom GRANT statements needed.
+-- and tracked-migration table receives Supabase's standard full grant set
+-- (anon, authenticated, service_role) automatically -- no custom GRANT
+-- statements needed for tables. The one object in the whole project with
+-- non-default grants, admin_customer_overview (service_role only), is
+-- handled explicitly in file 3 where that view is created, alongside the
+-- is_jobu_admin() function grant tightening handled in file 2.

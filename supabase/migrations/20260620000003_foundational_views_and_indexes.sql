@@ -1,11 +1,12 @@
--- Foundational schema baseline (Slice 1 branch-validation follow-up), part 3 of 5.
+-- Foundational schema baseline (Slice 1 branch-validation follow-up), part 3 of 6.
 -- See supabase/README.md for the full explanation of why this exists.
 -- Reconstructed via read-only introspection (Supabase list_tables +
 -- information_schema/pg_catalog queries), NOT a pg_dump/db push output.
 
--- Views and non-primary-key/non-unique indexes for foundational tables.
--- (Primary key and unique indexes were already created implicitly by
--- their constraints in file 1 -- not repeated here.)
+-- Views and non-primary-key/non-unique indexes for foundational and
+-- tracked-migration tables. (Primary key and unique indexes were already
+-- created implicitly by their constraints in files 1 and 2 -- not repeated
+-- here.)
 
 -- ── Views ────────────────────────────────────────────────────────────────
 CREATE OR REPLACE VIEW public.team_summary AS
@@ -96,3 +97,87 @@ CREATE INDEX IF NOT EXISTS idx_at_bats_pitcher_id ON public.at_bats USING btree 
 CREATE INDEX IF NOT EXISTS idx_derived_team_verified_totals_run ON public.derived_team_verified_totals USING btree (run_id);
 CREATE INDEX IF NOT EXISTS idx_game_stat_validation_results_run ON public.game_stat_validation_results USING btree (run_id);
 CREATE INDEX IF NOT EXISTS idx_game_stat_validation_results_team_game ON public.game_stat_validation_results USING btree (team_id, game_id);
+
+-- ── Tracked-migration view (admin_customer_overview_view) ──────────────────
+CREATE OR REPLACE VIEW public.admin_customer_overview AS
+ SELECT id,
+    name,
+    slug,
+    contact_email,
+    plan,
+    status,
+    subscription_status,
+    stripe_customer_id,
+    stripe_subscription_id,
+    plan_expires_at,
+    max_opponent_teams,
+    max_reports_per_month,
+    max_users,
+    max_self_scout_reports_per_month,
+    max_matchup_reports_per_month,
+    created_at,
+    ( SELECT count(*) AS count
+           FROM org_members m
+          WHERE ((m.org_id = o.id) AND (m.accepted_at IS NOT NULL))) AS member_count,
+    ( SELECT count(*) AS count
+           FROM teams t
+          WHERE (t.org_id = o.id)) AS team_count,
+    ( SELECT count(*) AS count
+           FROM reports r
+          WHERE (r.org_id = o.id)) AS reports_total,
+    ( SELECT count(*) AS count
+           FROM reports r
+          WHERE ((r.org_id = o.id) AND (r.created_at >= date_trunc('month'::text, now())))) AS reports_this_period,
+    ( SELECT COALESCE(sum(a.estimated_cost_usd), (0)::numeric) AS "coalesce"
+           FROM ai_usage_events a
+          WHERE (a.org_id = o.id)) AS ai_cost_total_usd,
+    ( SELECT COALESCE(sum(a.estimated_cost_usd), (0)::numeric) AS "coalesce"
+           FROM ai_usage_events a
+          WHERE ((a.org_id = o.id) AND (a.created_at >= date_trunc('month'::text, now())))) AS ai_cost_this_period_usd,
+    ( SELECT r.generated_at
+           FROM reports r
+          WHERE ((r.org_id = o.id) AND (r.generated_at IS NOT NULL))
+          ORDER BY r.generated_at DESC
+         LIMIT 1) AS last_report_at,
+    ( SELECT (r.status)::text AS status
+           FROM reports r
+          WHERE (r.org_id = o.id)
+          ORDER BY r.created_at DESC
+         LIMIT 1) AS last_report_status,
+    ( SELECT s.finished_at
+           FROM scrape_jobs s
+          WHERE ((s.org_id = o.id) AND (s.status = 'done'::scrape_status))
+          ORDER BY s.finished_at DESC
+         LIMIT 1) AS last_successful_scrape_at,
+    ( SELECT (s.status)::text AS status
+           FROM scrape_jobs s
+          WHERE (s.org_id = o.id)
+          ORDER BY s.created_at DESC
+         LIMIT 1) AS last_scrape_status
+   FROM organizations o;
+
+-- Grants on this view were found NOT to follow the standard Supabase
+-- default set (verified against production, not assumed) -- service_role
+-- only, deliberately excluding anon/authenticated since this is an
+-- admin-only aggregate over every tenant's data.
+revoke all on public.admin_customer_overview from anon, authenticated;
+grant select, insert, update, delete, references, trigger, truncate on public.admin_customer_overview to service_role;
+
+-- ── Indexes for tracked-migration tables ────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_admin_audit_log_action ON public.admin_audit_log USING btree (action);
+CREATE INDEX IF NOT EXISTS idx_admin_audit_log_admin_user_id ON public.admin_audit_log USING btree (admin_user_id);
+CREATE INDEX IF NOT EXISTS idx_admin_audit_log_created_at ON public.admin_audit_log USING btree (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_admin_audit_log_org_id ON public.admin_audit_log USING btree (org_id);
+CREATE INDEX IF NOT EXISTS idx_admin_support_sessions_org_id ON public.admin_support_sessions USING btree (org_id);
+CREATE INDEX IF NOT EXISTS idx_admin_support_sessions_token ON public.admin_support_sessions USING btree (token);
+CREATE INDEX IF NOT EXISTS idx_ai_usage_events_created_at ON public.ai_usage_events USING btree (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_usage_events_org_id ON public.ai_usage_events USING btree (org_id);
+CREATE INDEX IF NOT EXISTS idx_ai_usage_events_report_id ON public.ai_usage_events USING btree (report_id);
+CREATE INDEX IF NOT EXISTS idx_org_entitlement_overrides_org_id ON public.org_entitlement_overrides USING btree (org_id);
+CREATE INDEX IF NOT EXISTS idx_org_support_notes_org_id ON public.org_support_notes USING btree (org_id);
+CREATE INDEX IF NOT EXISTS idx_platform_admins_user_id ON public.platform_admins USING btree (user_id);
+CREATE INDEX IF NOT EXISTS idx_player_gc_spray_charts_team ON public.player_gc_spray_charts USING btree (team_id);
+CREATE INDEX IF NOT EXISTS idx_player_gc_stats_team ON public.player_gc_stats USING btree (team_id);
+CREATE INDEX IF NOT EXISTS idx_player_handedness_team ON public.player_handedness USING btree (team_id);
+CREATE INDEX IF NOT EXISTS idx_player_handedness_team_matchkey ON public.player_handedness USING btree (team_id, match_key);
+CREATE INDEX IF NOT EXISTS idx_roster_players_team ON public.roster_players USING btree (team_id);
