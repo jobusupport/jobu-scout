@@ -22,6 +22,51 @@ project happened directly against Supabase with nothing committed to git.
 `supabase/migrations/` replaces that with a real, reviewable history,
 starting with Phase 2 Slice 1's organization product fields.
 
+## What's actually in this directory
+
+Three distinct kinds of file live here, and it matters which is which:
+
+1. **Six foundational baseline migrations**
+   (`20260620000000_foundational_types_and_tables.sql` through
+   `20260620000005_foundational_triggers_and_grants.sql`). These
+   reconstruct, via read-only introspection of the live production
+   database (not `pg_dump`, not a migration replay), the *entire*
+   consolidated schema that predates this repo's migration history --
+   every table, function, view, index, RLS policy, trigger, and grant
+   Jobu Scout owns. Verified schema-identical to production via a full
+   comparison (tables/columns/constraints/functions/views/indexes/RLS/
+   grants), and verified to replay cleanly from a completely empty
+   database. **These must never be executed directly against the
+   existing production database** -- production already has every
+   object they create, so a plain replay would fail with
+   already-exists errors. They exist for two purposes: (a) so a fresh
+   environment (disaster recovery, a new project) can be stood up from
+   nothing, and (b) as the target state that production's own migration
+   history gets reconciled against via `migration repair` (see below) --
+   never applied there directly.
+2. **Twenty-two historical marker migrations**
+   (`<production-timestamp>_<original-name>_history_marker.sql`).
+   Production's own tracked migration history contains 22 versions
+   between `20260630211818` and `20260721183527` that were never
+   committed as files in this repository (they were applied directly
+   against the live project). Their cumulative schema effect is already
+   fully captured by the six foundational migrations above -- these 22
+   files exist only so this repo's local migration list lines up
+   version-for-version with production's remote migration history.
+   Each one is **intentionally a no-op** (`select 1;` plus an
+   explanatory comment) -- none of them reconstruct or re-run the
+   original migration SQL, since the foundational baseline already
+   represents that verified end state. They are not something a
+   production replay ever executes for real; production already has
+   these versions marked applied in its own history table, and a
+   `migration repair --status applied` (never a raw `db push`) is what
+   ties that fact together.
+3. **One genuine pending schema change**
+   (`20260721140000_add_organization_product_fields.sql`, Phase 2
+   Slice 1) -- the only migration in this directory that actually needs
+   to run against production for real. Everything else above is either
+   a from-scratch baseline or a no-op alignment marker.
+
 ## Naming convention
 
 `supabase/migrations/<YYYYMMDDHHMMSS>_<snake_case_description>.sql` -- the
