@@ -38,15 +38,24 @@ actually live -- the discipline this convention exists to enforce is
 
 ## Down migrations
 
-Each forward migration may have a matching `<same-name>.down.sql`. **These
-are reference files for the pre-adoption window only** -- safe to run
-before any real data depends on the change they undo, not a general-purpose
-rollback tool. Once a migration's columns/tables hold real, admin- or
-customer-assigned state, a schema-level rollback needs a deliberate,
-documented data-export step first, not a blind re-run of the down file.
-That procedure is written into the down file's own header comment once it
-applies (see `20260721140000_add_organization_product_fields.down.sql` for
-the first example) rather than kept as a second always-safe script, because
+Each forward migration may have a matching `<same-name>.down.sql` under
+`supabase/rollback/` -- **deliberately not** under `supabase/migrations/`.
+Supabase (and the CLI) treat every `.sql` file in `migrations/` as part of
+normal replay order; a down file living there risks being picked up and
+executed as if it were just another forward migration, which would be
+actively destructive (it would drop the very objects the matching forward
+migration just created). `supabase/rollback/` holds the same files for
+reference and history, safely outside that scan path.
+
+**These are reference files for the pre-adoption window only** -- safe to
+run manually before any real data depends on the change they undo, not a
+general-purpose rollback tool. Once a migration's columns/tables hold real,
+admin- or customer-assigned state, a schema-level rollback needs a
+deliberate, documented data-export step first, not a blind re-run of the
+down file. That procedure is written into the down file's own header
+comment once it applies (see
+`supabase/rollback/20260721140000_add_organization_product_fields.down.sql`
+for the first example) rather than kept as a second always-safe script, because
 what's actually safe changes over time as a feature gets adopted.
 
 The safest rollback for *any* migration in this directory, at any point, is
