@@ -73,3 +73,45 @@ it simply never selects or writes the new columns until its own deploy
 lands. Apply the migration first; deploy the code that depends on it
 second. No stricter coordination window is required unless a specific
 migration's own comments say otherwise.
+
+## Preview Branch validation workflow
+
+Changes to this directory are validated against a Supabase Preview Branch
+before ever touching production -- never applied to production directly to
+"see if it works."
+
+The project's GitHub integration (Project Settings -> Integrations ->
+GitHub) is configured with:
+
+- **Automatic branching: on** -- every pull request gets its own preview
+  database, built by replaying every file in `supabase/migrations/` in
+  filename order against a fresh database.
+- **Supabase changes only: on** -- a preview build only triggers on a push
+  that actually changes a file under `supabase/`. A no-op push (e.g. an
+  empty commit) will not trigger a build under this setting -- if you need
+  to force a rebuild without a real schema change, touch a file in this
+  directory (this file is a reasonable, harmless target) rather than
+  pushing an empty commit.
+- **Deploy to production: off** -- merging a pull request does **not**
+  automatically apply anything to the production database or its migration
+  history. Promoting a validated migration to production is a separate,
+  deliberate, manual step, performed only after Preview Branch replay,
+  schema comparison, RLS testing, and application smoke testing have all
+  passed for that change.
+
+Validating a change:
+
+1. Open a pull request touching `supabase/`.
+2. Wait for the Preview Branch to provision and replay all migrations --
+   check its status via the Supabase dashboard's Branching page, or via the
+   Management API (`list_branches`, `list_migrations` against the branch's
+   own `project_ref`, `get_logs` with `service: "branch-action"` on the
+   parent project for provisioning-level events).
+3. Compare the Preview Branch's resulting schema against production before
+   trusting it (tables, columns, constraints, functions, RLS policies,
+   triggers, indexes -- not just "did the migration run without erroring").
+4. Only after that comparison passes, and independently of this workflow,
+   apply the same migration to production through whatever process is
+   current at that time -- this directory's existence doesn't by itself
+   grant production auto-deploy, by design (see "Deploy to production: off"
+   above).
