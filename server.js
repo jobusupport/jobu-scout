@@ -73,6 +73,12 @@ const {
   blockWriteDuringReadOnlySupport,
 } = require('./src/admin-lib');
 
+// ── Product capabilities (Phase 2 Slice 1) ───────────────────────────────────
+const { getOrganizationCapabilities } = require('./src/product-capabilities');
+
+// ── Trusted organization resolution (extracted for database-free testing) ────
+const { resolveTrustedOrgId, buildAcceptedMembershipsQuery } = require('./src/org-resolution');
+
 let pipelineDb = null;
 if (USE_SUPABASE) {
   pipelineDb = require('./src/db');
@@ -486,101 +492,29 @@ async function selectSafe(query) {
   }
 }
 
+// Thin wrapper around src/org-resolution.js's resolveTrustedOrgId -- the
+// actual trust decisions, every ignored input, and every fail-closed
+// branch live there now (and are unit-tested there, database-free, via
+// dependency injection), specifically so that logic is exercised by the
+// normal `npm test` run rather than only by gated, skipped-by-default
+// integration tests. This wrapper supplies the one thing that needs a
+// real database: `lookupAcceptedMemberships`, wired to the real
+// adminClient (service-role -- see org-resolution.js's header comment for
+// why RLS is not in play for this query) via selectSafe, exactly as
+// before. It also restores the memoization the previous inline
+// implementation had (`req._orgId = ...`), so a request that calls
+// getRequestOrgId more than once (e.g. assertTeamInRequestOrg calling it
+// after a route handler already did) still only performs the lookup once.
 async function getRequestOrgId(req) {
   if (!USE_SUPABASE) return null;
 
-  if (req?._orgId) return req._orgId;
+  const orgId = await resolveTrustedOrgId(req, {
+    lookupAcceptedMemberships: (userId) =>
+      selectSafe(buildAcceptedMembershipsQuery(adminClient, userId)),
+  });
 
-  const user = req?.user || null;
-  const userId = user?.id || null;
-  const userEmail = user?.email || null;
-
-  const metadataOrgId =
-    user?.app_metadata?.org_id ||
-    user?.user_metadata?.org_id ||
-    user?.org_id ||
-    null;
-
-  if (metadataOrgId) {
-    req._orgId = metadataOrgId;
-    return metadataOrgId;
-  }
-
-  if (!userId && !userEmail) {
-    throw new Error('Unable to determine the current user. Please sign out and sign back in.');
-  }
-
-  // Common schema: profiles.id = auth.users.id, profiles.org_id
-  if (userId) {
-    const profileById = await maybeSingleSafe(
-      adminClient.from('profiles').select('org_id').eq('id', userId).limit(1)
-    );
-    if (profileById?.org_id) {
-      req._orgId = profileById.org_id;
-      return profileById.org_id;
-    }
-  }
-
-  if (userEmail) {
-    const profileByEmail = await maybeSingleSafe(
-      adminClient.from('profiles').select('org_id').ilike('email', userEmail).limit(1)
-    );
-    if (profileByEmail?.org_id) {
-      req._orgId = profileByEmail.org_id;
-      return profileByEmail.org_id;
-    }
-  }
-
-  // Common schema: org_members.user_id / org_members.email -> org_id
-  if (userId) {
-    const memberByUserId = await maybeSingleSafe(
-      adminClient.from('org_members').select('org_id').eq('user_id', userId).limit(1)
-    );
-    if (memberByUserId?.org_id) {
-      req._orgId = memberByUserId.org_id;
-      return memberByUserId.org_id;
-    }
-  }
-
-  if (userEmail) {
-    const memberByEmail = await maybeSingleSafe(
-      adminClient.from('org_members').select('org_id').ilike('email', userEmail).limit(1)
-    );
-    if (memberByEmail?.org_id) {
-      req._orgId = memberByEmail.org_id;
-      return memberByEmail.org_id;
-    }
-  }
-
-  // Alternate naming sometimes used by SaaS templates.
-  if (userId) {
-    const membershipByUserId = await maybeSingleSafe(
-      adminClient.from('memberships').select('org_id').eq('user_id', userId).limit(1)
-    );
-    if (membershipByUserId?.org_id) {
-      req._orgId = membershipByUserId.org_id;
-      return membershipByUserId.org_id;
-    }
-  }
-
-  // Safe customer-friendly fallback for single-org installs:
-  // no manual Railway variable, but we refuse to guess when more than one org exists.
-  const orgs = await selectSafe(adminClient.from('orgs').select('id').limit(2));
-  if (orgs.length === 1) {
-    req._orgId = orgs[0].id;
-    return orgs[0].id;
-  }
-
-  const organizations = await selectSafe(adminClient.from('organizations').select('id').limit(2));
-  if (organizations.length === 1) {
-    req._orgId = organizations[0].id;
-    return organizations[0].id;
-  }
-
-  throw new Error(
-    `No organization could be resolved for ${userEmail || userId}. ` +
-    'Create a profiles.org_id or org_members row for this user so teams can be assigned to the correct customer organization.'
-  );
+  req._orgId = orgId;
+  return orgId;
 }
 
 async function assertTeamInRequestOrg(req, teamId) {
@@ -984,6 +918,48 @@ function buildUsageEnv(req, quota) {
   if (quota?.reportId) env.JOBU_USAGE_REPORT_ID = quota.reportId;
   return env;
 }
+
+// GET /api/product/capabilities
+//
+// Read-only. Not called by the current dashboard -- nothing in
+// dashboard-src/ references this endpoint, and no route in this file is
+// gated on it yet (see src/product-capabilities.js's requireProductAccess,
+// which is implemented but intentionally unmounted in Phase 2 Slice 1).
+// resolveSupportSession runs first specifically so a support-view request
+// resolves capabilities for the target org being supported, never the
+// admin's own -- see the precedence rules in
+// docs/architecture/PHASE_2_PRODUCT_CAPABILITY_RFC.md §11.
+app.get('/api/product/capabilities', requireAuth, resolveSupportSession, async (req, res) => {
+  try {
+    const orgId = await getRequestOrgId(req);
+    const capabilities = await getOrganizationCapabilities(orgId);
+    res.json(capabilities);
+  } catch (err) {
+    // Authentication (401) and admin authorization (403) failures never
+    // reach this handler; they're already handled by requireAuth and
+    // requireJobuAdmin before this route runs. This branch is only for
+    // organization-lookup or capability-configuration failures.
+    //
+    // Full detail always goes server-side first (matches the
+    // "[module-name] description: err" convention already used in
+    // src/admin-lib.js's logAdminAction catch block). The client only ever
+    // sees err.message when the error carries an explicit statusCode --
+    // getOrganizationCapabilities's "Organization not found." and every
+    // error resolveTrustedOrgId (src/org-resolution.js, via
+    // getRequestOrgId) throws are all deliberately authored, safe, public
+    // strings paired with an explicit statusCode for exactly this reason.
+    // Anything without a statusCode is treated as unexpected (e.g. a raw
+    // Supabase/Postgres error, which could contain SQL fragments or
+    // internal table/column names) and replaced with a stable, generic
+    // message instead of being passed through verbatim.
+    console.error('[api/product/capabilities] failed to resolve capabilities:', err);
+    const statusCode = err.statusCode || 400;
+    const publicMessage = err.statusCode
+      ? err.message
+      : 'Unable to resolve organization for this request.';
+    res.status(statusCode).json({ error: publicMessage });
+  }
+});
 
 // GET /api/billing/status
 app.get('/api/billing/status', requireAuth, async (req, res) => {

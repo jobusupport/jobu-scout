@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node server.js",
     "postinstall": "npx playwright install chromium --with-deps",
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test test/product-capabilities.test.js test/api-product-capabilities.test.js test/org-resolution.test.js",
     "login": "node src/login-gamechanger.js",
     "teams": "node src/test-read-teams.js",
     "search-teams": "node src/search-gamechanger-teams.js",
