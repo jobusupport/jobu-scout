@@ -106,4 +106,30 @@ function buildAcceptedMembershipsQuery(adminClient, userId) {
     .not('accepted_at', 'is', null);
 }
 
-module.exports = { resolveTrustedOrgId, buildAcceptedMembershipsQuery };
+// ── Shared, testable error-to-response mapping ──────────────────────────────
+//
+// Every route in server.js that calls getRequestOrgId (directly, or via
+// requireOrgAdmin) needs to make the same decision about a caught error:
+// forward it safely, or hide it. This function is that one decision,
+// factored out so it's unit-testable without a database and so every
+// caller applies it identically rather than re-implementing (and
+// potentially getting wrong) the same three-line check inline.
+//
+// A `.statusCode` already set on the error means it was thrown
+// deliberately, by resolveTrustedOrgId/getRequestOrgId or by this file's
+// own explicit `err.statusCode = ...; throw err;` sites -- its `.message`
+// is a pre-authored, safe, public string in every such case, and is
+// forwarded as-is. Anything without a `.statusCode` is treated as
+// unexpected -- a raw Supabase/Postgres error is the typical case, and can
+// contain SQL fragments, table/column names, or connection details -- and
+// is mapped to a stable generic 500 instead. This function never logs;
+// logging the real error in full, server-side, before calling this is the
+// caller's job (see sendResolverError in server.js).
+function mapErrorToResponse(err) {
+  if (err && err.statusCode) {
+    return { statusCode: err.statusCode, message: err.message };
+  }
+  return { statusCode: 500, message: 'Something went wrong. Please try again.' };
+}
+
+module.exports = { resolveTrustedOrgId, buildAcceptedMembershipsQuery, mapErrorToResponse };

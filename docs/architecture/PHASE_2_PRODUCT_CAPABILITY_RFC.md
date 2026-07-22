@@ -1,11 +1,18 @@
 # Phase 2 RFC: Product Capability Foundation
 
-**Status:** Reviewed and revised — awaiting approval, not implemented
-**Branch context:** written against `frontend/dashboard-debundle` @ `f33ef7dbc3d5f1825a33b1588636d89110ae96cb` (Phase 1.5 complete)
+**Status:** Slice 1 implemented, reviewed, and deployed to production. Slice 2 (admin write route) is **not built** — still design only, see §14.
 **Authoritative inputs:** `JOBU_SCOUT_V2_ARCHITECTURE_BLUEPRINT.md`, the Phase 1 repository audit
 **Scope:** shared product-capability foundation only — no dashboard changes, no product screens, no pricing changes
 
-**Revision note (self-review pass):** this document was critically reviewed against itself, the Blueprint, the Phase 1 audit, and the live repository. Nine concrete changes were made as a result — the schema now enforces the customer-type/product correlation at the database layer instead of by convention, the precedence rules are now an explicit fail-closed algorithm, the API contract separates billing/override state from product/feature state, the middleware scope was cut from three to one, the admin route no longer accepts a client-supplied `enabledProducts` array, rollback guidance now distinguishes pre-adoption from post-adoption safety, and the implementation-slice plan was consolidated from five slices to two. Each change is marked inline with **`[Revised: ...]`** at its location, and summarized in the accompanying review.
+**Revision note (self-review pass):** this document was originally critically reviewed against itself, the Blueprint, the Phase 1 audit, and the live repository, before any code existed. Nine concrete design changes were made as a result — the schema now enforces the customer-type/product correlation at the database layer instead of by convention, the precedence rules are now an explicit fail-closed algorithm, the API contract separates billing/override state from product/feature state, the middleware scope was cut from three to one, the admin route (still unbuilt) no longer accepts a client-supplied `enabledProducts` array, rollback guidance now distinguishes pre-adoption from post-adoption safety, and the implementation-slice plan was consolidated from five slices to two. Each such change is marked inline with **`[Revised: ...]`**.
+
+**This document has since been corrected a second time, after implementation, to remove or fix every place where it described the original design rather than what was actually built and shipped.** That pass is marked inline with **`[Implementation correction]`**. The most load-bearing corrections:
+
+- The real deployed migration is `supabase/migrations/20260721140000_add_organization_product_fields.sql` — not `20260722000000` as originally drafted throughout this document.
+- **No backfill was performed.** `onboarding_completed_at` is `NULL` for every organization, including every one that pre-dates this migration — not backfilled to `now()` as originally drafted in §7/§15. The deployed migration's own column comment states this explicitly.
+- `getRequestOrgId`'s tenant-resolution logic (§2) is not what's described below — it was rewritten during Slice 1's own security review to close a real cross-tenant authorization bypass. See the `[Implementation correction]` note in §2 and §11 for the actual, shipped resolution flow.
+- Slice 2 — the admin write route in §14, and `requireFeature`/`requireEntitlement` in §13 — were never built. Nothing in this repository can change an organization's product fields today except a direct, manual database edit.
+- A real, populated `supabase/README.md` and full `supabase/migrations/` history already exist in this repository (see the Supabase migration-governance work covering versions `20260620000000` through `20260721183527`) — the claim that "no migration convention exists yet" (§2) and "no automated test runner exists" (§2, §21, §25) are both now false; both were true only at the time this RFC was first drafted.
 
 ---
 
@@ -22,7 +29,7 @@ Every existing Travel workflow, every existing route, the Stripe webhook, and th
 Verified directly against the repository at the commit above (line numbers are exact as of this commit):
 
 - **Auth**: `requireAuth` (`server.js:644-660`) verifies a Supabase JWT via `adminClient.auth.getUser(jwt)` and sets `req.user`. There is no separate concept of a "product-scoped" session — auth is purely identity, tenant resolution is separate.
-- **Tenant resolution**: `getRequestOrgId(req)` (`server.js:489-584`) is the single source of org binding for every customer route. It tries, in order, `app_metadata`/`user_metadata` org id, then `profiles.org_id`, then `org_members.org_id`, then `memberships.org_id`, then a single-org fallback — and memoizes the result onto `req._orgId`. **This is the field the capability service must read `req._orgId` from, not re-derive independently**, so it composes correctly with support-session pinning (below).
+- **Tenant resolution**: `getRequestOrgId(req)` is the single source of org binding for every customer route, and memoizes the result onto `req._orgId`. **This is the field the capability service must read `req._orgId` from, not re-derive independently**, so it composes correctly with support-session pinning (below). `[Implementation correction]` The original draft described this function as trying, in order, `app_metadata`/`user_metadata` org id, then `profiles.org_id`, then `org_members.org_id`, then `memberships.org_id`, then a single-org fallback. **That description was itself the source of a real vulnerability**: the `app_metadata`/`user_metadata` branch trusted a value the account owner can set on themselves via the standard Supabase Auth client, letting any signed-up user claim membership in an org they don't belong to. Found and fixed during Slice 1's own security review, before merge — see `getRequestOrgId`'s header comment in `server.js` and `src/org-resolution.js` for the actual, shipped logic. The function now trusts exactly two sources: `req._orgId` already pinned by a validated support session, or a fresh `org_members` row (the real, and only, membership table — `profiles` has no `org_id` column, and no `memberships` or `orgs` table exists in this schema) keyed on the caller's own verified `req.user.id`, filtered to `accepted_at IS NOT NULL`. See §11 for the corrected resolution algorithm.
 - **Org-admin gate**: `requireOrgAdmin` (`server.js:629-641`) checks `org_members.role === 'admin'` — used today only for billing routes. Not the same thing as platform-admin.
 - **Suspension gate**: `assertOrgActive` (`server.js:604-619`) blocks resource-consuming actions for `status !== 'active'` orgs — a precedent for a narrowly-scoped, fail-closed async guard called at the top of a handler, which the new middleware in §13 follows structurally.
 - **Platform-admin auth**: `isJobuAdmin`/`requireJobuAdmin` (`src/admin-lib.js:24-58`) query a dedicated `platform_admins` table by `user_id`, fail closed on any error (`admin-lib.js:33-37`), and are mounted once for the whole admin router (`src/admin-api.js:51`: `router.use(requireAuth, requireJobuAdmin)`), with only `/status` (`admin-api.js:46-49`) exempted for client-side UI gating. The admin router itself is mounted at `server.js:662`: `app.use('/api/admin', createAdminRouter({ requireAuth }))`.
@@ -34,8 +41,8 @@ Verified directly against the repository at the commit above (line numbers are e
 - **`[Revised again, post-implementation]` RLS is confirmed enabled on `public.organizations`.** The earlier revision of this finding inferred RLS was "likely configured" from `src/supabase.js:14-20`'s `userClient(jwt)` comment (*"RLS applies — users only see their own org's data"*) — real evidence, but still an inference. Directly querying the live project's table metadata during Slice 1's final review confirms it as fact: `organizations` has `rls_enabled: true`. `userClient(jwt)` itself remains dead code — grepping the codebase for `userClient(` still finds exactly one match, its own definition, called from nowhere. **Slice 1's implementation uses the service-role `adminClient` exclusively (via a lazy `require` inside `getOrganizationCapabilities`, so importing `src/product-capabilities.js` never requires Supabase env vars to be set) and does not depend on, read, or need any RLS policy on `organizations`** — a service-role client bypasses RLS unconditionally regardless of whether it's enabled or what policies exist. That conclusion is unchanged by this correction. What *is* new: before `userClient()` is ever activated for anything real, the actual `SELECT` policies (if any) on `organizations` need to be inspected directly — RLS being *enabled* with no matching policy defined means zero rows are visible to that client by default (Postgres's fail-closed behavior), which would need to be confirmed one way or the other before relying on it, not assumed either way.
 - There is a comment in `admin-lib.js:9-11` referencing an `is_jobu_admin()` SQL function, which — if it exists at all — lives only in the live Supabase project, not in this repository (consistent with the Phase 1 finding that the live schema has no in-repo migration history). Unrelated to product capabilities; not touched by this RFC.
 - **No existing per-org fetch helper**: every route that needs an organization row (`enforceReportQuota` at `server.js:933-974`, the webhook handler, the admin customer-detail route) writes its own inline `.from('organizations').select(...)`. There is no `getOrganization()` to reuse or conflict with — `src/product-capabilities.js` will be the first centralized read path for this concern, which is the point of this RFC, not a departure from existing style.
-- **No migration convention exists yet**: confirmed in the Phase 1 audit and unchanged since — `migrations/` holds a legacy SQLite schema (pre-rebrand "Voodoo Scout"), and the live Supabase/Postgres schema has zero in-repo migration files. This RFC is the first to establish `supabase/migrations/`, per Blueprint §11.1.
-- **No test runner is wired up**: `package.json`'s `test` script is literally `echo "Error: no test specified" && exit 1`. This RFC's test plan (§21) has to account for that rather than assume an existing suite.
+- **No migration convention existed at the time this RFC was drafted**: confirmed in the Phase 1 audit — `migrations/` held a legacy SQLite schema (pre-rebrand "Voodoo Scout"), and the live Supabase/Postgres schema had zero in-repo migration files. This RFC's migration was the first written against `supabase/migrations/`, per Blueprint §11.1. `[Implementation correction]` That convention is now real and populated: `supabase/migrations/` contains this RFC's migration (`20260721140000_add_organization_product_fields.sql`) alongside a full reconstructed foundational-schema baseline and 22 historical alignment markers, and `supabase/README.md` documents the convention going forward. This bullet described a gap that has since been closed.
+- **No test runner was wired up at the time this RFC was drafted**: `package.json`'s `test` script was literally `echo "Error: no test specified" && exit 1`. This RFC's test plan (§21) had to account for that rather than assume an existing suite. `[Implementation correction]` `node --test` is now wired up and runs 57 tests (45 executing, 12 gated integration tests skipped by default) across `test/product-capabilities.test.js`, `test/org-resolution.test.js`, and `test/api-product-capabilities.test.js`. This bullet described a gap that has since been closed.
 
 ## 3. Goals
 
@@ -68,99 +75,24 @@ Four new columns on `organizations`, additive only:
 
 No other table changes. No FKs point at these columns. Nothing else in the schema depends on them existing, so this is the lowest-blast-radius schema change possible for this feature.
 
-## 6. Exact SQL migration design
+## 6. Migration design
 
 Establishes the `supabase/` migration convention from Blueprint §11.1, deliberately separate from the legacy `migrations/` directory to avoid repeating the exact naming collision that caused the Phase 1 confusion.
 
-`supabase/migrations/20260722000000_add_organization_product_fields.sql`:
+**`[Implementation correction]` The deployed migration is `supabase/migrations/20260721140000_add_organization_product_fields.sql`** — not `20260722000000` as originally drafted here. The SQL previously reproduced in this section has been removed from this document rather than corrected in place, specifically so no future reader can mistake an inline copy for the deployed source of truth; **the migration file itself is now the only copy**. Summary of what it actually does, for reference:
 
-```sql
--- Phase 2: organization product-capability foundation.
--- Additive only. Every existing row becomes valid the instant this runs —
--- no follow-up backfill statement is required because every default below
--- is a constant, not computed from existing data.
+- Four additive columns on `organizations`: `customer_type text not null default 'travel'`, `primary_product text not null default 'travel'`, `enabled_products text[] not null default array['travel']::text[]`, `onboarding_completed_at timestamptz` (nullable, no default).
+- **No backfill statement of any kind.** `onboarding_completed_at` is `NULL` for every organization after this migration runs, including every organization that pre-dates it — this is stated explicitly in the deployed file's own header comment and in its `onboarding_completed_at` column comment. The original draft of this RFC (and §7/§15, corrected below) called for backfilling existing rows to `now()`; that backfill was a design decision that was **not carried into the deployed migration**.
+- Seven `CHECK` constraints: the five base constraints in §8's truth table, plus the two correlation constraints (`organizations_products_match_customer_type_check`, `organizations_primary_matches_type_check`) described below — all present in the deployed file exactly as designed.
+- Column comments on all four columns, matching the identity-vs-licensing distinction in this document's header and in `src/product-capabilities.js`'s own top-of-file comment.
 
-alter table organizations
-  add column if not exists customer_type text not null default 'travel',
-  add column if not exists primary_product text not null default 'travel',
-  add column if not exists enabled_products text[] not null default array['travel']::text[],
-  add column if not exists onboarding_completed_at timestamptz;
+**Consequence worth stating plainly**: with only two possible products, `enabled_products` is now *fully determined by* `customer_type` — there is no state where they can legitimately disagree. That raises a fair question of whether `enabled_products` needs to be a stored column at all right now versus a value computed on read from `customer_type`. The recommendation, carried into the deployed migration, is to keep it stored (not computed), because the Blueprint's own data model treats it as independently meaningful for a future 3rd product, and a generated/computed column would need to change shape the day that happens, whereas a stored, constrained column does not — only the constraint's `CASE` needs a new branch.
 
--- Grandfather existing orgs past any future onboarding-selection gate.
--- New signups after this migration get NULL here by design (see §15).
-update organizations
-  set onboarding_completed_at = now()
-  where onboarding_completed_at is null;
+The correlation constraints use containment (`@>`) + `cardinality` rather than array equality (`=`), specifically to stay insertion-order-safe — `array['travel','high_school'] = array['high_school','travel']` is `FALSE` in Postgres, which would have been a silent footgun.
 
-alter table organizations
-  add constraint organizations_customer_type_check
-    check (customer_type in ('travel', 'high_school', 'hybrid', 'internal')),
-  add constraint organizations_primary_product_check
-    check (primary_product in ('travel', 'high_school')),
-  add constraint organizations_enabled_products_subset_check
-    check (enabled_products <@ array['travel', 'high_school']::text[]),
-  add constraint organizations_enabled_products_nonempty_check
-    check (cardinality(enabled_products) > 0),
-  add constraint organizations_primary_in_enabled_check
-    check (primary_product = any(enabled_products));
+Down migration: `supabase/rollback/20260721140000_add_organization_product_fields.down.sql` — **`[Implementation correction]` note the directory**: it lives under `supabase/rollback/`, not `supabase/migrations/`, specifically so Supabase's migration scanner never picks it up and executes it as a forward migration (a real risk flagged during the Supabase migration-governance work, addressed by moving it out of the scanned directory rather than relying on a naming convention alone). **This file is safe to run only before real usage begins — see the "adoption boundary" in §9.** It is kept in-repo as a reference for the pre-adoption window, not as a general-purpose rollback tool.
 
--- [Revised] The self-review found that the four constraints above do NOT
--- prevent a contradictory label: nothing stopped customer_type='high_school'
--- from coexisting with enabled_products=['travel']. The original draft left
--- this correlation as an unenforced "admin convention" (see the struck-through
--- reasoning preserved in §8). That's a real gap, not a stylistic choice, so
--- it is now a fifth, enforced constraint. Uses containment (@>) + cardinality
--- rather than array equality (=) specifically to stay insertion-order-safe —
--- array['travel','high_school'] = array['high_school','travel'] is FALSE in
--- Postgres, which would have been a silent footgun.
-alter table organizations
-  add constraint organizations_products_match_customer_type_check check (
-    case customer_type
-      when 'travel'      then enabled_products = array['travel']::text[]
-      when 'high_school'  then enabled_products = array['high_school']::text[]
-      when 'hybrid'        then enabled_products @> array['travel','high_school']::text[]
-                              and cardinality(enabled_products) = 2
-      when 'internal'      then enabled_products @> array['travel','high_school']::text[]
-                              and cardinality(enabled_products) = 2
-      else false
-    end
-  ),
-  add constraint organizations_primary_matches_type_check check (
-    case customer_type
-      when 'travel'      then primary_product = 'travel'
-      when 'high_school'  then primary_product = 'high_school'
-      else primary_product in ('travel', 'high_school')  -- hybrid/internal: real choice
-    end
-  );
-
-comment on column organizations.customer_type is
-  'Phase 2: travel | high_school | hybrid | internal. Set by admin action only — never inferred from team/name data. See src/product-capabilities.js.';
-comment on column organizations.enabled_products is
-  'Products this org may access. Fully determined by customer_type as of Phase 2 (see organizations_products_match_customer_type_check) — stored as its own column for forward-compatibility with a future 3rd product, not because it is independently settable today. Never derived from Stripe (see RFC §16).';
-```
-
-**Consequence of this revision, worth stating plainly**: with only two possible products, `enabled_products` is now *fully determined by* `customer_type` — there is no state where they can legitimately disagree. That raises a fair question of whether `enabled_products` needs to be a stored column at all right now versus a value computed on read from `customer_type`. The recommendation is to keep it stored (not computed), because the Blueprint's own data model treats it as independently meaningful for a future 3rd product, and a generated/computed column would need to change shape the day that happens, whereas a stored, constrained column does not — only the constraint's `CASE` needs a new branch. The redundancy is deliberate and cheap; the alternative (an unconstrained, independently-settable column) is what created the actual gap this revision fixes.
-
-Down migration `supabase/migrations/20260722000000_add_organization_product_fields.down.sql` (kept alongside, not auto-run — see §9):
-
-```sql
-alter table organizations
-  drop constraint if exists organizations_primary_matches_type_check,
-  drop constraint if exists organizations_products_match_customer_type_check,
-  drop constraint if exists organizations_primary_in_enabled_check,
-  drop constraint if exists organizations_enabled_products_nonempty_check,
-  drop constraint if exists organizations_enabled_products_subset_check,
-  drop constraint if exists organizations_primary_product_check,
-  drop constraint if exists organizations_customer_type_check,
-  drop column if exists onboarding_completed_at,
-  drop column if exists enabled_products,
-  drop column if exists primary_product,
-  drop column if exists customer_type;
-```
-
-**`[Revised]` This file is safe to run only before real usage begins — see the "adoption boundary" in §9.** It is kept in-repo as a reference for the pre-adoption window, not as a general-purpose rollback tool. `supabase/README.md` documents the post-adoption procedure as prose instructions instead of a second runnable script (§9, §24, §review-area-9 in the accompanying review explain why).
-
-`supabase/README.md` (new) documents this as the canonical migration path going forward, mirroring `dashboard-src/README.md`'s role from Phase 1.5.
+`supabase/README.md` documents the migration convention, including the `supabase/rollback/` placement rationale above, mirroring `dashboard-src/README.md`'s role from Phase 1.5. `[Implementation correction]` This file now exists and is populated — it was speculative ("new") at the time this RFC was first drafted.
 
 ### `enabled_products`: array vs. jsonb vs. join table
 
@@ -174,7 +106,9 @@ alter table organizations
 
 Every existing row gets `customer_type = 'travel'`, `primary_product = 'travel'`, `enabled_products = ['travel']` via constant column defaults applied in the same `ALTER TABLE` (Postgres 11+ applies a constant default without a full table rewrite — no downtime, no batch backfill script needed).
 
-`onboarding_completed_at` is explicitly backfilled to `now()` (not `created_at`) via the `UPDATE` statement in §6. Rationale: this field's only stated purpose is gating a future onboarding-selection prompt (Blueprint §7's onboarding UI, out of scope here). Its correct semantics are "no onboarding action is pending," not a historical record of when the org first signed up — `created_at` would be answering a question nobody's asking and would misrepresent orgs that signed up under the pre-Phase-2 single-product flow as having gone through product selection, which they didn't. `now()` honestly means "grandfathered as of this migration." Flagged as a judgment call in §26 in case the team prefers otherwise — either value produces identical behavior (no gate exists yet either way), so there's no correctness risk in this choice, only semantic accuracy.
+**`[Implementation correction]` `onboarding_completed_at` is NOT backfilled.** The original draft of this section called for backfilling it to `now()` (reasoning preserved below, since it explains why a deliberate choice was considered), but the migration that actually shipped performs no backfill at all — every organization, pre-existing and new alike, has `onboarding_completed_at = NULL` after this migration runs. This was confirmed directly against production after deployment: all pre-existing organization rows read back `onboarding_completed_at: NULL`. Verified independently, read-only, not assumed.
+
+Original reasoning for the now-superseded `now()` backfill design, kept for context: this field's only stated purpose is gating a future onboarding-selection prompt (Blueprint §7's onboarding UI, out of scope here). Its intended semantics are "no onboarding action is pending," not a historical record of when the org first signed up. Since no onboarding-selection flow exists yet either way, `NULL` and a hypothetical `now()` backfill are behaviorally identical today — nothing reads or gates on this column. The as-shipped choice (`NULL` for everyone, no backfill) is simpler, requires no data migration step, and defers the actual semantic decision to whichever future phase builds the onboarding flow this column is for.
 
 ## 8. Constraints and validation rules
 
@@ -218,34 +152,50 @@ Enforced at the database layer (§6) as the source of truth, re-validated at the
 
 ## 10. Product-capability service design
 
-`src/product-capabilities.js` exports two layers, split specifically so the interesting logic is unit-testable without touching a database (see §21):
+`src/product-capabilities.js` exports layers split specifically so the interesting logic is unit-testable without touching a database (see §21). **`[Implementation correction]` The function names below are the original design's; the actual shipped names differ (the shape and split are the same idea, renamed and, in one case, split further during implementation review — see each function's own header comment in `src/product-capabilities.js` for the current reasoning):**
 
 ```js
-// Pure — no I/O. Takes already-fetched data, returns the capability object.
-// This is what unit tests exercise directly.
-function resolveProductCapabilities(orgRow, { supportSession = null } = {}) { ... }
+// Pure -- no I/O. Assumes the row already satisfies the DB constraints.
+// Actual shipped name: resolveOrganizationCapabilities (not resolveProductCapabilities).
+function resolveOrganizationCapabilities(orgRow) { ... }
 
-// Request-aware wrapper. Fetches the org row via the same req._orgId that
-// getRequestOrgId(req) / resolveSupportSession already populate, then
-// delegates to the pure resolver above. This is what routes and
-// middleware call.
-async function getProductCapabilitiesForRequest(req) { ... }
+// Fail-closed sanitization boundary, split out from the resolver above
+// during implementation review specifically so the resolver could stay
+// pure (no defensive branching) while this layer handles a malformed row
+// -- corrects what a single caller sees in a single response, never
+// writes back to the database. Not present in the original design as a
+// separate function.
+function sanitizeOrganizationRow(orgRow) { ... }
 
-// Middleware factories, §13, built on top of getProductCapabilitiesForRequest.
+// Request-aware wrapper -- the only exported function that touches the
+// database. Takes a plain orgId (not an Express req, and not
+// req._orgId/getRequestOrgId directly -- server.js's route handler
+// resolves orgId itself and passes it in, keeping this module fully
+// decoupled from Express request objects). Actual shipped name:
+// getOrganizationCapabilities (not getProductCapabilitiesForRequest).
+async function getOrganizationCapabilities(orgId) { ... }
+
+// Middleware factory, §13. Implemented and unit-tested; not mounted on
+// any route. Name unchanged from the original design.
 function requireProductAccess(product) { ... }
-function requireFeature(featureKey) { ... }
-function requireEntitlement(entitlementKey) { ... }
+
+// requireFeature / requireEntitlement: NOT IMPLEMENTED. See §13 -- both
+// were cut from scope during the original design review, before any code
+// was written, and remain unbuilt.
 
 module.exports = {
-  resolveProductCapabilities,
-  getProductCapabilitiesForRequest,
+  sanitizeOrganizationRow,
+  resolveOrganizationCapabilities,
+  mapOrganizationRowOrThrow, // extracted later, for database-free 404-mapping tests
+  getOrganizationCapabilities,
   requireProductAccess,
-  requireFeature,
-  requireEntitlement,
+  KNOWN_PRODUCTS,
+  KNOWN_CUSTOMER_TYPES,
+  CAPABILITY_SCHEMA_VERSION,
 };
 ```
 
-`getProductCapabilitiesForRequest` reads `req._orgId` (via the *existing* `getRequestOrgId(req)` from `server.js`, imported rather than duplicated) and selects exactly the four new columns plus the existing `plan` and the four `max_*` limit columns in one query — the same shape of single-row read `enforceReportQuota` already does at `server.js:939`, so this introduces no new query pattern into the codebase.
+`getOrganizationCapabilities` is called by the `GET /api/product/capabilities` route handler in `server.js` with an `orgId` the route already resolved via `getRequestOrgId(req)` (§11), and selects exactly the four new columns plus the existing `plan` and the four `max_*` limit columns in one query — the same shape of single-row read `enforceReportQuota` already does, so this introduces no new query pattern into the codebase.
 
 ## 11. Capability resolution precedence
 
@@ -408,13 +358,15 @@ requireFeature(featureKey)      // deferred — build when Phase 3/4 defines rea
 requireEntitlement(entitlementKey)  // deferred — build when §26's Q4 is actually decided
 ```
 
-`requireProductAccess` runs after `requireAuth` (and `resolveSupportSession` where mounted), calls `getProductCapabilitiesForRequest(req)`, and checks `product` against the resolved `enabledProducts`. **Fails closed** on every path — an error resolving capabilities or a missing org denies (403), mirroring the existing fail-closed pattern in `isJobuAdmin` (`admin-lib.js:33-37`). It never trusts a client-supplied product value — the `product` argument is always a literal baked into a route definition by the developer, never read from `req.body`/`req.query`/`req.params`.
+`requireProductAccess` runs after `requireAuth` (and `resolveSupportSession` where mounted), reads `req._orgId` (populated by upstream middleware — it does not perform org resolution itself) and calls `getOrganizationCapabilities(orgId)` `[Implementation correction: not getProductCapabilitiesForRequest(req) as originally drafted — see §10]`, and checks `product` against the resolved `enabledProducts`. **Fails closed** on every path — a missing `req._orgId`, an error resolving capabilities, or the product not being enabled all deny (403), mirroring the existing fail-closed pattern in `isJobuAdmin`. It never trusts a client-supplied product value — the `product` argument is always a literal baked into a route definition by the developer, never read from `req.body`/`req.query`/`req.params`.
 
 **It is not wired into any existing route in this RFC.** It's net-new, unit-tested (§21), and ready for Phase 3/4 to import — there is no route yet that needs to gate on product.
 
 ## 14. Admin integration
 
-New route in `src/admin-api.js`, inside the existing router (already gated by `router.use(requireAuth, requireJobuAdmin)` at `admin-api.js:51` — no new authorization code needed).
+**`[Implementation correction] NOT IMPLEMENTED.** Everything in this section is Slice 2 design only. No route matching this description exists anywhere in this repository as of Slice 1's deployment — `src/admin-api.js` has no `/customers/:orgId/product` route, and nothing in the codebase can change an organization's `customer_type`/`primary_product`/`enabled_products` today except a direct, manual database edit. This section is retained as the design for Slice 2, not as documentation of shipped behavior — see the header block and §27 for current status.**
+
+Planned: a new route in `src/admin-api.js`, inside the existing router (already gated by `router.use(requireAuth, requireJobuAdmin)` — no new authorization code needed).
 
 ### `[Revised]` Request shape simplified — `enabledProducts` is no longer a client-supplied field
 
@@ -455,7 +407,7 @@ Body: { customerType, primaryProduct?, reason }
 
 ## 15. Onboarding implications
 
-`onboarding_completed_at` exists and is correctly populated (§7: `now()` for every pre-existing org) but **this RFC does not build an onboarding-selection screen** — that's explicitly out of scope. New signups after this migration ships get `onboarding_completed_at = NULL` by column default (no default specified — §6), which is semantically correct (they haven't gone through a product-selection step that doesn't exist yet) and has **zero visible effect**, because nothing in the current dashboard reads this field or gates on it. It's there, correctly populated, ready for Phase 3/4 to build against — that's the entire scope of this RFC's involvement with onboarding.
+`onboarding_completed_at` exists but **this RFC does not build an onboarding-selection screen** — that's explicitly out of scope. **`[Implementation correction]` Every organization — pre-existing and newly signed up alike — has `onboarding_completed_at = NULL`** (§6, §7: no backfill was performed, contrary to this section's original claim that pre-existing orgs were backfilled to `now()`). `NULL` is semantically correct for all of them: none have gone through a product-selection step that doesn't exist yet. This has **zero visible effect** today, because nothing in the current dashboard reads this field or gates on it. It's there, uniformly `NULL`, ready for Phase 3/4 to build against — that's the entire scope of this RFC's involvement with onboarding.
 
 ## 16. Billing and entitlement interaction
 
@@ -477,6 +429,8 @@ No new metrics infrastructure — relies on standard request logging plus `admin
 
 ## 20. Files expected to change
 
+**`[Implementation correction]` As originally drafted (Slice 2's admin route included):**
+
 ```
 supabase/migrations/20260722000000_add_organization_product_fields.sql   (new)
 supabase/migrations/20260722000000_add_organization_product_fields.down.sql (new)
@@ -486,15 +440,35 @@ src/admin-api.js                    (+1 route: PATCH /customers/:orgId/product)
 server.js                           (+1 mount: GET /api/product/capabilities)
 ```
 
-Explicitly **not** expected to change: `src/admin-lib.js` (existing helpers reused as-is), `dashboard/index.html`, any file under `dashboard-src/`, `admin/index.html`, `package.json` (no new dependency — see §21), `src/stripe.js`, any report-generation or scraping file.
+**What Slice 1 actually changed:**
+
+```
+supabase/migrations/20260721140000_add_organization_product_fields.sql   (new)
+supabase/rollback/20260721140000_add_organization_product_fields.down.sql (new)
+supabase/README.md                                                        (new, then further extended by later Supabase migration-governance work)
+src/product-capabilities.js                                               (new)
+src/org-resolution.js               (new -- not in the original design; extracted from
+                                      server.js's getRequestOrgId during the security
+                                      review so its authorization logic is unit-testable
+                                      without a live database)
+server.js                           (+1 mount: GET /api/product/capabilities;
+                                      +getRequestOrgId rewritten, see §11)
+test/product-capabilities.test.js, test/org-resolution.test.js,
+test/api-product-capabilities.test.js, test/fixtures/organizations.js  (new)
+package.json                        (test script updated to run the new suite)
+```
+
+`src/admin-api.js` was **not** touched — Slice 2's route (§14) is unbuilt.
+
+Explicitly **not** changed: `src/admin-lib.js` (existing helpers reused as-is), `dashboard/index.html`, any file under `dashboard-src/`, `admin/index.html`, `src/stripe.js`, any report-generation or scraping file.
 
 `[Revised]` `requireProductAccess` (only — see §13) lives inside `src/product-capabilities.js` rather than `server.js`, deliberately — `server.js` is already 2,337 lines, and this RFC's own goal is incremental maintainability; new self-contained concerns get their own module, following the precedent `admin-lib.js` already set for admin/support-session logic.
 
 ## 21. Test plan
 
-**No test runner currently exists** (`package.json`'s `test` script errors intentionally). Recommend adding Node's built-in `node --test` runner as part of implementing this RFC — zero new dependency, consistent with Phase 1.5's "no dependencies beyond the standard library" precedent for `scripts/build-dashboard.js`. Scoped only to the tests below, not a general test-infrastructure project.
+**`[Implementation correction]` `node --test` is wired up and running** — this section originally described a test runner that didn't exist yet at draft time (`package.json`'s `test` script errored intentionally). Zero new dependency, as planned, consistent with Phase 1.5's "no dependencies beyond the standard library" precedent for `scripts/build-dashboard.js`. Current totals: **57 tests total, 45 executing and passing, 12 gated integration tests skipped by default** (they require a live server and seeded Supabase test data — see `test/api-product-capabilities.test.js`'s own header for the exact three-env-var gate).
 
-**Unit tests** (against `resolveProductCapabilities`, the pure function from §10 — no database needed):
+**Unit tests** (against `resolveOrganizationCapabilities`, the pure function from §10 — no database needed):
 - Travel-only, High-School-only, Hybrid, and Internal org rows each resolve to the correct `enabledProducts`/`features`.
 - A support session present in the input always resolves against the *target* org's row, never a broader set, regardless of what the calling admin's own org looks like (see §22).
 - `[Revised]` Malformed/null `customer_type`, malformed/empty `enabled_products`, and `primaryProduct` absent from `enabledProducts` each independently exercise one of the three correction branches in §11's algorithm — never throw, always resolve to Travel-only-or-safer, never grant.
@@ -517,20 +491,20 @@ Explicitly **not** expected to change: `src/admin-lib.js` (existing helpers reus
 
 ## 23. Deployment sequence
 
-`[Revised to match the 2-slice plan, §27]`
+`[Implementation correction]` **Slice 1 has completed all four planned steps; Slice 2 has not started.**
 
-**Slice 1** (migration + capability service + read endpoint + `requireProductAccess`):
-1. Apply the migration (§6) to the live Supabase project. Purely additive — the running (pre-Slice-1) application code never selects or writes the new columns, so this is safe to apply with old code still live; no coordinated deploy window required.
-2. Deploy application code: `src/product-capabilities.js` (resolver + `requireProductAccess`) and the new `GET` route. Net-new and unmounted from any existing route — deploying this changes zero existing request-handling behavior.
-3. Smoke test: `GET /api/product/capabilities` with a real token against an arbitrary pre-existing org returns `{customerType: "travel", enabledProducts: ["travel"], ...}`.
-4. No dashboard deploy is needed or expected.
+**Slice 1** (migration + capability service + read endpoint + `requireProductAccess`) — done:
+1. ✅ Migration applied to the live Supabase project (`20260721140000_add_organization_product_fields.sql`, via the migration-repair procedure documented in `supabase/README.md` — not a direct `db push` against production, since production already had 22 tracked migrations with no corresponding repo files; see the Supabase migration-governance work for the full reconciliation). Purely additive — the pre-Slice-1 application code never selected or wrote the new columns, so this was safe to apply with old code still live.
+2. ✅ Application code deployed: `src/product-capabilities.js`, `src/org-resolution.js`, and the new `GET` route. Net-new and unmounted from any existing route.
+3. ✅ Smoke-tested, both via the Preview Branch validation process (schema comparison, RLS tests, synthetic-data smoke tests — see the Supabase migration-governance work) and via this Slice's own database-free regression suite (§21).
+4. ✅ No dashboard deploy needed — none occurred.
 
-**Slice 2** (admin write route), only after Slice 1 has been running without issue:
-1. Deploy the `PATCH /api/admin/customers/:orgId/product` route.
-2. Smoke test: round-trip against a **test/internal org only**, never a real paying customer, and confirm the expected `admin_audit_log` entry.
-3. This is the point at which the §9 "adoption boundary" begins — from here on, schema rollback is no longer costless (§9, §24).
+**Slice 2** (admin write route, §14) — **not started**:
+1. Not deployed. `PATCH /api/admin/customers/:orgId/product` does not exist in `src/admin-api.js`.
+2. Not smoke-tested.
+3. The §9 "adoption boundary" has therefore **not begun** — no organization has ever been assigned anything but the migration's default (`travel`/`['travel']`), so a schema rollback of the Slice 1 migration would still be lossless as of this writing.
 
-Rolling-deployment safety (both slices): because the new columns are all defaulted and no pre-Phase-2 code path references them, old and new application instances can run simultaneously against the migrated schema with zero errors on either side.
+Rolling-deployment safety (both slices): because the new columns are all defaulted and no pre-Phase-2 code path references them, old and new application instances can run simultaneously against the migrated schema with zero errors on either side. Confirmed true in practice — Slice 1 shipped with zero coordinated deploy window and zero incident.
 
 ## 24. Rollback sequence
 
@@ -547,15 +521,15 @@ Rolling-deployment safety (both slices): because the new columns are all default
 | `primary_product` not a member of `enabled_products` (inconsistent state) | DB `CHECK` (§6) + the admin route validates the combined new state atomically, not field-by-field |
 | Support session leaking broader access into the target org's capability view | Explicit precedence rule (§11.5) + dedicated required test (§22) |
 | A future route bypasses `product-capabilities.js` and queries `organizations.enabled_products` directly, reviving the scattered `if (isHighSchool)` anti-pattern this whole effort exists to avoid | Process mitigation, not a technical one this RFC can fully enforce by itself: keep the file list in §20 as the review checklist — any future `.select()` touching these three columns outside `src/product-capabilities.js` should be a code-review flag |
-| No automated test runner exists today, so "test plan" has nowhere to run | Add `node --test` as part of implementing this RFC — zero dependency, scoped to this feature's tests only |
-| `supabase/migrations/` drifts from what's actually live if someone applies a change via the Supabase dashboard UI instead of committing a migration — the exact failure mode that produced the original "no migration history" problem | Apply this migration via the Supabase CLI/MCP tooling, then confirm `list_migrations` reflects it in-repo before considering the slice done; this is a discipline this RFC can start but not fully guarantee going forward |
+| ~~No automated test runner exists today, so "test plan" has nowhere to run~~ `[Resolved]` | `node --test` is wired up and running (§21) — 57 tests, 45 executing |
+| `supabase/migrations/` drifts from what's actually live if someone applies a change via the Supabase dashboard UI instead of committing a migration — the exact failure mode that produced the original "no migration history" problem | This migration was applied via `migration repair` + `db push --dry-run` verification (not a raw dashboard-UI edit), and `list_migrations` was confirmed to reflect it in-repo before the slice was considered done, per the Supabase migration-governance work. That discipline held for this migration; it remains a per-change discipline going forward, not a guarantee this RFC can enforce structurally |
 | `[Found and fixed during this Slice's own security review]` `getRequestOrgId` trusted `user.app_metadata.org_id`/`user.user_metadata.org_id` ahead of any database lookup. `user_metadata` is end-user-editable via the standard Supabase Auth client, so this was a full cross-tenant authorization bypass reachable by any signed-up user against every route that calls `getRequestOrgId`, not only this Slice's new endpoint | Removed entirely. `getRequestOrgId` now trusts exactly two sources: `req._orgId` already pinned by a validated support session, or a fresh `org_members` row keyed on the caller's own verified `req.user.id` (accepted-membership only, and failing closed — not just defaulting to travel-only — on zero or more-than-one matching row). See `server.js`'s `getRequestOrgId` header comment and the "Tenant-isolation regression tests" section of `test/api-product-capabilities.test.js` |
 
 ## 26. Open questions
 
 1. ~~Should `customer_type = 'internal'` mechanically force `enabled_products` to contain both products?~~ **`[Resolved by this review]`**: yes, enforced by DB constraint now (§6, §8) — `internal` and `hybrid` both require the full product set, no longer a convention.
 2. Long-term Stripe → product mapping mechanism (price metadata key vs. a dedicated mapping table) — doesn't block this RFC, but worth a directional decision before Phase 8 so the admin-driven design here doesn't need rework.
-3. `onboarding_completed_at` backfill value: `now()` (this RFC's recommendation, §7) vs. `created_at` — genuinely no behavioral difference today; flagging for a quick explicit call rather than assuming.
+3. ~~`onboarding_completed_at` backfill value: `now()` (this RFC's recommendation, §7) vs. `created_at`~~ **`[Resolved by implementation]`**: neither — the deployed migration performs no backfill at all. Every organization has `onboarding_completed_at = NULL` (§6, §7). No behavioral difference results, as this section originally predicted.
 4. Should a future, real `requireEntitlement` eventually subsume `enforceReportQuota`'s numeric-quota logic (`server.js:933`), or remain a permanently separate, narrower boolean/feature check? No longer blocking this RFC at all (§13) — `requireEntitlement` isn't being built in this slice — but still worth a deliberate decision before Phase 6/7 report-platform convergence.
 5. The `canonical_team_id` schema gap raised in the earlier blueprint review remains open and is not addressed by this RFC (out of scope — `organizations` only).
 6. `[Updated — no longer a guess]` The unused `userClient(jwt)` helper (`src/supabase.js:14-20`) is confirmed dead code, and RLS is confirmed enabled on `organizations` (see §2). Worth a deliberate decision on whether `userClient()` is an abandoned direction to remove, or a live one to eventually finish wiring in — and if the latter, the actual `SELECT` policies on `organizations` need to be inspected first, since "RLS enabled" does not by itself confirm any row is visible to that client. Not urgent, not blocking Slice 1 or Slice 2, but worth not leaving ambiguous indefinitely.
@@ -576,54 +550,57 @@ The one piece that *is* qualitatively different risk is the admin write route: i
 
 Recommend landing Slice 1, letting it sit in production for at least one deploy cycle with nothing depending on it, then Slice 2.
 
-## 28. Acceptance criteria
+## 28. Acceptance criteria — Slice 1 (`[Implementation correction]` status added per item)
 
-- Migration applies cleanly to the live Supabase project with zero downtime; `list_migrations` reflects it in-repo afterward.
-- Every existing organization reads back `customer_type = 'travel'`, `enabled_products = ['travel']`, `onboarding_completed_at` populated, immediately after the migration — verified by query, not assumption.
-- `[New]` The truth table in §8 has been exercised directly against the live constraint (attempt each ❌ row, confirm it's rejected) before Slice 1 is considered done — not just reviewed on paper.
-- Every existing route, the Stripe webhook, report generation, and scraping continue to function with **zero code changes** to any of them.
-- `GET /api/product/capabilities` returns the documented v1 shape, correctly reflecting the authenticated user's actual org state.
-- The support-session non-expansion test (§22) passes, for both the read endpoint and — once Slice 2 ships — the confirmation that the admin write route 403s during a support session.
-- Every admin-driven product-access change produces a correctly-shaped `admin_audit_log` row.
-- No customer-facing behavior changes as a result of this release — the dashboard continues to load and behave exactly as it does today.
-- The rollback path (§9, §24) has been reviewed line-by-line, with the pre-/post-adoption distinction explicitly acknowledged, and — if a Supabase branch is available via the MCP tooling — exercised there before Slice 1 ships to production.
+- ✅ Migration applied cleanly to the live Supabase project with zero downtime; `list_migrations` reflects it in-repo.
+- `[Implementation correction]` **Every existing organization reads back `onboarding_completed_at = NULL`, not "populated"** as this criterion originally stated — no backfill was performed (§6, §7). `customer_type = 'travel'`, `enabled_products = ['travel']` are correctly populated as originally stated, verified by query, not assumption.
+- ✅ The truth table in §8 was exercised against the live constraint during the Supabase migration-governance work's schema-comparison and validation passes.
+- ✅ Every existing route, the Stripe webhook, report generation, and scraping continue to function with **zero code changes** to any of them (the `getRequestOrgId` rewrite during the security review changed that function's internals, not its external contract — every caller still receives an org id or a typed error exactly as before).
+- ✅ `GET /api/product/capabilities` returns the documented v1 shape.
+- ✅ The support-session non-expansion test (§22) passes for the read endpoint. **The admin-write-route half of this criterion does not apply — Slice 2 is unbuilt (§14).**
+- **N/A — Slice 2 not built.** No admin-driven product-access change is possible yet, so there is no `admin_audit_log` row to produce.
+- ✅ No customer-facing behavior changes resulted from this release.
+- ✅ The rollback path (§9, §24) was reviewed, the pre-/post-adoption distinction holds (no organization has been assigned anything but the default — §23), and a from-empty Preview Branch replay was exercised as part of the Supabase migration-governance work before this migration was applied to production.
 
 ---
 
 ## Summary
 
-`[Revised after self-review — see the accompanying decision package for the full list of changes.]`
+`[Implementation correction]` This summary originally described a proposal. Slice 1 has shipped; the text below is corrected to describe what was actually built and deployed, not what was proposed.
 
-A four-column additive migration on `organizations` — now with the customer-type/product correlation enforced at the database layer, not left to convention — one capability-resolution module, one read endpoint, one unmounted-but-tested middleware (`requireProductAccess` only; `requireFeature`/`requireEntitlement` deferred until a route needs them), and one admin write route with an explicit support-session exclusion rule — reusing the existing auth, audit-logging, and support-session machinery at every point rather than building parallel versions of any of it. Nothing a current customer does changes. Nothing in Stripe changes. No dashboard code changes.
+A four-column additive migration on `organizations` — with the customer-type/product correlation enforced at the database layer, not left to convention — one capability-resolution module (`src/product-capabilities.js`, plus `src/org-resolution.js`, added during implementation for the tenant-isolation fix — see §11), one read endpoint, and one unmounted-but-tested middleware (`requireProductAccess` only; `requireFeature`/`requireEntitlement` deferred until a route needs them) — reusing the existing auth and support-session machinery rather than building parallel versions of it. **The admin write route (§14) was never built** — it remains Slice 2 design only. Nothing a current customer does changed. Nothing in Stripe changed. No dashboard code changed.
 
-**Proposed migration shape:** `organizations` gains `customer_type text not null default 'travel'`, `primary_product text not null default 'travel'`, `enabled_products text[] not null default array['travel']`, `onboarding_completed_at timestamptz` — all constant-defaulted, so every existing row is valid the instant the migration runs — with **seven** `CHECK` constraints (five original + two new correlation constraints from this review) guaranteeing that `travel`/`high_school` orgs can never carry the other product's access, and `hybrid`/`internal` orgs always carry both.
+**Deployed migration shape:** `organizations` gained `customer_type text not null default 'travel'`, `primary_product text not null default 'travel'`, `enabled_products text[] not null default array['travel']`, `onboarding_completed_at timestamptz` (nullable, **no default, no backfill** — every organization, pre-existing and new, has `NULL` here) — with **seven** `CHECK` constraints (five base + two correlation constraints) guaranteeing that `travel`/`high_school` orgs can never carry the other product's access, and `hybrid`/`internal` orgs always carry both. Source of truth: `supabase/migrations/20260721140000_add_organization_product_fields.sql`.
 
-**Proposed API response** (`GET /api/product/capabilities`):
+**Actual API response shape** (`GET /api/product/capabilities`) — matches the originally proposed shape exactly:
 ```json
 {
+  "schemaVersion": 1,
   "customerType": "travel",
   "primaryProduct": "travel",
   "enabledProducts": ["travel"],
-  "onboardingCompleted": true,
+  "onboardingCompleted": false,
   "features": { "travel.enabled": true, "highSchool.enabled": false },
   "limits": { "opponentTeams": 10, "travelReportsPerMonth": 15, "selfScoutReportsPerMonth": 5, "matchupReportsPerMonth": 5 },
   "billing": { "plan": "coach", "status": "active" },
   "overridesActive": false
 }
 ```
+(`schemaVersion` was added during implementation, not in the original design; `onboardingCompleted` is `false` for every organization today, per the no-backfill correction above.)
 
-**Expected implementation files (unchanged from the original draft):**
+**Actual implementation files** (see §20 for the full list including test files):
 ```
-supabase/migrations/20260722000000_add_organization_product_fields.sql
-supabase/migrations/20260722000000_add_organization_product_fields.down.sql
+supabase/migrations/20260721140000_add_organization_product_fields.sql
+supabase/rollback/20260721140000_add_organization_product_fields.down.sql
 supabase/README.md
 src/product-capabilities.js
-src/admin-api.js   (+1 route)
-server.js          (+1 mount)
+src/org-resolution.js   (new -- not in the original design)
+server.js   (+1 mount, +getRequestOrgId rewritten)
 ```
+`src/admin-api.js` was **not** touched — no admin route exists.
 
-**Highest-risk decision:** keeping `enabled_products` as a plain admin-managed field with *no* Stripe-derived source of truth in this release (§16). Still the right call for the smallest safe slice — Stripe genuinely has no product axis today — but it means every High School (and future Hybrid) customer's access is 100% a manual admin action until billing catches up, a real operational dependency on admin diligence rather than just a technical detail.
+**Highest-risk decision:** keeping `enabled_products` as a plain admin-managed field with *no* Stripe-derived source of truth in this release (§16) — still the right call, and unchanged by implementation, though it now also means product access literally cannot be changed at all yet by anyone, admin or otherwise, until Slice 2 exists.
 
-**Recommended first implementation slice:** `[Revised]` Slice 1 — migration + capability service + read endpoint + `requireProductAccess`, together, as one self-verifying, still-fully-inert PR. See §27 for why this replaced the original five-slice plan.
+**Actual first implementation slice:** Slice 1 — migration + capability service + read endpoint + `requireProductAccess`, shipped together as one self-verifying PR, exactly as recommended. Slice 2 has not been started.
 
-Stopping here — not modifying application code, migrations, package files, or dashboard files, and not committing this document. Awaiting approval.
+This document is no longer a proposal awaiting approval — it is a corrected implementation record for a slice that has shipped. Corrections were made without modifying any Supabase migration file or touching production; every factual claim about production state was verified by direct, read-only query, not assumed.

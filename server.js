@@ -77,7 +77,8 @@ const {
 const { getOrganizationCapabilities } = require('./src/product-capabilities');
 
 // ── Trusted organization resolution (extracted for database-free testing) ────
-const { resolveTrustedOrgId, buildAcceptedMembershipsQuery } = require('./src/org-resolution');
+const { resolveTrustedOrgId, buildAcceptedMembershipsQuery, mapErrorToResponse } = require('./src/org-resolution');
+const { asyncHandler, buildFinalErrorHandler } = require('./src/express-helpers');
 
 let pipelineDb = null;
 if (USE_SUPABASE) {
@@ -517,6 +518,23 @@ async function getRequestOrgId(req) {
   return orgId;
 }
 
+// Sends a safe error response for any error caught around a
+// getRequestOrgId call (directly, or via requireOrgAdmin/
+// assertTeamInRequestOrg/assertOrgActive/enforceReportQuota). Logs the
+// real error in full, server-side, then maps it via
+// src/org-resolution.js's mapErrorToResponse -- a typed error (with a
+// `.statusCode` already set) forwards its own safe, pre-authored
+// `.message`; anything else becomes a generic 500. `context` is just a
+// label for the server-side log line, matching the existing
+// `[module-name] description: err` convention already used elsewhere in
+// this file (e.g. src/admin-lib.js's logAdminAction catch block). Always
+// `return`ed by its caller so no code runs after the response is sent.
+function sendResolverError(res, err, context) {
+  console.error(`[${context}]`, err);
+  const { statusCode, message } = mapErrorToResponse(err);
+  return res.status(statusCode).json({ error: message });
+}
+
 async function assertTeamInRequestOrg(req, teamId) {
   if (!USE_SUPABASE) return;
   const orgId = await getRequestOrgId(req);
@@ -570,7 +588,7 @@ async function requireOrgAdmin(req, res, next) {
     req._orgId = orgId;
     next();
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    return sendResolverError(res, err, 'requireOrgAdmin');
   }
 }
 
@@ -938,26 +956,9 @@ app.get('/api/product/capabilities', requireAuth, resolveSupportSession, async (
     // Authentication (401) and admin authorization (403) failures never
     // reach this handler; they're already handled by requireAuth and
     // requireJobuAdmin before this route runs. This branch is only for
-    // organization-lookup or capability-configuration failures.
-    //
-    // Full detail always goes server-side first (matches the
-    // "[module-name] description: err" convention already used in
-    // src/admin-lib.js's logAdminAction catch block). The client only ever
-    // sees err.message when the error carries an explicit statusCode --
-    // getOrganizationCapabilities's "Organization not found." and every
-    // error resolveTrustedOrgId (src/org-resolution.js, via
-    // getRequestOrgId) throws are all deliberately authored, safe, public
-    // strings paired with an explicit statusCode for exactly this reason.
-    // Anything without a statusCode is treated as unexpected (e.g. a raw
-    // Supabase/Postgres error, which could contain SQL fragments or
-    // internal table/column names) and replaced with a stable, generic
-    // message instead of being passed through verbatim.
-    console.error('[api/product/capabilities] failed to resolve capabilities:', err);
-    const statusCode = err.statusCode || 400;
-    const publicMessage = err.statusCode
-      ? err.message
-      : 'Unable to resolve organization for this request.';
-    res.status(statusCode).json({ error: publicMessage });
+    // organization-lookup or capability-configuration failures --
+    // see sendResolverError's own comment for the forwarding rule.
+    return sendResolverError(res, err, 'api/product/capabilities');
   }
 });
 
@@ -1016,7 +1017,7 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
       canManageBilling: role === 'admin',
     });
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    return sendResolverError(res, err, 'api/billing/status');
   }
 });
 
@@ -1195,7 +1196,7 @@ app.get('/api/debug/auth', (req, res) => {
   res.json({ authPath, exists, cwd, storageContents, appContents });
 });
 
-app.get('/api/teams', requireAuth, resolveSupportSession, async (req, res) => {
+app.get('/api/teams', requireAuth, resolveSupportSession, asyncHandler(async (req, res) => {
   try {
     const includeArchived = req.query.includeArchived === 'true';
     const rawTeams = await getTeams(req, includeArchived);
@@ -1211,10 +1212,9 @@ app.get('/api/teams', requireAuth, resolveSupportSession, async (req, res) => {
     }));
     res.json(teams);
   } catch (err) {
-    console.error('[api/teams]', err);
-    res.status(500).json({ error: err.message });
+    return sendResolverError(res, err, 'api/teams');
   }
-});
+}));
 
 
 app.get('/api/teams/:id/summary', requireAuth, resolveSupportSession, async (req, res) => {
@@ -1222,8 +1222,7 @@ app.get('/api/teams/:id/summary', requireAuth, resolveSupportSession, async (req
     if (USE_SUPABASE) await assertTeamInRequestOrg(req, req.params.id);
     res.json(await getTeamSummary(req.params.id));
   } catch (err) {
-    console.error('[api/teams/:id/summary]', err);
-    res.status(500).json({ error: err.message });
+    return sendResolverError(res, err, 'api/teams/:id/summary');
   }
 });
 
@@ -1283,7 +1282,7 @@ app.post('/api/jobs/:id/stop', (req, res) => {
 });
 
 // POST /api/run/gc-scraper
-app.post('/api/run/gc-scraper', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+app.post('/api/run/gc-scraper', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   await assertOrgActive(req);
   const team = (await getTeams(req)).find(t => t.id == req.body.teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
@@ -1299,10 +1298,10 @@ app.post('/api/run/gc-scraper', requireAuth, resolveSupportSession, blockWriteDu
     spawnJob(id, 'node', ['src/search-gamechanger-teams.js'], ROOT, env);
   }
   res.json({ jobId: id });
-});
+}));
 
 // POST /api/run/pg-scraper
-app.post('/api/run/pg-scraper', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+app.post('/api/run/pg-scraper', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   await assertOrgActive(req);
   const team = (await getTeams(req)).find(t => t.id == req.body.teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
@@ -1311,10 +1310,10 @@ app.post('/api/run/pg-scraper', requireAuth, resolveSupportSession, blockWriteDu
   spawnJob(id, 'node', ['perfectgame-scraper.js', team.pg_team_url || '', team.team_name],
     path.join(ROOT, 'perfectgame-scraper'));
   res.json({ jobId: id });
-});
+}));
 
 // POST /api/run/reingest
-app.post('/api/run/reingest', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+app.post('/api/run/reingest', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   await assertOrgActive(req);
   const team  = req.body.teamId ? (await getTeams(req)).find(t => t.id == req.body.teamId) : null;
   const label = team ? `Reingest — ${team.team_name}` : 'Reingest — All Teams';
@@ -1322,7 +1321,7 @@ app.post('/api/run/reingest', requireAuth, resolveSupportSession, blockWriteDuri
   appendLog(id, label);
   spawnJob(id, 'node', team ? ['reingest-games.js', team.team_name] : ['reingest-games.js', '--all'], ROOT);
   res.json({ jobId: id });
-});
+}));
 
 // Shared env-var builder for the coach-context fields every /api/run/*
 // report-generating route now accepts: gameLocation, gameDate, gameTime,
@@ -1342,7 +1341,7 @@ function buildReportContextEnv(body = {}) {
 }
 
 // POST /api/run/report  { teamId, gameLocation?, gameDate?, gameTime?, humanObservations?, gameScope?, customPrompt? }
-app.post('/api/run/report', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+app.post('/api/run/report', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   const { teamId } = req.body;
   const team = (await getTeams(req)).find(t => t.id == teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
@@ -1351,7 +1350,7 @@ app.post('/api/run/report', requireAuth, resolveSupportSession, blockWriteDuring
   try {
     quota = await enforceReportQuota(req, { reportType: 'opponent', limitColumn: 'max_reports_per_month', title, linkedTeamId: team.id });
   } catch (err) {
-    return res.status(err.statusCode || 500).json({ error: err.message });
+    return sendResolverError(res, err, 'api/run/report');
   }
   const id = createJob(title);
   appendLog(id, `Generating scouting report for: ${team.team_name}`);
@@ -1362,15 +1361,15 @@ app.post('/api/run/report', requireAuth, resolveSupportSession, blockWriteDuring
   const env = { ...buildReportContextEnv(req.body), ...buildUsageEnv(req, quota) };
   spawnJob(id, 'node', ['src/generate-report.js', team.team_name], ROOT, env);
   res.json({ jobId: id });
-});
+}));
 
 // POST /api/run/self-scout  { gameLocation?, gameDate?, gameTime?, humanObservations?, customPrompt?, ourTeamId? }
-app.post('/api/run/self-scout', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+app.post('/api/run/self-scout', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   let quota;
   try {
     quota = await enforceReportQuota(req, { reportType: 'self_scout', limitColumn: 'max_self_scout_reports_per_month', title: 'Self-Scout Report', linkedTeamId: req.body.ourTeamId });
   } catch (err) {
-    return res.status(err.statusCode || 500).json({ error: err.message });
+    return sendResolverError(res, err, 'api/run/self-scout');
   }
   const id = createJob('Self-Scout Report');
   appendLog(id, 'Generating self-scout report for our own team');
@@ -1378,11 +1377,11 @@ app.post('/api/run/self-scout', requireAuth, resolveSupportSession, blockWriteDu
   if (req.body.ourTeamId) env.OUR_TEAM_ID = req.body.ourTeamId;
   spawnJob(id, 'node', ['src/generate-report.js', '--self-scout'], ROOT, env);
   res.json({ jobId: id });
-});
+}));
 
 // POST /api/run/matchup  { teamId, gameLocation?, gameDate?, gameTime?, humanObservations?, customPrompt?, ourTeamId? }
 // teamId is the OPPONENT team we're building the matchup game plan against.
-app.post('/api/run/matchup', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+app.post('/api/run/matchup', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   const { teamId } = req.body;
   const team = (await getTeams(req)).find(t => t.id == teamId);
   if (!team) return res.status(404).json({ error: 'Opponent team not found' });
@@ -1390,7 +1389,7 @@ app.post('/api/run/matchup', requireAuth, resolveSupportSession, blockWriteDurin
   try {
     quota = await enforceReportQuota(req, { reportType: 'matchup', limitColumn: 'max_matchup_reports_per_month', title: `Matchup — ${team.team_name}`, linkedTeamId: team.id });
   } catch (err) {
-    return res.status(err.statusCode || 500).json({ error: err.message });
+    return sendResolverError(res, err, 'api/run/matchup');
   }
   const id = createJob(`Matchup — ${team.team_name}`);
   appendLog(id, `Generating matchup report: our team vs ${team.team_name}`);
@@ -1398,10 +1397,10 @@ app.post('/api/run/matchup', requireAuth, resolveSupportSession, blockWriteDurin
   if (req.body.ourTeamId) env.OUR_TEAM_ID = req.body.ourTeamId;
   spawnJob(id, 'node', ['src/generate-report.js', '--matchup', team.team_name], ROOT, env);
   res.json({ jobId: id });
-});
+}));
 
 // POST /api/run/full-pipeline  { teamId, gameLocation?, gameDate?, gameTime?, humanObservations?, gameScope?, customPrompt? }
-app.post('/api/run/full-pipeline', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+app.post('/api/run/full-pipeline', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   const { teamId, gameLocation, gameDate } = req.body;
   const team = (await getTeams(req)).find(t => t.id == teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
@@ -1409,7 +1408,7 @@ app.post('/api/run/full-pipeline', requireAuth, resolveSupportSession, blockWrit
   try {
     quota = await enforceReportQuota(req, { reportType: 'opponent', limitColumn: 'max_reports_per_month', title: `Report — ${team.team_name}`, linkedTeamId: team.id });
   } catch (err) {
-    return res.status(err.statusCode || 500).json({ error: err.message });
+    return sendResolverError(res, err, 'api/run/full-pipeline');
   }
   const id      = createJob(`Full Pipeline — ${team.team_name}`);
   const pgRoot  = path.join(ROOT, 'perfectgame-scraper');
@@ -1443,10 +1442,10 @@ app.post('/api/run/full-pipeline', requireAuth, resolveSupportSession, blockWrit
     }
   })();
   res.json({ jobId: id });
-});
+}));
 
 // POST /api/run/all-gc — scrape all teams GC
-app.post('/api/run/all-gc', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+app.post('/api/run/all-gc', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   await assertOrgActive(req);
   const allTeams = await getTeams(req);
   const teamsWithUrlFlags = await Promise.all(allTeams.map(async t => ({ ...t, _hasGameUrls: await hasGameUrls(t.id) })));
@@ -1478,10 +1477,10 @@ app.post('/api/run/all-gc', requireAuth, resolveSupportSession, blockWriteDuring
     appendLog(id, `\n── Complete: ${done} succeeded, ${failed} failed ──`);
   })();
   res.json({ jobId: id });
-});
+}));
 
 // POST /api/run/all-pg — scrape all teams PG
-app.post('/api/run/all-pg', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+app.post('/api/run/all-pg', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   await assertOrgActive(req);
   const teams   = (await getTeams(req)).filter(t => t.pg_team_url);
   if (!teams.length) return res.status(400).json({ error: 'No teams with PG URLs' });
@@ -1505,10 +1504,10 @@ app.post('/api/run/all-pg', requireAuth, resolveSupportSession, blockWriteDuring
     appendLog(id, `\n── Complete: ${done} succeeded, ${failed} failed ──`);
   })();
   res.json({ jobId: id });
-});
+}));
 
 // POST /api/run/all-reports — generate reports for all teams with games
-app.post('/api/run/all-reports', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+app.post('/api/run/all-reports', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   const teams   = (await getTeams(req)).filter(t => t.game_count > 0);
   if (!teams.length) return res.status(400).json({ error: 'No teams with game data' });
   const id      = createJob(`Reports All (${teams.length} teams)`);
@@ -1523,7 +1522,12 @@ app.post('/api/run/all-reports', requireAuth, resolveSupportSession, blockWriteD
       try {
         quota = await enforceReportQuota(req, { reportType: 'opponent', limitColumn: 'max_reports_per_month', title: `Report — ${team.team_name}`, linkedTeamId: team.id });
       } catch (err) {
-        appendLog(id, `✗ Stopping: ${err.message}`);
+        // Same forwarding rule as an HTTP response, applied to this job
+        // log instead: a typed error's own safe message is fine to show;
+        // anything else (e.g. a raw DB error from enforceReportQuota's
+        // internal count/insert calls) is replaced with a generic message
+        // rather than leaked into a log the coach can read.
+        appendLog(id, `✗ Stopping: ${mapErrorToResponse(err).message}`);
         quotaHit = true;
         break;
       }
@@ -1538,7 +1542,7 @@ app.post('/api/run/all-reports', requireAuth, resolveSupportSession, blockWriteD
     appendLog(id, `\n── Complete: ${done} succeeded, ${failed} failed ──`);
   })();
   res.json({ jobId: id });
-});
+}));
 
 // ── Serve dashboard ─────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.sendFile(path.join(ROOT, 'dashboard', 'index.html')));
@@ -1578,7 +1582,7 @@ app.post('/api/teams/:id/game-urls', requireAuth, resolveSupportSession, blockWr
     ).run(req.params.id, (gc_game_url || '').trim(), label.trim(), box_side);
     db.close();
     res.json({ ok: true, id: info.lastInsertRowid });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { return sendResolverError(res, err, 'api/teams/:id/game-urls POST'); }
 });
 
 app.put('/api/teams/:id/game-urls/:urlId', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
@@ -1609,7 +1613,7 @@ app.put('/api/teams/:id/game-urls/:urlId', requireAuth, resolveSupportSession, b
     `).run(gc_game_url ?? null, label ?? null, box_side ?? null, req.params.urlId, req.params.id);
     db.close();
     res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { return sendResolverError(res, err, 'api/teams/:id/game-urls PUT'); }
 });
 
 app.delete('/api/teams/:id/game-urls/:urlId', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
@@ -1629,7 +1633,7 @@ app.delete('/api/teams/:id/game-urls/:urlId', requireAuth, resolveSupportSession
     db.prepare(`DELETE FROM team_game_urls WHERE id = ? AND team_id = ?`).run(req.params.urlId, req.params.id);
     db.close();
     res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { return sendResolverError(res, err, 'api/teams/:id/game-urls DELETE'); }
 });
 
 // ── Team Roster (Players) ───────────────────────────────────────────────────
@@ -1655,7 +1659,7 @@ app.get('/api/teams/:id/players', requireAuth, resolveSupportSession, async (req
     const rows = db.prepare(`SELECT * FROM roster_players WHERE team_id = ? ORDER BY last_name, first_name`).all(req.params.id);
     db.close();
     res.json(rows);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { return sendResolverError(res, err, 'api/teams/:id/players GET'); }
 });
 
 app.post('/api/teams/:id/players', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
@@ -1703,7 +1707,7 @@ app.post('/api/teams/:id/players', requireAuth, resolveSupportSession, blockWrit
     );
     db.close();
     res.json({ ok: true, id: info.lastInsertRowid });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { return sendResolverError(res, err, 'api/teams/:id/players POST'); }
 });
 
 app.put('/api/teams/:id/players/:playerId', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
@@ -1765,7 +1769,7 @@ app.put('/api/teams/:id/players/:playerId', requireAuth, resolveSupportSession, 
     );
     db.close();
     res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { return sendResolverError(res, err, 'api/teams/:id/players/:playerId PUT'); }
 });
 
 app.delete('/api/teams/:id/players/:playerId', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
@@ -1781,7 +1785,7 @@ app.delete('/api/teams/:id/players/:playerId', requireAuth, resolveSupportSessio
     db.prepare(`DELETE FROM roster_players WHERE id = ? AND team_id = ?`).run(req.params.playerId, req.params.id);
     db.close();
     res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { return sendResolverError(res, err, 'api/teams/:id/players/:playerId DELETE'); }
 });
 
 // Seeds the roster from player names already captured by PSG analysis (distinct
@@ -1847,7 +1851,7 @@ app.post('/api/teams/:id/players/seed-from-games', requireAuth, resolveSupportSe
     }
 
     res.json({ ok: true, added: toAdd.length });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { return sendResolverError(res, err, 'api/teams/:id/players/seed-from-games'); }
 });
 
 // ── Add Team ─────────────────────────────────────────────────────────────────
@@ -1918,8 +1922,7 @@ app.post('/api/teams/add', requireAuth, resolveSupportSession, blockWriteDuringR
     db.close();
     res.json({ ok: true, id: info.lastInsertRowid });
   } catch (err) {
-    console.error('[api/teams/add]', err);
-    res.status(500).json({ error: err.message });
+    return sendResolverError(res, err, 'api/teams/add');
   }
 });
 
@@ -1980,8 +1983,7 @@ app.put('/api/teams/:id', requireAuth, resolveSupportSession, blockWriteDuringRe
     db.close();
     return res.json({ ok: true });
   } catch (err) {
-    console.error('[api/teams/:id PUT]', err);
-    return res.status(500).json({ error: err.message });
+    return sendResolverError(res, err, 'api/teams/:id PUT');
   }
 });
 
@@ -2023,8 +2025,7 @@ app.delete('/api/teams/:id', requireAuth, resolveSupportSession, blockWriteDurin
     db.close();
     return res.json({ ok: true });
   } catch (err) {
-    console.error('[api/teams/:id DELETE]', err);
-    return res.status(500).json({ error: err.message });
+    return sendResolverError(res, err, 'api/teams/:id DELETE');
   }
 });
 
@@ -2055,8 +2056,7 @@ app.patch('/api/teams/:id/archive', requireAuth, resolveSupportSession, blockWri
     db.close();
     return res.json({ ok: true, archived });
   } catch (err) {
-    console.error('[api/teams/:id/archive PATCH]', err);
-    return res.status(500).json({ error: err.message });
+    return sendResolverError(res, err, 'api/teams/:id/archive PATCH');
   }
 });
 
@@ -2303,9 +2303,18 @@ app.post('/api/settings/sheet', requireAuth, resolveSupportSession, blockWriteDu
       : `Synced ${added} new, ${updated} updated from sheet.`;
     res.json({ ok: true, added, updated, removed, skipped, message: msg });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return sendResolverError(res, err, 'api/settings/sheet');
   }
 });
+
+// ── Terminal error handler ──────────────────────────────────────────────────
+// Mounted after every route (required for Express to recognize a 4-arg
+// function as an error handler, and for it to actually receive errors
+// forwarded by asyncHandler-wrapped routes via next(err)). Catches
+// anything an affected route's own local try/catch didn't -- see
+// src/express-helpers.js for the full reasoning and the res.headersSent
+// safety check.
+app.use(buildFinalErrorHandler(mapErrorToResponse));
 
 // ── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {

@@ -19,7 +19,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { resolveTrustedOrgId, buildAcceptedMembershipsQuery } = require('../src/org-resolution');
+const { resolveTrustedOrgId, buildAcceptedMembershipsQuery, mapErrorToResponse } = require('../src/org-resolution');
 
 // ── Test helpers ────────────────────────────────────────────────────────────
 
@@ -303,4 +303,97 @@ test('buildAcceptedMembershipsQuery — the user id is passed through exactly, n
   buildAcceptedMembershipsQuery(builder, 'exact-caller-user-id');
   const eqCall = calls.find((c) => c[0] === 'eq');
   assert.deepEqual(eqCall, ['eq', 'user_id', 'exact-caller-user-id']);
+});
+
+// ── mapErrorToResponse: the corrected caller error-handling contract ──────
+// Regression coverage for the second batch of corrections requested after
+// PR #2's first push: every server.js route/middleware that calls
+// getRequestOrgId now maps errors through this one shared function instead
+// of each re-implementing (and risking getting wrong) the same check.
+
+test('mapErrorToResponse — a typed error (statusCode set) forwards its own safe message unchanged', () => {
+  const err = new Error('No organization membership found for this account.');
+  err.statusCode = 403;
+  assert.deepEqual(mapErrorToResponse(err), {
+    statusCode: 403,
+    message: 'No organization membership found for this account.',
+  });
+});
+
+test('mapErrorToResponse — every statusCode resolveTrustedOrgId can throw is forwarded as-is', () => {
+  for (const statusCode of [401, 403, 500]) {
+    const err = new Error(`typed message for ${statusCode}`);
+    err.statusCode = statusCode;
+    assert.deepEqual(mapErrorToResponse(err), { statusCode, message: `typed message for ${statusCode}` });
+  }
+});
+
+test('mapErrorToResponse — an untyped error (no statusCode) becomes a generic 500, message discarded', () => {
+  const rawDbError = new Error(
+    'relation "org_members" does not exist: SELECT org_id FROM org_members (connection postgres://admin:s3cr3t@db.internal:5432)'
+  );
+  // deliberately no .statusCode -- simulates a raw Supabase/Postgres error
+  const result = mapErrorToResponse(rawDbError);
+  assert.equal(result.statusCode, 500);
+  assert.equal(result.message, 'Something went wrong. Please try again.');
+  assert.doesNotMatch(result.message, /org_members|postgres|s3cr3t/i);
+});
+
+test('mapErrorToResponse — statusCode 0 and other falsy-but-set values are still treated as untyped (defensive)', () => {
+  const err = new Error('edge case');
+  err.statusCode = 0; // falsy -- must not be mistaken for "not set"
+  const result = mapErrorToResponse(err);
+  assert.equal(result.statusCode, 500); // falls back safely rather than responding with statusCode 0
+});
+
+test('mapErrorToResponse — a plain object without an Error prototype is still handled safely', () => {
+  const result = mapErrorToResponse({ message: 'not a real Error instance' });
+  assert.equal(result.statusCode, 500);
+  assert.equal(result.message, 'Something went wrong. Please try again.');
+});
+
+test('mapErrorToResponse — null/undefined input is handled safely (never throws)', () => {
+  assert.deepEqual(mapErrorToResponse(null), { statusCode: 500, message: 'Something went wrong. Please try again.' });
+  assert.deepEqual(mapErrorToResponse(undefined), { statusCode: 500, message: 'Something went wrong. Please try again.' });
+});
+
+// ── End-to-end: resolveTrustedOrgId's thrown errors map correctly ─────────
+// Proves the two functions compose the way server.js's sendResolverError
+// actually uses them, not just that each works in isolation.
+
+test('resolveTrustedOrgId + mapErrorToResponse — missing user maps to 401 with the safe message', async () => {
+  const req = { user: null };
+  await assert.rejects(resolveTrustedOrgId(req, { lookupAcceptedMemberships: lookupThatMustNotBeCalled() }), (err) => {
+    const mapped = mapErrorToResponse(err);
+    assert.equal(mapped.statusCode, 401);
+    assert.match(mapped.message, /unable to determine the current user/i);
+    return true;
+  });
+});
+
+test('resolveTrustedOrgId + mapErrorToResponse — zero memberships maps to 403 with the safe message', async () => {
+  const req = { user: { id: 'u1' } };
+  await assert.rejects(resolveTrustedOrgId(req, { lookupAcceptedMemberships: lookupReturning([]) }), (err) => {
+    const mapped = mapErrorToResponse(err);
+    assert.equal(mapped.statusCode, 403);
+    assert.match(mapped.message, /no organization membership/i);
+    return true;
+  });
+});
+
+test('resolveTrustedOrgId + mapErrorToResponse — a raw database failure maps to a generic 500, never the raw text', async () => {
+  const req = { user: { id: 'u1' } };
+  const sensitiveDbError = new Error('FATAL: password authentication failed for user "admin"');
+  await assert.rejects(
+    resolveTrustedOrgId(req, { lookupAcceptedMemberships: async () => { throw sensitiveDbError; } }),
+    (err) => {
+      // resolveTrustedOrgId itself already re-throws a typed 500 here (not
+      // the raw dbErr) -- confirm mapErrorToResponse forwards THAT safe
+      // message, and that the original raw text is nowhere in the result.
+      const mapped = mapErrorToResponse(err);
+      assert.equal(mapped.statusCode, 500);
+      assert.doesNotMatch(mapped.message, /password|authentication failed|admin/i);
+      return true;
+    }
+  );
 });
