@@ -64,8 +64,12 @@ enabled = true
 schema_paths = []
 
 [db.seed]
-# If enabled, seeds the database after migrations during a db reset.
-enabled = true
+# Disabled for the initial foundational-migration replay test -- no seed.sql
+# exists yet, and the goal of this pass is proving the schema replays
+# cleanly before any data is involved. Synthetic test data (two orgs, an
+# admin, per-org normal users, teams/games/stats) comes in a later step,
+# once replay is confirmed working.
+enabled = false
 # Specifies an ordered list of seed files to load during db reset.
 # Supports glob patterns relative to supabase directory: "./seeds/*.sql"
 sql_paths = ["./seed.sql"]
