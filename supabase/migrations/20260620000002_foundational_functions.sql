@@ -416,10 +416,24 @@ begin
 end;
 $function$;
 
+-- admin_dashboard_metrics() grants -- found over-permissive during Phase 4
+-- schema-diff validation: a newly created function in this project gets an
+-- automatic anon/authenticated/service_role grant (not just the plain
+-- Postgres default PUBLIC grant), so revoking from public alone is
+-- insufficient. Production restricts this one to postgres + service_role
+-- only (verified via information_schema.role_routine_grants) since it
+-- surfaces admin-only aggregate data.
+revoke execute on function public.admin_dashboard_metrics() from public, anon, authenticated;
+grant execute on function public.admin_dashboard_metrics() to postgres, service_role;
+
 -- ── Tracked-migration grant change (tighten_is_jobu_admin_grants) ──────────
 -- Verified against production's current grants (information_schema.
--- routine_privileges), not guessed: authenticated/postgres/service_role can
--- execute is_jobu_admin(); anon (the default PUBLIC grant a new SQL
--- function otherwise gets) cannot.
-revoke execute on function public.is_jobu_admin(uuid) from public;
-grant execute on function public.is_jobu_admin(uuid) to authenticated, service_role;
+-- routine_privileges): authenticated/postgres/service_role can execute
+-- is_jobu_admin(); anon cannot. "revoke ... from public" alone (the
+-- original assumption here) does not remove anon's access, because this
+-- project auto-grants anon on new functions independently of the PUBLIC
+-- pseudo-role -- anon must be revoked explicitly, same as
+-- admin_dashboard_metrics() above. Also found missing during the same
+-- Phase 4 pass: an explicit grant to postgres, to match production exactly.
+revoke execute on function public.is_jobu_admin(uuid) from public, anon;
+grant execute on function public.is_jobu_admin(uuid) to authenticated, postgres, service_role;

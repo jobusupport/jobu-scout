@@ -540,6 +540,10 @@ alter table public."player_advanced_stats" add constraint "player_advanced_stats
 alter table public."player_advanced_stats" add constraint "player_advanced_stats_team_id_fkey" foreign key ("team_id") references public."teams" ("id") on delete cascade;
 alter table public."players" add constraint "players_org_id_fkey" foreign key ("org_id") references public."organizations" ("id") on delete cascade;
 alter table public."players" add constraint "players_team_id_fkey" foreign key ("team_id") references public."teams" ("id") on delete cascade;
+-- profiles.id -> auth.users(id): found missing during Phase 4 schema-diff
+-- validation against production (verified via pg_constraint, not assumed).
+-- ON DELETE CASCADE -- deleting an auth user removes their profile row.
+alter table public."profiles" add constraint "profiles_id_fkey" foreign key ("id") references auth."users" ("id") on delete cascade;
 alter table public."reports" add constraint "reports_created_by_fkey" foreign key ("created_by") references public."profiles" ("id");
 alter table public."reports" add constraint "reports_linked_team_id_fkey" foreign key ("linked_team_id") references public."teams" ("id");
 alter table public."reports" add constraint "reports_org_id_fkey" foreign key ("org_id") references public."organizations" ("id") on delete cascade;

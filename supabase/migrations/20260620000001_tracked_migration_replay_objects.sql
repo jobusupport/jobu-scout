@@ -195,6 +195,15 @@ create table if not exists public."roster_players" (
 );
 
 -- ── Unique constraints ──────────────────────────────────────────────────
+-- Found missing during Phase 4 schema-diff validation against production
+-- (verified via information_schema.table_constraints, not assumed).
+alter table public."admin_support_sessions" add constraint "admin_support_sessions_token_key" unique ("token");
+alter table public."ai_usage_events" add constraint "ai_usage_events_idempotency_key_key" unique ("idempotency_key");
+alter table public."feature_flags" add constraint "feature_flags_key_key" unique ("key");
+alter table public."platform_admins" add constraint "platform_admins_user_id_key" unique ("user_id");
+alter table public."player_gc_spray_charts" add constraint "player_gc_spray_charts_team_id_jersey_number_category_key" unique ("team_id", "jersey_number", "category");
+alter table public."player_gc_stats" add constraint "player_gc_stats_team_id_jersey_number_category_key" unique ("team_id", "jersey_number", "category");
+alter table public."player_handedness" add constraint "player_handedness_team_id_jersey_number_key" unique ("team_id", "jersey_number");
 
 -- ── Foreign keys (verified ON DELETE rules; targets may be tracked or
 --    foundational tables, both already exist by this point) ─────────────
@@ -208,3 +217,19 @@ alter table public."player_gc_spray_charts" add constraint "player_gc_spray_char
 alter table public."player_gc_stats" add constraint "player_gc_stats_team_id_fkey" foreign key ("team_id") references public."teams" ("id") on delete cascade;
 alter table public."player_handedness" add constraint "player_handedness_team_id_fkey" foreign key ("team_id") references public."teams" ("id") on delete cascade;
 alter table public."roster_players" add constraint "roster_players_team_id_fkey" foreign key ("team_id") references public."teams" ("id") on delete cascade;
+
+-- ── Foreign keys to auth.users -- also found missing during Phase 4
+--    schema-diff validation (verified via pg_constraint against
+--    production, since information_schema.constraint_column_usage doesn't
+--    surface cross-schema FKs into auth reliably). ON UPDATE is NO ACTION
+--    for all of these (Postgres default); only platform_admins_user_id_fkey
+--    cascades on delete -- every other one is NO ACTION.
+alter table public."admin_audit_log" add constraint "admin_audit_log_admin_user_id_fkey" foreign key ("admin_user_id") references auth."users" ("id");
+alter table public."admin_support_sessions" add constraint "admin_support_sessions_admin_user_id_fkey" foreign key ("admin_user_id") references auth."users" ("id");
+alter table public."ai_usage_events" add constraint "ai_usage_events_user_id_fkey" foreign key ("user_id") references auth."users" ("id");
+alter table public."org_entitlement_overrides" add constraint "org_entitlement_overrides_created_by_fkey" foreign key ("created_by") references auth."users" ("id");
+alter table public."org_support_notes" add constraint "org_support_notes_admin_user_id_fkey" foreign key ("admin_user_id") references auth."users" ("id");
+alter table public."platform_admins" add constraint "platform_admins_created_by_fkey" foreign key ("created_by") references auth."users" ("id");
+alter table public."platform_admins" add constraint "platform_admins_user_id_fkey" foreign key ("user_id") references auth."users" ("id") on delete cascade;
+alter table public."platform_settings" add constraint "platform_settings_credit_balance_verified_by_fkey" foreign key ("credit_balance_verified_by") references auth."users" ("id");
+alter table public."platform_settings" add constraint "platform_settings_updated_by_fkey" foreign key ("updated_by") references auth."users" ("id");
