@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node server.js",
     "postinstall": "npx playwright install chromium --with-deps",
-    "test": "node --test test/product-capabilities.test.js test/api-product-capabilities.test.js test/org-resolution.test.js test/express-helpers.test.js test/admin-product-route.test.js test/admin-api-product-route-wiring.test.js",
+    "test": "node --test test/product-capabilities.test.js test/api-product-capabilities.test.js test/org-resolution.test.js test/express-helpers.test.js test/admin-product-route.test.js test/admin-api-product-route-wiring.test.js test/normalizer-game-date.test.js test/pipeline-diagnostic-logging.test.js",
     "login": "node src/login-gamechanger.js",
     "teams": "node src/test-read-teams.js",
     "search-teams": "node src/search-gamechanger-teams.js",

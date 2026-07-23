@@ -545,7 +545,7 @@ function normalizeGameMeta(meta, teamId) {
     teamId,
     gcGameId:        meta.gameId || null,
     gcGameUrl:       meta.gameUrl || meta.pageUrl || null,
-    gameDate:        explicitGameDate || dateTime.date,
+    gameDate:        dateTime.date || explicitGameDate,
     gameTime:        meta.gameTime || meta.game_time || dateTime.time,
     gameDatetimeRaw: dateTime.raw || rawDateTime || explicitGameDate || null,
     result,

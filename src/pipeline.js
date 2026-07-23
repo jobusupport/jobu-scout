@@ -432,25 +432,6 @@ async function recalculateTeamStats(teamId, options = {}) {
 
   console.log(`[pipeline] Recalculating stats from ${allGameData.length} game(s) for team ${teamId}${invertTeamSide ? ' (inverted)' : ''}...`);
 
-  // ── Diagnostic logging ──────────────────────────────────────────────────
-  // Temporary instrumentation to pin down a real/synthetic-test discrepancy:
-  // a hand-built single-game test proves processGames() classifies isOurTeam
-  // correctly, but production output doesn't match. Log the actual shape of
-  // what got fetched for the first few games so we can see where it diverges.
-  for (const g of allGameData.slice(0, 3)) {
-    const bat = g.boxScore?.batting || [];
-    const pit = g.boxScore?.pitching || [];
-    const trueBat = bat.filter(b => b.isOurTeam === true).length;
-    const falseBat = bat.filter(b => b.isOurTeam === false).length;
-    console.log(`[pipeline][diag] game ${g.meta?.gameId}: batting=${bat.length} (isOurTeam true=${trueBat} false=${falseBat}), pitching=${pit.length}, plays=${(g.plays || []).length}`);
-    if (bat.length) {
-      console.log(`[pipeline][diag]   sample batting row:`, JSON.stringify(bat[0]));
-    }
-  }
-  console.log(`[pipeline][diag] total games with 0 batting rows: ${allGameData.filter(g => !(g.boxScore?.batting || []).length).length} / ${allGameData.length}`);
-  console.log(`[pipeline][diag] total games with 0 plays: ${allGameData.filter(g => !(g.plays || []).length).length} / ${allGameData.length}`);
-  // ── End diagnostic logging ──────────────────────────────────────────────
-
   const statsResult = processGames(allGameData);
 
   if (statsResult.unattributedErrors && (statsResult.unattributedErrors.ourSide || statsResult.unattributedErrors.opponentSide)) {
