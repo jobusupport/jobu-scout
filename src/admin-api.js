@@ -13,7 +13,9 @@ const {
   logAdminAction,
   startSupportSession,
   endSupportSession,
+  resolveSupportSession,
 } = require('./admin-lib');
+const { handleProductChange } = require('./admin-product-route');
 
 const UNLIMITED_VALUE = 999999; // matches the sentinel already used on the house account
 
@@ -180,6 +182,32 @@ module.exports = function createAdminRouter({ requireAuth }) {
     });
 
     res.json({ ok: true, metricKey, previousValue, newValue });
+  });
+
+  // Slice 2 (Phase 2 RFC §14). resolveSupportSession is mounted only on
+  // this route -- it's a no-op when no X-Support-Session header is
+  // present, and populates req._supportSession when one is, which
+  // handleProductChange uses to unconditionally deny the request (see its
+  // own comment: changing product access must always be an action taken
+  // as the admin, never "as" a support session).
+  router.patch('/customers/:orgId/product', resolveSupportSession, async (req, res) => {
+    try {
+      const result = await handleProductChange({
+        orgId: req.params.orgId,
+        body: req.body,
+        hasSupportSession: !!req._supportSession,
+        adminUser: req.user,
+        adminRole: req.adminRole,
+        req,
+        fetchOrg: (id) => adminClient.from('organizations').select('id').eq('id', id).maybeSingle(),
+        callRpc: (fn, args) => adminClient.rpc(fn, args),
+      });
+      res.json(result);
+    } catch (err) {
+      const statusCode = err.statusCode || 500;
+      const message = err.statusCode ? err.message : 'Something went wrong. Please try again.';
+      res.status(statusCode).json({ error: message });
+    }
   });
 
   router.post('/customers/:orgId/notes', async (req, res) => {
