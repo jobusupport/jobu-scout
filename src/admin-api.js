@@ -81,8 +81,14 @@ module.exports = function createAdminRouter({ requireAuth }) {
 
   router.get('/customers/:orgId', async (req, res) => {
     const { orgId } = req.params;
-    const [orgRes, membersRes, teamsRes, reportsRes, scrapesRes, overridesRes, notesRes, auditRes] = await Promise.all([
+    const [orgRes, productFieldsRes, membersRes, teamsRes, reportsRes, scrapesRes, overridesRes, notesRes, auditRes] = await Promise.all([
       adminClient.from('admin_customer_overview').select('*').eq('id', orgId).maybeSingle(),
+      // admin_customer_overview predates the Phase 2 Slice 1 product-fields
+      // migration and was never updated to expose them -- read directly
+      // from organizations instead. Selected here, not folded into the
+      // view, so this stays a small additive read rather than a schema
+      // change (out of scope for Slice 3B, which may not add migrations).
+      adminClient.from('organizations').select('customer_type, primary_product, enabled_products').eq('id', orgId).maybeSingle(),
       adminClient.from('org_members').select('id,user_id,role,accepted_at,created_at').eq('org_id', orgId).order('created_at'),
       adminClient.from('teams').select('id,team_name,is_our_team,archived,created_at').eq('org_id', orgId).order('created_at', { ascending: false }),
       adminClient.from('reports').select('id,title,report_type,status,format,generated_at,created_at,error_message').eq('org_id', orgId).order('created_at', { ascending: false }).limit(25),
@@ -92,8 +98,39 @@ module.exports = function createAdminRouter({ requireAuth }) {
       adminClient.from('admin_audit_log').select('*').eq('org_id', orgId).order('created_at', { ascending: false }).limit(25),
     ]);
 
-    if (orgRes.error) return res.status(500).json({ error: orgRes.error.message });
+    // orgRes.error.message was previously forwarded to the client verbatim
+    // -- a raw Supabase/Postgres error (table name, SQLSTATE, query detail)
+    // could reach the browser. Sanitized the same way the product-fields
+    // failure below already is: log the real detail server-side only,
+    // return a generic message, and no `organization` key at all. The
+    // existing 404 behavior (row genuinely absent) is unchanged.
+    if (orgRes.error) {
+      console.error('GET /customers/:orgId — admin_customer_overview lookup failed:', orgRes.error.message);
+      return res.status(500).json({ error: 'Unable to load this customer. Please try again.' });
+    }
     if (!orgRes.data) return res.status(404).json({ error: 'Customer not found' });
+
+    // The organizations lookup is the ONLY authoritative source for
+    // customer_type/primary_product/enabled_products (admin_customer_overview
+    // predates them and doesn't have the columns at all). A failed query or
+    // an unexpectedly-missing row here must never produce a 200 that mixes
+    // real organization data with silently-missing/null product fields --
+    // that response would look authoritative while actually being partial,
+    // which is worse than an obvious failure. So this fails the whole
+    // request the same way orgRes's own failure modes do just above (same
+    // res.status().json({error}) shape, no new response format), and never
+    // forwards productFieldsRes.error.message (raw Postgres/Supabase text)
+    // to the client -- only a generic, sanitized message. No `organization`
+    // key is present in this response at all.
+    if (productFieldsRes.error) {
+      console.error('GET /customers/:orgId — product-fields lookup failed:', productFieldsRes.error.message);
+      return res.status(500).json({ error: 'Unable to load this customer’s product access settings. Please try again.' });
+    }
+    if (!productFieldsRes.data) {
+      console.error('GET /customers/:orgId — product-fields lookup returned no row for an existing organization:', orgId);
+      return res.status(500).json({ error: 'Unable to load this customer’s product access settings. Please try again.' });
+    }
+    const pf = productFieldsRes.data;
 
     const members = await Promise.all((membersRes.data || []).map(async m => {
       try {
@@ -104,8 +141,16 @@ module.exports = function createAdminRouter({ requireAuth }) {
       }
     }));
 
+    // orgRes.data comes from admin_customer_overview (a VIEW), which does
+    // not define customerType/primaryProduct/enabledProducts at all today --
+    // but the spread order here still guarantees the authoritative
+    // organizations values (pf.*) always win over any same-named field the
+    // view might ever carry, rather than relying on the view simply never
+    // having them.
+    const organization = { ...orgRes.data, customerType: pf.customer_type, primaryProduct: pf.primary_product, enabledProducts: pf.enabled_products };
+
     res.json({
-      organization: orgRes.data,
+      organization,
       members,
       teams: teamsRes.data || [],
       reports: reportsRes.data || [],
