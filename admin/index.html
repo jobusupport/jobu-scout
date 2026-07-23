@@ -259,7 +259,15 @@ async function router() {
   try {
     if (path === '/admin' || path === '/admin/') return renderDashboard(content);
     if (path === '/admin/customers') return renderCustomers(content);
-    if (m) return renderCustomerDetail(content, m[1]);
+    // Awaited specifically here (unlike the other route handlers above/
+    // below, which stay out of scope for this fix) -- renderCustomerDetail
+    // now has an internal try/catch that renders its own error+retry state
+    // for a failed fetch (see its own comment), so this await is a safety
+    // net for anything else, and is what lets this existing catch block
+    // below actually catch a truly-unexpected synchronous throw instead of
+    // it becoming an unhandled promise rejection that leaves the page
+    // stuck on "Loading customer…" forever.
+    if (m) { await renderCustomerDetail(content, m[1]); return; }
     if (path === '/admin/reports') return renderReports(content);
     if (path === '/admin/usage') return renderUsage(content);
     if (path === '/admin/system-health') return renderSystemHealth(content);
@@ -535,9 +543,479 @@ const METRIC_LABELS = {
 
 let customerDetailTab = 'overview';
 
+// ── Product access (Phase 2 Slice 3B) ───────────────────────────────────────
+// Pure logic only below -- no DOM access -- deliberately mirroring
+// src/admin-product-route.js's own validateProductChangeRequest exactly
+// (same known-value lists, same derivation table, same "primaryProduct
+// required only for hybrid/internal, must equal customerType otherwise"
+// rule). This is a client-side convenience for fast feedback and disabling
+// impossible submissions -- the server (src/admin-product-route.js +
+// admin_update_org_product) remains the sole authority and re-validates
+// everything independently; nothing here is trusted to be sufficient on
+// its own. Kept as free-standing functions (not closed over any DOM
+// state) specifically so they're testable directly.
+const PRODUCT_KNOWN_CUSTOMER_TYPES = ['travel', 'high_school', 'hybrid', 'internal'];
+const PRODUCT_KNOWN_PRODUCTS = ['travel', 'high_school'];
+const PRODUCT_ENABLED_BY_CUSTOMER_TYPE = {
+  travel: ['travel'],
+  high_school: ['high_school'],
+  hybrid: ['travel', 'high_school'],
+  internal: ['travel', 'high_school'],
+};
+
+function productCustomerTypeRequiresChoice(customerType) {
+  return customerType === 'hybrid' || customerType === 'internal';
+}
+
+function deriveEnabledProducts(customerType) {
+  // Gated on the known-value list first, not a direct property lookup --
+  // PRODUCT_ENABLED_BY_CUSTOMER_TYPE is a plain object literal, so an
+  // untrusted/malformed customerType of e.g. "constructor" or "toString"
+  // would otherwise resolve via the prototype chain to a function (not an
+  // array), which callers then call .join() on and crash.
+  return PRODUCT_KNOWN_CUSTOMER_TYPES.includes(customerType) ? PRODUCT_ENABLED_BY_CUSTOMER_TYPE[customerType] : [];
+}
+
+// Pure. Validates + normalizes one edit-form snapshot. Never throws --
+// returns { valid, errors, ... } so the UI can render field-level messages
+// and disable submission without a try/catch at every call site.
+function validateProductEditForm({ customerType, primaryProduct, reason }) {
+  const errors = {};
+
+  if (!PRODUCT_KNOWN_CUSTOMER_TYPES.includes(customerType)) {
+    errors.customerType = 'Select a customer type.';
+  }
+
+  let resolvedPrimaryProduct = null;
+  if (PRODUCT_KNOWN_CUSTOMER_TYPES.includes(customerType)) {
+    if (productCustomerTypeRequiresChoice(customerType)) {
+      if (PRODUCT_KNOWN_PRODUCTS.includes(primaryProduct)) {
+        resolvedPrimaryProduct = primaryProduct;
+      } else {
+        errors.primaryProduct = 'Select a primary product.';
+      }
+    } else {
+      // travel/high_school: primary product is always the customer type
+      // itself -- not a real choice, so there's no separate error state
+      // for it here (the UI never offers a conflicting control for it).
+      resolvedPrimaryProduct = customerType;
+    }
+  }
+
+  const trimmedReason = typeof reason === 'string' ? reason.trim() : '';
+  if (!trimmedReason) {
+    errors.reason = 'A reason is required.';
+  }
+
+  return {
+    valid: Object.keys(errors).length === 0,
+    errors,
+    customerType,
+    primaryProduct: resolvedPrimaryProduct,
+    enabledProducts: PRODUCT_KNOWN_CUSTOMER_TYPES.includes(customerType) ? deriveEnabledProducts(customerType) : [],
+    reason: trimmedReason,
+  };
+}
+
+// Pure. "Nothing changed" detection -- compares against the org's current
+// customerType/primaryProduct only (enabledProducts is fully determined by
+// customerType, so it can never differ without customerType also
+// differing -- checking it separately would be redundant).
+function productFormHasChanges(current, next) {
+  if (!current || !next) return true;
+  return current.customerType !== next.customerType || current.primaryProduct !== next.primaryProduct;
+}
+
+// Pure. The exact request body PATCH .../product accepts -- precisely
+// these three keys. Sending anything else (including enabledProducts) is
+// a 400 on the server (src/admin-product-route.js) -- this function is the
+// one place that shape is constructed, so it can never drift per call site.
+function buildProductChangeRequestBody({ customerType, primaryProduct, reason }) {
+  return { customerType, primaryProduct, reason };
+}
+
+// Pure. apiFetch() already extracts a safe, server-sanitized message from
+// any well-formed JSON error response (see its own definition above) --
+// this only supplies a fallback for the cases apiFetch can't label itself
+// (a raw network failure, or an error object with no usable .message).
+function describeProductChangeError(err) {
+  if (err && typeof err.message === 'string' && err.message) return err.message;
+  return 'Something went wrong. Please try again.';
+}
+
+// Pure. Defensive shape check on the PATCH response before it's ever
+// treated as the new authoritative org state -- guards against a
+// malformed/unexpected response being silently rendered as a success.
+function isValidProductChangeResponse(res) {
+  return !!res
+    && typeof res.customerType === 'string'
+    && typeof res.primaryProduct === 'string'
+    && Array.isArray(res.enabledProducts);
+}
+
+// Pure. Whether org's product-access fields are safe to display as editable
+// and to open the editor against -- driven entirely by the actual, approved
+// GET /customers/:orgId response shape (organization.customerType/
+// primaryProduct/enabledProducts), never by an invented signal: a failed
+// or missing product-fields lookup fails the whole GET request server-side
+// (see src/admin-api.js), so a successfully-parsed `org` here is always
+// data the endpoint actually returned. False whenever:
+//  - org is missing entirely
+//  - customerType/primaryProduct aren't one of the known values
+//  - enabledProducts isn't a non-empty array of only known products
+//  - primaryProduct isn't actually a member of enabledProducts
+// Never attempts to guess or repair a default in any of these cases --
+// renderProductAccessReadout shows a read-only "unavailable" state instead
+// of the normal kv grid + Edit button, and openProductChangeModal refuses
+// to open at all, whenever this returns false. An administrator should
+// never be able to open an editor prepopulated with a value nobody
+// actually chose, since saving it as-is would silently mint a new "current"
+// state.
+function isValidProductFields(org) {
+  if (!org) return false;
+  if (!PRODUCT_KNOWN_CUSTOMER_TYPES.includes(org.customerType)) return false;
+  if (!PRODUCT_KNOWN_PRODUCTS.includes(org.primaryProduct)) return false;
+  if (!Array.isArray(org.enabledProducts) || org.enabledProducts.length === 0) return false;
+  if (!org.enabledProducts.every(p => PRODUCT_KNOWN_PRODUCTS.includes(p))) return false;
+  if (!org.enabledProducts.includes(org.primaryProduct)) return false;
+  return true;
+}
+
+// Pure. The audit table's "Change" cell for one product_access_changed row.
+// Reads exactly the three camelCase keys admin_update_org_product() writes
+// into old_values/new_values (jsonb_build_object('customerType', ...,
+// 'primaryProduct', ..., 'enabledProducts', ...) -- verified directly
+// against the deployed function, not inferred from the PATCH response
+// shape) and nothing else, so no unrelated audit metadata that might ever
+// live alongside them on the row can leak into this cell. Never throws on
+// a legacy/malformed row (null old_values/new_values, a non-object, a
+// missing individual field, or a non-array enabledProducts) -- degrades
+// field-by-field to '—' rather than showing "undefined" or blowing up the
+// whole row.
+function renderProductChangeDiff(entry) {
+  const ov = entry && typeof entry.old_values === 'object' && entry.old_values !== null ? entry.old_values : null;
+  const nv = entry && typeof entry.new_values === 'object' && entry.new_values !== null ? entry.new_values : null;
+  if (!ov || !nv) return '—';
+
+  const parts = [];
+  if (typeof ov.customerType === 'string' || typeof nv.customerType === 'string') {
+    parts.push(`Type: ${esc(ov.customerType ?? '—')} &rarr; ${esc(nv.customerType ?? '—')}`);
+  }
+  if (typeof ov.primaryProduct === 'string' || typeof nv.primaryProduct === 'string') {
+    parts.push(`Primary: ${esc(ov.primaryProduct ?? '—')} &rarr; ${esc(nv.primaryProduct ?? '—')}`);
+  }
+  const ovEnabled = Array.isArray(ov.enabledProducts) ? ov.enabledProducts.join(', ') : null;
+  const nvEnabled = Array.isArray(nv.enabledProducts) ? nv.enabledProducts.join(', ') : null;
+  if (ovEnabled !== null || nvEnabled !== null) {
+    parts.push(`Enabled: ${esc(ovEnabled ?? '—')} &rarr; ${esc(nvEnabled ?? '—')}`);
+  }
+  return parts.length ? parts.join('<br>') : '—';
+}
+
+// Pure. The exact old/new data the confirmation phase displays -- kept
+// separate from the HTML that renders it so the content's accuracy is
+// directly testable without touching the DOM.
+function buildConfirmationSummary(org, next) {
+  return {
+    organizationName: org.name,
+    customerType: { from: org.customerType, to: next.customerType },
+    primaryProduct: { from: org.primaryProduct, to: next.primaryProduct },
+    // org.enabledProducts comes straight from the GET response -- guard
+    // against it ever being a non-array (null already falls through the
+    // `|| []`, but a malformed truthy non-array, e.g. a string, would
+    // otherwise reach the .join() call below in the render path and throw).
+    enabledProducts: { from: Array.isArray(org.enabledProducts) ? org.enabledProducts : [], to: next.enabledProducts },
+    reason: next.reason,
+  };
+}
+
+// ── Product access: read-only display ───────────────────────────────────────
+// Builds markup only (no DOM access) -- called both on initial render and
+// again after a successful change, from the freshly-updated org object, so
+// there is never a separate "patch the old DOM in place" path that could
+// drift from a full re-render.
+function renderProductAccessReadout(org, auditLog) {
+  const recentProductChanges = (auditLog || []).filter(a => a.action === 'product_access_changed').slice(0, 5);
+  const valid = isValidProductFields(org);
+  return `
+    ${valid ? `
+      <div class="kv">
+        <div class="k">Customer type</div><div id="paCustomerType">${esc(org.customerType)}</div>
+        <div class="k">Primary product</div><div id="paPrimaryProduct">${esc(org.primaryProduct)}</div>
+        <div class="k">Enabled products</div><div id="paEnabledProducts">${esc(org.enabledProducts.join(', '))}</div>
+      </div>
+      <button class="btn" id="btnEditProduct" style="margin-top:14px">Edit</button>
+    ` : `
+      <div class="error-banner" id="paUnavailable">Product settings unavailable. Refresh the page or try again later.</div>
+    `}
+    <div id="productChangeSuccess"></div>
+    ${recentProductChanges.length ? `
+      <div class="section-title" style="font-size:11px;margin:18px 0 8px">Recent product changes</div>
+      <div class="table-scroll"><table>
+        <thead><tr><th>When</th><th>Admin</th><th>Change</th><th>Reason</th></tr></thead>
+        <tbody>
+          ${recentProductChanges.map(a => `
+            <tr>
+              <td class="muted" style="white-space:nowrap">${fmtDate(a.created_at)}</td>
+              <td>${esc(a.admin_email || '')}</td>
+              <td>${renderProductChangeDiff(a)}</td>
+              <td class="muted">${esc(a.reason || '')}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table></div>
+    ` : ''}
+  `;
+}
+
+// ── Product access: edit modal (two-phase: edit, then confirm) ─────────────
+// Reuses openModal() verbatim (Phase 2 Slice 3A) for the dialog chrome --
+// role="dialog"/aria-modal, initial focus, Tab/Shift+Tab containment,
+// Escape, backdrop close, focus restoration, and listener cleanup all come
+// from there unchanged. This function only ever swaps .modal's *inner*
+// content between the two phases; it never closes and reopens the dialog
+// between them, so there is exactly one open/close lifecycle (and exactly
+// one set of listeners) for the whole edit -> confirm -> submit flow.
+function openProductChangeModal({ org, orgId, onUpdated }) {
+  // Defense in depth: renderProductAccessReadout already omits the Edit
+  // button entirely whenever isValidProductFields(org) is false, so this
+  // shouldn't normally be reachable with bad data -- but this function is
+  // the actual place an editor gets opened, so it independently refuses to
+  // do so on unavailable/malformed product data rather than trusting the
+  // caller. Opening an editor prepopulated from a value nobody actually
+  // chose would let "Confirm" silently mint that guess as the new current
+  // state.
+  if (!isValidProductFields(org)) return;
+
+  const current = { customerType: org.customerType, primaryProduct: org.primaryProduct };
+  // Never mutated in place -- every field read below comes from the live
+  // <select>/<textarea> values at the moment they're needed, and `current`
+  // (captured once, above) is only ever compared against, never written to.
+  let pending = false;
+
+  const wrap = openModal(editPhaseHtml(current));
+  const dialog = wrap.querySelector('.modal');
+  wireEditPhase();
+
+  function editPhaseHtml(values) {
+    const requiresChoice = productCustomerTypeRequiresChoice(values.customerType);
+    return `
+      <h3>Edit product access</h3>
+      <p class="muted" style="font-size:13px;margin-bottom:12px">${esc(org.name)}</p>
+      <div class="field">
+        <label>Customer type</label>
+        <select id="pcCustomerType">
+          ${PRODUCT_KNOWN_CUSTOMER_TYPES.map(t => `<option value="${t}" ${t === values.customerType ? 'selected' : ''}>${t}</option>`).join('')}
+        </select>
+      </div>
+      <div class="field" id="pcPrimaryProductField" ${requiresChoice ? '' : 'style="display:none"'}>
+        <label>Primary product</label>
+        <select id="pcPrimaryProduct">
+          ${PRODUCT_KNOWN_PRODUCTS.map(p => `<option value="${p}" ${p === values.primaryProduct ? 'selected' : ''}>${p}</option>`).join('')}
+        </select>
+      </div>
+      <div class="field">
+        <label>Enabled products (derived automatically)</label>
+        <div id="pcEnabledPreview" class="muted" style="font-size:13px">${esc(deriveEnabledProducts(values.customerType).join(', '))}</div>
+      </div>
+      <div class="field">
+        <label>Reason (required)</label>
+        <textarea id="pcReason" rows="3" placeholder="Why are you making this change?">${esc(values.reason || '')}</textarea>
+        <div id="pcReasonError" class="muted" style="font-size:12px;color:var(--red)"></div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" id="pcCancel">Cancel</button>
+        <button class="btn btn-primary" id="pcContinue" disabled>Review changes</button>
+      </div>
+    `;
+  }
+
+  function readEditPhaseValues() {
+    return {
+      customerType: dialog.querySelector('#pcCustomerType').value,
+      primaryProduct: dialog.querySelector('#pcPrimaryProductField').style.display === 'none'
+        ? dialog.querySelector('#pcCustomerType').value
+        : dialog.querySelector('#pcPrimaryProduct').value,
+      reason: dialog.querySelector('#pcReason').value,
+    };
+  }
+
+  function wireEditPhase() {
+    const customerTypeSel = dialog.querySelector('#pcCustomerType');
+    const reasonEl = dialog.querySelector('#pcReason');
+
+    function refresh() {
+      const values = readEditPhaseValues();
+      const requiresChoice = productCustomerTypeRequiresChoice(values.customerType);
+      dialog.querySelector('#pcPrimaryProductField').style.display = requiresChoice ? '' : 'none';
+      dialog.querySelector('#pcEnabledPreview').textContent = deriveEnabledProducts(values.customerType).join(', ');
+
+      const validated = validateProductEditForm(values);
+      const changed = productFormHasChanges(current, validated);
+      dialog.querySelector('#pcReasonError').textContent = '';
+      dialog.querySelector('#pcContinue').disabled = !validated.valid || !changed || pending;
+    }
+
+    // Re-rendering the primary-product field when customer type changes
+    // (rather than just toggling visibility) resets it to a value that's
+    // actually valid for the new customer type -- e.g. switching from
+    // hybrid to travel must not leave a stale, now-meaningless primary
+    // product selection sitting hidden in the DOM.
+    customerTypeSel.addEventListener('change', () => {
+      const values = readEditPhaseValues();
+      const requiresChoice = productCustomerTypeRequiresChoice(values.customerType);
+      const field = dialog.querySelector('#pcPrimaryProductField');
+      field.style.display = requiresChoice ? '' : 'none';
+      if (requiresChoice) {
+        const sel = dialog.querySelector('#pcPrimaryProduct');
+        if (!sel.value) sel.value = PRODUCT_KNOWN_PRODUCTS[0];
+      }
+      refresh();
+    });
+    dialog.querySelector('#pcPrimaryProductField').addEventListener('change', refresh);
+    reasonEl.addEventListener('input', refresh);
+
+    dialog.querySelector('#pcCancel').onclick = () => wrap.remove();
+    dialog.querySelector('#pcContinue').onclick = () => {
+      const values = readEditPhaseValues();
+      const validated = validateProductEditForm(values);
+      if (!validated.valid || !productFormHasChanges(current, validated)) return;
+      showConfirmPhase(validated);
+    };
+
+    refresh();
+  }
+
+  function showConfirmPhase(next) {
+    const summary = buildConfirmationSummary(org, next);
+    dialog.innerHTML = `
+      <h3>Confirm product access change</h3>
+      <div class="kv" style="margin-bottom:14px">
+        <div class="k">Organization</div><div>${esc(summary.organizationName)}</div>
+        <div class="k">Customer type</div><div>${esc(summary.customerType.from)} &rarr; <strong>${esc(summary.customerType.to)}</strong></div>
+        <div class="k">Primary product</div><div>${esc(summary.primaryProduct.from)} &rarr; <strong>${esc(summary.primaryProduct.to)}</strong></div>
+        <div class="k">Enabled products</div><div>${esc(summary.enabledProducts.from.join(', '))} &rarr; <strong>${esc(summary.enabledProducts.to.join(', '))}</strong></div>
+        <div class="k">Reason</div><div>${esc(summary.reason)}</div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" id="pcBack">Back</button>
+        <button class="btn btn-danger" id="pcConfirm">Confirm change</button>
+      </div>
+    `;
+    // Confirm phase is itself a focusable-element set the existing Tab
+    // trap in openModal() re-queries fresh on every keypress -- swapping
+    // .modal's content here needs no additional wiring for that. Focus is
+    // moved explicitly below since nothing does it automatically for an
+    // innerHTML swap (unlike the initial openModal() focus-on-open step).
+    dialog.querySelector('#pcBack').focus();
+
+    dialog.querySelector('#pcBack').onclick = () => {
+      // Return to the edit phase with every field exactly as the admin
+      // left it -- never discard their selection or reason.
+      dialog.innerHTML = editPhaseHtml({ ...current, ...next });
+      wireEditPhase();
+      dialog.querySelector('#pcCustomerType').focus();
+    };
+
+    dialog.querySelector('#pcConfirm').onclick = async () => {
+      if (pending) return; // one request only, even under a rapid double-click
+      pending = true;
+      const btn = dialog.querySelector('#pcConfirm');
+      const backBtn = dialog.querySelector('#pcBack');
+      btn.disabled = true;
+      backBtn.disabled = true;
+      btn.textContent = 'Applying…';
+
+      let result;
+      try {
+        result = await apiFetch('/api/admin/customers/' + orgId + '/product', {
+          method: 'PATCH',
+          body: JSON.stringify(buildProductChangeRequestBody(next)),
+        });
+      } catch (err) {
+        pending = false;
+        btn.disabled = false;
+        backBtn.disabled = false;
+        btn.textContent = 'Confirm change';
+        let errEl = dialog.querySelector('.modal-err');
+        if (!errEl) {
+          errEl = document.createElement('div');
+          errEl.className = 'error-banner modal-err';
+          errEl.style.marginTop = '10px';
+          dialog.querySelector('.modal-actions').before(errEl);
+        }
+        errEl.textContent = describeProductChangeError(err);
+        return; // modal stays open -- reason/selection untouched, retry available
+      }
+
+      if (!isValidProductChangeResponse(result)) {
+        pending = false;
+        btn.disabled = false;
+        backBtn.disabled = false;
+        btn.textContent = 'Confirm change';
+        let errEl = dialog.querySelector('.modal-err');
+        if (!errEl) {
+          errEl = document.createElement('div');
+          errEl.className = 'error-banner modal-err';
+          errEl.style.marginTop = '10px';
+          dialog.querySelector('.modal-actions').before(errEl);
+        }
+        errEl.textContent = 'Unexpected response from the server. Please refresh and try again.';
+        return;
+      }
+
+      // Only now -- server-confirmed -- is the change treated as real.
+      wrap.remove();
+      onUpdated(result);
+    };
+  }
+}
+
+// Pure. Same sanitized-passthrough-or-generic-fallback shape as
+// describeProductChangeError -- apiFetch() already extracts a safe,
+// server-sanitized message from any well-formed JSON error response, or
+// produces a browser-generated message (e.g. "Failed to fetch") for a raw
+// network failure; this only supplies the fallback for anything else
+// (a malformed/unparseable response, or an error with no usable .message).
+function describeCustomerLoadError(err) {
+  if (err && typeof err.message === 'string' && err.message) return err.message;
+  return 'Something went wrong loading this customer. Please try again.';
+}
+
+// Pure. Builds the read-only error state shown in place of the customer
+// detail page when the initial GET fails -- kept separate from the DOM
+// wiring below so its content is directly testable.
+function renderCustomerDetailError(err) {
+  return `
+    <div class="error-banner" id="customerDetailError">${esc(describeCustomerLoadError(err))}</div>
+    <button class="btn" id="btnRetryCustomerDetail" style="margin-top:12px">Retry</button>
+  `;
+}
+
 async function renderCustomerDetail(content, orgId) {
   content.innerHTML = '<div class="loading">Loading customer…</div>';
-  const data = await apiFetch('/api/admin/customers/' + orgId);
+  let data;
+  try {
+    data = await apiFetch('/api/admin/customers/' + orgId);
+  } catch (err) {
+    // Leaves the loading state with a sanitized, escaped error message
+    // (never raw error text through innerHTML) and a Retry action that
+    // re-runs this exact same request for this exact same orgId -- not a
+    // generic page reload. Retry is disabled the instant it's clicked
+    // (synchronously, before any async work starts) so a rapid double
+    // click can't fire a second overlapping request; the next
+    // renderCustomerDetail call (this one, re-entered) fully replaces
+    // content.innerHTML on its very next line regardless of outcome, which
+    // is also what discards this button and its listener -- so retries,
+    // including repeated failures, never accumulate listeners.
+    setTitle('Error', 'Customers');
+    content.innerHTML = renderCustomerDetailError(err);
+    content.querySelector('#btnRetryCustomerDetail').onclick = (e) => {
+      e.target.disabled = true;
+      renderCustomerDetail(content, orgId);
+    };
+    return;
+  }
   const org = data.organization;
   setTitle(org.name, 'Customers / ' + org.name);
 
@@ -629,6 +1107,9 @@ function renderCustomerTab(el, tab, org, data, orgId) {
         </div>
       </div>
 
+      <div class="section-title">Product access</div>
+      <div id="productAccessCard" class="card">${renderProductAccessReadout(org, data.auditLog)}</div>
+
       <div class="section-title">Entitlements & overrides</div>
       <div class="card">
         <div class="table-scroll"><table>
@@ -684,6 +1165,43 @@ function renderCustomerTab(el, tab, org, data, orgId) {
       el.querySelector('#btnCopySummary').textContent = 'Copied!';
       setTimeout(() => { el.querySelector('#btnCopySummary').textContent = 'Copy Support Summary'; }, 1500);
     };
+
+    // Named (not inline) specifically so it can be re-attached to the
+    // freshly-rebuilt #btnEditProduct after a successful change -- an
+    // innerHTML swap detaches the old node and any listener on it, so
+    // re-wiring after every rebuild is what actually keeps a later edit
+    // working, not a copied/inherited handler.
+    function wireEditProductButton() {
+      const btn = el.querySelector('#btnEditProduct');
+      if (!btn) return;
+      btn.onclick = () => {
+        openProductChangeModal({
+          org, orgId,
+          onUpdated: (result) => {
+            // Authoritative-only: org is updated from the PATCH response
+            // body, never from what the form merely submitted, and the
+            // whole read-only card is rebuilt from that -- there is no
+            // separate "assume it worked" path.
+            org.customerType = result.customerType;
+            org.primaryProduct = result.primaryProduct;
+            org.enabledProducts = result.enabledProducts;
+            const card = document.getElementById('productAccessCard');
+            if (!card) return; // tab navigated away before the request finished
+            card.innerHTML = renderProductAccessReadout(org, data.auditLog);
+            const banner = card.querySelector('#productChangeSuccess');
+            if (banner) {
+              banner.innerHTML = `<div class="card" style="margin-top:10px;border-color:var(--green);color:var(--green);font-size:13px">Product access updated.</div>`;
+            }
+            wireEditProductButton();
+            // openModal()'s own restore-to-trigger already focused the OLD
+            // button an instant ago; this innerHTML swap just detached it,
+            // so the real, current button needs focus set explicitly.
+            el.querySelector('#btnEditProduct').focus();
+          },
+        });
+      };
+    }
+    wireEditProductButton();
 
     el.querySelectorAll('[data-override]').forEach(btn => {
       btn.onclick = () => {
