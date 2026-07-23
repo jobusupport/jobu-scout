@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -17,15 +17,23 @@
   body {
     background:var(--navy); color:var(--text);
     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-    font-size:14px; display:flex; min-height:100vh;
+    font-size:14px; min-height:100vh;
   }
+  /* #root, not body, is the real flex container -- #sidebar/#main are its
+     children (body's only child is #root itself). Putting display:flex on
+     body had no effect on their layout at all; they fell back to normal
+     block stacking at every viewport width. */
+  #root { display:flex; min-height:100vh; width:100%; }
   a { color:inherit; }
   button { font-family:inherit; cursor:pointer; }
   input, select, textarea { font-family:inherit; font-size:13px; background:var(--panel); border:1px solid var(--border); color:var(--text); border-radius:6px; padding:7px 9px; }
   input:focus, select:focus, textarea:focus { outline:1px solid var(--accent); }
+  .btn:focus-visible, #sidebar nav a:focus-visible, .tabs button:focus-visible, a[data-link]:focus-visible {
+    outline:2px solid var(--accent); outline-offset:2px;
+  }
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th { text-align:left; color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.04em; padding:8px 10px; border-bottom:1px solid var(--line-strong); white-space:nowrap; }
-  td { padding:9px 10px; border-bottom:1px solid var(--border); vertical-align:middle; }
+  td { padding:9px 10px; border-bottom:1px solid var(--border); vertical-align:middle; overflow-wrap:anywhere; }
   tr:hover td { background:rgba(255,255,255,0.02); }
   .btn { border:1px solid var(--border); background:var(--panel); color:var(--text); border-radius:6px; padding:6px 12px; font-size:12.5px; }
   .btn:hover { border-color:var(--accent); }
@@ -36,6 +44,16 @@
   .btn-sm { padding:4px 9px; font-size:12px; }
   .btn:disabled { opacity:.5; cursor:not-allowed; }
   .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:16px; }
+  /* Scoped horizontal scroll for dense tables only -- NOT applied to .card
+     itself, because .card is also used for forms (Add note, New flag,
+     Settings), kv-detail panels with a focusable button (Details/Totals),
+     an alerts list, and a plain notes list, none of which should scroll
+     horizontally or risk having a focus outline clipped by an overflow
+     container. .table-scroll wraps just the <table> -- in the three pages
+     with pagination controls in the same .card as the table (Customers,
+     Reports, Audit Log), the pagination div is a sibling OUTSIDE this
+     wrapper, so it never scrolls with the table. */
+  .table-scroll { overflow-x:auto; }
   .muted { color:var(--muted); }
   .pill { display:inline-block; padding:2px 8px; border-radius:20px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.03em; }
   .pill-active, .pill-done, .pill-ready { background:rgba(62,167,111,0.15); color:var(--green); }
@@ -55,14 +73,32 @@
   #sidebar nav a.active { color:var(--accent); border-left-color:var(--accent); background:rgba(199,154,69,0.08); }
   #sidebar .back-to-app { margin:14px 18px 0; }
   #main { flex:1; min-width:0; display:flex; flex-direction:column; }
-  #topbar { display:flex; align-items:center; gap:12px; padding:14px 24px; border-bottom:1px solid var(--border); }
-  #topbar h1 { font-size:16px; font-weight:600; }
-  #topbar .crumb { color:var(--muted); font-size:12px; }
+  #topbar { display:flex; align-items:center; gap:12px; padding:14px 24px; border-bottom:1px solid var(--border); min-width:0; }
+  /* min-width:0 + ellipsis truncation -- without it, a long customer name
+     as the page title (or in the breadcrumb) has no automatic minimum
+     size cap in a flex row, so #topbar (and everything above it, none of
+     which contains overflow) gets pushed wider than the viewport instead
+     of the title just truncating in place. */
+  #topbar h1 { font-size:16px; font-weight:600; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #topbar .crumb { color:var(--muted); font-size:12px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #topbar .spacer { flex:1; }
-  #topbar .who { font-size:12px; color:var(--muted); }
-  #content { flex:1; overflow-y:auto; padding:22px 24px 60px; }
+  #topbar .who { font-size:12px; color:var(--muted); flex-shrink:0; }
+  #content { flex:1; min-width:0; overflow-y:auto; padding:22px 24px 60px; }
+  /* Caps content width on very wide displays so lines/tables don't stretch
+     indefinitely -- inert at the desktop/laptop/mobile widths this repair
+     was verified against, since available content width there never
+     reaches 1600px. */
+  #content > * { max-width:1600px; margin-left:auto; margin-right:auto; }
   .grid { display:grid; gap:14px; }
   .grid-metrics { grid-template-columns:repeat(auto-fill, minmax(170px, 1fr)); }
+  /* Replaces the customer-detail overview page's old hardcoded inline
+     grid-template-columns:1fr 1fr, which had no responsive behavior and
+     overflowed the page at narrow widths (each column's content-driven
+     minimum width ignored the 1fr split). auto-fit with a minmax floor
+     collapses to one column once two 280px columns no longer fit,
+     matching the existing .grid-metrics pattern already used elsewhere in
+     this file rather than inventing a new responsive approach. */
+  .grid-2col { grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); }
   .metric-card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:14px 16px; }
   .metric-card .label { font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin-bottom:6px; }
   .metric-card .value { font-size:22px; font-weight:700; }
@@ -76,7 +112,7 @@
   .loading { padding:40px; text-align:center; color:var(--muted); }
   .pagination { display:flex; gap:8px; align-items:center; justify-content:flex-end; margin-top:12px; font-size:12.5px; color:var(--muted); }
   .modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.55); display:flex; align-items:center; justify-content:center; z-index:500; padding:16px; }
-  .modal { background:var(--card); border:1px solid var(--line-strong); border-radius:12px; padding:22px; width:100%; max-width:440px; }
+  .modal { background:var(--card); border:1px solid var(--line-strong); border-radius:12px; padding:22px; width:100%; max-width:440px; max-height:calc(100vh - 32px); overflow-y:auto; }
   .modal h3 { font-size:15px; margin-bottom:12px; }
   .modal .field { margin-bottom:12px; display:flex; flex-direction:column; gap:5px; }
   .modal .field label { font-size:12px; color:var(--muted); }
@@ -85,7 +121,7 @@
   .tabs { display:flex; gap:4px; border-bottom:1px solid var(--border); margin-bottom:16px; flex-wrap:wrap; }
   .tabs button { background:none; border:none; color:var(--muted); padding:9px 14px; font-size:13px; border-bottom:2px solid transparent; }
   .tabs button.active { color:var(--accent); border-bottom-color:var(--accent); }
-  .kv { display:grid; grid-template-columns:150px 1fr; gap:8px 14px; font-size:13px; }
+  .kv { display:grid; grid-template-columns:150px 1fr; gap:8px 14px; font-size:13px; overflow-wrap:anywhere; }
   .kv .k { color:var(--muted); }
   .toggle { position:relative; width:36px; height:20px; display:inline-block; }
   .toggle input { opacity:0; width:0; height:0; }
@@ -96,12 +132,13 @@
   .full-center { min-height:100vh; width:100%; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:10px; }
   code { background:var(--panel); padding:1px 5px; border-radius:4px; font-size:12px; }
   @media (max-width: 760px) {
-    body { flex-direction:column; }
+    #root { flex-direction:column; }
     #sidebar { width:100%; flex-direction:row; overflow-x:auto; padding:8px; }
     #sidebar .brand, #sidebar .back-to-app { display:none; }
     #sidebar nav { display:flex; }
     #sidebar nav a { border-left:none; border-bottom:3px solid transparent; padding:8px 12px; white-space:nowrap; }
     #sidebar nav a.active { border-left-color:transparent; border-bottom-color:var(--accent); }
+    #topbar .crumb { display:none; } /* redundant with the (now-truncating) h1 title; not worth the space here */
     #content { padding:16px; }
   }
 </style>
@@ -239,12 +276,42 @@ async function router() {
 }
 
 // ── Small UI helpers ─────────────────────────────────────────────────────────
+// Every existing call site closes a modal via `modal.remove()` (backdrop
+// click here, plus Cancel/Confirm-success in reasonModal below) -- rather
+// than touch each of those, wrap.remove is overridden on this instance so
+// all of them transparently get focus restoration + listener cleanup too,
+// including any future direct openModal() caller.
 function openModal(html) {
+  const previouslyFocused = document.activeElement;
   const wrap = document.createElement('div');
   wrap.className = 'modal-overlay';
-  wrap.innerHTML = `<div class="modal">${html}</div>`;
+  wrap.innerHTML = `<div class="modal" role="dialog" aria-modal="true" tabindex="-1">${html}</div>`;
+  const dialog = wrap.querySelector('.modal');
+
+  function focusableElements() {
+    return Array.from(dialog.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'))
+      .filter(el => !el.disabled && el.offsetParent !== null);
+  }
+
+  function onKeydown(e) {
+    if (e.key === 'Escape') { e.preventDefault(); wrap.remove(); return; }
+    if (e.key !== 'Tab') return;
+    const focusable = focusableElements();
+    if (!focusable.length) { e.preventDefault(); return; }
+    const first = focusable[0], last = focusable[focusable.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  }
+
+  wrap.remove = function () {
+    document.removeEventListener('keydown', onKeydown, true);
+    HTMLElement.prototype.remove.call(wrap);
+    if (previouslyFocused && typeof previouslyFocused.focus === 'function') previouslyFocused.focus();
+  };
   wrap.addEventListener('click', e => { if (e.target === wrap) wrap.remove(); });
+  document.addEventListener('keydown', onKeydown, true);
   document.body.appendChild(wrap);
+  (focusableElements()[0] || dialog).focus();
   return wrap;
 }
 
@@ -358,7 +425,7 @@ async function renderDashboard(content) {
     <div class="section-title">Recent admin actions</div>
     <div class="card">
       ${(m.recent_admin_actions || []).length ? `
-        <table><tbody>
+        <div class="table-scroll"><table><tbody>
           ${m.recent_admin_actions.map(a => `
             <tr>
               <td class="muted" style="white-space:nowrap">${fmtDate(a.created_at)}</td>
@@ -367,7 +434,7 @@ async function renderDashboard(content) {
               <td class="muted">${esc(a.reason || '')}</td>
             </tr>
           `).join('')}
-        </tbody></table>
+        </tbody></table></div>
       ` : `<div class="empty-state">No admin actions recorded yet.</div>`}
     </div>
   `;
@@ -425,7 +492,11 @@ async function loadCustomers() {
     wrap.innerHTML = '<div class="empty-state">No customers match these filters.</div>';
     return;
   }
+  // .table-scroll on this wrapper, not on #custTableWrap (.card) itself,
+  // so the scroll region is exactly the table -- paginationControls()
+  // below is appended as a sibling, outside it, and never scrolls with it.
   const table = document.createElement('div');
+  table.className = 'table-scroll';
   table.innerHTML = `
     <table>
       <thead><tr>
@@ -434,8 +505,8 @@ async function loadCustomers() {
       </tr></thead>
       <tbody>
         ${data.customers.map(c => `
-          <tr style="cursor:pointer" data-org="${c.id}">
-            <td><strong>${esc(c.name)}</strong><br><span class="muted" style="font-size:11.5px">${esc(c.contact_email || c.slug)}</span></td>
+          <tr>
+            <td><a href="/admin/customers/${c.id}" data-link><strong>${esc(c.name)}</strong></a><br><span class="muted" style="font-size:11.5px">${esc(c.contact_email || c.slug)}</span></td>
             <td>${esc(c.plan)}</td>
             <td><span class="${pillClass(c.status)}">${esc(c.status)}</span></td>
             <td>${fmtInt(c.member_count)}</td>
@@ -448,9 +519,6 @@ async function loadCustomers() {
       </tbody>
     </table>
   `;
-  table.querySelectorAll('tr[data-org]').forEach(row => {
-    row.addEventListener('click', () => navigate('/admin/customers/' + row.dataset.org));
-  });
   wrap.innerHTML = '';
   wrap.appendChild(table);
   wrap.appendChild(paginationControls(data.total, data.page, data.pageSize, p => { customersState.page = p; loadCustomers(); }));
@@ -535,7 +603,7 @@ async function renderCustomerDetail(content, orgId) {
 function renderCustomerTab(el, tab, org, data, orgId) {
   if (tab === 'overview') {
     el.innerHTML = `
-      <div class="grid" style="grid-template-columns:1fr 1fr;gap:16px">
+      <div class="grid grid-2col">
         <div class="card">
           <div class="section-title" style="margin-top:0">Details</div>
           <div class="kv">
@@ -563,7 +631,7 @@ function renderCustomerTab(el, tab, org, data, orgId) {
 
       <div class="section-title">Entitlements & overrides</div>
       <div class="card">
-        <table>
+        <div class="table-scroll"><table>
           <thead><tr><th>Metric</th><th>Current value</th><th></th></tr></thead>
           <tbody>
             ${Object.keys(METRIC_LABELS).map(key => `
@@ -577,13 +645,13 @@ function renderCustomerTab(el, tab, org, data, orgId) {
               </tr>
             `).join('')}
           </tbody>
-        </table>
+        </table></div>
       </div>
 
       ${data.overrides.length ? `
         <div class="section-title">Override history</div>
         <div class="card">
-          <table>
+          <div class="table-scroll"><table>
             <thead><tr><th>Metric</th><th>Previous</th><th>New</th><th>Reason</th><th>When</th></tr></thead>
             <tbody>
               ${data.overrides.map(o => `
@@ -596,7 +664,7 @@ function renderCustomerTab(el, tab, org, data, orgId) {
                 </tr>
               `).join('')}
             </tbody>
-          </table>
+          </table></div>
         </div>
       ` : ''}
     `;
@@ -660,36 +728,36 @@ function renderCustomerTab(el, tab, org, data, orgId) {
     });
 
   } else if (tab === 'users') {
-    el.innerHTML = `<div class="card"><table>
+    el.innerHTML = `<div class="card"><div class="table-scroll"><table>
       <thead><tr><th>Email</th><th>Role</th><th>Accepted</th><th>Joined</th></tr></thead>
       <tbody>${data.members.length ? data.members.map(m => `
         <tr><td>${esc(m.email || m.user_id)}</td><td>${esc(m.role)}</td><td>${m.accepted_at ? 'Yes' : 'Pending'}</td><td class="muted">${fmtDateOnly(m.created_at)}</td></tr>
       `).join('') : `<tr><td colspan="4" class="empty-state">No members yet.</td></tr>`}</tbody>
-    </table></div>`;
+    </table></div></div>`;
 
   } else if (tab === 'teams') {
-    el.innerHTML = `<div class="card"><table>
+    el.innerHTML = `<div class="card"><div class="table-scroll"><table>
       <thead><tr><th>Team</th><th>Type</th><th>Archived</th><th>Created</th></tr></thead>
       <tbody>${data.teams.length ? data.teams.map(t => `
         <tr><td>${esc(t.team_name)}</td><td>${t.is_our_team ? 'Our team' : 'Opponent'}</td><td>${t.archived ? 'Yes' : 'No'}</td><td class="muted">${fmtDateOnly(t.created_at)}</td></tr>
       `).join('') : `<tr><td colspan="4" class="empty-state">No teams yet.</td></tr>`}</tbody>
-    </table></div>`;
+    </table></div></div>`;
 
   } else if (tab === 'reports') {
-    el.innerHTML = `<div class="card"><table>
+    el.innerHTML = `<div class="card"><div class="table-scroll"><table>
       <thead><tr><th>Title</th><th>Type</th><th>Status</th><th>Generated</th><th>Error</th></tr></thead>
       <tbody>${data.reports.length ? data.reports.map(r => `
         <tr><td>${esc(r.title)}</td><td>${esc(r.report_type)}</td><td><span class="${pillClass(r.status)}">${esc(r.status)}</span></td><td class="muted">${fmtDate(r.generated_at || r.created_at)}</td><td class="muted">${esc(r.error_message || '')}</td></tr>
       `).join('') : `<tr><td colspan="5" class="empty-state">No reports yet.</td></tr>`}</tbody>
-    </table></div>`;
+    </table></div></div>`;
 
   } else if (tab === 'usage') {
-    el.innerHTML = `<div class="card"><table>
+    el.innerHTML = `<div class="card"><div class="table-scroll"><table>
       <thead><tr><th>Source</th><th>Status</th><th>Games found</th><th>Games ingested</th><th>Ran</th><th>Error</th></tr></thead>
       <tbody>${data.scrapeJobs.length ? data.scrapeJobs.map(s => `
         <tr><td>${esc(s.source)}</td><td><span class="${pillClass(s.status)}">${esc(s.status)}</span></td><td>${fmtInt(s.games_found)}</td><td>${fmtInt(s.games_ingested)}</td><td class="muted">${fmtDate(s.started_at || s.created_at)}</td><td class="muted">${esc(s.error_message || '')}</td></tr>
       `).join('') : `<tr><td colspan="6" class="empty-state">No scrape jobs yet.</td></tr>`}</tbody>
-    </table></div>`;
+    </table></div></div>`;
 
   } else if (tab === 'support') {
     el.innerHTML = `
@@ -716,12 +784,12 @@ function renderCustomerTab(el, tab, org, data, orgId) {
     };
 
   } else if (tab === 'activity') {
-    el.innerHTML = `<div class="card"><table>
+    el.innerHTML = `<div class="card"><div class="table-scroll"><table>
       <thead><tr><th>When</th><th>Admin</th><th>Action</th><th>Reason</th></tr></thead>
       <tbody>${data.auditLog.length ? data.auditLog.map(a => `
         <tr><td class="muted">${fmtDate(a.created_at)}</td><td>${esc(a.admin_email || '')}</td><td>${esc(a.action)}</td><td class="muted">${esc(a.reason || '')}</td></tr>
       `).join('') : `<tr><td colspan="4" class="empty-state">No activity yet.</td></tr>`}</tbody>
-    </table></div>`;
+    </table></div></div>`;
   }
 }
 
@@ -759,7 +827,10 @@ async function loadReports() {
   wrap.innerHTML = '<div class="loading">Loading…</div>';
   const data = await apiFetch('/api/admin/reports' + qs(reportsState));
   if (!data.reports.length) { wrap.innerHTML = '<div class="empty-state">No reports match these filters.</div>'; return; }
+  // See loadCustomers()'s identical comment: .table-scroll scopes the
+  // scroll to just the table, keeping paginationControls() as a sibling.
   const table = document.createElement('div');
+  table.className = 'table-scroll';
   table.innerHTML = `
     <table>
       <thead><tr><th>Customer</th><th>Title</th><th>Type</th><th>Status</th><th>Model</th><th>Requested</th></tr></thead>
@@ -798,23 +869,23 @@ async function renderUsage(content) {
 
     <div class="section-title">Cost by model</div>
     <div class="card">
-      ${data.byModel.length ? `<table><thead><tr><th>Model</th><th>Calls</th><th>Input tokens</th><th>Output tokens</th><th>Cost</th></tr></thead><tbody>
+      ${data.byModel.length ? `<div class="table-scroll"><table><thead><tr><th>Model</th><th>Calls</th><th>Input tokens</th><th>Output tokens</th><th>Cost</th></tr></thead><tbody>
         ${data.byModel.map(m => `<tr><td>${esc(m.model)}</td><td>${fmtInt(m.count)}</td><td>${fmtInt(m.inputTokens)}</td><td>${fmtInt(m.outputTokens)}</td><td>${fmtMoney(m.cost)}</td></tr>`).join('')}
-      </tbody></table>` : `<div class="empty-state">No AI usage recorded in the last 30 days.</div>`}
+      </tbody></table></div>` : `<div class="empty-state">No AI usage recorded in the last 30 days.</div>`}
     </div>
 
     <div class="section-title">Highest-cost tenants</div>
     <div class="card">
-      ${data.byOrg.length ? `<table><thead><tr><th>Tenant</th><th>Calls</th><th>Cost</th></tr></thead><tbody>
+      ${data.byOrg.length ? `<div class="table-scroll"><table><thead><tr><th>Tenant</th><th>Calls</th><th>Cost</th></tr></thead><tbody>
         ${data.byOrg.slice(0, 20).map(o => `<tr><td>${o.orgId ? `<a href="/admin/customers/${o.orgId}" data-link>${esc(o.orgName)}</a>` : esc(o.orgName)}</td><td>${fmtInt(o.count)}</td><td>${fmtMoney(o.cost)}</td></tr>`).join('')}
-      </tbody></table>` : `<div class="empty-state">No AI usage recorded in the last 30 days.</div>`}
+      </tbody></table></div>` : `<div class="empty-state">No AI usage recorded in the last 30 days.</div>`}
     </div>
 
     <div class="section-title">Cost by day</div>
     <div class="card">
-      ${data.byDay.length ? `<table><thead><tr><th>Day</th><th>Calls</th><th>Cost</th></tr></thead><tbody>
+      ${data.byDay.length ? `<div class="table-scroll"><table><thead><tr><th>Day</th><th>Calls</th><th>Cost</th></tr></thead><tbody>
         ${data.byDay.slice().reverse().map(d => `<tr><td>${esc(d.day)}</td><td>${fmtInt(d.count)}</td><td>${fmtMoney(d.cost)}</td></tr>`).join('')}
-      </tbody></table>` : `<div class="empty-state">No AI usage recorded in the last 30 days.</div>`}
+      </tbody></table></div>` : `<div class="empty-state">No AI usage recorded in the last 30 days.</div>`}
     </div>
   `;
 }
@@ -826,29 +897,29 @@ async function renderSystemHealth(content) {
   const data = await apiFetch('/api/admin/system-health');
   content.innerHTML = `
     <div class="section-title" style="margin-top:0">Running scrapes (${data.runningScrapes.length})</div>
-    <div class="card">${data.runningScrapes.length ? `<table><thead><tr><th>Source</th><th>Started</th></tr></thead><tbody>
+    <div class="card">${data.runningScrapes.length ? `<div class="table-scroll"><table><thead><tr><th>Source</th><th>Started</th></tr></thead><tbody>
       ${data.runningScrapes.map(s => `<tr><td>${esc(s.source)}</td><td class="muted">${fmtDate(s.started_at)}</td></tr>`).join('')}
-    </tbody></table>` : `<div class="empty-state">Nothing running.</div>`}</div>
+    </tbody></table></div>` : `<div class="empty-state">Nothing running.</div>`}</div>
 
     <div class="section-title">Recently failed scrapes (${data.failingScrapes.length})</div>
-    <div class="card">${data.failingScrapes.length ? `<table><thead><tr><th>Source</th><th>Error</th><th>When</th></tr></thead><tbody>
+    <div class="card">${data.failingScrapes.length ? `<div class="table-scroll"><table><thead><tr><th>Source</th><th>Error</th><th>When</th></tr></thead><tbody>
       ${data.failingScrapes.map(s => `<tr><td>${esc(s.source)}</td><td class="muted">${esc(s.error_message || '')}</td><td class="muted">${fmtDate(s.finished_at)}</td></tr>`).join('')}
-    </tbody></table>` : `<div class="empty-state">No recent failures.</div>`}</div>
+    </tbody></table></div>` : `<div class="empty-state">No recent failures.</div>`}</div>
 
     <div class="section-title">Queued reports (${data.queuedReports.length})</div>
-    <div class="card">${data.queuedReports.length ? `<table><thead><tr><th>Title</th><th>Type</th><th>Queued</th></tr></thead><tbody>
+    <div class="card">${data.queuedReports.length ? `<div class="table-scroll"><table><thead><tr><th>Title</th><th>Type</th><th>Queued</th></tr></thead><tbody>
       ${data.queuedReports.map(r => `<tr><td>${esc(r.title)}</td><td>${esc(r.report_type)}</td><td class="muted">${fmtDate(r.created_at)}</td></tr>`).join('')}
-    </tbody></table>` : `<div class="empty-state">Nothing queued.</div>`}</div>
+    </tbody></table></div>` : `<div class="empty-state">Nothing queued.</div>`}</div>
 
     <div class="section-title">Recently failed reports (${data.failedReports.length})</div>
-    <div class="card">${data.failedReports.length ? `<table><thead><tr><th>Title</th><th>Error</th><th>When</th></tr></thead><tbody>
+    <div class="card">${data.failedReports.length ? `<div class="table-scroll"><table><thead><tr><th>Title</th><th>Error</th><th>When</th></tr></thead><tbody>
       ${data.failedReports.map(r => `<tr><td>${esc(r.title)}</td><td class="muted">${esc(r.error_message || '')}</td><td class="muted">${fmtDate(r.updated_at)}</td></tr>`).join('')}
-    </tbody></table>` : `<div class="empty-state">No recent failures.</div>`}</div>
+    </tbody></table></div>` : `<div class="empty-state">No recent failures.</div>`}</div>
 
     <div class="section-title">Tenants without a recent successful scrape</div>
-    <div class="card">${data.staleScrapeOrgs.length ? `<table><thead><tr><th>Tenant</th><th>Last successful scrape</th></tr></thead><tbody>
+    <div class="card">${data.staleScrapeOrgs.length ? `<div class="table-scroll"><table><thead><tr><th>Tenant</th><th>Last successful scrape</th></tr></thead><tbody>
       ${data.staleScrapeOrgs.map(o => `<tr><td><a href="/admin/customers/${o.id}" data-link>${esc(o.name)}</a></td><td class="muted">${o.last_successful_scrape_at ? fmtDate(o.last_successful_scrape_at) : 'Never'}</td></tr>`).join('')}
-    </tbody></table>` : `<div class="empty-state">All tenants have a recent successful scrape.</div>`}</div>
+    </tbody></table></div>` : `<div class="empty-state">All tenants have a recent successful scrape.</div>`}</div>
   `;
 }
 
@@ -861,7 +932,7 @@ async function renderBilling(content) {
   content.innerHTML = `
     <p class="muted" style="margin-bottom:14px">Stripe remains the source of truth for payment status. This is a read-only view of what's synced to <code>organizations</code>; plan/trial changes happen from the customer detail page. Deeper billing actions (cancel-at-period-end, invoice history) are deferred — open the customer directly in Stripe for those.</p>
     <div class="card">
-      <table>
+      <div class="table-scroll"><table>
         <thead><tr><th>Organization</th><th>Plan</th><th>Status</th><th>Subscription</th><th>Stripe customer</th></tr></thead>
         <tbody>
           ${data.customers.map(c => `
@@ -874,7 +945,7 @@ async function renderBilling(content) {
             </tr>
           `).join('')}
         </tbody>
-      </table>
+      </table></div>
     </div>
   `;
 }
@@ -895,7 +966,7 @@ async function renderFeatureFlags(content) {
       </div>
     </div>
     <div class="card">
-      ${data.flags.length ? `<table>
+      ${data.flags.length ? `<div class="table-scroll"><table>
         <thead><tr><th>Key</th><th>Name</th><th>Global</th><th>Plans</th></tr></thead>
         <tbody>
           ${data.flags.map(f => `
@@ -907,7 +978,7 @@ async function renderFeatureFlags(content) {
             </tr>
           `).join('')}
         </tbody>
-      </table>` : `<div class="empty-state">No feature flags yet.</div>`}
+      </table></div>` : `<div class="empty-state">No feature flags yet.</div>`}
     </div>
   `;
   content.querySelector('#ffCreate').onclick = async () => {
@@ -960,7 +1031,10 @@ async function loadAudit() {
   wrap.innerHTML = '<div class="loading">Loading…</div>';
   const data = await apiFetch('/api/admin/audit-log' + qs(auditState));
   if (!data.entries.length) { wrap.innerHTML = '<div class="empty-state">No audit entries match these filters.</div>'; return; }
+  // See loadCustomers()'s identical comment: .table-scroll scopes the
+  // scroll to just the table, keeping paginationControls() as a sibling.
   const table = document.createElement('div');
+  table.className = 'table-scroll';
   table.innerHTML = `
     <table>
       <thead><tr><th>When</th><th>Admin</th><th>Action</th><th>Resource</th><th>Reason</th></tr></thead>
