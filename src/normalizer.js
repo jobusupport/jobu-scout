@@ -182,14 +182,20 @@ function normalizeDateCandidate(value) {
 function parseDateTimeRaw(raw) {
   if (!raw) return { date: null, time: null, raw: null };
 
+  // Both full names and their standard abbreviation (with an optional
+  // trailing period, e.g. "Jun." or "Sept.") map to the same 2-digit
+  // month -- mirrors normalizeDateCandidate()'s own accepted month forms
+  // above, since GC's individual-game header text uses abbreviated months
+  // ("Sat Jun 13, ...") at least as often as full ones.
   const MONTHS = {
-    january: '01', february: '02', march: '03', april: '04',
-    may: '05', june: '06', july: '07', august: '08',
-    september: '09', october: '10', november: '11', december: '12'
+    jan: '01', january: '01', feb: '02', february: '02', mar: '03', march: '03',
+    apr: '04', april: '04', may: '05', jun: '06', june: '06', jul: '07', july: '07',
+    aug: '08', august: '08', sep: '09', sept: '09', september: '09', oct: '10', october: '10',
+    nov: '11', november: '11', dec: '12', december: '12'
   };
 
   const monthMatch = raw.match(
-    /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})/i
+    /\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2})/i
   );
 
   const yearMatch = raw.match(/\b(20\d{2})\b/);
@@ -197,7 +203,7 @@ function parseDateTimeRaw(raw) {
 
   let date = null;
   if (monthMatch) {
-    const month = MONTHS[monthMatch[1].toLowerCase()];
+    const month = MONTHS[monthMatch[1].toLowerCase().replace('.', '')];
     const day = String(monthMatch[2]).padStart(2, '0');
     const year = yearMatch ? yearMatch[1] : new Date().getFullYear();
     date = `${year}-${month}-${day}`;
