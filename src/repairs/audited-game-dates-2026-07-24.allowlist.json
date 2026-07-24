@@ -1,0 +1,24 @@
+{
+  "manifestVersion": "2026-07-24-audit",
+  "description": "Exact 13-record allowlist from the read-only production game-date audit (game-date-production-audit.md / game-date-remediation-manifest.json). This file is the sole source of truth for repair-audited-game-dates.js -- the tool refuses to operate on any game not listed here.",
+  "auditedTeamId": "8058e65c-254a-40f0-a2e4-64833f6ff30e",
+  "legitimateExcludedGameIds": [
+    "0a37af14-509a-4cb2-8229-87571fec0af9",
+    "e191766e-1258-4485-b48d-96aa3932d183"
+  ],
+  "records": [
+    { "gameId": "134ab4af-6ccd-4362-aade-81e5c47220a8", "gcGameId": "78539ac6-a12c-45f7-97fd-8e59c5961f78", "teamId": "8058e65c-254a-40f0-a2e4-64833f6ff30e", "oldDate": "2026-05-24", "newDate": "2026-03-15", "rawDateTime": "Sun Mar 15, 12:00 PM - 2:00 PM ET" },
+    { "gameId": "3e269efb-54dc-41fd-8446-efee29894681", "gcGameId": "9121fc4f-c894-4417-8582-f3c5a66191b7", "teamId": "8058e65c-254a-40f0-a2e4-64833f6ff30e", "oldDate": "2026-05-24", "newDate": "2026-04-04", "rawDateTime": "Sat Apr 4, 10:00 AM - 11:45 AM ET" },
+    { "gameId": "21e3e91c-3ede-4721-a50a-428503b3b44d", "gcGameId": "a913cfaf-688e-4e84-8375-e1bc281d53c2", "teamId": "8058e65c-254a-40f0-a2e4-64833f6ff30e", "oldDate": "2026-05-24", "newDate": "2026-04-04", "rawDateTime": "Sat Apr 4, 7:00 PM - 8:45 PM ET" },
+    { "gameId": "03699fb0-e2e4-41ba-9d6c-0920485a37af", "gcGameId": "9cf58c60-e7b4-4ffc-90c1-e09c3408968b", "teamId": "8058e65c-254a-40f0-a2e4-64833f6ff30e", "oldDate": "2026-05-24", "newDate": "2026-04-19", "rawDateTime": "Sun Apr 19, 12:30 PM - 2:20 PM ET" },
+    { "gameId": "0551f42f-fcc6-4082-a83b-c16d2fd050e7", "gcGameId": "73489841-375f-464f-89a7-41d43bdf93fc", "teamId": "8058e65c-254a-40f0-a2e4-64833f6ff30e", "oldDate": "2026-05-24", "newDate": "2026-05-01", "rawDateTime": "Fri May 1, 6:00 PM - 7:45 PM ET" },
+    { "gameId": "21d6946a-318f-4071-b8df-88562ade7c12", "gcGameId": "4aadb80f-2525-4ca5-bd9c-8c0f1a2f7147", "teamId": "8058e65c-254a-40f0-a2e4-64833f6ff30e", "oldDate": "2026-05-24", "newDate": "2026-05-08", "rawDateTime": "Fri May 8, 8:15 PM - 10:00 PM ET" },
+    { "gameId": "45ef0442-d96a-4f6b-8771-78be7c0195ff", "gcGameId": "58e0eb22-5346-4da1-852c-1341d1f86e02", "teamId": "8058e65c-254a-40f0-a2e4-64833f6ff30e", "oldDate": "2026-05-24", "newDate": "2026-05-09", "rawDateTime": "Sat May 9, 7:30 PM - 9:15 PM ET" },
+    { "gameId": "242d5c76-8923-479e-8cec-692cf5123cdf", "gcGameId": "5c691273-749a-4418-9a0e-ea7671b78164", "teamId": "8058e65c-254a-40f0-a2e4-64833f6ff30e", "oldDate": "2026-05-24", "newDate": "2026-05-10", "rawDateTime": "Sun May 10, 10:45 AM - 12:30 PM ET" },
+    { "gameId": "4c115845-1ec9-41e7-bf6f-7abaa021910d", "gcGameId": "89be7315-f6c3-4c52-94c8-5e34f7266540", "teamId": "8058e65c-254a-40f0-a2e4-64833f6ff30e", "oldDate": "2026-05-24", "newDate": "2026-05-10", "rawDateTime": "Sun May 10, 1:00 PM - 2:00 PM ET" },
+    { "gameId": "52a2fd5a-d200-4234-a44b-af9420b8dcd8", "gcGameId": "865c7c94-6f53-4e2f-b81e-9534f1984563", "teamId": "8058e65c-254a-40f0-a2e4-64833f6ff30e", "oldDate": "2026-05-24", "newDate": "2026-05-22", "rawDateTime": "Fri May 22, 7:00 PM - 8:45 PM ET" },
+    { "gameId": "47d615ea-265f-4cf8-8853-782bfe2baf4b", "gcGameId": "8bc6b841-b46b-40a1-87f8-3c7175f83e10", "teamId": "8058e65c-254a-40f0-a2e4-64833f6ff30e", "oldDate": "2026-05-24", "newDate": "2026-06-05", "rawDateTime": "Fri Jun 5, 4:00 PM - 5:50 PM ET" },
+    { "gameId": "19e82305-6025-4254-bf6f-e5784a3a23f2", "gcGameId": "ce29c4fe-1a63-447e-848b-918a1988fcb4", "teamId": "8058e65c-254a-40f0-a2e4-64833f6ff30e", "oldDate": "2026-05-24", "newDate": "2026-06-07", "rawDateTime": "Sun Jun 7, 1:30 PM - 3:20 PM ET" },
+    { "gameId": "1104a50e-cc1b-4cd5-9e07-a13d6894242c", "gcGameId": "2c33d7be-7f99-47b4-9e34-22e345069334", "teamId": "8058e65c-254a-40f0-a2e4-64833f6ff30e", "oldDate": "2026-05-24", "newDate": "2026-06-21", "rawDateTime": "Sun Jun 21, 5:00 PM - 6:45 PM CT" }
+  ]
+}
