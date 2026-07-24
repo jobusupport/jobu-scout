@@ -28,6 +28,37 @@ listed explicitly in the allowlist's `legitimateExcludedGameIds` field, and
 the tool's own structural validation refuses to load an allowlist that
 contains either of their IDs as a repair target.
 
+## Server-side security enforcement (the actual security boundary)
+
+`audited-game-dates-2026-07-24.allowlist.json` is a **preflight and
+reporting aid for the operator running this CLI -- it is not a security
+boundary.** The actual enforcement lives entirely inside the Postgres
+function itself
+(`supabase/migrations/20260724000000_repair_audited_game_dates_fn.sql`),
+which hardcodes the identical 13-record before/after mapping as an
+immutable literal directly in the function body. The function's only
+parameter is `p_operation`, constrained to exactly `'repair'` or
+`'rollback'` -- **there is no calling convention through which any caller,
+including one that bypasses this CLI entirely and invokes the RPC
+directly, can supply a different game ID, a different date, a different
+team, or a different count of targets.** A caller with RPC access cannot:
+
+- substitute another game;
+- change the proposed or expected-old date;
+- omit or add a target;
+- submit fewer or more than 13 targets;
+- duplicate a target;
+- touch a game outside the audited 13;
+- turn `rollback` into an arbitrary date write, or vice versa.
+
+`test/repair-audited-game-dates-server-boundary.test.js` verifies this
+directly against the migration's SQL text (byte-for-byte comparison of the
+hardcoded mapping against the allowlist file, function signature, grants,
+and the specific safety constructs the design depends on) -- see that
+file's own header comment for exactly what it does and does not prove
+(no local/CI Postgres is available in this repository to execute the
+function against a real database).
+
 ## Commands
 
 ```bash
@@ -55,6 +86,17 @@ environment variable alone ever causes a write.
 `src/supabase.js` already reads via `.env`). The tool never calls
 `db.init()` or any other code path that runs migrations, sets pragmas, or
 otherwise mutates storage merely by starting up.
+
+## Migration prerequisite
+
+`--apply` (and `--rollback --apply`) requires that
+`supabase/migrations/20260724000000_repair_audited_game_dates_fn.sql` has
+already been applied to the target database -- that migration is authored
+in this PR but **not applied** as part of it. Applying it is a separately
+authorized step. Until it's applied, `--apply` mode will fail at the RPC
+call with a "function does not exist" error (dry-run mode never needs the
+function at all, since it only reads `games`/`game_stat_validation_results`
+directly).
 
 ## Safety preconditions (checked for every one of the 13 records, every run)
 
@@ -127,6 +169,27 @@ same evaluation the tool already uses for preconditions) and reports
 PASS/FAIL plus the exact before/after date for every record. A human
 operator should additionally re-run the dry-run mode afterward as an
 independent, from-scratch confirmation.
+
+## Post-repair cleanup (recommended, not applied by this PR)
+
+Once the repair has been applied and independently verified (dry-run
+re-confirms all 13 rows show the proposed date, and the working team's
+data looks correct in the admin UI), **`repair_audited_game_dates` should
+be removed from production** -- it has no purpose once the one-time repair
+it exists for is complete, and leaving a working, if narrowly-scoped,
+SECURITY DEFINER function callable by `service_role` around indefinitely
+is unnecessary residual attack surface. Recommended mechanism: a small
+follow-up migration containing exactly
+
+```sql
+drop function if exists public.repair_audited_game_dates(text);
+```
+
+(Revoking execute alone would also work, but dropping the function
+entirely is cleaner and self-documenting -- there is no plausible future
+reason to re-run this exact hardcoded repair.) This cleanup is
+intentionally **not** included in this PR or applied by it -- it's a
+follow-up step for after the repair is confirmed successful.
 
 ## This is not a general cleanup utility
 

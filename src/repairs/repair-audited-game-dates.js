@@ -15,6 +15,16 @@
  * file to fix a different set of games, write a new, separately-audited
  * allowlist and a new task -- do not broaden this one.
  *
+ * IMPORTANT: this local allowlist file is a preflight/reporting aid for the
+ * operator running this CLI -- it is NOT the security boundary. The actual
+ * enforcement lives entirely inside the Postgres function
+ * (supabase/migrations/20260724000000_repair_audited_game_dates_fn.sql),
+ * which hardcodes the same 13-record mapping as an immutable literal and
+ * accepts only a `repair`/`rollback` operation name -- no game ID, date, or
+ * count is ever accepted from any caller, including this script. A caller
+ * invoking that RPC directly, bypassing this CLI entirely, cannot widen or
+ * alter the repair scope under any input.
+ *
  * Usage:
  *   node src/repairs/repair-audited-game-dates.js                                        (dry-run, default)
  *   node src/repairs/repair-audited-game-dates.js --dry-run                               (dry-run, explicit)
@@ -94,6 +104,21 @@ function parseArgs(argv) {
 // Pure (given file contents); fails closed on anything malformed rather than
 // guessing at a "best effort" interpretation.
 
+// A plain /^\d{4}-\d{2}-\d{2}$/ shape check would accept a syntactically
+// ISO-shaped but calendar-impossible date like "2026-02-30" -- Postgres's
+// own ::date cast would reject that at write time (a real safety net for
+// the hardcoded SQL values, already independently verified), but this
+// function validates the LOCAL allowlist FILE's data quality, and should
+// catch the same class of defect before it ever reaches that point. Round-
+// tripping through UTC midnight and comparing the ISO-date slice back
+// against the input catches exactly this: `new Date('2026-02-30T00:00:00Z')`
+// silently normalizes to March 2, so the round-trip fails.
+function isValidCalendarDate(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const d = new Date(`${value}T00:00:00Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === value;
+}
+
 function validateAllowlistStructure(allowlist) {
   const errors = [];
   if (!allowlist || typeof allowlist !== 'object') {
@@ -119,7 +144,7 @@ function validateAllowlistStructure(allowlist) {
     }
     if (rec.teamId && rec.teamId !== EXPECTED_TEAM_ID) errors.push(`${prefix}.teamId is not the audited team ID`);
     if (rec.oldDate && rec.oldDate !== '2026-05-24') errors.push(`${prefix}.oldDate is not the audited stored date`);
-    if (rec.newDate && !/^\d{4}-\d{2}-\d{2}$/.test(rec.newDate)) errors.push(`${prefix}.newDate is not a valid ISO date`);
+    if (rec.newDate && !isValidCalendarDate(rec.newDate)) errors.push(`${prefix}.newDate is not a valid ISO calendar date`);
     if (rec.gameId && LEGITIMATE_EXCLUDED_IDS.includes(rec.gameId)) errors.push(`${prefix}.gameId is one of the two legitimate May-24 games -- must never be targeted`);
 
     if (rec.gameId) { if (gameIds.has(rec.gameId)) dupGameIds.add(rec.gameId); gameIds.add(rec.gameId); }
@@ -333,7 +358,17 @@ async function run({ argv, client, parseDateTimeRaw, supabaseUrl, allowlistPath 
     return { exitCode: 1 };
   }
 
-  const { data, error } = await client.rpc(RPC_NAME, { p_records: records });
+  // The RPC's ONLY parameter is the operation name -- the exact 13-record
+  // before/after mapping lives hardcoded inside the Postgres function
+  // itself (supabase/migrations/20260724000000_repair_audited_game_dates_fn.sql),
+  // not in this payload. `records`/`workingAllowlist` above exist purely
+  // for this CLI's own local preflight reporting to the operator -- they
+  // are never sent to the database. The database independently enforces
+  // the exact audited scope regardless of what this script does or does
+  // not check; a caller invoking this RPC directly, bypassing this CLI
+  // entirely, cannot influence which games or which dates are touched.
+  const rpcOperation = isRollback ? 'rollback' : 'repair';
+  const { data, error } = await client.rpc(RPC_NAME, { p_operation: rpcOperation });
   if (error) {
     log(`\nABORTED: RPC call failed, no changes were committed (the function rolled back internally): ${error.message}`);
     return { exitCode: 1 };
@@ -355,6 +390,7 @@ async function run({ argv, client, parseDateTimeRaw, supabaseUrl, allowlistPath 
 
 module.exports = {
   parseArgs,
+  isValidCalendarDate,
   validateAllowlistStructure,
   loadAllowlist,
   checkPrecondition,

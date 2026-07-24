@@ -198,6 +198,37 @@ test('validateAllowlistStructure — wrong oldDate fails', () => {
   assert.ok(errors.some(e => /oldDate/.test(e)));
 });
 
+test('isValidCalendarDate — rejects a syntactically ISO-shaped but nonexistent calendar date (2026-02-30)', () => {
+  assert.equal(tool.isValidCalendarDate('2026-02-30'), false);
+});
+
+test('isValidCalendarDate — rejects malformed shapes and accepts real dates', () => {
+  assert.equal(tool.isValidCalendarDate('not-a-date'), false);
+  assert.equal(tool.isValidCalendarDate('2026-13-01'), false); // month 13
+  assert.equal(tool.isValidCalendarDate('2026-4-4'), false); // not zero-padded
+  assert.equal(tool.isValidCalendarDate('2026-04-04'), true);
+  assert.equal(tool.isValidCalendarDate('2024-02-29'), true); // real leap day
+});
+
+test('validateAllowlistStructure — a nonexistent calendar date for newDate fails, not just a format check', () => {
+  const allowlist = makeValidAllowlist(13);
+  allowlist.records[0].newDate = '2026-02-30';
+  const errors = tool.validateAllowlistStructure(allowlist);
+  assert.ok(errors.some(e => /not a valid ISO calendar date/.test(e)));
+});
+
+test('validateAllowlistStructure — a 14th, arbitrary extra record fails the exact-count check', () => {
+  const allowlist = makeValidAllowlist(14);
+  const errors = tool.validateAllowlistStructure(allowlist);
+  assert.ok(errors.some(e => /expected exactly 13/.test(e)));
+});
+
+test('validateAllowlistStructure — one audited record omitted (12 records) fails the exact-count check', () => {
+  const allowlist = makeValidAllowlist(12);
+  const errors = tool.validateAllowlistStructure(allowlist);
+  assert.ok(errors.some(e => /expected exactly 13/.test(e)));
+});
+
 test('loadAllowlist — the REAL repository allowlist file passes structural validation', () => {
   const r = tool.loadAllowlist(REAL_ALLOWLIST_PATH);
   assert.equal(r.ok, true, r.error);
@@ -300,14 +331,20 @@ function buildFullyMatchingFakeClient(allowlist, { cachePerGame = 2, rpc = null 
   return makeFakeClient({ gamesById, cacheCountByGameId, rpc });
 }
 
-// A real RPC would atomically mutate every row; this simulates that
-// observable effect on the fake client's backing store so post-write
-// verification in run() sees the change, exactly as it would against a
-// real, successfully-committed transaction.
-function makeMutatingRpc(gamesById) {
+// A real RPC call now sends ONLY { p_operation }; the 13-record mapping is
+// hardcoded server-side (see the migration). This simulates that same
+// contract: the mock never reads game IDs/dates from `args` at all -- it
+// mutates strictly from its OWN closure-captured `allowlist` (standing in
+// for the DB's hardcoded literal), keyed only by p_operation, exactly
+// mirroring what the real function can and cannot be told to do.
+function makeMutatingRpc(gamesById, allowlist) {
   return (name, args) => {
-    for (const rec of args.p_records) gamesById[rec.gameId].game_date = rec.newDate;
-    return { data: { updatedCount: args.p_records.length }, error: null };
+    assert.deepEqual(Object.keys(args), ['p_operation'], 'the RPC payload must contain only p_operation -- no game data of any kind');
+    assert.ok(args.p_operation === 'repair' || args.p_operation === 'rollback', 'p_operation must be exactly "repair" or "rollback"');
+    for (const rec of allowlist.records) {
+      gamesById[rec.gameId].game_date = args.p_operation === 'repair' ? rec.newDate : rec.oldDate;
+    }
+    return { data: { operation: args.p_operation, updatedCount: allowlist.records.length }, error: null };
   };
 }
 
@@ -346,7 +383,7 @@ test('run() — apply mode against the REAL allowlist, fully matching fake data,
   const gamesById = buildGamesById(allowlist);
   let rpcCallCount = 0;
   let rpcArgs = null;
-  const mutate = makeMutatingRpc(gamesById);
+  const mutate = makeMutatingRpc(gamesById, allowlist);
   const client = makeFakeClient({
     gamesById, cacheCountByGameId: {},
     rpc: (name, args) => { rpcCallCount++; rpcArgs = args; return mutate(name, args); },
@@ -359,7 +396,7 @@ test('run() — apply mode against the REAL allowlist, fully matching fake data,
   });
   assert.equal(exitCode, 0);
   assert.equal(rpcCallCount, 1, 'exactly one RPC call -- not 13 independent updates');
-  assert.equal(rpcArgs.p_records.length, 13);
+  assert.deepEqual(rpcArgs, { p_operation: 'repair' }, 'the RPC must receive ONLY the operation name -- no game data');
   assert.equal(tool.RPC_NAME, 'repair_audited_game_dates');
 });
 
@@ -482,10 +519,11 @@ test('run() — rollback apply, records currently in repaired state, restores or
     gamesById[rec.gameId] = { id: rec.gameId, gc_game_id: rec.gcGameId, our_team_id: rec.teamId, game_date: rec.newDate /* repaired state */, game_datetime_raw: rec.rawDateTime };
   }
   let rpcCallCount = 0;
-  const mutate = makeMutatingRpc(gamesById);
+  let rpcArgs = null;
+  const mutate = makeMutatingRpc(gamesById, allowlist);
   const client = makeFakeClient({
     gamesById, cacheCountByGameId: {},
-    rpc: (name, args) => { rpcCallCount++; return mutate(name, args); },
+    rpc: (name, args) => { rpcCallCount++; rpcArgs = args; return mutate(name, args); },
   });
   const logs = [];
   const { exitCode } = await tool.run({
@@ -495,6 +533,7 @@ test('run() — rollback apply, records currently in repaired state, restores or
   });
   assert.equal(exitCode, 0);
   assert.equal(rpcCallCount, 1);
+  assert.deepEqual(rpcArgs, { p_operation: 'rollback' }, 'rollback must send only the operation name, and it must not be "repair"');
 });
 
 // ── 25. Redaction ────────────────────────────────────────────────────────────
