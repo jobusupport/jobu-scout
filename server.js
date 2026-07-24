@@ -112,6 +112,21 @@ app.use(express.static(path.join(ROOT, 'dashboard')));
 // route independently requires requireAuth + requireJobuAdmin server-side.
 app.get(['/admin', '/admin/*splat'], (req, res) => res.sendFile(path.join(ROOT, 'admin', 'index.html')));
 
+// Product shells (Jobu Scout Travel / Jobu Scout High School) — both serve
+// the same dashboard bundle. This app has no server-side session: auth is
+// a client-held bearer JWT (see getSession()/apiFetch() in
+// dashboard/index.html), verified per-API-call by requireAuth, never via a
+// cookie the server could branch a redirect on here. Which product shell
+// actually renders is therefore decided entirely client-side, once the
+// dashboard boots and calls GET /api/product/capabilities, using the same
+// resolution rules as src/product-resolution.js (documented there; that
+// module is intentionally not required from here — this route has no
+// authorization decision to make, only a static file to serve). The real
+// security boundary is unchanged by this addition: every /api/* route
+// still independently requires requireAuth and resolves its own
+// org-scoped data server-side.
+app.get(['/travel', '/travel/*splat', '/high-school', '/high-school/*splat'], (req, res) => res.sendFile(path.join(ROOT, 'dashboard', 'index.html')));
+
 // ── Job store ───────────────────────────────────────────────────────────────
 const jobs = {};
 let jobSeq = 1;
