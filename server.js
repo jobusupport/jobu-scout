@@ -76,6 +76,9 @@ const {
 // ── Product capabilities (Phase 2 Slice 1) ───────────────────────────────────
 const { getOrganizationCapabilities } = require('./src/product-capabilities');
 
+// ── High School domain (read-only foundation) ────────────────────────────────
+const createHighSchoolRouter = require('./src/high-school-api');
+
 // ── Trusted organization resolution (extracted for database-free testing) ────
 const { resolveTrustedOrgId, buildAcceptedMembershipsQuery, mapErrorToResponse } = require('./src/org-resolution');
 const { asyncHandler, buildFinalErrorHandler } = require('./src/express-helpers');
@@ -627,6 +630,7 @@ async function requireAuth(req, res, next) {
 }
 
 app.use('/api/admin', createAdminRouter({ requireAuth }));
+app.use('/api/high-school', createHighSchoolRouter({ requireAuth }));
 
 // ── Auth routes ──────────────────────────────────────────────────────────────
 
