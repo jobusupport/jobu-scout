@@ -120,10 +120,10 @@ test('a support session remains pinned to its target organization and cannot exc
   const startRes = await apiFetch('/api/admin/support-sessions', {
     method: 'POST',
     token: TEST_ADMIN_TOKEN,
-    body: JSON.stringify({ orgId: process.env.TEST_TRAVEL_ORG_ID, mode: 'read_only' }),
+    body: JSON.stringify({ orgId: process.env.TEST_TRAVEL_ORG_ID, mode: 'read_only', reason: 'High School tenant-isolation integration test' }),
   });
   assert.equal(startRes.status, 200);
-  const { sessionToken } = await startRes.json();
+  const { token: sessionToken } = await startRes.json();
   try {
     const res = await apiFetch('/api/high-school/program', {
       token: TEST_ADMIN_TOKEN,
