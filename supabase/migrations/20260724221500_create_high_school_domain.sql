@@ -74,6 +74,64 @@
 --
 -- Contains no seed data, no production IDs, and no statement that touches
 -- any existing table's data.
+--
+-- ── GameChanger roster-import readiness ─────────────────────────────────
+-- The columns below exist so a FUTURE importer (not built by this
+-- migration) can sync High School rosters from GameChanger. No scraper or
+-- synchronization code is added here -- this is schema only, and every
+-- field choice below is grounded in what this codebase's EXISTING
+-- GameChanger scraping code actually does today, not invented semantics:
+--
+-- * gc_player_id (the equivalent Travel-domain column, on public.players)
+--   is DEAD CODE -- grepping the entire repository shows nothing ever
+--   assigns it a value. It is not proof that GameChanger exposes a
+--   reliable, durable per-person player ID. Accordingly, hs_players below
+--   does NOT get a bare "gc player id" column -- inventing one would
+--   contradict the evidence. The one place a GC-issued player identifier
+--   MIGHT plausibly be captured in the future is scoped to
+--   hs_roster_memberships (team+season), because the one historical
+--   precedent for this concept in this codebase (players_team_id_gc_
+--   player_id_key) was itself team-scoped, never claimed to be stable
+--   across teams or seasons for the same person.
+-- * Jersey numbers are extracted from both a roster page and box scores in
+--   the existing scrapers (src/search-gamechanger-teams.js,
+--   src/scrape-handedness.js), always as text, never coerced to a number,
+--   with leading zeros preserved end-to-end
+--   (src/db-supabase.js's jersey_number: String(...) writes). This
+--   migration's existing hs_roster_memberships.jersey_number text column
+--   already matches that convention -- unchanged here.
+-- * Two different real players sharing a name is an EXPLICITLY
+--   acknowledged, accepted risk in the existing codebase
+--   (src/scrape-handedness.js's buildMatchKey doc comment: "Two players
+--   sharing a last name + first initial on one roster will collide on
+--   this key -- acceptable for now; jersey_number is the real identity
+--   used for roster diffing"). Normalized-name columns added below are
+--   therefore candidate-matching aids only, never a uniqueness/identity
+--   constraint -- the future importer's job (documented, not implemented,
+--   below) is to use a real external ID when one is available and fall
+--   back to jersey number + normalized name only to produce candidates,
+--   never to silently merge on name alone.
+-- * teams.gc_team_url has NO unique constraint in the existing schema --
+--   it had one in the old SQLite schema and was deliberately DROPPED
+--   (see fix-gc-url-constraint.js's own header: "Multiple teams can
+--   legitimately have no GC URL (null), which violates a UNIQUE
+--   constraint when more than one row is null"). Every nullable
+--   GameChanger identifier added below is therefore protected by a
+--   PARTIAL unique index (WHERE column IS NOT NULL), scoped by org_id (or
+--   by team_id/season_id where the identifier's own scope requires it) --
+--   never a bare column-level UNIQUE -- to avoid reintroducing that exact
+--   already-fixed bug.
+-- * GameChanger authentication is entirely file-based
+--   (storage/gamechanger-auth.json, a Playwright storageState -- see
+--   src/login-gamechanger.js) and lives OUTSIDE the database everywhere
+--   in this codebase today. Nothing added below stores a credential,
+--   token, cookie, or browser-session artifact of any kind, and nothing
+--   ever will -- that separation is intentional and permanent, not an
+--   oversight to fix later.
+--
+-- See src/high-school-importer-contract.js for the documented (not
+-- implemented) future importer contract and conflict-resolution policy
+-- this schema is designed to support.
 
 -- ── hs_programs ──────────────────────────────────────────────────────────
 -- One High School program per organization. No existing business rule in
@@ -119,6 +177,15 @@ create index if not exists idx_hs_seasons_org_id on public.hs_seasons using btre
 create index if not exists idx_hs_seasons_program_id on public.hs_seasons using btree ("program_id");
 
 -- ── hs_teams ─────────────────────────────────────────────────────────────
+-- record_source / roster_sync_* / gc_* columns exist for the future
+-- GameChanger roster importer (see the GameChanger roster-import
+-- readiness note above and src/high-school-importer-contract.js) -- no
+-- synchronization code runs against them yet. gc_team_url is the primary,
+-- reliably-capturable GameChanger identifier (this codebase's scrapers
+-- already capture the analogous teams.gc_team_url reliably); gc_external_
+-- team_id has NO existing extraction code anywhere in this repository and
+-- is included purely for forward compatibility, not because a stable team
+-- ID is proven to exist today.
 create table if not exists public.hs_teams (
   "id" uuid not null default extensions.uuid_generate_v4(),
   "org_id" uuid not null,
@@ -126,13 +193,27 @@ create table if not exists public.hs_teams (
   "level" text not null,
   "name" text not null,
   "is_active" boolean not null default true,
+  "record_source" text not null default 'manual',
+  "gc_team_url" text,
+  "gc_external_team_id" text,
+  "roster_sync_status" text not null default 'never',
+  "roster_sync_attempted_at" timestamptz,
+  "roster_sync_succeeded_at" timestamptz,
+  -- Sanitized status detail only -- never a raw error object, stack
+  -- trace, or scraped HTML. Bounded so a future importer cannot
+  -- accidentally persist an unbounded blob here; anything needing more
+  -- detail belongs in application logs, not this row.
+  "roster_sync_error" text,
   "created_at" timestamptz not null default now(),
   "updated_at" timestamptz not null default now(),
   primary key ("id"),
   constraint "hs_teams_org_id_id_key" unique ("org_id", "id"),
   constraint "hs_teams_program_id_name_key" unique ("program_id", "name"),
   constraint "hs_teams_org_program_fkey" foreign key ("org_id", "program_id") references public.hs_programs ("org_id", "id") on delete cascade,
-  constraint "hs_teams_level_check" check ("level" = any (array['varsity'::text, 'junior_varsity'::text, 'freshman'::text]))
+  constraint "hs_teams_level_check" check ("level" = any (array['varsity'::text, 'junior_varsity'::text, 'freshman'::text])),
+  constraint "hs_teams_record_source_check" check ("record_source" = any (array['manual'::text, 'gamechanger'::text])),
+  constraint "hs_teams_roster_sync_status_check" check ("roster_sync_status" = any (array['never'::text, 'pending'::text, 'running'::text, 'succeeded'::text, 'failed'::text])),
+  constraint "hs_teams_roster_sync_error_length_check" check ("roster_sync_error" is null or char_length("roster_sync_error") <= 2000)
 );
 
 create trigger trg_hs_teams_updated_at before update on public.hs_teams for each row execute function set_updated_at();
@@ -140,12 +221,29 @@ create trigger trg_hs_teams_updated_at before update on public.hs_teams for each
 create index if not exists idx_hs_teams_org_id on public.hs_teams using btree ("org_id");
 create index if not exists idx_hs_teams_program_id on public.hs_teams using btree ("program_id");
 
+-- Partial (nullable-safe) unique indexes, not a bare column-level UNIQUE --
+-- see the GameChanger roster-import readiness note above for why: a bare
+-- UNIQUE on a nullable GameChanger identifier already broke exactly this
+-- way once in this codebase's Travel domain (fix-gc-url-constraint.js).
+create unique index if not exists idx_hs_teams_org_gc_team_url on public.hs_teams ("org_id", "gc_team_url") where "gc_team_url" is not null;
+create unique index if not exists idx_hs_teams_org_gc_external_team_id on public.hs_teams ("org_id", "gc_external_team_id") where "gc_external_team_id" is not null;
+
 -- ── hs_players ───────────────────────────────────────────────────────────
 -- Durable player identity within a program, reused across every season's
 -- roster memberships (see header comment). Only foundational identity
 -- fields are included -- contact info, guardians, academics, measurements,
 -- evaluations, recruiting status, and strength/conditioning metrics are
 -- explicitly deferred to future slices, not modeled here.
+--
+-- Deliberately NO gc_player_id-shaped column here -- see the GameChanger
+-- roster-import readiness note above for why: the existing, unpopulated
+-- players.gc_player_id precedent was itself team-scoped, so a value here
+-- (which spans every team/season a player has ever been on) would be
+-- inventing stability the evidence doesn't support. normalized_first_name
+-- / normalized_last_name are generated (always kept in sync, never drift
+-- from first_name/last_name) and exist ONLY as candidate-matching aids for
+-- a future importer -- never a uniqueness constraint, never proof two rows
+-- are the same person (see the same-name-collision note above).
 create table if not exists public.hs_players (
   "id" uuid not null default extensions.uuid_generate_v4(),
   "org_id" uuid not null,
@@ -155,6 +253,16 @@ create table if not exists public.hs_players (
   "preferred_name" text,
   "graduation_year" integer,
   "is_active" boolean not null default true,
+  "record_source" text not null default 'manual',
+  "normalized_first_name" text generated always as (lower(trim("first_name"))) stored,
+  "normalized_last_name" text generated always as (lower(trim("last_name"))) stored,
+  -- Set by a future importer only when normalized-name matching finds
+  -- more than one plausible candidate and nothing (jersey number, a
+  -- roster-scoped GC id) disambiguates -- see hs_players_gc_match_status_check
+  -- for the allowed values. NULL means "no ambiguity has ever been
+  -- flagged for this player," not "confirmed identity."
+  "gc_match_status" text,
+  "last_observed_at" timestamptz,
   "created_at" timestamptz not null default now(),
   "updated_at" timestamptz not null default now(),
   primary key ("id"),
@@ -166,7 +274,9 @@ create table if not exists public.hs_players (
   -- bound would. No upper bound is enforced -- a hard-coded "current year +
   -- N" ceiling would itself become wrong every year, which is exactly the
   -- brittleness this migration is instructed to avoid.
-  constraint "hs_players_graduation_year_check" check ("graduation_year" is null or "graduation_year" >= 2000)
+  constraint "hs_players_graduation_year_check" check ("graduation_year" is null or "graduation_year" >= 2000),
+  constraint "hs_players_record_source_check" check ("record_source" = any (array['manual'::text, 'gamechanger'::text])),
+  constraint "hs_players_gc_match_status_check" check ("gc_match_status" is null or "gc_match_status" = any (array['confirmed'::text, 'ambiguous'::text]))
 );
 
 create trigger trg_hs_players_updated_at before update on public.hs_players for each row execute function set_updated_at();
@@ -174,6 +284,7 @@ create trigger trg_hs_players_updated_at before update on public.hs_players for 
 create index if not exists idx_hs_players_org_id on public.hs_players using btree ("org_id");
 create index if not exists idx_hs_players_program_id on public.hs_players using btree ("program_id");
 create index if not exists idx_hs_players_program_name on public.hs_players using btree ("program_id", "last_name", "first_name");
+create index if not exists idx_hs_players_program_normalized_name on public.hs_players using btree ("program_id", "normalized_last_name", "normalized_first_name");
 
 -- ── hs_roster_memberships ────────────────────────────────────────────────
 -- Join table: connects one hs_players row to one (hs_teams, hs_seasons)
@@ -181,6 +292,29 @@ create index if not exists idx_hs_players_program_name on public.hs_players usin
 -- specifically so every foreign key below can be composite -- see the
 -- header comment for why this is what makes cross-program contamination
 -- structurally impossible rather than merely application-enforced.
+--
+-- jersey_number belongs HERE, not on hs_players -- it is a property of a
+-- specific team+season membership, not permanent player identity (a
+-- player can wear a different number on a different team, or in a
+-- different season on the same team). Already text (unchanged): every
+-- existing GameChanger jersey-number extraction path in this codebase
+-- (src/db-supabase.js, src/scrape-handedness.js) stores it as a string
+-- and preserves leading zeros end-to-end -- there was never a numeric
+-- jersey_number to correct here.
+--
+-- gc_external_player_id is scoped to THIS table (team+season), not
+-- hs_players, because that is the only scope any GameChanger player
+-- identifier has ever had precedent for in this codebase (see the
+-- GameChanger roster-import readiness note above) -- a future importer
+-- uses it as the strongest match signal for reconciling a SPECIFIC team's
+-- roster against a previous import of that same team+season, never as a
+-- cross-team/cross-season person identifier.
+--
+-- "status" (already present) doubles as the reconciliation state a future
+-- importer needs: 'active' means currently observed/expected on the
+-- roster, 'inactive' means not re-observed in the latest sync (or
+-- manually removed) -- reconciliation is always an UPDATE of this column,
+-- never a DELETE, so historical membership is preserved by construction.
 create table if not exists public.hs_roster_memberships (
   "id" uuid not null default extensions.uuid_generate_v4(),
   "org_id" uuid not null,
@@ -189,6 +323,9 @@ create table if not exists public.hs_roster_memberships (
   "season_id" uuid not null,
   "jersey_number" text,
   "status" text not null default 'active',
+  "record_source" text not null default 'manual',
+  "gc_external_player_id" text,
+  "last_observed_at" timestamptz,
   "created_at" timestamptz not null default now(),
   "updated_at" timestamptz not null default now(),
   primary key ("id"),
@@ -196,7 +333,8 @@ create table if not exists public.hs_roster_memberships (
   constraint "hs_roster_memberships_org_player_fkey" foreign key ("org_id", "player_id") references public.hs_players ("org_id", "id") on delete cascade,
   constraint "hs_roster_memberships_org_team_fkey" foreign key ("org_id", "team_id") references public.hs_teams ("org_id", "id") on delete cascade,
   constraint "hs_roster_memberships_org_season_fkey" foreign key ("org_id", "season_id") references public.hs_seasons ("org_id", "id") on delete cascade,
-  constraint "hs_roster_memberships_status_check" check ("status" = any (array['active'::text, 'inactive'::text]))
+  constraint "hs_roster_memberships_status_check" check ("status" = any (array['active'::text, 'inactive'::text])),
+  constraint "hs_roster_memberships_record_source_check" check ("record_source" = any (array['manual'::text, 'gamechanger'::text]))
 );
 
 create trigger trg_hs_roster_memberships_updated_at before update on public.hs_roster_memberships for each row execute function set_updated_at();
@@ -204,6 +342,12 @@ create trigger trg_hs_roster_memberships_updated_at before update on public.hs_r
 create index if not exists idx_hs_roster_memberships_org_id on public.hs_roster_memberships using btree ("org_id");
 create index if not exists idx_hs_roster_memberships_team_season on public.hs_roster_memberships using btree ("team_id", "season_id");
 create index if not exists idx_hs_roster_memberships_player_id on public.hs_roster_memberships using btree ("player_id");
+
+-- Partial unique index, not a bare column-level UNIQUE, for the same
+-- nullable-GameChanger-identifier reason as hs_teams above. Scoped to
+-- (team_id, season_id) -- the only scope this identifier has precedent
+-- for -- not globally and not merely by org_id.
+create unique index if not exists idx_hs_roster_memberships_team_season_gc_player on public.hs_roster_memberships ("team_id", "season_id", "gc_external_player_id") where "gc_external_player_id" is not null;
 
 -- ── Row Level Security ───────────────────────────────────────────────────
 alter table public.hs_programs enable row level security;
