@@ -282,6 +282,33 @@ test('PATCH /api/high-school/teams/:teamId — a foreign-org teamId 404s, identi
   assert.equal(res.status, 404);
 });
 
+test('POST /api/high-school/teams/:teamId/roster — an inactive (archived) team rejects new roster memberships (409)', { skip }, async () => {
+  const teamRes = await apiFetch('/api/high-school/teams', { method: 'POST', token: TEST_HS_USER_TOKEN, body: JSON.stringify({ name: `Archived Team ${Date.now()}`, level: 'freshman', is_active: false }) });
+  assert.equal(teamRes.status, 201);
+  const { team } = await teamRes.json();
+
+  const playerRes = await apiFetch('/api/high-school/players', { method: 'POST', token: TEST_HS_USER_TOKEN, body: JSON.stringify({ first_name: 'Archived', last_name: `Team${Date.now()}` }) });
+  const { player } = await playerRes.json();
+
+  const res = await apiFetch(`/api/high-school/teams/${team.id}/roster`, {
+    method: 'POST', token: TEST_HS_USER_TOKEN,
+    body: JSON.stringify({ playerId: player.id, seasonId: TEST_HS_SEASON_ID }),
+  });
+  assert.equal(res.status, 409);
+});
+
+test('POST /api/high-school/teams/:teamId/roster — an inactive (archived) player is rejected (409)', { skip }, async () => {
+  const playerRes = await apiFetch('/api/high-school/players', { method: 'POST', token: TEST_HS_USER_TOKEN, body: JSON.stringify({ first_name: 'Inactive', last_name: `Player${Date.now()}`, is_active: false }) });
+  assert.equal(playerRes.status, 201);
+  const { player } = await playerRes.json();
+
+  const res = await apiFetch(`/api/high-school/teams/${TEST_HS_TEAM_ID}/roster`, {
+    method: 'POST', token: TEST_HS_USER_TOKEN,
+    body: JSON.stringify({ playerId: player.id, seasonId: TEST_HS_SEASON_ID }),
+  });
+  assert.equal(res.status, 409);
+});
+
 test('POST /api/high-school/teams/:teamId/roster — a player from a different organization cannot be linked in (404, not a successful cross-tenant link)', { skip }, async () => {
   if (!TEST_HS_ORG_2_PLAYER_ID) return; // fixture not provided even when the file's gate is open
   const res = await apiFetch(`/api/high-school/teams/${TEST_HS_TEAM_ID}/roster`, {
@@ -293,12 +320,17 @@ test('POST /api/high-school/teams/:teamId/roster — a player from a different o
 
 test('POST /api/high-school/teams/:teamId/roster — a season from a different organization cannot be linked in (404)', { skip }, async () => {
   if (!TEST_HS_ORG_2_SEASON_ID) return; // fixture not provided even when the file's gate is open
-  const playersRes = await apiFetch('/api/high-school/players', { token: TEST_HS_USER_TOKEN });
-  const { players } = await playersRes.json();
-  if (!players?.length) return; // needs at least one seeded player under TEST_HS_ORG_ID
+  // A dedicated, guaranteed-active player for THIS test only -- not an
+  // arbitrary players[0] from the shared list, which can otherwise pick up
+  // an inactive player created by an earlier test in this same file and
+  // fail on the (correct, intentional) inactive-player 409 before ever
+  // reaching the cross-org season check this test means to isolate.
+  const playerRes = await apiFetch('/api/high-school/players', { method: 'POST', token: TEST_HS_USER_TOKEN, body: JSON.stringify({ first_name: 'CrossOrgSeason', last_name: `Test${Date.now()}` }) });
+  assert.equal(playerRes.status, 201);
+  const { player } = await playerRes.json();
   const res = await apiFetch(`/api/high-school/teams/${TEST_HS_TEAM_ID}/roster`, {
     method: 'POST', token: TEST_HS_USER_TOKEN,
-    body: JSON.stringify({ playerId: players[0].id, seasonId: TEST_HS_ORG_2_SEASON_ID }),
+    body: JSON.stringify({ playerId: player.id, seasonId: TEST_HS_ORG_2_SEASON_ID }),
   });
   assert.equal(res.status, 404);
 });
@@ -349,4 +381,20 @@ test('roster add/update/remove round-trip against the seeded team+season, ending
   assert.equal(removeRes.status, 200);
   const removed = await removeRes.json();
   assert.equal(removed.membership.status, 'inactive');
+
+  // Re-POSTing the same player+team+season after removal must 409 (the row
+  // still exists, just inactive) -- restore is PATCH status:'active' on the
+  // existing membership, the one documented restore path.
+  const rePostRes = await apiFetch(`/api/high-school/teams/${TEST_HS_TEAM_ID}/roster`, {
+    method: 'POST', token: TEST_HS_USER_TOKEN,
+    body: JSON.stringify({ playerId: player.id, seasonId: TEST_HS_SEASON_ID }),
+  });
+  assert.equal(rePostRes.status, 409);
+
+  const restoreRes = await apiFetch(`/api/high-school/teams/${TEST_HS_TEAM_ID}/roster/${membership.membershipId}`, {
+    method: 'PATCH', token: TEST_HS_USER_TOKEN, body: JSON.stringify({ status: 'active' }),
+  });
+  assert.equal(restoreRes.status, 200);
+  const restored = await restoreRes.json();
+  assert.equal(restored.membership.status, 'active');
 });

@@ -459,21 +459,36 @@ function toRosterMembershipResponse(row) {
   };
 }
 
-// Adds an existing player to a team for a given season. team ownership is
-// the caller's responsibility (the route already re-fetches/validates
-// :teamId before calling this, matching the existing GET roster route's own
-// pattern) -- player and season ownership are each independently re-checked
-// here via their own org-scoped lookup, so a foreign-org id supplied for
-// either can never be linked, regardless of what the caller already
-// validated.
+// Adds an existing player to a team for a given season. Team, player, and
+// season ownership are each independently re-checked here via their own
+// org-scoped lookup -- not merely trusted from a caller that may have
+// already fetched one of them for its own purposes -- so a foreign-org id
+// supplied for any of the three can never be linked, regardless of what the
+// caller already validated (the same "defense in depth is two-sided, not
+// one-sided" reasoning src/admin-product-route.js documents for its own
+// duplicated checks).
+//
+// Both the team and the player must currently be active. An archived
+// (is_active=false) team or player is still fully readable -- nothing here
+// hides it -- but new roster memberships are exactly the kind of write an
+// archival flag exists to prevent going forward; both hs_teams.is_active
+// and hs_players.is_active already exist for this in the deployed schema,
+// so this is enforced in application code, not a new migration. Seasons
+// have no is_active column at all (see high-school-roster-service's own
+// header/PR notes), so no equivalent check exists for season -- there is
+// nothing to check.
 async function addRosterMembership({ orgId, teamId, body, adminClient }) {
   const validated = validateRosterAdd(body);
 
-  const [player, season] = await Promise.all([
+  const [team, player, season] = await Promise.all([
+    getTeamInOrg({ orgId, teamId, adminClient }),
     getPlayerInOrg({ orgId, playerId: validated.playerId, adminClient }),
     getSeasonInOrg({ orgId, seasonId: validated.seasonId, adminClient }),
   ]);
+  if (!team) throw typedError('Team not found', 404);
+  if (!team.is_active) throw typedError('Cannot add a roster membership to an inactive team.', 409);
   if (!player) throw typedError('Player not found', 404);
+  if (!player.is_active) throw typedError('Cannot add an inactive player to a roster.', 409);
   if (!season) throw typedError('Season not found', 404);
 
   const { data, error } = await adminClient

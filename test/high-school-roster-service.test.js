@@ -246,8 +246,36 @@ test('validateRosterUpdate rejects an unknown status value', () => {
 
 // ── Roster memberships: orchestration ────────────────────────────────────
 
+const ACTIVE_TEAM = { id: TEAM_ID, is_active: true };
+const ACTIVE_PLAYER = { id: PLAYER_ID, is_active: true };
+
+test('addRosterMembership returns 404 when the team belongs to a different organization', async () => {
+  const adminClient = makeFakeAdminClient({
+    hs_teams: queued(ok(null)),
+    hs_players: queued(ok(ACTIVE_PLAYER)),
+    hs_seasons: queued(ok({ id: SEASON_ID })),
+  });
+  await assert.rejects(
+    () => svc.addRosterMembership({ orgId: ORG_ID, teamId: TEAM_ID, body: { playerId: PLAYER_ID, seasonId: SEASON_ID }, adminClient }),
+    (e) => e.statusCode === 404 && /Team not found/.test(e.message)
+  );
+});
+
+test('addRosterMembership rejects adding to an inactive (archived) team (409, not silently allowed)', async () => {
+  const adminClient = makeFakeAdminClient({
+    hs_teams: queued(ok({ id: TEAM_ID, is_active: false })),
+    hs_players: queued(ok(ACTIVE_PLAYER)),
+    hs_seasons: queued(ok({ id: SEASON_ID })),
+  });
+  await assert.rejects(
+    () => svc.addRosterMembership({ orgId: ORG_ID, teamId: TEAM_ID, body: { playerId: PLAYER_ID, seasonId: SEASON_ID }, adminClient }),
+    (e) => e.statusCode === 409 && /inactive team/.test(e.message)
+  );
+});
+
 test('addRosterMembership returns 404 when the player belongs to a different organization', async () => {
   const adminClient = makeFakeAdminClient({
+    hs_teams: queued(ok(ACTIVE_TEAM)),
     hs_players: queued(ok(null)),
     hs_seasons: queued(ok({ id: SEASON_ID })),
   });
@@ -257,9 +285,22 @@ test('addRosterMembership returns 404 when the player belongs to a different org
   );
 });
 
+test('addRosterMembership rejects an inactive (archived) player (409, not silently allowed)', async () => {
+  const adminClient = makeFakeAdminClient({
+    hs_teams: queued(ok(ACTIVE_TEAM)),
+    hs_players: queued(ok({ id: PLAYER_ID, is_active: false })),
+    hs_seasons: queued(ok({ id: SEASON_ID })),
+  });
+  await assert.rejects(
+    () => svc.addRosterMembership({ orgId: ORG_ID, teamId: TEAM_ID, body: { playerId: PLAYER_ID, seasonId: SEASON_ID }, adminClient }),
+    (e) => e.statusCode === 409 && /inactive player/.test(e.message)
+  );
+});
+
 test('addRosterMembership returns 404 when the season belongs to a different organization', async () => {
   const adminClient = makeFakeAdminClient({
-    hs_players: queued(ok({ id: PLAYER_ID })),
+    hs_teams: queued(ok(ACTIVE_TEAM)),
+    hs_players: queued(ok(ACTIVE_PLAYER)),
     hs_seasons: queued(ok(null)),
   });
   await assert.rejects(
@@ -270,7 +311,8 @@ test('addRosterMembership returns 404 when the season belongs to a different org
 
 test('addRosterMembership maps a duplicate-membership unique violation to 409', async () => {
   const adminClient = makeFakeAdminClient({
-    hs_players: queued(ok({ id: PLAYER_ID })),
+    hs_teams: queued(ok(ACTIVE_TEAM)),
+    hs_players: queued(ok(ACTIVE_PLAYER)),
     hs_seasons: queued(ok({ id: SEASON_ID })),
     hs_roster_memberships: queued(err({ code: '23505', message: 'duplicate key value violates unique constraint "hs_roster_memberships_player_team_season_key"' })),
   });
@@ -282,12 +324,24 @@ test('addRosterMembership maps a duplicate-membership unique violation to 409', 
 
 test('addRosterMembership succeeds and returns a camelCase membership shape', async () => {
   const adminClient = makeFakeAdminClient({
-    hs_players: queued(ok({ id: PLAYER_ID })),
+    hs_teams: queued(ok(ACTIVE_TEAM)),
+    hs_players: queued(ok(ACTIVE_PLAYER)),
     hs_seasons: queued(ok({ id: SEASON_ID })),
     hs_roster_memberships: queued(ok({ id: MEMBERSHIP_ID, team_id: TEAM_ID, season_id: SEASON_ID, player_id: PLAYER_ID, jersey_number: '7', status: 'active' })),
   });
   const result = await svc.addRosterMembership({ orgId: ORG_ID, teamId: TEAM_ID, body: { playerId: PLAYER_ID, seasonId: SEASON_ID, jerseyNumber: '7' }, adminClient });
   assert.deepEqual(result, { membershipId: MEMBERSHIP_ID, teamId: TEAM_ID, seasonId: SEASON_ID, playerId: PLAYER_ID, jerseyNumber: '7', status: 'active' });
+});
+
+test('a soft-removed membership can be restored via PATCH {status: "active"} — the one documented restore path', async () => {
+  const adminClient = makeFakeAdminClient({
+    hs_roster_memberships: queued(
+      ok({ id: MEMBERSHIP_ID, team_id: TEAM_ID, season_id: SEASON_ID, player_id: PLAYER_ID, jersey_number: null, status: 'inactive' }),
+      ok({ id: MEMBERSHIP_ID, team_id: TEAM_ID, season_id: SEASON_ID, player_id: PLAYER_ID, jersey_number: null, status: 'active' })
+    ),
+  });
+  const result = await svc.updateRosterMembership({ orgId: ORG_ID, teamId: TEAM_ID, membershipId: MEMBERSHIP_ID, body: { status: 'active' }, adminClient });
+  assert.equal(result.status, 'active');
 });
 
 test('removeRosterMembership never issues a DELETE-shaped call -- it updates status to inactive', async () => {

@@ -384,14 +384,20 @@ module.exports = function createHighSchoolRouter({ requireAuth }) {
   }));
 
   // POST body: { playerId, seasonId, jerseyNumber? }. team_id always comes
-  // from the URL, never the body -- team ownership is checked here (the
-  // same existence+ownership pattern as the GET roster route above) before
-  // delegating to rosterService, which independently re-checks player and
-  // season ownership itself.
+  // from the URL, never the body. Team, player, and season ownership (and
+  // the team/player active-status check) all happen inside
+  // rosterService.addRosterMembership itself -- see that function's own
+  // comment for why each is independently re-checked there rather than
+  // partially pre-checked here.
+  //
+  // Restoring a previously soft-removed membership: re-POSTing the same
+  // player+team+season after a DELETE (see below) hits
+  // hs_roster_memberships_player_team_season_key and 409s, by design -- the
+  // row still exists (just status='inactive'), so "restore" is PATCH
+  // .../roster/:membershipId {status:'active'}, not a second POST. This is
+  // the one and only supported restore path.
   router.post('/teams/:teamId/roster', requireAuth, resolveSupportSession, requireHighSchoolAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
     try {
-      const team = await rosterService.getTeamInOrg({ orgId: req._orgId, teamId: req.params.teamId, adminClient });
-      if (!team) return res.status(404).json({ error: 'Team not found' });
       const membership = await rosterService.addRosterMembership({ orgId: req._orgId, teamId: req.params.teamId, body: req.body, adminClient });
       res.status(201).json({ membership });
     } catch (err) {
