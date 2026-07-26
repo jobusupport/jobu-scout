@@ -1,16 +1,31 @@
 'use strict';
 
-// Read-only High School domain API. Mounted at /api/high-school in
-// server.js. Every route requires requireAuth -> resolveSupportSession ->
-// requireHighSchoolAccess, in that order -- identical middleware ordering
-// to GET /api/product/capabilities in server.js, so a support session
-// viewing a High-School-entitled customer sees that customer's own HS
-// records, and a support session viewing a Travel-only customer is denied
-// exactly like any other unentitled organization.
+// High School domain API. Mounted at /api/high-school in server.js. Every
+// route requires requireAuth -> resolveSupportSession -> requireHighSchoolAccess,
+// in that order -- identical middleware ordering to GET /api/product/capabilities
+// in server.js, so a support session viewing a High-School-entitled customer
+// sees that customer's own HS records, and a support session viewing a
+// Travel-only customer is denied exactly like any other unentitled
+// organization. Every route that writes additionally runs
+// blockWriteDuringReadOnlySupport immediately after resolveSupportSession,
+// so an active (today, always read_only) support session can view a
+// customer's High School data but can never mutate it.
 //
-// This is the foundation slice only: read-only retrieval of a program,
-// its seasons, its teams, and one team's roster for one season. No
-// mutation route exists here, and none reads req.body.
+// Covers the program/seasons/teams/players/roster-membership CRUD
+// foundation for a later roster-management UI and GameChanger importer.
+// Write-side validation and orchestration lives in
+// src/high-school-roster-service.js (database-free unit-testable, the same
+// separation src/admin-product-route.js already established for
+// PATCH /api/admin/customers/:orgId/product) -- route handlers below stay
+// thin Express adapters over that module, exactly like admin-api.js's own
+// relationship to admin-product-route.js.
+//
+// No route ever accepts org_id, program_id, or any other parent scope from
+// the client as something to trust -- the effective org always comes from
+// req._orgId (requireHighSchoolAccess), and every parent record (program,
+// team, season, player) referenced by a write is independently re-fetched
+// scoped to that org before use, so a foreign-org id can never be linked in,
+// regardless of what a caller supplies.
 //
 // Follows src/admin-api.js's factory pattern: requireAuth is injected
 // (owned by server.js, so JWT verification logic isn't duplicated);
@@ -18,10 +33,11 @@
 
 const express = require('express');
 const { adminClient } = require('./supabase');
-const { resolveSupportSession } = require('./admin-lib');
+const { resolveSupportSession, blockWriteDuringReadOnlySupport } = require('./admin-lib');
 const { getOrganizationCapabilities } = require('./product-capabilities');
 const { resolveTrustedOrgId, buildAcceptedMembershipsQuery, mapErrorToResponse } = require('./org-resolution');
 const { asyncHandler } = require('./express-helpers');
+const rosterService = require('./high-school-roster-service');
 
 // Same tolerance rule server.js's own isMissingRelationError/selectSafe/
 // maybeSingleSafe apply to every other org-scoped query in this codebase
@@ -135,6 +151,8 @@ async function getHsProgram(orgId) {
 module.exports = function createHighSchoolRouter({ requireAuth }) {
   const router = express.Router();
 
+  // ── Program ──────────────────────────────────────────────────────────
+
   router.get('/program', requireAuth, resolveSupportSession, requireHighSchoolAccess, asyncHandler(async (req, res) => {
     try {
       const program = await getHsProgram(req._orgId);
@@ -147,6 +165,26 @@ module.exports = function createHighSchoolRouter({ requireAuth }) {
       return sendResolverError(res, err, 'api/high-school/program');
     }
   }));
+
+  router.post('/program', requireAuth, resolveSupportSession, requireHighSchoolAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+    try {
+      const program = await rosterService.createProgram({ orgId: req._orgId, body: req.body, adminClient });
+      res.status(201).json({ program });
+    } catch (err) {
+      return sendResolverError(res, err, 'api/high-school/program (create)');
+    }
+  }));
+
+  router.patch('/program', requireAuth, resolveSupportSession, requireHighSchoolAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+    try {
+      const program = await rosterService.updateProgram({ orgId: req._orgId, body: req.body, adminClient, getProgram: getHsProgram });
+      res.json({ program });
+    } catch (err) {
+      return sendResolverError(res, err, 'api/high-school/program (update)');
+    }
+  }));
+
+  // ── Seasons ──────────────────────────────────────────────────────────
 
   router.get('/seasons', requireAuth, resolveSupportSession, requireHighSchoolAccess, asyncHandler(async (req, res) => {
     try {
@@ -165,6 +203,36 @@ module.exports = function createHighSchoolRouter({ requireAuth }) {
     }
   }));
 
+  router.get('/seasons/:seasonId', requireAuth, resolveSupportSession, requireHighSchoolAccess, asyncHandler(async (req, res) => {
+    try {
+      const season = await rosterService.getSeasonInOrg({ orgId: req._orgId, seasonId: req.params.seasonId, adminClient });
+      if (!season) return res.status(404).json({ error: 'Season not found' });
+      res.json({ season });
+    } catch (err) {
+      return sendResolverError(res, err, 'api/high-school/seasons/:seasonId');
+    }
+  }));
+
+  router.post('/seasons', requireAuth, resolveSupportSession, requireHighSchoolAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+    try {
+      const season = await rosterService.createSeason({ orgId: req._orgId, body: req.body, adminClient, getProgram: getHsProgram });
+      res.status(201).json({ season });
+    } catch (err) {
+      return sendResolverError(res, err, 'api/high-school/seasons (create)');
+    }
+  }));
+
+  router.patch('/seasons/:seasonId', requireAuth, resolveSupportSession, requireHighSchoolAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+    try {
+      const season = await rosterService.updateSeason({ orgId: req._orgId, seasonId: req.params.seasonId, body: req.body, adminClient });
+      res.json({ season });
+    } catch (err) {
+      return sendResolverError(res, err, 'api/high-school/seasons/:seasonId (update)');
+    }
+  }));
+
+  // ── Teams ────────────────────────────────────────────────────────────
+
   router.get('/teams', requireAuth, resolveSupportSession, requireHighSchoolAccess, asyncHandler(async (req, res) => {
     try {
       const program = await getHsProgram(req._orgId);
@@ -182,6 +250,79 @@ module.exports = function createHighSchoolRouter({ requireAuth }) {
     }
   }));
 
+  router.get('/teams/:teamId', requireAuth, resolveSupportSession, requireHighSchoolAccess, asyncHandler(async (req, res) => {
+    try {
+      const team = await rosterService.getTeamInOrg({ orgId: req._orgId, teamId: req.params.teamId, adminClient });
+      if (!team) return res.status(404).json({ error: 'Team not found' });
+      res.json({ team });
+    } catch (err) {
+      return sendResolverError(res, err, 'api/high-school/teams/:teamId');
+    }
+  }));
+
+  router.post('/teams', requireAuth, resolveSupportSession, requireHighSchoolAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+    try {
+      const team = await rosterService.createTeam({ orgId: req._orgId, body: req.body, adminClient, getProgram: getHsProgram });
+      res.status(201).json({ team });
+    } catch (err) {
+      return sendResolverError(res, err, 'api/high-school/teams (create)');
+    }
+  }));
+
+  router.patch('/teams/:teamId', requireAuth, resolveSupportSession, requireHighSchoolAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+    try {
+      const team = await rosterService.updateTeam({ orgId: req._orgId, teamId: req.params.teamId, body: req.body, adminClient });
+      res.json({ team });
+    } catch (err) {
+      return sendResolverError(res, err, 'api/high-school/teams/:teamId (update)');
+    }
+  }));
+
+  // ── Players ──────────────────────────────────────────────────────────
+  // GET /players?q=<search> -- q is optional free-text, matched against
+  // first/last/preferred name via a safely-escaped ilike (see
+  // rosterService.listPlayers / escapeIlike). No pagination, matching the
+  // existing HS list routes' own precedent (org-scoped row counts are
+  // expected to be small).
+
+  router.get('/players', requireAuth, resolveSupportSession, requireHighSchoolAccess, asyncHandler(async (req, res) => {
+    try {
+      const players = await rosterService.listPlayers({ orgId: req._orgId, search: req.query.q, adminClient });
+      res.json({ players });
+    } catch (err) {
+      return sendResolverError(res, err, 'api/high-school/players');
+    }
+  }));
+
+  router.get('/players/:playerId', requireAuth, resolveSupportSession, requireHighSchoolAccess, asyncHandler(async (req, res) => {
+    try {
+      const player = await rosterService.getPlayerInOrg({ orgId: req._orgId, playerId: req.params.playerId, adminClient });
+      if (!player) return res.status(404).json({ error: 'Player not found' });
+      res.json({ player });
+    } catch (err) {
+      return sendResolverError(res, err, 'api/high-school/players/:playerId');
+    }
+  }));
+
+  router.post('/players', requireAuth, resolveSupportSession, requireHighSchoolAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+    try {
+      const player = await rosterService.createPlayer({ orgId: req._orgId, body: req.body, adminClient, getProgram: getHsProgram });
+      res.status(201).json({ player });
+    } catch (err) {
+      return sendResolverError(res, err, 'api/high-school/players (create)');
+    }
+  }));
+
+  router.patch('/players/:playerId', requireAuth, resolveSupportSession, requireHighSchoolAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+    try {
+      const player = await rosterService.updatePlayer({ orgId: req._orgId, playerId: req.params.playerId, body: req.body, adminClient });
+      res.json({ player });
+    } catch (err) {
+      return sendResolverError(res, err, 'api/high-school/players/:playerId (update)');
+    }
+  }));
+
+  // ── Roster ───────────────────────────────────────────────────────────
   // GET /teams/:teamId/roster?seasonId=<uuid> -- seasonId is optional,
   // defaulting to the program's current season (is_current = true) when
   // omitted. Every lookup filters by BOTH the requested ID and the
@@ -239,6 +380,46 @@ module.exports = function createHighSchoolRouter({ requireAuth }) {
       res.json({ roster });
     } catch (err) {
       return sendResolverError(res, err, 'api/high-school/teams/:teamId/roster');
+    }
+  }));
+
+  // POST body: { playerId, seasonId, jerseyNumber? }. team_id always comes
+  // from the URL, never the body -- team ownership is checked here (the
+  // same existence+ownership pattern as the GET roster route above) before
+  // delegating to rosterService, which independently re-checks player and
+  // season ownership itself.
+  router.post('/teams/:teamId/roster', requireAuth, resolveSupportSession, requireHighSchoolAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+    try {
+      const team = await rosterService.getTeamInOrg({ orgId: req._orgId, teamId: req.params.teamId, adminClient });
+      if (!team) return res.status(404).json({ error: 'Team not found' });
+      const membership = await rosterService.addRosterMembership({ orgId: req._orgId, teamId: req.params.teamId, body: req.body, adminClient });
+      res.status(201).json({ membership });
+    } catch (err) {
+      return sendResolverError(res, err, 'api/high-school/teams/:teamId/roster (add)');
+    }
+  }));
+
+  router.patch('/teams/:teamId/roster/:membershipId', requireAuth, resolveSupportSession, requireHighSchoolAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+    try {
+      const membership = await rosterService.updateRosterMembership({
+        orgId: req._orgId, teamId: req.params.teamId, membershipId: req.params.membershipId, body: req.body, adminClient,
+      });
+      res.json({ membership });
+    } catch (err) {
+      return sendResolverError(res, err, 'api/high-school/teams/:teamId/roster/:membershipId (update)');
+    }
+  }));
+
+  // Soft-remove only: sets status='inactive', never deletes the row. See
+  // rosterService.removeRosterMembership's own comment for why.
+  router.delete('/teams/:teamId/roster/:membershipId', requireAuth, resolveSupportSession, requireHighSchoolAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+    try {
+      const membership = await rosterService.removeRosterMembership({
+        orgId: req._orgId, teamId: req.params.teamId, membershipId: req.params.membershipId, adminClient,
+      });
+      res.json({ membership });
+    } catch (err) {
+      return sendResolverError(res, err, 'api/high-school/teams/:teamId/roster/:membershipId (remove)');
     }
   }));
 

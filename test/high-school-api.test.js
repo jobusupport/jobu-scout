@@ -94,9 +94,24 @@ function startApp({ requireAuth }) {
 
 const ROUTES = [
   { method: 'GET', path: '/program' },
+  { method: 'POST', path: '/program' },
+  { method: 'PATCH', path: '/program' },
   { method: 'GET', path: '/seasons' },
+  { method: 'GET', path: '/seasons/11111111-1111-4111-8111-111111111111' },
+  { method: 'POST', path: '/seasons' },
+  { method: 'PATCH', path: '/seasons/11111111-1111-4111-8111-111111111111' },
   { method: 'GET', path: '/teams' },
+  { method: 'GET', path: '/teams/11111111-1111-4111-8111-111111111111' },
+  { method: 'POST', path: '/teams' },
+  { method: 'PATCH', path: '/teams/11111111-1111-4111-8111-111111111111' },
+  { method: 'GET', path: '/players' },
+  { method: 'GET', path: '/players/11111111-1111-4111-8111-111111111111' },
+  { method: 'POST', path: '/players' },
+  { method: 'PATCH', path: '/players/11111111-1111-4111-8111-111111111111' },
   { method: 'GET', path: '/teams/11111111-1111-4111-8111-111111111111/roster' },
+  { method: 'POST', path: '/teams/11111111-1111-4111-8111-111111111111/roster' },
+  { method: 'PATCH', path: '/teams/11111111-1111-4111-8111-111111111111/roster/22222222-2222-4222-8222-222222222222' },
+  { method: 'DELETE', path: '/teams/11111111-1111-4111-8111-111111111111/roster/22222222-2222-4222-8222-222222222222' },
 ];
 
 for (const { method, path } of ROUTES) {
@@ -126,15 +141,12 @@ for (const { method, path } of ROUTES) {
   });
 }
 
-test('no route in this router accepts POST, PUT, PATCH, or DELETE (read-only slice)', async () => {
+test('PUT is not accepted anywhere in this router (every mutation route uses POST/PATCH/DELETE, not PUT)', async () => {
   const { baseUrl, close } = startApp({ requireAuth: (req, res, next) => next() });
   try {
-    for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) {
-      const res = await fetch(`${baseUrl}/program`, { method });
-      // Express reports an unmatched method+path combination as 404 (no
-      // route registered for POST /program etc.) rather than routing it
-      // to the GET handler -- proving no mutation route exists here.
-      assert.equal(res.status, 404, `expected no route for ${method} /program`);
+    for (const path of ['/program', '/seasons', '/teams', '/players', '/teams/11111111-1111-4111-8111-111111111111/roster']) {
+      const res = await fetch(`${baseUrl}${path}`, { method: 'PUT' });
+      assert.equal(res.status, 404, `expected no PUT route for ${path}`);
     }
   } finally {
     await close();
@@ -154,8 +166,17 @@ function loadSourceStatementsOnly() {
     .join('\n');
 }
 
-test('the module source never reads req.body anywhere', () => {
-  assert.doesNotMatch(loadSourceStatementsOnly(), /req\.body/);
+test('every req.body read in this module is passed straight to rosterService, never destructured/used for org or parent scoping inline', () => {
+  // This module gained mutation routes (POST/PATCH/DELETE), so req.body is
+  // now legitimately read -- but always as an opaque `body: req.body`
+  // handoff to src/high-school-roster-service.js, which does its own
+  // validation. This asserts the narrower, still-true property: no route
+  // handler here ever reads a specific field off req.body itself (e.g.
+  // req.body.orgId, req.body.programId) to decide organization or parent
+  // scope -- see the next test for the org-id-specific version of this.
+  const statementsOnly = loadSourceStatementsOnly();
+  const bodyFieldAccesses = statementsOnly.match(/req\.body\.\w+/g) || [];
+  assert.deepEqual(bodyFieldAccesses, []);
 });
 
 test('the module source never trusts a client-supplied organization id (no req.query.orgId / req.params.orgId / req.body reference of any kind for org resolution)', () => {

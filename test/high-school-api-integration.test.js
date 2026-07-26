@@ -1,8 +1,10 @@
 'use strict';
 
-// Integration tests for the High School domain read-only API
-// (GET /api/high-school/program, /seasons, /teams, /teams/:id/roster) and
-// the underlying tenant-isolation / RLS guarantees.
+// Integration tests for the High School domain API -- both the original
+// read-only routes (GET /api/high-school/program, /seasons, /teams,
+// /teams/:id/roster) and the program/seasons/teams/players/roster-membership
+// CRUD foundation added on top of them -- and the underlying tenant-isolation
+// / RLS / entitlement / support-session guarantees both layers share.
 //
 // WRITTEN BUT NOT EXECUTED by default -- mirrors
 // test/api-product-capabilities.test.js's exact gating design (see that
@@ -20,7 +22,8 @@
 //        hs_roster_memberships row connecting them.
 //      - TEST_HS_ORG_2_ID: a SECOND High-School-entitled org, with its own
 //        program/season/team/player/roster fixtures, used only to prove
-//        tenant isolation (Tenant A cannot see Tenant B's records).
+//        tenant isolation (Tenant A cannot see Tenant B's records, and
+//        cannot LINK Tenant B's records into its own writes either).
 //   4. TEST_USER_TOKEN: JWT for a member of TEST_TRAVEL_ORG_ID.
 //   5. TEST_HS_USER_TOKEN: JWT for a member of TEST_HS_ORG_ID.
 //   6. TEST_HS_TEAM_ID / TEST_HS_SEASON_ID: known IDs of the seeded team
@@ -29,10 +32,16 @@
 //      to prove TEST_HS_USER_TOKEN cannot read it.
 //   8. TEST_ADMIN_TOKEN: a platform-admin token, for the support-session
 //      tests (mirrors api-product-capabilities.test.js's own use of this).
+//   9. TEST_HS_ORG_2_PLAYER_ID / TEST_HS_ORG_2_SEASON_ID: a player id and
+//      season id belonging to TEST_HS_ORG_2_ID, used to prove a roster-add
+//      request naming either one from TEST_HS_ORG_ID's session 404s instead
+//      of linking across the tenant boundary. Write tests needing either of
+//      these are individually gated and skip (not fail) if unset, matching
+//      the file's own existing precedent for TEST_HS_ORG_NO_PROGRAM_TOKEN.
 //
 // Every test below is skipped by default -- `npm test` stays green using
-// only the database-free tests in test/high-school-domain-migration.test.js
-// and test/high-school-api.test.js.
+// only the database-free tests in test/high-school-domain-migration.test.js,
+// test/high-school-api.test.js, and test/high-school-roster-service.test.js.
 //
 // Same multi-gate safety design as test/api-product-capabilities.test.js:
 // RUN_INTEGRATION_TESTS=1 AND an explicit TEST_BASE_URL (no default) AND
@@ -67,6 +76,8 @@ const TEST_ADMIN_TOKEN = process.env.TEST_ADMIN_TOKEN;
 const TEST_HS_TEAM_ID = process.env.TEST_HS_TEAM_ID;
 const TEST_HS_SEASON_ID = process.env.TEST_HS_SEASON_ID;
 const TEST_HS_ORG_2_TEAM_ID = process.env.TEST_HS_ORG_2_TEAM_ID;
+const TEST_HS_ORG_2_PLAYER_ID = process.env.TEST_HS_ORG_2_PLAYER_ID;
+const TEST_HS_ORG_2_SEASON_ID = process.env.TEST_HS_ORG_2_SEASON_ID;
 
 async function apiFetch(path, { token, headers = {}, ...opts } = {}) {
   return fetch(`${BASE_URL}${path}`, {
@@ -185,10 +196,17 @@ test('missing program state is handled cleanly — seasons/teams return empty ar
   assert.deepEqual(body.seasons, []);
 });
 
-test('no endpoint in this router performs a write — a HS-entitled token cannot POST/PUT/PATCH/DELETE any HS route', { skip }, async () => {
-  for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) {
-    const res = await apiFetch('/api/high-school/program', { method, token: TEST_HS_USER_TOKEN });
-    assert.equal(res.status, 404);
+test('PUT is never accepted on any High School route — every mutation uses POST/PATCH/DELETE', { skip }, async () => {
+  for (const path of ['/program', '/seasons', '/teams', '/players', `/teams/${TEST_HS_TEAM_ID}/roster`]) {
+    const res = await apiFetch(path, { method: 'PUT', token: TEST_HS_USER_TOKEN });
+    assert.equal(res.status, 404, `expected no PUT route for ${path}`);
+  }
+});
+
+test('DELETE is only defined on a roster membership, not on program/seasons/teams/players', { skip }, async () => {
+  for (const path of ['/program', '/seasons', '/teams', '/players']) {
+    const res = await apiFetch(path, { method: 'DELETE', token: TEST_HS_USER_TOKEN });
+    assert.equal(res.status, 404, `expected no DELETE route for ${path}`);
   }
 });
 
@@ -199,4 +217,136 @@ test('existing admin and Travel endpoints remain unaffected by this addition', {
   ]);
   assert.equal(teamsRes.status, 200);
   assert.equal(adminStatusRes.status, 200); // isAdmin:false for a non-admin, still 200
+});
+
+// ── Write-path authorization ─────────────────────────────────────────────
+
+test('POST /api/high-school/program — a Travel-only organization is rejected (403)', { skip }, async () => {
+  const res = await apiFetch('/api/high-school/program', { method: 'POST', token: TEST_USER_TOKEN, body: JSON.stringify({ name: 'Should Not Be Created' }) });
+  assert.equal(res.status, 403);
+});
+
+test('POST /api/high-school/seasons — unauthenticated request is rejected (401)', { skip }, async () => {
+  const res = await apiFetch('/api/high-school/seasons', { method: 'POST', body: JSON.stringify({ name: 'x', school_year: '2025-2026' }) });
+  assert.equal(res.status, 401);
+});
+
+test('a support session cannot create a team even when viewing a High-School-entitled organization (write blocked, read allowed)', { skip }, async () => {
+  const startRes = await apiFetch('/api/admin/support-sessions', {
+    method: 'POST',
+    token: TEST_ADMIN_TOKEN,
+    body: JSON.stringify({ orgId: process.env.TEST_HS_ORG_ID, mode: 'read_only', reason: 'High School write-blocking integration test' }),
+  });
+  assert.equal(startRes.status, 200);
+  const { token: sessionToken } = await startRes.json();
+  try {
+    const readRes = await apiFetch('/api/high-school/teams', { token: TEST_ADMIN_TOKEN, headers: { 'X-Support-Session': sessionToken } });
+    assert.equal(readRes.status, 200); // reads remain allowed during a support session
+
+    const writeRes = await apiFetch('/api/high-school/teams', {
+      method: 'POST',
+      token: TEST_ADMIN_TOKEN,
+      headers: { 'X-Support-Session': sessionToken },
+      body: JSON.stringify({ name: 'Support-Created Team', level: 'varsity' }),
+    });
+    assert.equal(writeRes.status, 403);
+  } finally {
+    await apiFetch(`/api/admin/support-sessions/${sessionToken}/end`, { method: 'POST', token: TEST_ADMIN_TOKEN }).catch(() => {});
+  }
+});
+
+test('POST /api/high-school/players — an unknown body field is rejected (400), nothing is created', { skip }, async () => {
+  const res = await apiFetch('/api/high-school/players', {
+    method: 'POST',
+    token: TEST_HS_USER_TOKEN,
+    body: JSON.stringify({ first_name: 'Jo', last_name: 'Smith', record_source: 'gamechanger' }),
+  });
+  assert.equal(res.status, 400);
+});
+
+test('POST /api/high-school/players — missing required fields is rejected (400)', { skip }, async () => {
+  const res = await apiFetch('/api/high-school/players', { method: 'POST', token: TEST_HS_USER_TOKEN, body: JSON.stringify({ first_name: 'Jo' }) });
+  assert.equal(res.status, 400);
+});
+
+test('GET /api/high-school/teams/:teamId — a malformed UUID is rejected (400), not a raw database error', { skip }, async () => {
+  const res = await apiFetch('/api/high-school/teams/not-a-uuid', { token: TEST_HS_USER_TOKEN });
+  assert.equal(res.status, 400);
+});
+
+test('PATCH /api/high-school/teams/:teamId — a foreign-org teamId 404s, identical to a nonexistent one', { skip }, async () => {
+  if (!TEST_HS_ORG_2_TEAM_ID) return; // fixture not provided even when the file's gate is open
+  const res = await apiFetch(`/api/high-school/teams/${TEST_HS_ORG_2_TEAM_ID}`, {
+    method: 'PATCH', token: TEST_HS_USER_TOKEN, body: JSON.stringify({ is_active: false }),
+  });
+  assert.equal(res.status, 404);
+});
+
+test('POST /api/high-school/teams/:teamId/roster — a player from a different organization cannot be linked in (404, not a successful cross-tenant link)', { skip }, async () => {
+  if (!TEST_HS_ORG_2_PLAYER_ID) return; // fixture not provided even when the file's gate is open
+  const res = await apiFetch(`/api/high-school/teams/${TEST_HS_TEAM_ID}/roster`, {
+    method: 'POST', token: TEST_HS_USER_TOKEN,
+    body: JSON.stringify({ playerId: TEST_HS_ORG_2_PLAYER_ID, seasonId: TEST_HS_SEASON_ID }),
+  });
+  assert.equal(res.status, 404);
+});
+
+test('POST /api/high-school/teams/:teamId/roster — a season from a different organization cannot be linked in (404)', { skip }, async () => {
+  if (!TEST_HS_ORG_2_SEASON_ID) return; // fixture not provided even when the file's gate is open
+  const playersRes = await apiFetch('/api/high-school/players', { token: TEST_HS_USER_TOKEN });
+  const { players } = await playersRes.json();
+  if (!players?.length) return; // needs at least one seeded player under TEST_HS_ORG_ID
+  const res = await apiFetch(`/api/high-school/teams/${TEST_HS_TEAM_ID}/roster`, {
+    method: 'POST', token: TEST_HS_USER_TOKEN,
+    body: JSON.stringify({ playerId: players[0].id, seasonId: TEST_HS_ORG_2_SEASON_ID }),
+  });
+  assert.equal(res.status, 404);
+});
+
+test('program create/duplicate/update round-trip, including the 409 on a second program for the same org', { skip }, async () => {
+  const createRes = await apiFetch('/api/high-school/program', { method: 'POST', token: TEST_HS_USER_TOKEN, body: JSON.stringify({ name: 'Integration Test Program' }) });
+  // Either this org already has a fixture program (409, expected given the
+  // file's own documented fixture requirements) or this is the first
+  // program created for it (201) -- both are valid starting states.
+  assert.ok([201, 409].includes(createRes.status));
+
+  const dupeRes = await apiFetch('/api/high-school/program', { method: 'POST', token: TEST_HS_USER_TOKEN, body: JSON.stringify({ name: 'Second Program' }) });
+  assert.equal(dupeRes.status, 409);
+
+  const updateRes = await apiFetch('/api/high-school/program', { method: 'PATCH', token: TEST_HS_USER_TOKEN, body: JSON.stringify({ school_name: 'Updated School Name' }) });
+  assert.equal(updateRes.status, 200);
+  const { program } = await updateRes.json();
+  assert.equal(program.school_name, 'Updated School Name');
+});
+
+test('roster add/update/remove round-trip against the seeded team+season, ending with status=inactive (soft remove, never a deleted row)', { skip }, async () => {
+  const playersRes = await apiFetch('/api/high-school/players', { method: 'POST', token: TEST_HS_USER_TOKEN, body: JSON.stringify({ first_name: 'Roster', last_name: `Test${Date.now()}` }) });
+  assert.equal(playersRes.status, 201);
+  const { player } = await playersRes.json();
+
+  const addRes = await apiFetch(`/api/high-school/teams/${TEST_HS_TEAM_ID}/roster`, {
+    method: 'POST', token: TEST_HS_USER_TOKEN,
+    body: JSON.stringify({ playerId: player.id, seasonId: TEST_HS_SEASON_ID, jerseyNumber: '99' }),
+  });
+  assert.equal(addRes.status, 201);
+  const { membership } = await addRes.json();
+  assert.equal(membership.status, 'active');
+
+  const dupeRes = await apiFetch(`/api/high-school/teams/${TEST_HS_TEAM_ID}/roster`, {
+    method: 'POST', token: TEST_HS_USER_TOKEN,
+    body: JSON.stringify({ playerId: player.id, seasonId: TEST_HS_SEASON_ID }),
+  });
+  assert.equal(dupeRes.status, 409);
+
+  const updateRes = await apiFetch(`/api/high-school/teams/${TEST_HS_TEAM_ID}/roster/${membership.membershipId}`, {
+    method: 'PATCH', token: TEST_HS_USER_TOKEN, body: JSON.stringify({ jerseyNumber: '7' }),
+  });
+  assert.equal(updateRes.status, 200);
+
+  const removeRes = await apiFetch(`/api/high-school/teams/${TEST_HS_TEAM_ID}/roster/${membership.membershipId}`, {
+    method: 'DELETE', token: TEST_HS_USER_TOKEN,
+  });
+  assert.equal(removeRes.status, 200);
+  const removed = await removeRes.json();
+  assert.equal(removed.membership.status, 'inactive');
 });
