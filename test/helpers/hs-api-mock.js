@@ -29,6 +29,24 @@ function json(route, body, status) {
   return route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
 }
 
+// Mirrors src/high-school-roster-service.js's rejectUnknownFields exactly
+// (same allowlists, same 400 shape) -- without this, the mock would be
+// MORE permissive than the real server, silently accepting a client
+// request the real API would reject. The UI never actually sends an
+// unlisted field (verified by direct code review during this PR's
+// review), but this keeps that guarantee enforced by the mock itself
+// rather than only by inspection, and lets a defense-in-depth test prove
+// the server-side rejection is still what the client would see if that
+// ever changed.
+function unknownFieldError(body, allowedKeys) {
+  const present = Object.keys(body || {});
+  const unknown = present.filter((k) => !allowedKeys.includes(k));
+  if (unknown.length > 0) {
+    return { error: `Unknown field(s): ${unknown.join(', ')}` };
+  }
+  return null;
+}
+
 // capabilities: the GET /api/product/capabilities response this org should
 // see. Pass enabledProducts without 'high_school' to simulate a
 // Travel-only/unentitled org.
@@ -56,6 +74,8 @@ async function installHsApiMock(page, { capabilities, forbidden = false } = {}) 
       if (method === 'GET') return json(route, { program: db.program }, 200);
       if (method === 'POST') {
         const body = await readJsonBody(route);
+        const unknownErr = unknownFieldError(body, ['name', 'school_name']);
+        if (unknownErr) return json(route, unknownErr, 400);
         if (db.program) return json(route, { error: 'A program already exists for this organization.' }, 409);
         if (!body.name || !String(body.name).trim()) {
           return json(route, { error: 'name is required and must be a non-empty string' }, 400);
@@ -65,6 +85,8 @@ async function installHsApiMock(page, { capabilities, forbidden = false } = {}) 
       }
       if (method === 'PATCH') {
         const body = await readJsonBody(route);
+        const unknownErr = unknownFieldError(body, ['name', 'school_name', 'is_active']);
+        if (unknownErr) return json(route, unknownErr, 400);
         if (!db.program) return json(route, { error: 'Program not found. Create one first.' }, 404);
         if (body.name !== undefined) db.program.name = body.name;
         if (body.school_name !== undefined) db.program.school_name = body.school_name;
@@ -77,6 +99,8 @@ async function installHsApiMock(page, { capabilities, forbidden = false } = {}) 
       if (method === 'GET') return json(route, { seasons: db.seasons }, 200);
       if (method === 'POST') {
         const body = await readJsonBody(route);
+        const unknownErr = unknownFieldError(body, ['name', 'school_year', 'start_date', 'end_date', 'is_current']);
+        if (unknownErr) return json(route, unknownErr, 400);
         if (!db.program) return json(route, { error: 'Create a program before adding seasons.' }, 404);
         if (!body.name || !body.school_year) {
           return json(route, { error: 'name is required and must be a non-empty string' }, 400);
@@ -95,9 +119,11 @@ async function installHsApiMock(page, { capabilities, forbidden = false } = {}) 
     }
     let m = pathname.match(/^\/api\/high-school\/seasons\/([^/]+)$/);
     if (m && method === 'PATCH') {
+      const body = await readJsonBody(route);
+      const unknownErr = unknownFieldError(body, ['name', 'school_year', 'start_date', 'end_date', 'is_current']);
+      if (unknownErr) return json(route, unknownErr, 400);
       const season = db.seasons.find((s) => s.id === m[1]);
       if (!season) return json(route, { error: 'Season not found' }, 404);
-      const body = await readJsonBody(route);
       Object.assign(season, body);
       return json(route, { season }, 200);
     }
@@ -106,6 +132,8 @@ async function installHsApiMock(page, { capabilities, forbidden = false } = {}) 
       if (method === 'GET') return json(route, { teams: db.teams }, 200);
       if (method === 'POST') {
         const body = await readJsonBody(route);
+        const unknownErr = unknownFieldError(body, ['name', 'level', 'is_active']);
+        if (unknownErr) return json(route, unknownErr, 400);
         if (!db.program) return json(route, { error: 'Create a program before adding teams.' }, 404);
         if (!body.name) return json(route, { error: 'name is required and must be a non-empty string' }, 400);
         if (db.teams.some((t) => t.name === body.name)) {
@@ -118,9 +146,11 @@ async function installHsApiMock(page, { capabilities, forbidden = false } = {}) 
     }
     m = pathname.match(/^\/api\/high-school\/teams\/([^/]+)$/);
     if (m && method === 'PATCH') {
+      const body = await readJsonBody(route);
+      const unknownErr = unknownFieldError(body, ['name', 'level', 'is_active']);
+      if (unknownErr) return json(route, unknownErr, 400);
       const team = db.teams.find((t) => t.id === m[1]);
       if (!team) return json(route, { error: 'Team not found' }, 404);
-      const body = await readJsonBody(route);
       Object.assign(team, body);
       return json(route, { team }, 200);
     }
@@ -140,6 +170,8 @@ async function installHsApiMock(page, { capabilities, forbidden = false } = {}) 
       }
       if (method === 'POST') {
         const body = await readJsonBody(route);
+        const unknownErr = unknownFieldError(body, ['first_name', 'last_name', 'preferred_name', 'graduation_year', 'is_active']);
+        if (unknownErr) return json(route, unknownErr, 400);
         if (!db.program) return json(route, { error: 'Create a program before adding players.' }, 404);
         if (!body.first_name || !body.last_name) {
           return json(route, { error: 'first_name is required and must be a non-empty string' }, 400);
@@ -155,9 +187,11 @@ async function installHsApiMock(page, { capabilities, forbidden = false } = {}) 
     }
     m = pathname.match(/^\/api\/high-school\/players\/([^/]+)$/);
     if (m && method === 'PATCH') {
+      const body = await readJsonBody(route);
+      const unknownErr = unknownFieldError(body, ['first_name', 'last_name', 'preferred_name', 'graduation_year', 'is_active']);
+      if (unknownErr) return json(route, unknownErr, 400);
       const player = db.players.find((p) => p.id === m[1]);
       if (!player) return json(route, { error: 'Player not found' }, 404);
-      const body = await readJsonBody(route);
       Object.assign(player, body);
       return json(route, { player }, 200);
     }
@@ -176,6 +210,8 @@ async function installHsApiMock(page, { capabilities, forbidden = false } = {}) 
     if (m && method === 'POST') {
       const teamId = m[1];
       const body = await readJsonBody(route);
+      const unknownErr = unknownFieldError(body, ['playerId', 'seasonId', 'jerseyNumber']);
+      if (unknownErr) return json(route, unknownErr, 400);
       const team = db.teams.find((t) => t.id === teamId);
       if (!team) return json(route, { error: 'Team not found' }, 404);
       if (!team.is_active) return json(route, { error: 'Cannot add a roster membership to an inactive team.' }, 409);
@@ -195,6 +231,8 @@ async function installHsApiMock(page, { capabilities, forbidden = false } = {}) 
       if (!row) return json(route, { error: 'Roster membership not found' }, 404);
       if (method === 'DELETE') { row.status = 'inactive'; return json(route, { membership: row }, 200); }
       const body = await readJsonBody(route);
+      const unknownErr = unknownFieldError(body, ['jerseyNumber', 'status']);
+      if (unknownErr) return json(route, unknownErr, 400);
       if (body.jerseyNumber !== undefined) row.jerseyNumber = body.jerseyNumber;
       if (body.status !== undefined) row.status = body.status;
       return json(route, { membership: row }, 200);

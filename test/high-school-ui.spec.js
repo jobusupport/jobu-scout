@@ -64,6 +64,24 @@ test.describe('routing and access', () => {
     await page.goto('/');
     await expect(page.locator('#loginScreen')).not.toHaveClass(/hidden/);
   });
+
+  // A stale/cached frontend entitlement (e.g. capabilities fetched before
+  // access was revoked) must never override what the API itself decides
+  // for a specific resource read. The capabilities check says this org
+  // has High School access (so the UI renders), but the underlying
+  // /api/high-school/program call is independently denied -- the UI must
+  // surface that denial, not silently show data or pretend the read
+  // succeeded.
+  test('a stale frontend entitlement cannot override an API-level denial', async ({ page }) => {
+    await seedSession(page);
+    await page.route('**/api/product/capabilities', (route) =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(HS_CAPS) }));
+    await page.route('**/api/high-school/program', (route) =>
+      route.fulfill({ status: 403, contentType: 'application/json', body: JSON.stringify({ error: 'This organization does not have High School access.' }) }));
+    await page.goto('/high-school');
+    await expect(page.locator('#hs-pane-program')).toContainText('This organization does not have High School access.');
+    await expect(page.locator('#hs-pane-program button:has-text("Set Up Program")')).toHaveCount(0);
+  });
 });
 
 test.describe('program', () => {
@@ -201,6 +219,33 @@ test.describe('players', () => {
     await expect(page.locator('#hs-pane-players')).toContainText('No players match your search');
   });
 
+  // Search must reach the server intact for every character the API's own
+  // ilike-escaping (escapeIlike in high-school-roster-service.js) and
+  // ordinary query-string encoding are responsible for handling safely:
+  // spaces, %, _, &, +, and non-ASCII text. This proves the CLIENT's own
+  // half of that contract -- encodeURIComponent(q) -- never mangles or
+  // drops any of them before the request leaves the browser.
+  test('search preserves special characters and spaces exactly in the request', async ({ page }) => {
+    await seedSession(page);
+    await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+    await createProgram(page);
+    await page.evaluate(() => switchHsTab('players'));
+
+    const queries = ['100% sure', 'a_b', 'Q&A team', 'C++ Coach', 'José García', 'multi word search'];
+    for (const q of queries) {
+      const [request] = await Promise.all([
+        page.waitForRequest((req) => req.url().includes('/api/high-school/players?q=')),
+        (async () => {
+          await page.fill('#hsPlayerSearchInput', q);
+          await page.click('#hs-pane-players button:has-text("Search")');
+        })(),
+      ]);
+      const url = new URL(request.url());
+      expect(url.searchParams.get('q')).toBe(q);
+    }
+  });
+
   test('validation error for a missing required field', async ({ page }) => {
     await seedSession(page);
     await installHsApiMock(page, { capabilities: HS_CAPS });
@@ -259,8 +304,14 @@ test.describe('roster', () => {
     await page.click('#hsRosterMembershipModal button:has-text("Save")');
     await expect(page.locator('#hsRosterListWrap')).toContainText('#7');
 
-    // Soft-remove requires confirmation (native confirm()).
-    page.once('dialog', (dialog) => dialog.accept());
+    // Soft-remove requires confirmation (native confirm()), and the
+    // message must describe this as removal from the roster -- never as
+    // deleting the player.
+    page.once('dialog', (dialog) => {
+      expect(dialog.message()).toContain('from the roster');
+      expect(dialog.message().toLowerCase()).not.toContain('delete');
+      dialog.accept();
+    });
     await page.click('#hsRosterListWrap button:has-text("Remove")');
     await expect(page.locator('#hsRosterListWrap')).toContainText('Removed', { ignoreCase: true });
     await expect(page.locator('#hsRosterListWrap button:has-text("Restore")')).toBeVisible();
@@ -374,6 +425,149 @@ test.describe('error and state handling', () => {
     await page.goto('/high-school');
     await expect(page.locator('#hs-pane-program')).toContainText('Check your connection and try again.');
     await expect(page.locator('#hs-pane-program button:has-text("Retry")')).toBeVisible();
+  });
+});
+
+test.describe('accessibility', () => {
+  // Regression coverage for a defect found during the PR #13 independent
+  // review: showHsRosterAddModal()/showHsRosterEditModal() opened the
+  // dialog but never moved focus into it, unlike every other modal in
+  // this file (Program/Season/Team/Player all focus their first field).
+  // A keyboard or screen-reader user opening either roster dialog would
+  // have had no indication where they landed.
+  test('opening the roster Add or Edit dialog moves focus into it', async ({ page }) => {
+    await seedSession(page);
+    await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+    await setUpProgramTeamSeasonPlayer(page);
+    await page.evaluate(() => switchHsTab('roster'));
+
+    await page.click('#hsRosterListWrap button:has-text("Add Player to Roster")');
+    await expect(page.locator('#hsRosterPlayerSelect')).toBeFocused();
+    await page.click('#hsRosterMembershipModal button:has-text("Cancel")');
+
+    await page.click('#hsRosterListWrap button:has-text("Add Player to Roster")');
+    await page.selectOption('#hsRosterPlayerSelect', { label: 'Jake Thompson' });
+    await page.click('#hsRosterMembershipModal button:has-text("Save")');
+    await page.locator('#hsRosterMembershipModal').waitFor({ state: 'hidden' });
+
+    await page.click('#hsRosterListWrap button:has-text("Edit")');
+    await expect(page.locator('#hsRosterJerseyNumber')).toBeFocused();
+  });
+});
+
+test.describe('contract precision', () => {
+  // Proves the exact wire shape (method + full request body, no extra
+  // fields) for two representative writes -- one snake_case resource
+  // (season) and one camelCase resource (roster membership) -- rather
+  // than only inferring the request shape from the rendered outcome.
+  test('season create sends exactly the allowed snake_case fields', async ({ page }) => {
+    await seedSession(page);
+    await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+    await createProgram(page);
+    await page.evaluate(() => switchHsTab('seasons'));
+
+    const [request] = await Promise.all([
+      page.waitForRequest((req) => req.url().endsWith('/api/high-school/seasons') && req.method() === 'POST'),
+      (async () => {
+        await page.click('#hs-pane-seasons button:has-text("Add Season")');
+        await page.fill('#hsSeasonName', 'Spring 2027');
+        await page.fill('#hsSeasonSchoolYear', '2026-2027');
+        await page.check('#hsSeasonIsCurrent');
+        await page.click('#hsSeasonModal button:has-text("Save Season")');
+      })(),
+    ]);
+    const body = request.postDataJSON();
+    expect(body).toEqual({
+      name: 'Spring 2027',
+      school_year: '2026-2027',
+      start_date: null,
+      end_date: null,
+      is_current: true,
+    });
+  });
+
+  test('roster add sends exactly the allowed camelCase fields', async ({ page }) => {
+    await seedSession(page);
+    await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+    await setUpProgramTeamSeasonPlayer(page);
+    await page.evaluate(() => switchHsTab('roster'));
+
+    const [request] = await Promise.all([
+      page.waitForRequest((req) => /\/api\/high-school\/teams\/[^/]+\/roster$/.test(new URL(req.url()).pathname) && req.method() === 'POST'),
+      (async () => {
+        await page.click('#hsRosterListWrap button:has-text("Add Player to Roster")');
+        await page.selectOption('#hsRosterPlayerSelect', { label: 'Jake Thompson' });
+        await page.fill('#hsRosterJerseyNumber', '23');
+        await page.click('#hsRosterMembershipModal button:has-text("Save")');
+      })(),
+    ]);
+    const body = request.postDataJSON();
+    expect(Object.keys(body).sort()).toEqual(['jerseyNumber', 'playerId', 'seasonId'].sort());
+    expect(body.jerseyNumber).toBe('23');
+  });
+
+  // Defense-in-depth: the UI never sends an unlisted field (verified by
+  // direct code review), but this proves the mock's own rejection -- and
+  // therefore what a real client-side regression would actually run into
+  // -- matches the server's rejectUnknownFields behavior exactly, so a
+  // future change that accidentally added an extra field would fail a
+  // test rather than only being caught by manual contract review.
+  test('an unlisted field in a write is rejected the same way the real server rejects it', async ({ page }) => {
+    await seedSession(page);
+    await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+
+    const result = await page.evaluate(async () => {
+      const res = await apiFetch('/api/high-school/program', {
+        method: 'POST',
+        body: JSON.stringify({ name: 'Central High Baseball', not_a_real_field: true }),
+      });
+      return { status: res.status, body: await res.json() };
+    });
+    expect(result.status).toBe(400);
+    expect(result.body.error).toBe('Unknown field(s): not_a_real_field');
+  });
+});
+
+test.describe('narrow-width tab access', () => {
+  // Regression coverage for the layout defect found and fixed during the
+  // PR #13 independent review: five High School tabs don't fit in a
+  // mobile-width .main-tabs row, and without overflow-x:auto + scoped
+  // flex-shrink:0 on each tab, the Roster tab was clipped with no way to
+  // reach it. Proves both the CSS state and that the tab is actually
+  // reachable (scrollIntoView lands it inside the visible strip), not
+  // just present somewhere in the overflowed DOM.
+  test('the tab bar scrolls horizontally so every tab, including the last one, is reachable', async ({ page }) => {
+    await page.setViewportSize({ width: 375, height: 812 });
+    await seedSession(page);
+    await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+
+    const overflowInfo = await page.evaluate(() => {
+      const tabs = document.getElementById('hsMainTabs');
+      const cs = getComputedStyle(tabs);
+      return { overflowX: cs.overflowX, scrollWidth: tabs.scrollWidth, clientWidth: tabs.clientWidth };
+    });
+    expect(overflowInfo.overflowX).toBe('auto');
+    expect(overflowInfo.scrollWidth).toBeGreaterThan(overflowInfo.clientWidth);
+
+    const rosterTab = page.locator('[data-hs-tab="roster"]');
+    await rosterTab.scrollIntoViewIfNeeded();
+    await expect(rosterTab).toBeInViewport();
+    await rosterTab.click();
+    await expect(page.locator('#hs-pane-roster')).toHaveClass(/active/);
+  });
+
+  test('#mainPanel fills the full viewport width on mobile (sidebar hidden, no 280px collapse)', async ({ page }) => {
+    await page.setViewportSize({ width: 375, height: 812 });
+    await seedSession(page);
+    await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+    const width = await page.evaluate(() => document.getElementById('mainPanel').getBoundingClientRect().width);
+    expect(width).toBeGreaterThan(300);
   });
 });
 
