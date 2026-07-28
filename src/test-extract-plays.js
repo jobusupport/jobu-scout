@@ -16,6 +16,7 @@
  * Requires a valid login session first: npm run login
  */
 
+const fs = require('fs');
 const path = require('path');
 const { chromium } = require('playwright');
 const { extractPlays } = require('./search-gamechanger-teams');
@@ -28,6 +29,10 @@ async function main() {
   if (!gameUrl) {
     console.error('Usage: node src/test-extract-plays.js "<any GameChanger game URL>"');
     process.exit(1);
+  }
+
+  if (!fs.existsSync(STORAGE_STATE)) {
+    throw new Error(`Missing auth file: ${STORAGE_STATE}. Run npm run login first.`);
   }
 
   console.log('[test] Launching Chromium...');

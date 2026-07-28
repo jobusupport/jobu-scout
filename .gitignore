@@ -9,7 +9,12 @@ voodoo-scout.db-shm
 voodoo-scout.db-wal
 temp-screenshots/
 
-
+# GameChanger Playwright session state (cookies/localStorage) -- must never
+# be committed. See docs/architecture note on the High School importer's
+# GameChanger roster-import readiness for why this stays file-based and
+# out of the database entirely.
+/gamechanger-auth.json
+/storage/gamechanger-auth.json
 
 
 perfectgame-scraper/node_modules/
