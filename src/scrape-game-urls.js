@@ -134,6 +134,10 @@ function overrideSide(gameData, forcedSide, teamName) {
     process.exit(1);
   }
 
+  if (!fs.existsSync(STORAGE_STATE)) {
+    throw new Error(`Missing auth file: ${STORAGE_STATE}. Run npm run login first.`);
+  }
+
   const browser = await chromium.launch({ headless: true });
   const context  = await browser.newContext({ storageState: STORAGE_STATE });
   const page     = await context.newPage();
