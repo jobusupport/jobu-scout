@@ -344,6 +344,62 @@ test('swapping which row carries isHighSchoolTeam: true changes the persisted re
   assert.notEqual(rowA.box_score_batting.h, rowB.box_score_batting.h);
 });
 
+// Same asymmetric-ownership proof as the batting tests above, but for the
+// PITCHING box-score bucket -- invertRowOwnershipForReconstruction and
+// toReconstructionInput apply the identical row-by-row mapping to
+// boxScore.pitching, but nothing above actually exercised that path with
+// distinguishable (asymmetric) home/away pitching lines. Without this, a
+// bug that inverted batting rows correctly while leaving pitching rows
+// un-inverted (or inverted from the wrong flag) would pass every existing
+// test in this file.
+function asymmetricPitchingGame({ highSchoolTeamEr, highSchoolTeamSo, opponentEr, opponentSo }) {
+  return {
+    boxScore: {
+      batting: [],
+      pitching: [
+        { Player: 'HS Pitcher', TeamSide: 'away', isHighSchoolTeam: true, BF: 20, ER: highSchoolTeamEr, SO: highSchoolTeamSo, BB: 0, H: 0 },
+        { Player: 'Opponent Pitcher', TeamSide: 'home', isHighSchoolTeam: false, BF: 20, ER: opponentEr, SO: opponentSo, BB: 0, H: 0 },
+      ],
+    },
+    plays: [],
+  };
+}
+
+test('recordGameValidation persists the HIGH SCHOOL TEAM\'s own pitching numbers, not the opponent\'s, when the two are asymmetric', async () => {
+  const { service } = setup();
+  const run = await service.startImportRun({ ...ctx(), sourceProvider: 'gamechanger', triggerKind: 'manual' });
+  const { row: game } = await service.resolveCanonicalGame({ ...ctx(), sourceProvider: 'gamechanger', sourceGameRef: 'gc-asym-pitch' });
+  const capturedGame = asymmetricPitchingGame({ highSchoolTeamEr: 1, highSchoolTeamSo: 12, opponentEr: 6, opponentSo: 2 });
+  const { row } = await service.recordGameValidation({ orgId: ORG_ID, importRunId: run.id, importRunGameId: null, hsGameId: game.id, teamId: TEAM_ID, capturedGame });
+  assert.equal(row.box_score_pitching.er, 1, 'must reflect the High School team\'s 1 earned run, not the opponent\'s 6');
+  assert.equal(row.box_score_pitching.so, 12, 'must reflect the High School team\'s 12 strikeouts, not the opponent\'s 2');
+});
+
+test('swapping which pitching row carries isHighSchoolTeam: true changes the persisted result correspondingly (not accidentally symmetric)', async () => {
+  const { service: serviceA } = setup();
+  const { service: serviceB } = setup();
+
+  const runA = await serviceA.startImportRun({ ...ctx(), sourceProvider: 'gamechanger', triggerKind: 'manual' });
+  const { row: gameA } = await serviceA.resolveCanonicalGame({ ...ctx(), sourceProvider: 'gamechanger', sourceGameRef: 'gc-swap-pitch-a' });
+  const originalGame = asymmetricPitchingGame({ highSchoolTeamEr: 1, highSchoolTeamSo: 12, opponentEr: 6, opponentSo: 2 });
+  const { row: rowA } = await serviceA.recordGameValidation({ orgId: ORG_ID, importRunId: runA.id, importRunGameId: null, hsGameId: gameA.id, teamId: TEAM_ID, capturedGame: originalGame });
+
+  const runB = await serviceB.startImportRun({ ...ctx(), sourceProvider: 'gamechanger', triggerKind: 'manual' });
+  const { row: gameB } = await serviceB.resolveCanonicalGame({ ...ctx(), sourceProvider: 'gamechanger', sourceGameRef: 'gc-swap-pitch-b' });
+  const swappedGame = {
+    boxScore: {
+      batting: [],
+      pitching: originalGame.boxScore.pitching.map((row) => ({ ...row, isHighSchoolTeam: !row.isHighSchoolTeam })),
+    },
+    plays: [],
+  };
+  const { row: rowB } = await serviceB.recordGameValidation({ orgId: ORG_ID, importRunId: runB.id, importRunGameId: null, hsGameId: gameB.id, teamId: TEAM_ID, capturedGame: swappedGame });
+
+  assert.equal(rowA.box_score_pitching.er, 1);
+  assert.equal(rowB.box_score_pitching.er, 6, 'swapping ownership must swap which side\'s pitching numbers get persisted as official');
+  assert.notEqual(rowA.box_score_pitching.er, rowB.box_score_pitching.er);
+});
+
 // ── publishVerifiedTotals ─────────────────────────────────────────────────
 
 test('publishVerifiedTotals rejects an empty games array rather than publishing a meaningless zero-game total', async () => {

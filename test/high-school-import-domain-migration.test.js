@@ -519,6 +519,67 @@ test('no source or UI file OTHER THAN the Slice 1A importer persistence layer re
   }
 });
 
+// ── Importer ownership contract (repo-wide, call-shape based) ───────────
+//
+// The check above proves its own, narrower claim: no file in src/ or
+// dashboard/ OTHER THAN the three listed persistence files even mentions
+// one of these table names as a string. That leaves two real blind spots:
+// (1) it never walks the repo root (server.js, the one-off migration/repair
+// scripts like sync-to-supabase.js, rebuild-team-from-json.js) or admin/,
+// where a legacy or admin-tooling script could add a stray write without
+// this test ever seeing it; (2) a bare string-mention check can't
+// distinguish "this file WRITES to hs_verified_totals" from "this file's
+// comment mentions hs_verified_totals in passing" -- so it is both too
+// narrow in scope and too blunt in what it actually proves.
+//
+// This test supplements (does not replace) the one above with a clearer,
+// two-part ownership contract: walk EVERY .js/.html file in the repo
+// (excluding node_modules, .git, coverage, supabase/, and this project's
+// own test/ directory, none of which are application code that could
+// write to these tables), and assert that a WRITE-shaped call
+// (`.from('hs_<table>')` immediately followed, anywhere in the same
+// statement chain, by `.insert(`/`.update(`/`.upsert(`/`.delete(`, or the
+// three publish RPC names) appears only inside the same three Slice 1A
+// persistence files. This is what "only the importer persistence layer
+// writes to these tables" actually means, expressed directly as a write-
+// call-shape predicate rather than inferred from a blanket string ban.
+const REPO_WIDE_EXCLUDED_DIRS = new Set(['node_modules', '.git', 'coverage', 'supabase', 'test', '.claude']);
+
+function walkRepoJsAndHtmlFiles(dir) {
+  const matches = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      if (REPO_WIDE_EXCLUDED_DIRS.has(entry.name)) continue;
+      matches.push(...walkRepoJsAndHtmlFiles(path.join(dir, entry.name)));
+    } else if (/\.(js|html)$/.test(entry.name)) {
+      matches.push(path.join(dir, entry.name));
+    }
+  }
+  return matches;
+}
+
+const HS_IMPORT_RPC_NAMES = [
+  'publish_hs_verified_totals',
+  'publish_hs_player_advanced_stats',
+  'publish_hs_pitcher_advanced_stats',
+];
+
+test('no file anywhere in the repository (outside the Slice 1A persistence layer) makes a write-shaped call against a High School import table or its publish RPCs', () => {
+  const fromWritePattern = new RegExp(
+    `\\.from\\(\\s*['"](${NEW_TABLES.join('|')})['"]\\s*\\)[^;]{0,200}?\\.(insert|update|upsert|delete)\\s*\\(`,
+    's'
+  );
+  const rpcPattern = new RegExp(`\\.rpc\\(\\s*['"](${HS_IMPORT_RPC_NAMES.join('|')})['"]`);
+
+  for (const filePath of walkRepoJsAndHtmlFiles(REPO_ROOT)) {
+    const relativePath = path.relative(REPO_ROOT, filePath);
+    if (SLICE_1A_PERSISTENCE_FILES.includes(relativePath)) continue;
+    const contents = fs.readFileSync(filePath, 'utf8');
+    assert.doesNotMatch(contents, fromWritePattern, `expected no write-shaped .from(...).insert/update/upsert/delete(...) call against a Slice 1A table outside the persistence layer in ${relativePath}`);
+    assert.doesNotMatch(contents, rpcPattern, `expected no direct .rpc(...) call to a Slice 1A publish RPC outside the persistence layer in ${relativePath}`);
+  }
+});
+
 // ── Non-negative and consistency CHECK constraints ───────────────────────
 
 test('hs_import_runs count columns are non-negative', () => {
