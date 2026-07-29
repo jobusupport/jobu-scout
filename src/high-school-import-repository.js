@@ -50,9 +50,18 @@
 // A single PostgREST call is atomic; a SEQUENCE of calls (e.g. "select the
 // current row, update it to superseded, insert the new current row") is
 // NOT. publishVerifiedTotals/publishPlayerAdvancedStats/
-// publishPitcherAdvancedStats each document their own specific gap inline
-// below -- see the "NOT ATOMIC" comments -- rather than pretending the
-// three-step sequence is a transaction.
+// publishPitcherAdvancedStats used to document exactly that gap inline
+// (a three-step, non-atomic sequence). Slice 1A.1
+// (supabase/migrations/20260729190000_add_hs_publish_rpcs.sql) closes it:
+// each of the three functions below now makes exactly ONE PostgREST call --
+// `adminClient.rpc(...)` against a SECURITY DEFINER Postgres function that
+// performs the whole find-current/supersede/insert sequence, plus
+// independent org/team/season/player/import-run ownership and lifecycle
+// checks, inside a single database transaction. A failure at any point
+// leaves the previously published row completely untouched -- there is no
+// longer a window where the old row is superseded but no replacement
+// exists. See that migration's own header comment for the full
+// authorization-model and concurrency rationale.
 
 const {
   importError,
@@ -74,8 +83,8 @@ function persistenceFailed(table, error) {
 }
 
 function createHighSchoolImportRepository(adminClient) {
-  if (!adminClient || typeof adminClient.from !== 'function') {
-    throw importError('INVALID_REPOSITORY_CLIENT', 'createHighSchoolImportRepository requires an injected client exposing .from()', {
+  if (!adminClient || typeof adminClient.from !== 'function' || typeof adminClient.rpc !== 'function') {
+    throw importError('INVALID_REPOSITORY_CLIENT', 'createHighSchoolImportRepository requires an injected client exposing .from() and .rpc()', {
       statusCode: 500,
     });
   }
@@ -418,152 +427,109 @@ function createHighSchoolImportRepository(adminClient) {
     return { row: existing, created: false };
   }
 
-  // ── Shared current/superseded publication pattern ────────────────────
+  // ── Shared atomic-publish RPC caller ──────────────────────────────────
   //
-  // NOT ATOMIC. Three separate PostgREST calls: (1) find the current row
-  // for this identity, if any; (2) update it to is_current=false,
-  // superseded_at=now(); (3) insert the new row as current. Step (2) must
-  // happen BEFORE step (3) -- the schema's own partial unique index
-  // (`... where is_current`) would otherwise reject the new row outright
-  // while the old one is still current, which is the correctness property
-  // that makes "at most one current row" real. But that ordering means a
-  // crash or error between (2) and (3) leaves ZERO current rows for this
-  // identity, not two -- the migration's own current/superseded index
-  // makes "two current rows" structurally impossible, but does not (and,
-  // via a plain client, cannot) make this whole sequence atomic. If step
-  // (3) fails after step (2) already succeeded, this throws a distinctly
-  // coded error rather than pretending nothing happened; closing this gap
-  // for real requires a database-side function (e.g. a
-  // publish_hs_verified_totals-shaped RPC) that this slice is explicitly
-  // NOT authorized to add. See this repository's PR description for the
-  // recommendation to build one in a later slice.
+  // Every publish* function below makes exactly ONE `adminClient.rpc(...)`
+  // call against a SECURITY DEFINER Postgres function
+  // (supabase/migrations/20260729190000_add_hs_publish_rpcs.sql) that
+  // performs the entire find-current/supersede/insert sequence, plus
+  // org/team/season/player/import-run ownership and lifecycle checks,
+  // inside one database transaction. There is no longer a client-visible
+  // "supersede succeeded, insert failed" state to document or detect --
+  // the database guarantees all-or-nothing.
   //
-  // ── Concurrent publisher detection ───────────────────────────────────
-  // Step (2)'s update filters by BOTH id AND is_current=true, and its
-  // result is inspected for exactly one affected row -- not just "no
-  // error". A plain `.eq('id', existingCurrent.id)` update (the earlier
-  // version of this function) would report success even if a CONCURRENT
-  // publish had already superseded (or otherwise altered) that exact row
-  // between step (1)'s select and step (2)'s update: an UPDATE matching
-  // zero rows is not a Postgres error, so that race would have gone
-  // completely undetected, and this function would have proceeded to
-  // insert a second row that (depending on timing) could either violate
-  // the current-row unique index against the competing publisher's own
-  // new row, or -- worse -- silently create a state this function had no
-  // way to reason about. Detecting the race explicitly (rather than
-  // silently succeeding or producing a misleading error) is the most this
-  // module can do without the same atomic RPC referenced above.
-  async function publishCurrentRow({ table, currentLookup, newRow }) {
-    let query = adminClient.from(table).select('id').eq('is_current', true);
-    for (const [column, value] of Object.entries(currentLookup)) query = query.eq(column, value);
-    const { data: existingCurrent, error: selectError } = await query.maybeSingle();
-    if (selectError) throw persistenceFailed(table, selectError);
+  // PUBLISH_RPC_ERRORS maps the stable, documented error-message PREFIXES
+  // each RPC function raises (see the migration's own comments) onto this
+  // module's typed error codes -- never a raw Postgres message forwarded
+  // as-is. CONCURRENT_PUBLICATION_CONFLICT is intentionally preserved
+  // under the same code name Slice 1A used for its own (weaker, detect-
+  // after-the-fact) JS-level check: the underlying race is now prevented
+  // by row locking rather than merely detected, but a caller who loses a
+  // lock-wait race against another publisher for the exact same identity
+  // still sees this same, already-documented, retryable error.
+  const PUBLISH_RPC_ERRORS = [
+    { prefix: 'team_not_found_for_org_program', code: 'TEAM_NOT_FOUND_FOR_ORG', statusCode: 404 },
+    { prefix: 'season_not_found_for_org_program', code: 'SEASON_NOT_FOUND_FOR_ORG', statusCode: 404 },
+    { prefix: 'player_not_found_for_org_program', code: 'PLAYER_NOT_FOUND_FOR_ORG', statusCode: 404 },
+    { prefix: 'import_run_not_found_for_org_team', code: 'IMPORT_RUN_NOT_FOUND_FOR_ORG_TEAM', statusCode: 404 },
+    { prefix: 'incomplete_box_score_coverage', code: 'INCOMPLETE_BOX_SCORE_COVERAGE', statusCode: 409 },
+    { prefix: 'unresolved_mismatch', code: 'UNRESOLVED_MISMATCH', statusCode: 409 },
+    { prefix: 'invalid_import_run_state', code: 'INVALID_IMPORT_RUN_STATE', statusCode: 409 },
+    { prefix: 'stale_import_run_publication', code: 'STALE_IMPORT_RUN_PUBLICATION', statusCode: 409 },
+    { prefix: 'unknown_stat_field', code: 'UNKNOWN_STAT_FIELD', statusCode: 400 },
+    { prefix: 'concurrent_publication_conflict', code: 'CONCURRENT_PUBLICATION_CONFLICT', statusCode: 409, retryable: true },
+  ];
 
-    if (existingCurrent) {
-      const { data: supersededRows, error: supersedeError } = await adminClient
-        .from(table)
-        .update({ is_current: false, superseded_at: new Date().toISOString() })
-        .eq('id', existingCurrent.id)
-        .eq('is_current', true)
-        .select('id');
-      if (supersedeError) throw persistenceFailed(table, supersedeError);
-      const supersededCount = Array.isArray(supersededRows) ? supersededRows.length : 0;
-      if (supersededCount !== 1) {
-        throw importError(
-          'CONCURRENT_PUBLICATION_CONFLICT',
-          `Another publish altered the current row in ${table} between lookup and update; retry the publish`,
-          { statusCode: 409, retryable: true, context: { table } }
-        );
+  async function publishViaRpc(table, rpcName, params) {
+    const { data, error } = await adminClient.rpc(rpcName, params);
+    if (error) {
+      const message = error.message || '';
+      const matched = PUBLISH_RPC_ERRORS.find((m) => message.startsWith(m.prefix));
+      if (matched) {
+        throw importError(matched.code, sanitizeErrorMessage(message) || matched.code, {
+          statusCode: matched.statusCode,
+          retryable: !!matched.retryable,
+          context: { table },
+        });
       }
+      throw persistenceFailed(table, error);
     }
-
-    const { data: inserted, error: insertError } = await adminClient
-      .from(table)
-      .insert({ ...newRow, is_current: true, superseded_at: null })
-      .select('*')
-      .single();
-    if (insertError) {
-      throw importError(
-        'CURRENT_ROW_SUPERSESSION_INCOMPLETE',
-        existingCurrent
-          ? `Superseded the previous current row in ${table} but failed to insert its replacement; no current row now exists for this identity and it must be republished`
-          : sanitizeErrorMessage(insertError.message) || `Insert into ${table} failed`,
-        { statusCode: 502, retryable: true, context: { table } }
-      );
-    }
-    return inserted;
+    return data;
   }
 
   async function publishVerifiedTotals({ orgId, programId, teamId, seasonId, importRunId, aggregate }) {
-    return publishCurrentRow({
-      table: 'hs_verified_totals',
-      currentLookup: { team_id: teamId, season_id: seasonId },
-      newRow: {
-        org_id: orgId,
-        program_id: programId,
-        team_id: teamId,
-        season_id: seasonId,
-        import_run_id: importRunId ?? null,
-        games: aggregate.games,
-        box_score_games: aggregate.boxScoreGames,
-        play_by_play_games: aggregate.playByPlayGames,
-        validated_games: aggregate.validatedGames,
-        mismatch_games: aggregate.mismatchGames,
-        batting_official: aggregate.officialBatting ?? {},
-        pitching_official: aggregate.officialPitching ?? {},
-        batting_reconstructed: aggregate.reconstructedBatting ?? {},
-        pitching_reconstructed: aggregate.reconstructedPitchingDefense ?? {},
-        tendencies: aggregate.tendencies ?? {},
-        warnings: aggregate.warnings ?? [],
-        confidence: aggregate.confidence,
-      },
+    return publishViaRpc('hs_verified_totals', 'publish_hs_verified_totals', {
+      p_org_id: orgId,
+      p_program_id: programId,
+      p_team_id: teamId,
+      p_season_id: seasonId,
+      p_import_run_id: importRunId ?? null,
+      p_games: aggregate.games,
+      p_box_score_games: aggregate.boxScoreGames,
+      p_play_by_play_games: aggregate.playByPlayGames,
+      p_validated_games: aggregate.validatedGames,
+      p_mismatch_games: aggregate.mismatchGames,
+      p_batting_official: aggregate.officialBatting ?? {},
+      p_pitching_official: aggregate.officialPitching ?? {},
+      p_batting_reconstructed: aggregate.reconstructedBatting ?? {},
+      p_pitching_reconstructed: aggregate.reconstructedPitchingDefense ?? {},
+      p_tendencies: aggregate.tendencies ?? {},
+      p_warnings: aggregate.warnings ?? [],
+      p_confidence: aggregate.confidence,
     });
   }
 
   // stats is a passthrough map of already-computed hs_player_advanced_stats
   // column values (games, total_pitches, gb, fb, ld, ...) -- Slice 1A does
-  // not compute these from raw play data (see this module's own PR
-  // description); reserved/identity columns are stripped so a caller can
-  // never use the stats blob to smuggle in a different org/player/current
-  // flag than the one explicitly passed as playerId/hierarchy context.
-  const RESERVED_STAT_COLUMNS = ['id', 'org_id', 'program_id', 'team_id', 'season_id', 'player_id', 'import_run_id', 'is_current', 'superseded_at', 'created_at', 'updated_at'];
-  function stripReservedColumns(stats) {
-    const clean = { ...(stats || {}) };
-    for (const key of RESERVED_STAT_COLUMNS) delete clean[key];
-    return clean;
-  }
-
+  // not compute these from raw play data. Unlike Slice 1A's own JS layer
+  // (which silently STRIPPED reserved/identity keys out of a caller-
+  // supplied stats blob), this is no longer done here: the RPC itself
+  // rejects any key that is not a recognized stat column -- including a
+  // reserved/identity key like org_id or is_current -- with a distinct
+  // UNKNOWN_STAT_FIELD error, rather than silently discarding it. See the
+  // migration's own comment for why an explicit rejection is preferable to
+  // a silent strip a caller could never observe.
   async function publishPlayerAdvancedStats({ orgId, programId, teamId, seasonId, importRunId, playerId, stats }) {
-    return publishCurrentRow({
-      table: 'hs_player_advanced_stats',
-      currentLookup: { player_id: playerId, team_id: teamId, season_id: seasonId },
-      newRow: {
-        org_id: orgId,
-        program_id: programId,
-        team_id: teamId,
-        season_id: seasonId,
-        player_id: playerId,
-        import_run_id: importRunId ?? null,
-        generated_at: new Date().toISOString(),
-        ...stripReservedColumns(stats),
-      },
+    return publishViaRpc('hs_player_advanced_stats', 'publish_hs_player_advanced_stats', {
+      p_org_id: orgId,
+      p_program_id: programId,
+      p_team_id: teamId,
+      p_season_id: seasonId,
+      p_player_id: playerId,
+      p_import_run_id: importRunId ?? null,
+      p_stats: stats ?? {},
     });
   }
 
   async function publishPitcherAdvancedStats({ orgId, programId, teamId, seasonId, importRunId, playerId, stats }) {
-    return publishCurrentRow({
-      table: 'hs_pitcher_advanced_stats',
-      currentLookup: { player_id: playerId, team_id: teamId, season_id: seasonId },
-      newRow: {
-        org_id: orgId,
-        program_id: programId,
-        team_id: teamId,
-        season_id: seasonId,
-        player_id: playerId,
-        import_run_id: importRunId ?? null,
-        generated_at: new Date().toISOString(),
-        ...stripReservedColumns(stats),
-      },
+    return publishViaRpc('hs_pitcher_advanced_stats', 'publish_hs_pitcher_advanced_stats', {
+      p_org_id: orgId,
+      p_program_id: programId,
+      p_team_id: teamId,
+      p_season_id: seasonId,
+      p_player_id: playerId,
+      p_import_run_id: importRunId ?? null,
+      p_stats: stats ?? {},
     });
   }
 

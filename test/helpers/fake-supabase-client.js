@@ -2,7 +2,7 @@
 
 // A minimal, IN-MEMORY, STATEFUL fake of the subset of the Supabase
 // query-builder surface src/high-school-import-repository.js actually
-// uses (.from/.insert/.update/.select/.eq/.is/.single/.maybeSingle).
+// uses (.from/.insert/.update/.select/.eq/.is/.single/.maybeSingle/.rpc).
 //
 // ── Honest fidelity statement ─────────────────────────────────────────────
 // This fake approximates, and does NOT claim to exactly reproduce, live
@@ -148,6 +148,135 @@ const TABLES_WITH_UPDATED_AT = new Set([
   'hs_games', 'hs_import_runs', 'hs_import_run_games',
   'hs_verified_totals', 'hs_player_advanced_stats', 'hs_pitcher_advanced_stats',
 ]);
+
+// ── Slice 1A.1 publish-RPC emulation ────────────────────────────────────
+//
+// Mirrors supabase/migrations/20260729190000_add_hs_publish_rpcs.sql at
+// EXACTLY the same fidelity level this fake already uses for `.from()`
+// (schema-shape NOT NULL/UUID checks, the migration's own partial unique
+// indexes) -- and, per this file's own "explicitly does NOT model" header
+// comment, deliberately does NOT reproduce the real RPCs' cross-table
+// ownership checks (team/season/player belongs to org+program) or
+// import-run lifecycle/staleness checks. Those depend on composite
+// referential integrity this fake has never modeled and are verified
+// instead against a real, disposable Postgres instance -- see
+// test/high-school-import-publish-rpcs.integration.test.js. What this DOES
+// faithfully reproduce is the one property a JS-level test can actually
+// prove without a real database: the whole supersede-then-insert sequence
+// happens as a single, atomic step with no client-observable partial
+// state, and an unrecognized stats field is rejected outright rather than
+// silently dropped.
+const PUBLISH_RPC_TABLE = {
+  publish_hs_verified_totals: 'hs_verified_totals',
+  publish_hs_player_advanced_stats: 'hs_player_advanced_stats',
+  publish_hs_pitcher_advanced_stats: 'hs_pitcher_advanced_stats',
+};
+
+const PUBLISH_RPC_IDENTITY_COLUMNS = {
+  hs_verified_totals: ['team_id', 'season_id'],
+  hs_player_advanced_stats: ['player_id', 'team_id', 'season_id'],
+  hs_pitcher_advanced_stats: ['player_id', 'team_id', 'season_id'],
+};
+
+// Transcribed verbatim from the migration's own v_allowed_columns arrays.
+const PLAYER_STAT_ALLOWED_COLUMNS = [
+  'games', 'total_pitches', 'gb', 'fb', 'ld', 'batted_balls',
+  'gb_pct', 'fb_pct', 'ld_pct',
+  'spray_lf', 'spray_cf', 'spray_rf', 'spray_3b', 'spray_ss', 'spray_2b', 'spray_1b', 'spray_pc',
+  'spray_lf_pct', 'spray_cf_pct', 'spray_rf_pct', 'spray_3b_pct', 'spray_ss_pct', 'spray_2b_pct', 'spray_1b_pct', 'spray_pc_pct',
+  'risp_ab', 'risp_h', 'ba_risp',
+  'swing_decisions', 'spray_by_count',
+  'k_pct', 'bb_pct', 'errors', 'bunts',
+];
+const PITCHER_STAT_ALLOWED_COLUMNS = [
+  'games', 'total_pitches', 'strikes', 's_pct',
+  'gb', 'fb', 'ld', 'gb_pct', 'fb_pct', 'ld_pct', 'go_ao',
+  'so_per7', 'bb_per7', 'k_pct_bf', 'bb_pct_bf', 'p_per_ip',
+  'wp', 'bk', 'pik',
+];
+
+function unknownStatFieldError(key) {
+  return { code: 'P0001', message: `unknown_stat_field: ${key} is not a recognized field` };
+}
+
+function buildPublishNewRow(table, params, nowIso) {
+  if (table === 'hs_verified_totals') {
+    return {
+      org_id: params.p_org_id,
+      program_id: params.p_program_id,
+      team_id: params.p_team_id,
+      season_id: params.p_season_id,
+      import_run_id: params.p_import_run_id ?? null,
+      games: params.p_games,
+      box_score_games: params.p_box_score_games,
+      play_by_play_games: params.p_play_by_play_games,
+      validated_games: params.p_validated_games,
+      mismatch_games: params.p_mismatch_games,
+      batting_official: params.p_batting_official ?? {},
+      pitching_official: params.p_pitching_official ?? {},
+      batting_reconstructed: params.p_batting_reconstructed ?? {},
+      pitching_reconstructed: params.p_pitching_reconstructed ?? {},
+      tendencies: params.p_tendencies ?? {},
+      warnings: params.p_warnings ?? [],
+      confidence: params.p_confidence,
+      is_current: true,
+      superseded_at: null,
+    };
+  }
+  return {
+    org_id: params.p_org_id,
+    program_id: params.p_program_id,
+    team_id: params.p_team_id,
+    season_id: params.p_season_id,
+    player_id: params.p_player_id,
+    import_run_id: params.p_import_run_id ?? null,
+    generated_at: nowIso,
+    ...(params.p_stats || {}),
+    is_current: true,
+    superseded_at: null,
+  };
+}
+
+// Single synchronous step: validate stats keys, check schema shape, find
+// and supersede the existing current row for this identity (if any), then
+// insert the new one -- all before this function returns, so there is no
+// await boundary a "concurrent" caller in the SAME test could ever
+// interleave with, which is the property that matters here (the real RPC
+// gets this from a Postgres transaction + row lock instead).
+function executePublishRpc(state, rpcName, params) {
+  const table = PUBLISH_RPC_TABLE[rpcName];
+  if (!table) return { data: null, error: { message: `fake client: unknown rpc "${rpcName}"` } };
+
+  if (table === 'hs_player_advanced_stats' || table === 'hs_pitcher_advanced_stats') {
+    const allowed = table === 'hs_player_advanced_stats' ? PLAYER_STAT_ALLOWED_COLUMNS : PITCHER_STAT_ALLOWED_COLUMNS;
+    for (const key of Object.keys(params.p_stats || {})) {
+      if (!allowed.includes(key)) return { data: null, error: unknownStatFieldError(key) };
+    }
+  }
+
+  const now = new Date().toISOString();
+  const candidate = buildPublishNewRow(table, params, now);
+
+  const schemaViolation = findSchemaViolation(table, candidate);
+  if (schemaViolation) return { data: null, error: schemaViolation };
+
+  if (!state.tables.has(table)) state.tables.set(table, []);
+  const rows = state.tables.get(table);
+  const identityColumns = PUBLISH_RPC_IDENTITY_COLUMNS[table];
+  const existingCurrent = rows.find((r) => r.is_current && identityColumns.every((c) => r[c] === candidate[c]));
+
+  if (existingCurrent) {
+    existingCurrent.is_current = false;
+    existingCurrent.superseded_at = now;
+    if (TABLES_WITH_UPDATED_AT.has(table)) existingCurrent.updated_at = now;
+  }
+
+  const row = { id: nextId(), created_at: now, ...candidate };
+  if (TABLES_WITH_UPDATED_AT.has(table)) row.updated_at = now;
+  rows.push(row);
+
+  return { data: FakeQueryBuilder.snapshot(row), error: null };
+}
 
 function conflictError() {
   return { code: '23505', message: 'duplicate key value violates unique constraint' };
@@ -310,20 +439,15 @@ function createFakeSupabaseClient() {
       touchedTables.add(table);
       return new FakeQueryBuilder(state, table);
     },
+    rpc(name, params) {
+      touchedTables.add(`rpc:${name}`);
+      const targetTable = PUBLISH_RPC_TABLE[name];
+      if (targetTable) touchedTables.add(targetTable);
+      return Promise.resolve(executePublishRpc(state, name, params || {}));
+    },
     __touchedTables: touchedTables,
     __getRows(table) {
       return (state.tables.get(table) || []).map((r) => ({ ...r }));
-    },
-    // Test-only escape hatch: mutates a row IN PLACE, bypassing every
-    // constraint this fake otherwise enforces -- used exclusively to
-    // simulate a CONCURRENT publisher's write landing between two steps of
-    // this repository's own multi-call sequences (see the
-    // publishCurrentRow concurrency tests), which a single-threaded JS test
-    // cannot otherwise produce.
-    __mutateRow(table, id, patch) {
-      const row = (state.tables.get(table) || []).find((r) => r.id === id);
-      if (!row) throw new Error(`__mutateRow: no row ${id} in ${table}`);
-      Object.assign(row, patch);
     },
     __reset() {
       state.tables.clear();
