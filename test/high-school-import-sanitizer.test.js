@@ -10,11 +10,12 @@ const {
   importError,
   requireEnum,
   optionalEnum,
+  requireUuid,
+  optionalUuid,
   requireNonEmptyString,
   requireNonNegativeInteger,
   validateImportContext,
-  assertNoCredentialLikeKeys,
-  assertJsonSerializable,
+  sanitizeJsonPayload,
   sanitizeErrorMessage,
   isCredentialLikeKey,
   IMPORT_RUN_STATUSES,
@@ -70,6 +71,22 @@ test('optionalEnum allows null/undefined but still rejects an invalid supplied v
   assert.throws(() => optionalEnum('nope', TRIGGER_KINDS, 'triggerKind'));
 });
 
+// ── UUID validation applied consistently to every uuid-backed identifier ─
+
+test('requireUuid accepts a well-formed uuid and rejects a malformed one', () => {
+  assert.equal(requireUuid(VALID_UUID, 'orgId'), VALID_UUID);
+  assert.throws(() => requireUuid('not-a-uuid', 'orgId'), (err) => { assert.equal(err.code, 'INVALID_FIELD'); assert.match(err.message, /orgId/); return true; });
+  assert.throws(() => requireUuid('run-1', 'importRunId'), (err) => { assert.match(err.message, /importRunId/); return true; });
+  assert.throws(() => requireUuid(undefined, 'hsGameId'));
+});
+
+test('optionalUuid allows null/undefined but still rejects a malformed supplied value', () => {
+  assert.equal(optionalUuid(undefined, 'importRunGameId'), null);
+  assert.equal(optionalUuid(null, 'importRunGameId'), null);
+  assert.equal(optionalUuid(VALID_UUID, 'importRunGameId'), VALID_UUID);
+  assert.throws(() => optionalUuid('game-1', 'importRunGameId'));
+});
+
 // ── context validation (item 2: missing tenant/program/team is rejected) ─
 
 test('validateImportContext accepts a fully-scoped valid context', () => {
@@ -120,31 +137,35 @@ test('isCredentialLikeKey deliberately flags game_token (unresolved ambiguity, r
   assert.equal(isCredentialLikeKey('game_token'), true);
 });
 
-test('assertNoCredentialLikeKeys passes silently on a clean payload', () => {
-  assert.doesNotThrow(() => assertNoCredentialLikeKeys({ batting: [{ player: 'Alice', ab: 3, h: 1 }], plays: [{ text: 'Alice singles' }] }));
+test('sanitizeJsonPayload passes a clean payload through and returns an equivalent (but distinct) clone', () => {
+  const original = { batting: [{ player: 'Alice', ab: 3, h: 1 }], plays: [{ text: 'Alice singles' }] };
+  const clone = sanitizeJsonPayload(original, 'payload');
+  assert.deepEqual(clone, original);
+  assert.notEqual(clone, original);
+  assert.notEqual(clone.batting, original.batting);
 });
 
-test('assertNoCredentialLikeKeys rejects a top-level credential-shaped key', () => {
-  assert.throws(() => assertNoCredentialLikeKeys({ authorization: 'Bearer xyz' }), (err) => {
+test('sanitizeJsonPayload rejects a top-level credential-shaped key', () => {
+  assert.throws(() => sanitizeJsonPayload({ authorization: 'Bearer xyz' }, 'payload'), (err) => {
     assert.equal(err.code, 'CREDENTIAL_LIKE_KEY_REJECTED');
     return true;
   });
 });
 
-test('assertNoCredentialLikeKeys rejects a DEEPLY NESTED credential-shaped key inside arrays and objects', () => {
+test('sanitizeJsonPayload rejects a DEEPLY NESTED credential-shaped key inside arrays and objects', () => {
   const payload = { boxScore: { batting: [{ player: 'Alice', meta: { request: { headers: { cookie: 'sess=abc' } } } }] } };
-  assert.throws(() => assertNoCredentialLikeKeys(payload), (err) => {
+  assert.throws(() => sanitizeJsonPayload(payload, 'payload'), (err) => {
     assert.equal(err.code, 'CREDENTIAL_LIKE_KEY_REJECTED');
     assert.match(err.context.path, /cookie/);
     return true;
   });
 });
 
-test('assertNoCredentialLikeKeys names the offending key PATH but never echoes the secret VALUE in the thrown error', () => {
+test('sanitizeJsonPayload names the offending key PATH but never echoes the secret VALUE in the thrown error', () => {
   const secretValue = 'sk_live_super_secret_value_12345';
   try {
-    assertNoCredentialLikeKeys({ nested: { api_key: secretValue } });
-    assert.fail('expected assertNoCredentialLikeKeys to throw');
+    sanitizeJsonPayload({ nested: { api_key: secretValue } }, 'payload');
+    assert.fail('expected sanitizeJsonPayload to throw');
   } catch (err) {
     assert.doesNotMatch(err.message, new RegExp(secretValue));
     assert.doesNotMatch(JSON.stringify(err.context), new RegExp(secretValue));
@@ -152,34 +173,93 @@ test('assertNoCredentialLikeKeys names the offending key PATH but never echoes t
   }
 });
 
-test('assertNoCredentialLikeKeys guards against pathological nesting depth', () => {
+test('sanitizeJsonPayload guards against pathological nesting depth', () => {
   let deep = { leaf: true };
   for (let i = 0; i < 40; i++) deep = { child: deep };
-  assert.throws(() => assertNoCredentialLikeKeys(deep), (err) => {
+  assert.throws(() => sanitizeJsonPayload(deep, 'payload'), (err) => {
     assert.equal(err.code, 'PAYLOAD_TOO_DEEPLY_NESTED');
     return true;
   });
 });
 
-test('assertNoCredentialLikeKeys accepts arrays of plain scalars and null/primitive leaves without error', () => {
-  assert.doesNotThrow(() => assertNoCredentialLikeKeys({ scores: [1, 2, 3], notes: null, flag: true, label: 'ok' }));
+test('sanitizeJsonPayload accepts arrays of plain scalars and null/primitive leaves without error', () => {
+  assert.doesNotThrow(() => sanitizeJsonPayload({ scores: [1, 2, 3], notes: null, flag: true, label: 'ok' }, 'payload'));
 });
 
-// ── JSON-serializability guard ────────────────────────────────────────────
+// ── canonical JSON safety: rejects everything that could diverge between
+// validated shape and persisted shape (items covered: getters, toJSON,
+// custom prototypes, NaN/Infinity, undefined, sparse arrays, functions) ──
 
-test('assertJsonSerializable rejects undefined and functions', () => {
-  assert.throws(() => assertJsonSerializable(undefined, 'payload'), (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; });
-  assert.throws(() => assertJsonSerializable(() => {}, 'payload'));
+test('sanitizeJsonPayload rejects undefined and functions', () => {
+  assert.throws(() => sanitizeJsonPayload(undefined, 'payload'), (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; });
+  assert.throws(() => sanitizeJsonPayload(() => {}, 'payload'));
 });
 
-test('assertJsonSerializable rejects a circular object rather than crashing on JSON.stringify', () => {
+test('sanitizeJsonPayload rejects a circular object rather than recursing forever', () => {
   const circular = {};
   circular.self = circular;
-  assert.throws(() => assertJsonSerializable(circular, 'payload'), (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; });
+  assert.throws(() => sanitizeJsonPayload(circular, 'payload'), (err) => { assert.equal(err.code, 'PAYLOAD_TOO_DEEPLY_NESTED'); return true; });
 });
 
-test('assertJsonSerializable accepts plain objects, arrays, numbers, and null', () => {
-  assert.doesNotThrow(() => assertJsonSerializable({ a: [1, 2, { b: null }] }, 'payload'));
+test('sanitizeJsonPayload accepts plain objects, arrays, numbers, and null', () => {
+  assert.deepEqual(sanitizeJsonPayload({ a: [1, 2, { b: null }] }, 'payload'), { a: [1, 2, { b: null }] });
+});
+
+test('sanitizeJsonPayload rejects NaN and Infinity rather than silently letting them become null at persistence time', () => {
+  assert.throws(() => sanitizeJsonPayload({ x: NaN }, 'payload'), (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; });
+  assert.throws(() => sanitizeJsonPayload({ x: Infinity }, 'payload'));
+  assert.throws(() => sanitizeJsonPayload({ x: -Infinity }, 'payload'));
+});
+
+test('sanitizeJsonPayload rejects an explicit undefined value nested inside an object rather than silently dropping the key', () => {
+  assert.throws(() => sanitizeJsonPayload({ a: 1, b: undefined }, 'payload'), (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; });
+});
+
+test('sanitizeJsonPayload rejects a sparse array rather than silently converting holes to null', () => {
+  const sparse = [1, , 3]; // eslint-disable-line no-sparse-arrays
+  assert.throws(() => sanitizeJsonPayload({ arr: sparse }, 'payload'), (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; });
+});
+
+test('sanitizeJsonPayload rejects a non-plain object (Date, Map, class instance) rather than trusting JSON.stringify to flatten it safely', () => {
+  assert.throws(() => sanitizeJsonPayload({ when: new Date() }, 'payload'), (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; });
+  assert.throws(() => sanitizeJsonPayload({ m: new Map() }, 'payload'));
+  class Custom { constructor() { this.x = 1; } }
+  assert.throws(() => sanitizeJsonPayload({ c: new Custom() }, 'payload'));
+});
+
+test('sanitizeJsonPayload rejects an object with a toJSON property -- a clean key-scan could otherwise pass while JSON.stringify serializes an entirely different, unscanned shape', () => {
+  const sneaky = { toJSON() { return { authorization: 'Bearer smuggled-in-after-the-scan' }; } };
+  assert.equal(Object.keys(sneaky).includes('authorization'), false, 'sanity: the OWN keys look clean');
+  assert.throws(() => sanitizeJsonPayload({ nested: sneaky }, 'payload'), (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; });
+});
+
+test('sanitizeJsonPayload rejects an accessor (getter) property WITHOUT EVER INVOKING IT -- a hostile getter can never execute or leak an unsanitized error', () => {
+  let invoked = false;
+  const hostile = {};
+  Object.defineProperty(hostile, 'name', {
+    enumerable: true,
+    get() { invoked = true; throw new Error('leaked-raw-secret-abc123'); },
+  });
+  assert.throws(() => sanitizeJsonPayload({ player: hostile }, 'payload'), (err) => {
+    assert.equal(err.code, 'INVALID_FIELD');
+    assert.doesNotMatch(err.message, /leaked-raw-secret-abc123/);
+    return true;
+  });
+  assert.equal(invoked, false, 'the getter must never be called');
+});
+
+test('sanitizeJsonPayload wraps an unexpected internal error (e.g. a hostile Proxy trap) rather than letting a raw one escape', () => {
+  const hostile = new Proxy(
+    { safe: 1 },
+    {
+      ownKeys() { throw new Error('raw-internal-secret-xyz'); },
+    }
+  );
+  assert.throws(() => sanitizeJsonPayload({ nested: hostile }, 'payload'), (err) => {
+    assert.equal(err.code, 'INVALID_FIELD');
+    assert.doesNotMatch(err.message, /raw-internal-secret-xyz/);
+    return true;
+  });
 });
 
 // ── error-message sanitization (reused from high-school-importer-contract.js) ─

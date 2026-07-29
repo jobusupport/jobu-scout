@@ -21,6 +21,7 @@ const PROGRAM_ID = '22222222-2222-2222-2222-222222222222';
 const TEAM_ID = '33333333-3333-3333-3333-333333333333';
 const SEASON_ID = '44444444-4444-4444-4444-444444444444';
 const PLAYER_ID = '55555555-5555-5555-5555-555555555555';
+const RUN_ID = '66666666-6666-6666-6666-666666666666';
 
 function ctx(extra = {}) {
   return { orgId: ORG_ID, programId: PROGRAM_ID, teamId: TEAM_ID, seasonId: SEASON_ID, ...extra };
@@ -34,12 +35,15 @@ function setup() {
 }
 
 // A single-play game, box score and play-by-play IN AGREEMENT (one single,
-// no other events) -- see this module's own comment on is_our_team: false
-// being the bucket that gets persisted.
+// no other events). isHighSchoolTeam: true marks Alice's row as the
+// imported High School team's OWN data, in this module's natural
+// (non-inverted) public polarity -- see toReconstructionInput's own header
+// comment for why this is a deliberately distinct field from the
+// travel-ball is_our_team convention.
 function agreeingCapturedGame() {
   return {
     boxScore: {
-      batting: [{ Player: 'Alice Smith', TeamSide: 'away', is_our_team: false, AB: 1, H: 1, BB: 0, SO: 0, HBP: 0 }],
+      batting: [{ Player: 'Alice Smith', TeamSide: 'away', isHighSchoolTeam: true, AB: 1, H: 1, BB: 0, SO: 0, HBP: 0 }],
       pitching: [],
     },
     plays: [{ text: 'Alice Smith singles to left field.', inning: 'Top 1' }],
@@ -51,7 +55,7 @@ function agreeingCapturedGame() {
 function mismatchedCapturedGame() {
   return {
     boxScore: {
-      batting: [{ Player: 'Alice Smith', TeamSide: 'away', is_our_team: false, AB: 3, H: 3, BB: 0, SO: 0, HBP: 0 }],
+      batting: [{ Player: 'Alice Smith', TeamSide: 'away', isHighSchoolTeam: true, AB: 3, H: 3, BB: 0, SO: 0, HBP: 0 }],
       pitching: [],
     },
     plays: [{ text: 'Alice Smith grounds out to second base.', inning: 'Top 1' }],
@@ -61,7 +65,7 @@ function mismatchedCapturedGame() {
 function boxScoreOnlyCapturedGame() {
   return {
     boxScore: {
-      batting: [{ Player: 'Alice Smith', TeamSide: 'away', is_our_team: false, AB: 1, H: 1, BB: 0, SO: 0, HBP: 0 }],
+      batting: [{ Player: 'Alice Smith', TeamSide: 'away', isHighSchoolTeam: true, AB: 1, H: 1, BB: 0, SO: 0, HBP: 0 }],
       pitching: [],
     },
     plays: [],
@@ -70,6 +74,19 @@ function boxScoreOnlyCapturedGame() {
 
 function noDataCapturedGame() {
   return { boxScore: { batting: [], pitching: [] }, plays: [] };
+}
+
+// A two-game aggregate where BOTH games have complete box-score coverage
+// and no mismatch -- used to prove the publication gate accepts a fully
+// box-score-only aggregate (no play-by-play at all), matching this
+// domain's own stated philosophy that box score alone is official.
+function completeBoxScoreOnlyGames() {
+  return [boxScoreOnlyCapturedGame(), boxScoreOnlyCapturedGame()];
+}
+
+// One game with a box score, one game WITHOUT -- incomplete coverage.
+function incompleteBoxScoreCoverageGames() {
+  return [boxScoreOnlyCapturedGame(), noDataCapturedGame()];
 }
 
 // ── item 1: import run starts with valid scoped context ──────────────────
@@ -104,7 +121,7 @@ test('startImportRun rejects an invalid triggerKind rather than silently accepti
 test('captureSnapshot rejects an unsupported snapshot kind before attempting persistence', async () => {
   const { service, client } = setup();
   await assert.rejects(
-    () => service.captureSnapshot({ orgId: ORG_ID, importRunId: 'run-1', snapshotKind: 'screenshot', sourceProvider: 'gamechanger', payload: {} }),
+    () => service.captureSnapshot({ orgId: ORG_ID, importRunId: RUN_ID, snapshotKind: 'screenshot', sourceProvider: 'gamechanger', payload: {} }),
     (err) => { assert.equal(err.code, 'INVALID_ENUM_VALUE'); return true; }
   );
   assert.equal(client.__touchedTables.has('hs_raw_snapshots'), false, 'nothing should be written when validation fails first');
@@ -133,6 +150,40 @@ test('captureSnapshot persists a clean payload successfully', async () => {
     payload: { batting: [{ player: 'Alice', ab: 3, h: 1 }] },
   });
   assert.deepEqual(row.payload.batting[0], { player: 'Alice', ab: 3, h: 1 });
+});
+
+// Required before merge #4: config/diagnostics/stats get the SAME
+// recursive credential scan as payload, not just a serializability check.
+
+test('startImportRun rejects a credential-shaped key nested inside config, before any write occurs', async () => {
+  const { service, client } = setup();
+  await assert.rejects(
+    () => service.startImportRun({ ...ctx(), sourceProvider: 'gamechanger', triggerKind: 'manual', config: { options: { apiKey: 'sk_live_xyz' } } }),
+    (err) => { assert.equal(err.code, 'CREDENTIAL_LIKE_KEY_REJECTED'); return true; }
+  );
+  assert.equal(client.__getRows('hs_import_runs').length, 0);
+});
+
+test('recordSourceGame rejects a credential-shaped key nested inside diagnostics, before any write occurs', async () => {
+  const { service, client } = setup();
+  const run = await service.startImportRun({ ...ctx(), sourceProvider: 'gamechanger', triggerKind: 'manual' });
+  await assert.rejects(
+    () => service.recordSourceGame({
+      orgId: ORG_ID, importRunId: run.id, sourceGameRef: 'gc-diag', discoveryStatus: 'failed',
+      diagnostics: { error: { context: { headers: { authorization: 'Bearer xyz' } } } },
+    }),
+    (err) => { assert.equal(err.code, 'CREDENTIAL_LIKE_KEY_REJECTED'); return true; }
+  );
+  assert.equal(client.__getRows('hs_import_run_games').length, 0);
+});
+
+test('publishPlayerAdvancedStats rejects a credential-shaped key nested inside the stats blob, before any write occurs', async () => {
+  const { service, client } = setup();
+  await assert.rejects(
+    () => service.publishPlayerAdvancedStats({ ...ctx(), hsPlayerId: PLAYER_ID, stats: { games: 1, debug: { session_token: 'abc' } } }),
+    (err) => { assert.equal(err.code, 'CREDENTIAL_LIKE_KEY_REJECTED'); return true; }
+  );
+  assert.equal(client.__getRows('hs_player_advanced_stats').length, 0);
 });
 
 // ── recordGameValidation: confidence/status derivation matrix (items 18, 19) ─
@@ -213,6 +264,86 @@ test('recordGameValidation on a game with no captured data at all is "pending", 
   assert.equal(row.confidence, 'low');
 });
 
+// ── High School team ownership: natural polarity, never falsified ────────
+// (corrects the earlier version's brittle requirement that CALLERS pass
+// is_our_team: false to mean "this is the school's own team")
+
+test('invertRowOwnershipForReconstruction requires an explicit isHighSchoolTeam boolean and refuses to guess', () => {
+  const { service } = setup();
+  assert.throws(() => service.invertRowOwnershipForReconstruction({ Player: 'Alice' }), (err) => { assert.equal(err.code, 'MISSING_TEAM_OWNERSHIP'); return true; });
+  assert.throws(() => service.invertRowOwnershipForReconstruction({ Player: 'Alice', isHighSchoolTeam: 'yes' }), (err) => { assert.equal(err.code, 'MISSING_TEAM_OWNERSHIP'); return true; });
+});
+
+test('invertRowOwnershipForReconstruction maps isHighSchoolTeam: true to the internal is_our_team: false reconstructGame expects, and discards any caller-supplied travel-ball ownership flag', () => {
+  const { service } = setup();
+  const mapped = service.invertRowOwnershipForReconstruction({ Player: 'Alice', isHighSchoolTeam: true, is_our_team: true, isOurTeam: true, AB: 3 });
+  assert.equal(mapped.is_our_team, false);
+  assert.equal(mapped.isHighSchoolTeam, undefined);
+  assert.equal(mapped.isOurTeam, undefined);
+  assert.equal(mapped.AB, 3);
+});
+
+test('invertRowOwnershipForReconstruction maps isHighSchoolTeam: false (the opponent) to is_our_team: true', () => {
+  const { service } = setup();
+  const mapped = service.invertRowOwnershipForReconstruction({ Player: 'Rival Player', isHighSchoolTeam: false });
+  assert.equal(mapped.is_our_team, true);
+});
+
+// Asymmetric fixture: the High School team's row and the opponent's row
+// have DIFFERENT, distinguishable stat lines. If the ownership mapping
+// were accidentally symmetric (e.g. a bug that always inverted both rows
+// the same way, or never inverted at all), swapping which row carries
+// isHighSchoolTeam: true would silently publish the WRONG team's numbers
+// as the school's own -- this proves that swap actually changes the
+// persisted result correspondingly, not silently pass either way.
+function asymmetricGame({ highSchoolTeamAb, highSchoolTeamH, opponentAb, opponentH }) {
+  return {
+    boxScore: {
+      batting: [
+        { Player: 'HS Player', TeamSide: 'away', isHighSchoolTeam: true, AB: highSchoolTeamAb, H: highSchoolTeamH, BB: 0, SO: 0, HBP: 0 },
+        { Player: 'Opponent Player', TeamSide: 'home', isHighSchoolTeam: false, AB: opponentAb, H: opponentH, BB: 0, SO: 0, HBP: 0 },
+      ],
+      pitching: [],
+    },
+    plays: [],
+  };
+}
+
+test('recordGameValidation persists the HIGH SCHOOL TEAM\'s own box score numbers, not the opponent\'s, when the two are asymmetric', async () => {
+  const { service } = setup();
+  const run = await service.startImportRun({ ...ctx(), sourceProvider: 'gamechanger', triggerKind: 'manual' });
+  const { row: game } = await service.resolveCanonicalGame({ ...ctx(), sourceProvider: 'gamechanger', sourceGameRef: 'gc-asym' });
+  const capturedGame = asymmetricGame({ highSchoolTeamAb: 4, highSchoolTeamH: 3, opponentAb: 4, opponentH: 0 });
+  const { row } = await service.recordGameValidation({ orgId: ORG_ID, importRunId: run.id, importRunGameId: null, hsGameId: game.id, teamId: TEAM_ID, capturedGame });
+  assert.equal(row.box_score_batting.ab, 4);
+  assert.equal(row.box_score_batting.h, 3, 'must reflect the High School team\'s 3 hits, not the opponent\'s 0');
+});
+
+test('swapping which row carries isHighSchoolTeam: true changes the persisted result correspondingly (the mapping is not accidentally symmetric)', async () => {
+  const { service: serviceA } = setup();
+  const { service: serviceB } = setup();
+
+  const runA = await serviceA.startImportRun({ ...ctx(), sourceProvider: 'gamechanger', triggerKind: 'manual' });
+  const { row: gameA } = await serviceA.resolveCanonicalGame({ ...ctx(), sourceProvider: 'gamechanger', sourceGameRef: 'gc-swap-a' });
+  const originalGame = asymmetricGame({ highSchoolTeamAb: 4, highSchoolTeamH: 3, opponentAb: 4, opponentH: 1 });
+  const { row: rowA } = await serviceA.recordGameValidation({ orgId: ORG_ID, importRunId: runA.id, importRunGameId: null, hsGameId: gameA.id, teamId: TEAM_ID, capturedGame: originalGame });
+
+  const runB = await serviceB.startImportRun({ ...ctx(), sourceProvider: 'gamechanger', triggerKind: 'manual' });
+  const { row: gameB } = await serviceB.resolveCanonicalGame({ ...ctx(), sourceProvider: 'gamechanger', sourceGameRef: 'gc-swap-b' });
+  const swappedGame = {
+    boxScore: {
+      batting: originalGame.boxScore.batting.map((row) => ({ ...row, isHighSchoolTeam: !row.isHighSchoolTeam })),
+      pitching: [],
+    },
+    plays: [],
+  };
+  const { row: rowB } = await serviceB.recordGameValidation({ orgId: ORG_ID, importRunId: runB.id, importRunGameId: null, hsGameId: gameB.id, teamId: TEAM_ID, capturedGame: swappedGame });
+
+  assert.equal(rowA.box_score_batting.h, 3);
+  assert.equal(rowB.box_score_batting.h, 1, 'swapping ownership must swap which side\'s numbers get persisted as official');
+  assert.notEqual(rowA.box_score_batting.h, rowB.box_score_batting.h);
+});
+
 // ── publishVerifiedTotals ─────────────────────────────────────────────────
 
 test('publishVerifiedTotals rejects an empty games array rather than publishing a meaningless zero-game total', async () => {
@@ -240,6 +371,62 @@ test('publishVerifiedTotals computes its aggregate via the real pure reconstruct
   assert.equal(rows.length, 1);
 });
 
+// ── publication gate: a non-empty games array alone is NOT sufficient ────
+//
+// Required before merge #1: reject mismatches, missing box-score coverage,
+// and unresolved side attribution -- and prove a rejected publish causes
+// ZERO database mutation, not a partial write.
+
+test('publishVerifiedTotals REJECTS an aggregate with incomplete box-score coverage, and writes nothing', async () => {
+  const { service, client } = setup();
+  await assert.rejects(
+    () => service.publishVerifiedTotals({ ...ctx(), games: incompleteBoxScoreCoverageGames() }),
+    (err) => { assert.equal(err.code, 'INCOMPLETE_BOX_SCORE_COVERAGE'); return true; }
+  );
+  assert.equal(client.__getRows('hs_verified_totals').length, 0, 'a rejected publish must cause no database mutation at all');
+});
+
+test('publishVerifiedTotals REJECTS an aggregate containing even one mismatched game, and writes nothing', async () => {
+  const { service, client } = setup();
+  await assert.rejects(
+    () => service.publishVerifiedTotals({ ...ctx(), games: [agreeingCapturedGame(), mismatchedCapturedGame()] }),
+    (err) => { assert.equal(err.code, 'UNRESOLVED_MISMATCH'); return true; }
+  );
+  assert.equal(client.__getRows('hs_verified_totals').length, 0);
+});
+
+test('publishVerifiedTotals REJECTS an aggregate where a game has play-by-play but no resolved scouted side, and writes nothing', async () => {
+  const { service, client } = setup();
+  const unresolvedSideGame = {
+    boxScore: {
+      batting: [{ Player: 'Alice Smith', isHighSchoolTeam: true, AB: 1, H: 1, BB: 0, SO: 0, HBP: 0 }], // no TeamSide at all -> side stays unresolved
+      pitching: [],
+    },
+    plays: [{ text: 'Alice Smith singles to left field.', inning: 'Top 1' }],
+  };
+  await assert.rejects(
+    () => service.publishVerifiedTotals({ ...ctx(), games: [unresolvedSideGame] }),
+    (err) => { assert.equal(err.code, 'UNRESOLVED_SIDE_ATTRIBUTION'); return true; }
+  );
+  assert.equal(client.__getRows('hs_verified_totals').length, 0);
+});
+
+test('publishVerifiedTotals ACCEPTS a fully box-score-only aggregate (zero play-by-play) -- box score alone is this domain\'s official source of truth', async () => {
+  const { service, client } = setup();
+  const published = await service.publishVerifiedTotals({ ...ctx(), games: completeBoxScoreOnlyGames() });
+  assert.equal(published.is_current, true);
+  assert.equal(published.play_by_play_games, 0);
+  assert.equal(client.__getRows('hs_verified_totals').length, 1);
+});
+
+test('publishVerifiedTotals ACCEPTS a complete, fully-matched aggregate with play-by-play', async () => {
+  const { service, client } = setup();
+  const published = await service.publishVerifiedTotals({ ...ctx(), games: [agreeingCapturedGame(), agreeingCapturedGame()] });
+  assert.equal(published.is_current, true);
+  assert.equal(published.mismatch_games, 0);
+  assert.equal(client.__getRows('hs_verified_totals').length, 1);
+});
+
 // ── item 21: unresolved players cannot receive advanced-stat rows ────────
 
 test('publishPlayerAdvancedStats rejects a null/missing hsPlayerId rather than falling back to name matching', async () => {
@@ -261,12 +448,74 @@ test('publishPitcherAdvancedStats rejects a null/missing hsPlayerId rather than 
 // item 22: pre-resolved player IDs are persisted with full hierarchy context
 test('publishPlayerAdvancedStats persists a pre-resolved hsPlayerId with full hierarchy context', async () => {
   const { service } = setup();
-  const row = await service.publishPlayerAdvancedStats({ ...ctx(), importRunId: 'run-1', hsPlayerId: PLAYER_ID, stats: { games: 4, gb: 2, fb: 1 } });
+  const row = await service.publishPlayerAdvancedStats({ ...ctx(), importRunId: RUN_ID, hsPlayerId: PLAYER_ID, stats: { games: 4, gb: 2, fb: 1 } });
   assert.equal(row.player_id, PLAYER_ID);
   assert.equal(row.org_id, ORG_ID);
   assert.equal(row.team_id, TEAM_ID);
   assert.equal(row.season_id, SEASON_ID);
   assert.equal(row.games, 4);
+});
+
+// ── item 6: UUID-backed identifiers are validated consistently everywhere ─
+//
+// Every uuid-typed identifier the service accepts is now checked with
+// requireUuid/optionalUuid, not requireNonEmptyString -- proving a
+// malformed identifier is rejected by THIS service, before ever reaching
+// the repository or a real database.
+
+test('recordDiscoveredCount rejects a malformed importRunId', async () => {
+  const { service } = setup();
+  await assert.rejects(() => service.recordDiscoveredCount({ orgId: ORG_ID, importRunId: 'not-a-uuid', count: 3 }), (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; });
+});
+
+test('completeImportRun rejects a malformed orgId', async () => {
+  const { service } = setup();
+  await assert.rejects(() => service.completeImportRun({ orgId: 'not-a-uuid', importRunId: RUN_ID }), (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; });
+});
+
+test('failImportRun rejects a malformed importRunId', async () => {
+  const { service } = setup();
+  await assert.rejects(() => service.failImportRun({ orgId: ORG_ID, importRunId: 'not-a-uuid', rawErrorMessage: 'x' }), (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; });
+});
+
+test('recordSourceGame rejects a malformed orgId/importRunId but still allows sourceGameRef to be a non-uuid external id', async () => {
+  const { service } = setup();
+  await assert.rejects(() => service.recordSourceGame({ orgId: 'not-a-uuid', importRunId: RUN_ID, sourceGameRef: 'gc-123', discoveryStatus: 'discovered' }), (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; });
+});
+
+test('updateSourceGameOutcome rejects a malformed runGameId', async () => {
+  const { service } = setup();
+  await assert.rejects(() => service.updateSourceGameOutcome({ orgId: ORG_ID, runGameId: 'not-a-uuid', discoveryStatus: 'processed' }), (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; });
+});
+
+test('captureSnapshot rejects a malformed optional importRunGameId/hsGameId, not just the required orgId/importRunId', async () => {
+  const { service } = setup();
+  await assert.rejects(
+    () => service.captureSnapshot({ orgId: ORG_ID, importRunId: RUN_ID, importRunGameId: 'not-a-uuid', snapshotKind: 'box_score', sourceProvider: 'gamechanger', payload: {} }),
+    (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; }
+  );
+  await assert.rejects(
+    () => service.captureSnapshot({ orgId: ORG_ID, importRunId: RUN_ID, hsGameId: 'not-a-uuid', snapshotKind: 'box_score', sourceProvider: 'gamechanger', payload: {} }),
+    (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; }
+  );
+});
+
+test('recordGameValidation rejects a malformed hsGameId/teamId/importRunGameId', async () => {
+  const { service } = setup();
+  await assert.rejects(
+    () => service.recordGameValidation({ orgId: ORG_ID, importRunId: RUN_ID, hsGameId: 'not-a-uuid', teamId: TEAM_ID, capturedGame: agreeingCapturedGame() }),
+    (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; }
+  );
+  await assert.rejects(
+    () => service.recordGameValidation({ orgId: ORG_ID, importRunId: RUN_ID, hsGameId: PLAYER_ID, teamId: 'not-a-uuid', capturedGame: agreeingCapturedGame() }),
+    (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; }
+  );
+});
+
+test('publishPlayerAdvancedStats/publishPitcherAdvancedStats reject a malformed (but non-null) hsPlayerId, not just a missing one', async () => {
+  const { service } = setup();
+  await assert.rejects(() => service.publishPlayerAdvancedStats({ ...ctx(), hsPlayerId: 'not-a-uuid', stats: {} }), (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; });
+  await assert.rejects(() => service.publishPitcherAdvancedStats({ ...ctx(), hsPlayerId: 'not-a-uuid', stats: {} }), (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; });
 });
 
 // ── error propagation (item 23) ───────────────────────────────────────────

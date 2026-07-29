@@ -95,6 +95,11 @@ function requireUuid(value, fieldName) {
   return value;
 }
 
+function optionalUuid(value, fieldName) {
+  if (value === undefined || value === null) return null;
+  return requireUuid(value, fieldName);
+}
+
 function requireEnum(value, allowed, fieldName) {
   if (!allowed.includes(value)) {
     throw importError('INVALID_ENUM_VALUE', `${fieldName} must be one of: ${allowed.join(', ')}`, {
@@ -192,44 +197,132 @@ function isCredentialLikeKey(key) {
   return CREDENTIAL_KEY_MARKERS.some((marker) => normalized.includes(marker));
 }
 
-// Throws importError('CREDENTIAL_LIKE_KEY_REJECTED', ...) naming the
-// offending key PATH (e.g. "boxScore.batting[2].authToken") -- never the
-// value at that path, which might be the very secret being rejected.
-function assertNoCredentialLikeKeys(value, path = '$', depth = 0) {
-  if (depth > MAX_SCAN_DEPTH) {
-    throw importError('PAYLOAD_TOO_DEEPLY_NESTED', `Payload exceeds maximum nesting depth (${MAX_SCAN_DEPTH}) at ${path}`, {
-      statusCode: 400,
-      context: { path },
-    });
-  }
-  if (Array.isArray(value)) {
-    value.forEach((item, index) => assertNoCredentialLikeKeys(item, `${path}[${index}]`, depth + 1));
-    return;
-  }
-  if (value && typeof value === 'object') {
-    for (const key of Object.keys(value)) {
-      if (isCredentialLikeKey(key)) {
-        throw importError('CREDENTIAL_LIKE_KEY_REJECTED', `Payload key "${key}" at ${path}.${key} resembles a credential/session field and was rejected`, {
-          statusCode: 400,
-          context: { path: `${path}.${key}` },
-        });
-      }
-      assertNoCredentialLikeKeys(value[key], `${path}.${key}`, depth + 1);
-    }
-  }
+// ── Canonical JSON sanitization + recursive credential scan ─────────────
+//
+// sanitizeJsonPayload replaces two earlier, separately-implemented checks
+// (a JSON.stringify-serializability probe and a key-name-only recursive
+// scan run against the ORIGINAL object) with a single walk that produces
+// the value ACTUALLY persisted, so "what was validated" and "what gets
+// written to jsonb" can never diverge. That divergence was a real,
+// exploitable gap in the earlier version:
+//   - a `toJSON()` method can make JSON.stringify (and therefore
+//     PostgREST) serialize an entirely different shape than the one whose
+//     keys were scanned -- e.g. `{ toJSON() { return { authorization: 'x' }; } }`
+//     has no credential-shaped OWN key, but stringifies to one;
+//   - a getter (accessor property) executes arbitrary caller code the
+//     instant it is read; a getter that throws would previously leak its
+//     own, unsanitized error message straight out of this function;
+//   - NaN/Infinity/-Infinity silently become `null` under JSON.stringify
+//     without ever throwing, so the old "does JSON.stringify throw" probe
+//     never caught them;
+//   - `undefined` object values are silently DROPPED by JSON.stringify,
+//     and sparse array holes silently become `null` -- both look like
+//     "successfully validated" under the old check while actually
+//     changing shape at persistence time;
+//   - a non-plain object (Date, Map, class instance, Proxy) can carry
+//     hidden state or behavior JSON.stringify does not faithfully expose.
+//
+// This function rejects every one of the above outright rather than
+// tolerating, coercing, or silently dropping them, and returns a brand
+// new plain object/array tree (the canonical clone) built ONLY from
+// already-validated primitive/plain-object/array values -- that returned
+// clone, not the caller's original value, is what every call site below
+// actually persists.
+//
+// Accessor properties are detected via Object.getOwnPropertyDescriptor
+// and rejected WITHOUT EVER INVOKING THE GETTER -- a hostile getter can
+// therefore never execute, let alone throw an error this function would
+// have to (and might fail to) sanitize before it escapes.
+function isPlainObject(value) {
+  if (value === null || typeof value !== 'object') return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
 }
 
-function assertJsonSerializable(value, fieldName) {
-  if (value === undefined || typeof value === 'function') {
-    throw importError('INVALID_FIELD', `${fieldName} must be JSON-serializable`, { statusCode: 400, context: { field: fieldName } });
-  }
-  try {
-    JSON.stringify(value);
-  } catch {
-    throw importError('INVALID_FIELD', `${fieldName} must be JSON-serializable (no circular references)`, {
+function sanitizeJsonValue(value, fieldName, path, depth) {
+  if (depth > MAX_SCAN_DEPTH) {
+    throw importError('PAYLOAD_TOO_DEEPLY_NESTED', `${fieldName} exceeds maximum nesting depth (${MAX_SCAN_DEPTH}) at ${path}`, {
       statusCode: 400,
-      context: { field: fieldName },
+      context: { field: fieldName, path },
     });
+  }
+
+  if (value === null) return null;
+  const type = typeof value;
+
+  if (type === 'string' || type === 'boolean') return value;
+
+  if (type === 'number') {
+    if (!Number.isFinite(value)) {
+      throw importError('INVALID_FIELD', `${fieldName} contains a non-finite number (NaN/Infinity) at ${path}`, { statusCode: 400, context: { field: fieldName, path } });
+    }
+    return value;
+  }
+
+  if (type === 'undefined' || type === 'function' || type === 'symbol' || type === 'bigint') {
+    throw importError('INVALID_FIELD', `${fieldName} contains a non-JSON-safe ${type === 'undefined' ? 'undefined value' : type} at ${path}`, {
+      statusCode: 400,
+      context: { field: fieldName, path },
+    });
+  }
+
+  // type === 'object' from here.
+  if (Array.isArray(value)) {
+    // Sparse-array guard: a hole (missing index) is not the same as an
+    // explicit null, and JSON.stringify would silently convert it to one.
+    if (Object.keys(value).length !== value.length) {
+      throw importError('INVALID_FIELD', `${fieldName} contains a sparse array at ${path}`, { statusCode: 400, context: { field: fieldName, path } });
+    }
+    return value.map((item, index) => sanitizeJsonValue(item, fieldName, `${path}[${index}]`, depth + 1));
+  }
+
+  if (!isPlainObject(value)) {
+    throw importError('INVALID_FIELD', `${fieldName} contains a non-plain object (custom prototype, Date, Map, etc.) at ${path}`, {
+      statusCode: 400,
+      context: { field: fieldName, path },
+    });
+  }
+
+  if (Object.prototype.hasOwnProperty.call(value, 'toJSON')) {
+    throw importError('INVALID_FIELD', `${fieldName} contains a toJSON property at ${path}, which could change the persisted shape after this validation ran`, {
+      statusCode: 400,
+      context: { field: fieldName, path },
+    });
+  }
+
+  const clone = {};
+  for (const key of Object.keys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor.get || descriptor.set) {
+      // Rejected WITHOUT reading descriptor.value -- an accessor's getter
+      // is never invoked, so it can never execute or throw here.
+      throw importError('INVALID_FIELD', `${fieldName} contains an accessor property "${key}" at ${path}.${key}, which is not a plain JSON value`, {
+        statusCode: 400,
+        context: { field: fieldName, path: `${path}.${key}` },
+      });
+    }
+    if (isCredentialLikeKey(key)) {
+      throw importError('CREDENTIAL_LIKE_KEY_REJECTED', `${fieldName} key "${key}" at ${path}.${key} resembles a credential/session field and was rejected`, {
+        statusCode: 400,
+        context: { field: fieldName, path: `${path}.${key}` },
+      });
+    }
+    clone[key] = sanitizeJsonValue(descriptor.value, fieldName, `${path}.${key}`, depth + 1);
+  }
+  return clone;
+}
+
+// Every call site below must persist the RETURNED value, never the
+// original -- that is what makes "validated" and "persisted" the same
+// representation. Any unexpected internal error is itself re-wrapped so
+// this function can never leak a raw, unsanitized message (defense in
+// depth on top of the getter-avoidance above).
+function sanitizeJsonPayload(value, fieldName) {
+  try {
+    return sanitizeJsonValue(value, fieldName, '$', 0);
+  } catch (err) {
+    if (err && err.code) throw err;
+    throw importError('INVALID_FIELD', `${fieldName} could not be validated as a safe JSON value`, { statusCode: 400, context: { field: fieldName } });
   }
 }
 
@@ -243,6 +336,7 @@ module.exports = {
   UUID_RE,
   isValidUuid,
   requireUuid,
+  optionalUuid,
   IMPORT_RUN_STATUSES,
   TRIGGER_KINDS,
   SOURCE_PROVIDERS,
@@ -264,7 +358,6 @@ module.exports = {
   requireNonNegativeInteger,
   validateImportContext,
   isCredentialLikeKey,
-  assertNoCredentialLikeKeys,
-  assertJsonSerializable,
+  sanitizeJsonPayload,
   sanitizeErrorMessage,
 };

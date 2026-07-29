@@ -16,12 +16,20 @@ const LEGACY_TRAVEL_TABLES = [
   'player_advanced_stats', 'pitcher_advanced_stats',
 ];
 
-const ORG_A = 'org-A';
-const ORG_B = 'org-B';
-const PROGRAM_A = 'program-A';
-const TEAM_A = 'team-A';
-const TEAM_B = 'team-B';
-const SEASON_A = 'season-A';
+const ORG_A = '11111111-1111-1111-1111-111111111111';
+const ORG_B = '22222222-2222-2222-2222-222222222222';
+const PROGRAM_A = '33333333-3333-3333-3333-333333333333';
+const PROGRAM_B = '44444444-4444-4444-4444-444444444444';
+const TEAM_A = '55555555-5555-5555-5555-555555555555';
+const TEAM_B = '66666666-6666-6666-6666-666666666666';
+const SEASON_A = '77777777-7777-7777-7777-777777777777';
+const SEASON_B = '88888888-8888-8888-8888-888888888888';
+const RUN_1 = '99999999-9999-9999-9999-999999999999';
+const RUN_2 = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+const PLAYER_1 = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+const PITCHER_1 = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
+const GAME_1 = 'dddddddd-dddd-dddd-dddd-dddddddddddd';
+const GAME_IDEM = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee';
 
 function ctxA(extra = {}) {
   return { orgId: ORG_A, programId: PROGRAM_A, teamId: TEAM_A, seasonId: SEASON_A, ...extra };
@@ -77,6 +85,59 @@ test('completeImportRun reports failed when every processed game failed', async 
   await repo.recordRunGame({ orgId: ORG_A, importRunId: run.id, sourceGameRef: 'gc-1', discoveryStatus: 'failed', gameOutcome: 'failed' });
   const completed = await repo.completeImportRun({ orgId: ORG_A, importRunId: run.id });
   assert.equal(completed.status, 'failed');
+});
+
+// A row still 'discovered' or 'processing' with no recorded outcome is NOT
+// terminal -- completion must be refused rather than silently counted as
+// "processed" and reported as a falsely-confident 'succeeded'.
+test('completeImportRun refuses to complete while any game is still discovered/processing with no recorded outcome', async () => {
+  const { repo } = setup();
+  const run = await repo.createImportRun({ ...ctxA(), sourceProvider: 'gamechanger', triggerKind: 'manual', config: {} });
+  await repo.recordRunGame({ orgId: ORG_A, importRunId: run.id, sourceGameRef: 'gc-done', discoveryStatus: 'processed', gameOutcome: 'inserted' });
+  await repo.recordRunGame({ orgId: ORG_A, importRunId: run.id, sourceGameRef: 'gc-pending', discoveryStatus: 'discovered' });
+  await assert.rejects(
+    () => repo.completeImportRun({ orgId: ORG_A, importRunId: run.id }),
+    (err) => { assert.equal(err.code, 'RUN_NOT_READY_TO_COMPLETE'); assert.equal(err.retryable, true); return true; }
+  );
+});
+
+test('completeImportRun refuses to complete while a game is still "processing"', async () => {
+  const { repo } = setup();
+  const run = await repo.createImportRun({ ...ctxA(), sourceProvider: 'gamechanger', triggerKind: 'manual', config: {} });
+  await repo.recordRunGame({ orgId: ORG_A, importRunId: run.id, sourceGameRef: 'gc-in-flight', discoveryStatus: 'processing' });
+  await assert.rejects(() => repo.completeImportRun({ orgId: ORG_A, importRunId: run.id }), (err) => { assert.equal(err.code, 'RUN_NOT_READY_TO_COMPLETE'); return true; });
+});
+
+test('completeImportRun refuses to complete a "processed" game that was never given a terminal game_outcome', async () => {
+  const { repo } = setup();
+  const run = await repo.createImportRun({ ...ctxA(), sourceProvider: 'gamechanger', triggerKind: 'manual', config: {} });
+  await repo.recordRunGame({ orgId: ORG_A, importRunId: run.id, sourceGameRef: 'gc-ambiguous', discoveryStatus: 'processed' }); // no gameOutcome
+  await assert.rejects(() => repo.completeImportRun({ orgId: ORG_A, importRunId: run.id }), (err) => { assert.equal(err.code, 'RUN_NOT_READY_TO_COMPLETE'); return true; });
+});
+
+// The exact scenario this repository's own review flagged: three games all
+// SKIPPED (a legitimate terminal outcome, not a failure) must not be
+// silently miscounted as neither succeeded nor failed while still letting
+// the run complete -- every terminal row is now classified into exactly
+// one bucket, and skipped/rejected counts are surfaced in result_summary
+// even though the status enum itself has no distinct "some games skipped"
+// value.
+test('completeImportRun classifies skipped and rejected outcomes explicitly rather than excluding them from every count', async () => {
+  const { repo } = setup();
+  const run = await repo.createImportRun({ ...ctxA(), sourceProvider: 'gamechanger', triggerKind: 'manual', config: {} });
+  await repo.recordRunGame({ orgId: ORG_A, importRunId: run.id, sourceGameRef: 'gc-skip-1', discoveryStatus: 'skipped', gameOutcome: 'skipped' });
+  await repo.recordRunGame({ orgId: ORG_A, importRunId: run.id, sourceGameRef: 'gc-skip-2', discoveryStatus: 'skipped' }); // discovery-level skip, no game_outcome
+  await repo.recordRunGame({ orgId: ORG_A, importRunId: run.id, sourceGameRef: 'gc-rejected', discoveryStatus: 'rejected', gameOutcome: 'rejected' });
+
+  const completed = await repo.completeImportRun({ orgId: ORG_A, importRunId: run.id });
+  assert.equal(completed.games_processed, 3);
+  assert.equal(completed.games_succeeded, 0);
+  assert.equal(completed.games_failed, 0);
+  // With zero failures the run itself did not fail -- 'succeeded' is the
+  // schema's closest available status -- but the nuance is NOT lost:
+  assert.equal(completed.status, 'succeeded');
+  assert.equal(completed.result_summary.skipped, 2);
+  assert.equal(completed.result_summary.rejected, 1);
 });
 
 // item 5: a failed run receives a bounded, sanitized error
@@ -197,7 +258,7 @@ test('two games on the same date for the same team (a doubleheader) are NOT dedu
 test('resolveOrCreateGame keeps games fully independent across two different orgs with their own distinct teams', async () => {
   const { repo } = setup();
   const orgAGame = await repo.resolveOrCreateGame({ orgId: ORG_A, programId: PROGRAM_A, teamId: TEAM_A, seasonId: SEASON_A, sourceProvider: 'gamechanger', sourceGameRef: 'gc-shared-ref' });
-  const orgBGame = await repo.resolveOrCreateGame({ orgId: ORG_B, programId: 'program-B', teamId: 'team-B-own', seasonId: 'season-B', sourceProvider: 'gamechanger', sourceGameRef: 'gc-shared-ref' });
+  const orgBGame = await repo.resolveOrCreateGame({ orgId: ORG_B, programId: PROGRAM_B, teamId: TEAM_B, seasonId: SEASON_B, sourceProvider: 'gamechanger', sourceGameRef: 'gc-shared-ref' });
   assert.equal(orgAGame.created, true);
   assert.equal(orgBGame.created, true);
   assert.notEqual(orgAGame.row.id, orgBGame.row.id);
@@ -290,7 +351,7 @@ test('insertGameValidationResult keeps box-score and reconstructed totals in sep
   const { repo } = setup();
   const run = await repo.createImportRun({ ...ctxA(), sourceProvider: 'gamechanger', triggerKind: 'manual', config: {} });
   const { row } = await repo.insertGameValidationResult({
-    orgId: ORG_A, importRunId: run.id, importRunGameId: null, hsGameId: 'game-1', teamId: TEAM_A,
+    orgId: ORG_A, importRunId: run.id, importRunGameId: null, hsGameId: GAME_1, teamId: TEAM_A,
     hasBoxScore: true, hasPlayByPlay: true,
     boxScoreBatting: { ab: 10, h: 3 },
     reconstructedBatting: { ab: 9, h: 2 },
@@ -304,8 +365,8 @@ test('insertGameValidationResult keeps box-score and reconstructed totals in sep
 test('insertGameValidationResult is idempotent per (import_run_id, hs_game_id)', async () => {
   const { repo } = setup();
   const run = await repo.createImportRun({ ...ctxA(), sourceProvider: 'gamechanger', triggerKind: 'manual', config: {} });
-  const first = await repo.insertGameValidationResult({ orgId: ORG_A, importRunId: run.id, hsGameId: 'game-idem', teamId: TEAM_A, hasBoxScore: true, hasPlayByPlay: false, battingMatchesBox: false, confidence: 'medium', validationStatus: 'validated' });
-  const second = await repo.insertGameValidationResult({ orgId: ORG_A, importRunId: run.id, hsGameId: 'game-idem', teamId: TEAM_A, hasBoxScore: true, hasPlayByPlay: false, battingMatchesBox: false, confidence: 'medium', validationStatus: 'validated' });
+  const first = await repo.insertGameValidationResult({ orgId: ORG_A, importRunId: run.id, hsGameId: GAME_IDEM, teamId: TEAM_A, hasBoxScore: true, hasPlayByPlay: false, battingMatchesBox: false, confidence: 'medium', validationStatus: 'validated' });
+  const second = await repo.insertGameValidationResult({ orgId: ORG_A, importRunId: run.id, hsGameId: GAME_IDEM, teamId: TEAM_A, hasBoxScore: true, hasPlayByPlay: false, battingMatchesBox: false, confidence: 'medium', validationStatus: 'validated' });
   assert.equal(first.created, true);
   assert.equal(second.created, false);
 });
@@ -344,7 +405,7 @@ test('at most one current row can ever exist per (team_id, season_id) -- the fak
 test('publishVerifiedTotals for a DIFFERENT season does not supersede the other season\'s current row', async () => {
   const { repo, client } = setup();
   await repo.publishVerifiedTotals({ ...ctxA(), importRunId: null, aggregate: { games: 1, boxScoreGames: 1, playByPlayGames: 0, validatedGames: 0, mismatchGames: 0, confidence: 'low' } });
-  await repo.publishVerifiedTotals({ ...ctxA({ seasonId: 'season-B' }), importRunId: null, aggregate: { games: 1, boxScoreGames: 1, playByPlayGames: 0, validatedGames: 0, mismatchGames: 0, confidence: 'low' } });
+  await repo.publishVerifiedTotals({ ...ctxA({ seasonId: SEASON_B }), importRunId: null, aggregate: { games: 1, boxScoreGames: 1, playByPlayGames: 0, validatedGames: 0, mismatchGames: 0, confidence: 'low' } });
   const currentRows = client.__getRows('hs_verified_totals').filter((r) => r.is_current);
   assert.equal(currentRows.length, 2);
 });
@@ -352,12 +413,12 @@ test('publishVerifiedTotals for a DIFFERENT season does not supersede the other 
 // item 22: pre-resolved player IDs are persisted with full hierarchy context
 test('publishPlayerAdvancedStats persists the full hierarchy (org/program/team/season/player) alongside the stat blob', async () => {
   const { repo } = setup();
-  const row = await repo.publishPlayerAdvancedStats({ ...ctxA(), importRunId: 'run-1', playerId: 'player-1', stats: { games: 5, gb: 3, fb: 2, k_pct: 12.5 } });
+  const row = await repo.publishPlayerAdvancedStats({ ...ctxA(), importRunId: RUN_1, playerId: PLAYER_1, stats: { games: 5, gb: 3, fb: 2, k_pct: 12.5 } });
   assert.equal(row.org_id, ORG_A);
   assert.equal(row.program_id, PROGRAM_A);
   assert.equal(row.team_id, TEAM_A);
   assert.equal(row.season_id, SEASON_A);
-  assert.equal(row.player_id, 'player-1');
+  assert.equal(row.player_id, PLAYER_1);
   assert.equal(row.games, 5);
   assert.equal(row.gb, 3);
   assert.equal(row.is_current, true);
@@ -365,8 +426,8 @@ test('publishPlayerAdvancedStats persists the full hierarchy (org/program/team/s
 
 test('publishPlayerAdvancedStats supersedes the prior current row for the same (player, team, season), keeping history', async () => {
   const { repo, client } = setup();
-  const first = await repo.publishPlayerAdvancedStats({ ...ctxA(), importRunId: 'run-1', playerId: 'player-1', stats: { games: 1 } });
-  const second = await repo.publishPlayerAdvancedStats({ ...ctxA(), importRunId: 'run-2', playerId: 'player-1', stats: { games: 2 } });
+  const first = await repo.publishPlayerAdvancedStats({ ...ctxA(), importRunId: RUN_1, playerId: PLAYER_1, stats: { games: 1 } });
+  const second = await repo.publishPlayerAdvancedStats({ ...ctxA(), importRunId: RUN_2, playerId: PLAYER_1, stats: { games: 2 } });
   assert.notEqual(first.id, second.id);
   const rows = client.__getRows('hs_player_advanced_stats');
   assert.equal(rows.length, 2);
@@ -376,18 +437,18 @@ test('publishPlayerAdvancedStats supersedes the prior current row for the same (
 test('publishPlayerAdvancedStats strips reserved/identity columns out of a caller-supplied stats blob rather than letting them override hierarchy context', async () => {
   const { repo } = setup();
   const row = await repo.publishPlayerAdvancedStats({
-    ...ctxA(), importRunId: 'run-1', playerId: 'player-1',
+    ...ctxA(), importRunId: RUN_1, playerId: PLAYER_1,
     stats: { games: 3, org_id: 'attacker-org', is_current: false, player_id: 'someone-else' },
   });
   assert.equal(row.org_id, ORG_A);
-  assert.equal(row.player_id, 'player-1');
+  assert.equal(row.player_id, PLAYER_1);
   assert.equal(row.is_current, true);
 });
 
 test('publishPitcherAdvancedStats follows the same current/superseded and hierarchy rules as player stats', async () => {
   const { repo, client } = setup();
-  const first = await repo.publishPitcherAdvancedStats({ ...ctxA(), importRunId: 'run-1', playerId: 'pitcher-1', stats: { games: 1, so_per7: 8.1 } });
-  const second = await repo.publishPitcherAdvancedStats({ ...ctxA(), importRunId: 'run-2', playerId: 'pitcher-1', stats: { games: 2, so_per7: 9.0 } });
+  const first = await repo.publishPitcherAdvancedStats({ ...ctxA(), importRunId: RUN_1, playerId: PITCHER_1, stats: { games: 1, so_per7: 8.1 } });
+  const second = await repo.publishPitcherAdvancedStats({ ...ctxA(), importRunId: RUN_2, playerId: PITCHER_1, stats: { games: 2, so_per7: 9.0 } });
   assert.notEqual(first.id, second.id);
   const currentRows = client.__getRows('hs_pitcher_advanced_stats').filter((r) => r.is_current);
   assert.equal(currentRows.length, 1);
@@ -434,6 +495,49 @@ test('publishVerifiedTotals surfaces a distinct, documented error (not a silent 
   assert.equal(afterRows.filter((r) => r.is_current).length, 0, 'no current row exists for this identity after the failed replacement -- the documented gap');
 });
 
+// A concurrent publisher altering the "current" row between this
+// function's own select and its own update must be DETECTED, not silently
+// treated as if the demotion succeeded (a Postgres UPDATE matching zero
+// rows is not an error -- only checking the affected-row count catches
+// this). __mutateRow simulates the concurrent write landing in that exact
+// window, which a single-threaded JS test cannot otherwise produce.
+test('publishVerifiedTotals detects a concurrent publisher that already altered the current row, rather than silently proceeding', async () => {
+  const { repo, client } = setup();
+  const first = await repo.publishVerifiedTotals({ ...ctxA(), importRunId: null, aggregate: { games: 1, boxScoreGames: 1, playByPlayGames: 0, validatedGames: 0, mismatchGames: 0, confidence: 'low' } });
+
+  const originalFrom = client.from.bind(client);
+  client.from = (table) => {
+    const builder = originalFrom(table);
+    if (table === 'hs_verified_totals') {
+      const originalThen = builder.then.bind(builder);
+      builder.then = (resolve, reject) => {
+        const wasSelect = builder.operation === 'select';
+        // originalThen computes the REAL select result first (correctly
+        // finding `first` as current); only once that has resolved does
+        // the "concurrent" publisher supersede it -- landing exactly in
+        // the window between our own select and our own subsequent update.
+        return originalThen((result) => {
+          if (wasSelect) {
+            client.__mutateRow('hs_verified_totals', first.id, { is_current: false, superseded_at: new Date().toISOString() });
+          }
+          return resolve ? resolve(result) : result;
+        }, reject);
+      };
+    }
+    return builder;
+  };
+
+  await assert.rejects(
+    () => repo.publishVerifiedTotals({ ...ctxA(), importRunId: null, aggregate: { games: 2, boxScoreGames: 2, playByPlayGames: 0, validatedGames: 0, mismatchGames: 0, confidence: 'low' } }),
+    (err) => { assert.equal(err.code, 'CONCURRENT_PUBLICATION_CONFLICT'); assert.equal(err.retryable, true); return true; }
+  );
+
+  // No second current row was inserted despite the race -- the conflict
+  // was detected and stopped, not silently worked around.
+  const currentRows = client.__getRows('hs_verified_totals').filter((r) => r.is_current);
+  assert.equal(currentRows.length, 0);
+});
+
 // ── item 23: repository failures propagate, never silently succeed ───────
 
 test('a client-level failure during completeImportRun propagates as a thrown error rather than a falsely-successful completion', async () => {
@@ -463,8 +567,8 @@ test('a full run/game/snapshot/validation/verified-totals/player-stats lifecycle
   await repo.updateRunGameOutcome({ orgId: ORG_A, runGameId: runGame.id, discoveryStatus: 'processed', gameOutcome: 'inserted', hsGameId: game.id });
   await repo.insertGameValidationResult({ orgId: ORG_A, importRunId: run.id, importRunGameId: runGame.id, hsGameId: game.id, teamId: TEAM_A, hasBoxScore: true, hasPlayByPlay: false, battingMatchesBox: false, confidence: 'medium', validationStatus: 'validated' });
   await repo.publishVerifiedTotals({ ...ctxA(), importRunId: run.id, aggregate: { games: 1, boxScoreGames: 1, playByPlayGames: 0, validatedGames: 0, mismatchGames: 0, confidence: 'medium' } });
-  await repo.publishPlayerAdvancedStats({ ...ctxA(), importRunId: run.id, playerId: 'player-1', stats: { games: 1 } });
-  await repo.publishPitcherAdvancedStats({ ...ctxA(), importRunId: run.id, playerId: 'pitcher-1', stats: { games: 1 } });
+  await repo.publishPlayerAdvancedStats({ ...ctxA(), importRunId: run.id, playerId: PLAYER_1, stats: { games: 1 } });
+  await repo.publishPitcherAdvancedStats({ ...ctxA(), importRunId: run.id, playerId: PITCHER_1, stats: { games: 1 } });
   await repo.completeImportRun({ orgId: ORG_A, importRunId: run.id });
 
   for (const legacyTable of LEGACY_TRAVEL_TABLES) {
@@ -473,6 +577,36 @@ test('a full run/game/snapshot/validation/verified-totals/player-stats lifecycle
   for (const hsTable of ['hs_import_runs', 'hs_import_run_games', 'hs_raw_snapshots', 'hs_games', 'hs_game_validation_results', 'hs_verified_totals', 'hs_player_advanced_stats', 'hs_pitcher_advanced_stats']) {
     assert.equal(client.__touchedTables.has(hsTable), true, `expected ${hsTable} to be touched by the full lifecycle`);
   }
+});
+
+// ── fake client schema enforcement (item 5: UUID/NOT NULL, not just uniqueness) ─
+//
+// These prove a malformed identifier or a missing required column is
+// rejected by THIS repository's calls, not merely tolerated by the fake
+// and left for a real database to catch later.
+
+test('a malformed (non-UUID) hierarchy identifier is rejected by the fake client the same way a real uuid column would reject it', async () => {
+  const { repo } = setup();
+  await assert.rejects(
+    () => repo.createImportRun({ orgId: 'not-a-uuid', programId: PROGRAM_A, teamId: TEAM_A, seasonId: SEASON_A, sourceProvider: 'gamechanger', triggerKind: 'manual', config: {} }),
+    (err) => { assert.equal(err.code, 'PERSISTENCE_FAILED'); assert.match(err.message, /uuid/i); return true; }
+  );
+});
+
+test('a missing NOT NULL column is rejected by the fake client rather than silently persisted as null', async () => {
+  const { repo } = setup();
+  await assert.rejects(
+    () => repo.createImportRun({ orgId: ORG_A, programId: undefined, teamId: TEAM_A, seasonId: SEASON_A, sourceProvider: 'gamechanger', triggerKind: 'manual', config: {} }),
+    (err) => { assert.equal(err.code, 'PERSISTENCE_FAILED'); assert.match(err.message, /program_id/); return true; }
+  );
+});
+
+test('resolveOrCreateGame with a malformed teamId is rejected rather than silently creating an unreferenceable row', async () => {
+  const { repo } = setup();
+  await assert.rejects(
+    () => repo.resolveOrCreateGame({ orgId: ORG_A, programId: PROGRAM_A, teamId: 'team-not-a-uuid', seasonId: SEASON_A, sourceProvider: 'gamechanger', sourceGameRef: 'gc-bad-team' }),
+    (err) => { assert.equal(err.code, 'PERSISTENCE_FAILED'); assert.match(err.message, /uuid/i); return true; }
+  );
 });
 
 // ── constructor guard ─────────────────────────────────────────────────────

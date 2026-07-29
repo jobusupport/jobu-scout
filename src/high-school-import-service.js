@@ -43,11 +43,12 @@ const {
   importError,
   requireEnum,
   optionalEnum,
+  requireUuid,
+  optionalUuid,
   requireNonEmptyString,
   requireNonNegativeInteger,
   validateImportContext,
-  assertNoCredentialLikeKeys,
-  assertJsonSerializable,
+  sanitizeJsonPayload,
   IMPORT_RUN_STATUSES,
   TRIGGER_KINDS,
   SOURCE_PROVIDERS,
@@ -70,32 +71,32 @@ function createHighSchoolImportService({ repository }) {
     const ctx = validateImportContext({ orgId, programId, teamId, seasonId });
     requireEnum(sourceProvider, SOURCE_PROVIDERS, 'sourceProvider');
     requireEnum(triggerKind, TRIGGER_KINDS, 'triggerKind');
-    if (config !== undefined) assertJsonSerializable(config, 'config');
+    const sanitizedConfig = config !== undefined ? sanitizeJsonPayload(config, 'config') : {};
     return repository.createImportRun({
       ...ctx,
       sourceProvider,
       sourceTeamRef: sourceTeamRef ?? null,
       triggerKind,
-      config: config ?? {},
+      config: sanitizedConfig,
     });
   }
 
   async function recordDiscoveredCount({ orgId, importRunId, count }) {
-    requireNonEmptyString(orgId, 'orgId');
-    requireNonEmptyString(importRunId, 'importRunId');
+    requireUuid(orgId, 'orgId');
+    requireUuid(importRunId, 'importRunId');
     requireNonNegativeInteger(count, 'count');
     return repository.recordDiscoveredCount({ orgId, importRunId, count });
   }
 
   async function completeImportRun({ orgId, importRunId }) {
-    requireNonEmptyString(orgId, 'orgId');
-    requireNonEmptyString(importRunId, 'importRunId');
+    requireUuid(orgId, 'orgId');
+    requireUuid(importRunId, 'importRunId');
     return repository.completeImportRun({ orgId, importRunId });
   }
 
   async function failImportRun({ orgId, importRunId, failureStage, rawErrorMessage }) {
-    requireNonEmptyString(orgId, 'orgId');
-    requireNonEmptyString(importRunId, 'importRunId');
+    requireUuid(orgId, 'orgId');
+    requireUuid(importRunId, 'importRunId');
     optionalEnum(failureStage, FAILURE_STAGES, 'failureStage');
     return repository.failImportRun({ orgId, importRunId, failureStage: failureStage ?? null, rawErrorMessage });
   }
@@ -103,41 +104,44 @@ function createHighSchoolImportService({ repository }) {
   // ── Source-game tracking ────────────────────────────────────────────
 
   async function recordSourceGame({ orgId, importRunId, sourceGameRef, sourceGameUrl, discoveryStatus, gameOutcome, diagnostics, hsGameId }) {
-    requireNonEmptyString(orgId, 'orgId');
-    requireNonEmptyString(importRunId, 'importRunId');
-    requireNonEmptyString(sourceGameRef, 'sourceGameRef');
+    requireUuid(orgId, 'orgId');
+    requireUuid(importRunId, 'importRunId');
+    requireNonEmptyString(sourceGameRef, 'sourceGameRef'); // external provider id, not a uuid column
     requireEnum(discoveryStatus, DISCOVERY_STATUSES, 'discoveryStatus');
     optionalEnum(gameOutcome, GAME_OUTCOMES, 'gameOutcome');
-    if (diagnostics !== undefined) assertJsonSerializable(diagnostics, 'diagnostics');
+    const sanitizedDiagnostics = diagnostics !== undefined ? sanitizeJsonPayload(diagnostics, 'diagnostics') : {};
+    const resolvedHsGameId = optionalUuid(hsGameId, 'hsGameId');
     return repository.recordRunGame({
       orgId, importRunId, sourceGameRef, sourceGameUrl: sourceGameUrl ?? null,
-      discoveryStatus, gameOutcome: gameOutcome ?? null, diagnostics: diagnostics ?? {}, hsGameId: hsGameId ?? null,
+      discoveryStatus, gameOutcome: gameOutcome ?? null, diagnostics: sanitizedDiagnostics, hsGameId: resolvedHsGameId,
     });
   }
 
   async function updateSourceGameOutcome({ orgId, runGameId, discoveryStatus, gameOutcome, diagnostics, hsGameId }) {
-    requireNonEmptyString(orgId, 'orgId');
-    requireNonEmptyString(runGameId, 'runGameId');
+    requireUuid(orgId, 'orgId');
+    requireUuid(runGameId, 'runGameId');
     if (discoveryStatus !== undefined) requireEnum(discoveryStatus, DISCOVERY_STATUSES, 'discoveryStatus');
     if (gameOutcome !== undefined) optionalEnum(gameOutcome, GAME_OUTCOMES, 'gameOutcome');
-    if (diagnostics !== undefined) assertJsonSerializable(diagnostics, 'diagnostics');
-    return repository.updateRunGameOutcome({ orgId, runGameId, discoveryStatus, gameOutcome, diagnostics, hsGameId });
+    const sanitizedDiagnostics = diagnostics !== undefined ? sanitizeJsonPayload(diagnostics, 'diagnostics') : undefined;
+    const resolvedHsGameId = hsGameId !== undefined ? optionalUuid(hsGameId, 'hsGameId') : undefined;
+    return repository.updateRunGameOutcome({ orgId, runGameId, discoveryStatus, gameOutcome, diagnostics: sanitizedDiagnostics, hsGameId: resolvedHsGameId });
   }
 
   // ── Raw snapshots ────────────────────────────────────────────────────
 
   async function captureSnapshot({ orgId, importRunId, importRunGameId, hsGameId, snapshotKind, sourceProvider, sourceRef, payload, contentType, schemaVersion, integrityHash, capturedAt }) {
-    requireNonEmptyString(orgId, 'orgId');
-    requireNonEmptyString(importRunId, 'importRunId');
+    requireUuid(orgId, 'orgId');
+    requireUuid(importRunId, 'importRunId');
+    const resolvedImportRunGameId = optionalUuid(importRunGameId, 'importRunGameId');
+    const resolvedHsGameId = optionalUuid(hsGameId, 'hsGameId');
     requireEnum(snapshotKind, SNAPSHOT_KINDS, 'snapshotKind');
     requireEnum(sourceProvider, SOURCE_PROVIDERS, 'sourceProvider');
     const resolvedContentType = contentType ?? 'json';
     requireEnum(resolvedContentType, CONTENT_TYPES, 'contentType');
-    assertJsonSerializable(payload, 'payload');
-    assertNoCredentialLikeKeys(payload, '$payload');
+    const sanitizedPayload = sanitizeJsonPayload(payload, 'payload');
     return repository.captureRawSnapshot({
-      orgId, importRunId, importRunGameId: importRunGameId ?? null, hsGameId: hsGameId ?? null,
-      snapshotKind, sourceProvider, sourceRef: sourceRef ?? null, payload, contentType: resolvedContentType,
+      orgId, importRunId, importRunGameId: resolvedImportRunGameId, hsGameId: resolvedHsGameId,
+      snapshotKind, sourceProvider, sourceRef: sourceRef ?? null, payload: sanitizedPayload, contentType: resolvedContentType,
       schemaVersion: schemaVersion || 'v1', integrityHash: integrityHash ?? null, capturedAt,
     });
   }
@@ -147,7 +151,7 @@ function createHighSchoolImportService({ repository }) {
   async function resolveCanonicalGame({ orgId, programId, teamId, seasonId, sourceProvider, sourceGameRef, opponentName, gameDate }) {
     const ctx = validateImportContext({ orgId, programId, teamId, seasonId });
     if (sourceProvider !== undefined && sourceProvider !== null) requireEnum(sourceProvider, SOURCE_PROVIDERS, 'sourceProvider');
-    requireNonEmptyString(sourceGameRef, 'sourceGameRef');
+    requireNonEmptyString(sourceGameRef, 'sourceGameRef'); // external provider id, not a uuid column
     return repository.resolveOrCreateGame({
       ...ctx, sourceProvider: sourceProvider ?? null, sourceGameRef,
       opponentName: opponentName ?? null, gameDate: gameDate ?? null,
@@ -161,19 +165,47 @@ function createHighSchoolImportService({ repository }) {
   // reinterpret or reshape raw scraped HTML itself, it only maps the pure
   // reconstruction OUTPUT onto this schema's columns.
   //
-  // IMPORTANT, non-obvious inherited convention: reconstructGame buckets
-  // each box-score row via isScoutedRow(row), which is true when
-  // row.is_our_team === false -- the OPPOSITE of what the name might
-  // suggest. This mirrors validate-team-stats.js's own existing usage
-  // (box_scouted_batting: r.scouted.boxBatting, never r.opponent.*), which
-  // this module deliberately matches: hs_game_validation_results is always
-  // populated from result.scouted.* (never result.opponent.*, which has no
-  // meaning in the High School domain -- hs_players/hs_teams model only
-  // one program's own players, never a scouted-opponent roster). Callers
-  // building capturedGame for an HS import must therefore mark the
-  // imported team's OWN batting/pitching rows with is_our_team: false so
-  // they land in the "scouted" bucket this module actually persists.
-  //
+  // ── High School team ownership: adapted, never falsified by the caller ──
+  // reconstructGame buckets each box-score row via isScoutedRow(row), which
+  // is true when row.is_our_team === false -- the OPPOSITE of what the name
+  // suggests, because that travel-ball function's "scouted" bucket means
+  // "the opponent being scouted," not "our own team." Requiring every
+  // caller of THIS module to know and correctly invert that convention
+  // (pass is_our_team: false to mean "this IS the High School team") is
+  // exactly the kind of brittle, easy-to-get-backwards contract that can
+  // silently publish an opponent's totals as the school's own. This module
+  // therefore exposes its OWN, non-inverted public field --
+  // `isHighSchoolTeam: true` on a row means precisely what it says, "this
+  // row belongs to the High School team this import is for" -- and
+  // toReconstructionInput() below is the ONE place, tested in isolation,
+  // that performs the inversion before handing data to reconstructGame.
+  // Every batting/pitching row MUST carry an explicit isHighSchoolTeam
+  // boolean; a row with neither is_our_team nor isHighSchoolTeam set is
+  // rejected rather than silently defaulted to either side.
+  function invertRowOwnershipForReconstruction(row) {
+    if (!row || typeof row !== 'object') return row;
+    if (!Object.prototype.hasOwnProperty.call(row, 'isHighSchoolTeam')) {
+      throw importError('MISSING_TEAM_OWNERSHIP', 'Every boxScore batting/pitching row must carry an explicit isHighSchoolTeam boolean; ownership is never guessed or defaulted', { statusCode: 400 });
+    }
+    const { isHighSchoolTeam, is_our_team, isOurTeam, ...rest } = row;
+    if (typeof isHighSchoolTeam !== 'boolean') {
+      throw importError('MISSING_TEAM_OWNERSHIP', 'isHighSchoolTeam must be a boolean (true for the High School team\'s own row, false for the opponent\'s)', { statusCode: 400 });
+    }
+    void is_our_team;
+    void isOurTeam; // any caller-supplied travel-ball-shaped ownership flag is discarded, never trusted alongside isHighSchoolTeam
+    return { ...rest, is_our_team: !isHighSchoolTeam };
+  }
+
+  function toReconstructionInput(capturedGame) {
+    return {
+      ...capturedGame,
+      boxScore: {
+        batting: (capturedGame?.boxScore?.batting || []).map(invertRowOwnershipForReconstruction),
+        pitching: (capturedGame?.boxScore?.pitching || []).map(invertRowOwnershipForReconstruction),
+      },
+    };
+  }
+
   // scoutedSide/opponentSide are constrained by the schema to exactly
   // 'home'/'away'; reconstructGame's own side detection can legitimately
   // produce null (ambiguous/unknown side) but never anything else, so no
@@ -205,15 +237,16 @@ function createHighSchoolImportService({ repository }) {
   }
 
   async function recordGameValidation({ orgId, importRunId, importRunGameId, hsGameId, teamId, capturedGame }) {
-    requireNonEmptyString(orgId, 'orgId');
-    requireNonEmptyString(importRunId, 'importRunId');
-    requireNonEmptyString(hsGameId, 'hsGameId');
-    requireNonEmptyString(teamId, 'teamId');
+    requireUuid(orgId, 'orgId');
+    requireUuid(importRunId, 'importRunId');
+    requireUuid(hsGameId, 'hsGameId');
+    requireUuid(teamId, 'teamId');
+    const resolvedImportRunGameId = optionalUuid(importRunGameId, 'importRunGameId');
     if (!capturedGame || typeof capturedGame !== 'object') {
       throw importError('INVALID_FIELD', 'capturedGame is required and must be an object', { statusCode: 400, context: { field: 'capturedGame' } });
     }
 
-    const result = reconstructGame(capturedGame);
+    const result = reconstructGame(toReconstructionInput(capturedGame));
     const { confidence, validationStatus } = deriveGameConfidenceAndStatus({
       hasBoxScore: result.hasBoxScore,
       hasPlayByPlay: result.hasPlayByPlay,
@@ -221,7 +254,7 @@ function createHighSchoolImportService({ repository }) {
     });
 
     return repository.insertGameValidationResult({
-      orgId, importRunId, importRunGameId: importRunGameId ?? null, hsGameId, teamId,
+      orgId, importRunId, importRunGameId: resolvedImportRunGameId, hsGameId, teamId,
       hasBoxScore: result.hasBoxScore,
       hasPlayByPlay: result.hasPlayByPlay,
       scoutedSide: sideOrNull(result.scoutedSide),
@@ -250,9 +283,48 @@ function createHighSchoolImportService({ repository }) {
   // `games` must be the actual in-memory captured-game objects, not a
   // caller-precomputed summary -- the aggregate published here is always
   // the direct output of reconstructTeamGames (pure, unmodified), never an
-  // arbitrary caller-supplied number, so "complete, validated aggregate
-  // that meets the existing reconstruction contract" is satisfied
-  // structurally rather than by trusting the caller's math.
+  // arbitrary caller-supplied number.
+  //
+  // ── Publication gate ─────────────────────────────────────────────────
+  // A non-empty games array alone is NOT sufficient to become the current
+  // row -- this domain's own stated philosophy (see game-reconstructor.js's
+  // header: "Box score totals are the official source... Play-by-play is
+  // used for advanced tendencies only when it can be side-attributed and
+  // measured against the box score") is applied here as three explicit,
+  // independently-checked requirements, none of which trust the caller's
+  // own math:
+  //   1. COMPLETE box-score coverage -- every game must have a box score.
+  //      Box score is this domain's required, official data; a total
+  //      published from partial coverage would silently understate a
+  //      real season. (Play-by-play coverage is deliberately NOT required
+  //      here -- a fully box-score-only aggregate is legitimately
+  //      publishable per this domain's own stated philosophy; PBP is
+  //      supplementary validation, not a prerequisite.)
+  //   2. ZERO mismatched games -- any game whose play-by-play reconstruction
+  //      contradicts its own box score blocks the whole publish. A
+  //      "verified" total can never include even one game with an
+  //      admitted, unresolved contradiction.
+  //   3. RESOLVED side attribution wherever play-by-play exists -- a game
+  //      with play-by-play but no confidently-resolved scoutedSide means
+  //      reconstruction could not tell which side's events were even
+  //      being counted; that game's numbers cannot be trusted enough to
+  //      fold into a published total.
+  // Any violation throws BEFORE repository.publishVerifiedTotals is ever
+  // called -- see this module's own tests for proof that a rejected
+  // publish causes zero database mutation.
+  function assertVerifiedTotalsPublishable(summary, gameResults) {
+    if (summary.boxScoreGames !== summary.games) {
+      throw importError('INCOMPLETE_BOX_SCORE_COVERAGE', `Cannot publish verified totals: ${summary.games - summary.boxScoreGames} of ${summary.games} game(s) are missing a box score`, { statusCode: 409 });
+    }
+    if (summary.mismatchGames > 0) {
+      throw importError('UNRESOLVED_MISMATCH', `Cannot publish verified totals: ${summary.mismatchGames} game(s) have an unresolved play-by-play/box-score mismatch`, { statusCode: 409 });
+    }
+    const unresolvedSideGames = (gameResults || []).filter((r) => r.hasPlayByPlay && !sideOrNull(r.scoutedSide));
+    if (unresolvedSideGames.length > 0) {
+      throw importError('UNRESOLVED_SIDE_ATTRIBUTION', `Cannot publish verified totals: ${unresolvedSideGames.length} game(s) have play-by-play but no resolved scouted side`, { statusCode: 409 });
+    }
+  }
+
   async function publishVerifiedTotals({ orgId, programId, teamId, seasonId, importRunId, games }) {
     const ctx = validateImportContext({ orgId, programId, teamId, seasonId: seasonId ?? undefined });
     if (!ctx.seasonId) {
@@ -261,7 +333,8 @@ function createHighSchoolImportService({ repository }) {
     if (!Array.isArray(games) || games.length === 0) {
       throw importError('EMPTY_AGGREGATE', 'publishVerifiedTotals requires at least one captured game', { statusCode: 400 });
     }
-    const { summary } = reconstructTeamGames(teamId, games);
+    const { summary, gameResults } = reconstructTeamGames(teamId, games.map(toReconstructionInput));
+    assertVerifiedTotalsPublishable(summary, gameResults);
     return repository.publishVerifiedTotals({ ...ctx, importRunId: importRunId ?? null, aggregate: summary });
   }
 
@@ -280,9 +353,10 @@ function createHighSchoolImportService({ repository }) {
     if (!hsPlayerId) {
       throw importError('UNRESOLVED_PLAYER', 'publishPlayerAdvancedStats requires an already-resolved hsPlayerId; unresolved players are rejected, not name-matched', { statusCode: 400 });
     }
-    requireNonEmptyString(hsPlayerId, 'hsPlayerId');
-    assertJsonSerializable(stats, 'stats');
-    return repository.publishPlayerAdvancedStats({ ...ctx, importRunId: importRunId ?? null, playerId: hsPlayerId, stats: stats ?? {} });
+    requireUuid(hsPlayerId, 'hsPlayerId');
+    const resolvedImportRunId = optionalUuid(importRunId, 'importRunId');
+    const sanitizedStats = sanitizeJsonPayload(stats ?? {}, 'stats');
+    return repository.publishPlayerAdvancedStats({ ...ctx, importRunId: resolvedImportRunId, playerId: hsPlayerId, stats: sanitizedStats });
   }
 
   async function publishPitcherAdvancedStats({ orgId, programId, teamId, seasonId, importRunId, hsPlayerId, stats }) {
@@ -293,9 +367,10 @@ function createHighSchoolImportService({ repository }) {
     if (!hsPlayerId) {
       throw importError('UNRESOLVED_PLAYER', 'publishPitcherAdvancedStats requires an already-resolved hsPlayerId; unresolved players are rejected, not name-matched', { statusCode: 400 });
     }
-    requireNonEmptyString(hsPlayerId, 'hsPlayerId');
-    assertJsonSerializable(stats, 'stats');
-    return repository.publishPitcherAdvancedStats({ ...ctx, importRunId: importRunId ?? null, playerId: hsPlayerId, stats: stats ?? {} });
+    requireUuid(hsPlayerId, 'hsPlayerId');
+    const resolvedImportRunId = optionalUuid(importRunId, 'importRunId');
+    const sanitizedStats = sanitizeJsonPayload(stats ?? {}, 'stats');
+    return repository.publishPitcherAdvancedStats({ ...ctx, importRunId: resolvedImportRunId, playerId: hsPlayerId, stats: sanitizedStats });
   }
 
   return {
@@ -312,6 +387,9 @@ function createHighSchoolImportService({ repository }) {
     publishPlayerAdvancedStats,
     publishPitcherAdvancedStats,
     deriveGameConfidenceAndStatus,
+    invertRowOwnershipForReconstruction,
+    toReconstructionInput,
+    assertVerifiedTotalsPublishable,
   };
 }
 

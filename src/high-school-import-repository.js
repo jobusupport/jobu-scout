@@ -129,9 +129,36 @@ function createHighSchoolImportRepository(adminClient) {
   // games_processed/succeeded/failed are DERIVED from hs_import_run_games
   // rather than trusted from a caller-supplied number -- see this slice's
   // own instruction not to trust caller-supplied derived counters when
-  // they can be computed safely. A run with zero games processed and zero
-  // failures is 'succeeded' (nothing to fail); any failure alongside at
-  // least one success is 'partial'; every game failing is 'failed'.
+  // they can be computed safely.
+  //
+  // A row counts as TERMINAL only if it has a recorded game_outcome, or a
+  // discovery_status that itself represents a terminal, no-outcome-needed
+  // stop ('skipped'/'rejected'/'failed'). A row still 'discovered' or
+  // 'processing' -- or 'processed' with no game_outcome ever recorded --
+  // is NOT terminal: completion is refused outright while any such row
+  // remains, rather than silently counting it as "processed" and reporting
+  // a falsely-confident 'succeeded' status.
+  //
+  // Every terminal row is classified into exactly one of
+  // succeeded/failed/skipped/rejected (never left uncounted, unlike the
+  // earlier version of this function, which silently excluded
+  // skipped/rejected outcomes from every bucket). The status enum
+  // (hs_import_runs.status) has no distinct "some games were skipped"
+  // value, so skipped/rejected counts alone -- with zero failures -- still
+  // resolve to 'succeeded' (the run itself did not fail); that nuance is
+  // NOT lost, though, because skipped/rejected are still recorded
+  // separately in result_summary for anyone inspecting the run.
+  function classifyRunGame(row) {
+    if (row.game_outcome) {
+      if (row.game_outcome === 'inserted' || row.game_outcome === 'replaced') return 'succeeded';
+      return row.game_outcome; // 'skipped' | 'rejected' | 'failed'
+    }
+    if (row.discovery_status === 'skipped' || row.discovery_status === 'rejected' || row.discovery_status === 'failed') {
+      return row.discovery_status;
+    }
+    return null; // not yet terminal
+  }
+
   async function completeImportRun({ orgId, importRunId }) {
     const { data: runGames, error: readError } = await adminClient
       .from('hs_import_run_games')
@@ -141,10 +168,21 @@ function createHighSchoolImportRepository(adminClient) {
     if (readError) throw persistenceFailed('hs_import_run_games', readError);
 
     const rows = runGames || [];
-    const failed = rows.filter((r) => r.discovery_status === 'failed' || r.game_outcome === 'failed').length;
-    const succeeded = rows.filter((r) => r.game_outcome === 'inserted' || r.game_outcome === 'replaced').length;
+    const stillPending = rows.filter((r) => classifyRunGame(r) === null);
+    if (stillPending.length > 0) {
+      throw importError(
+        'RUN_NOT_READY_TO_COMPLETE',
+        `Cannot complete run: ${stillPending.length} of ${rows.length} game(s) are still ${[...new Set(stillPending.map((r) => r.discovery_status))].join('/')} with no recorded outcome`,
+        { statusCode: 409, retryable: true, context: { table: 'hs_import_run_games' } }
+      );
+    }
+
+    const succeeded = rows.filter((r) => classifyRunGame(r) === 'succeeded').length;
+    const failed = rows.filter((r) => classifyRunGame(r) === 'failed').length;
+    const skipped = rows.filter((r) => classifyRunGame(r) === 'skipped').length;
+    const rejected = rows.filter((r) => classifyRunGame(r) === 'rejected').length;
     const processed = rows.length;
-    const status = processed === 0 || failed === 0 ? 'succeeded' : succeeded === 0 ? 'failed' : 'partial';
+    const status = failed === 0 ? 'succeeded' : succeeded === 0 ? 'failed' : 'partial';
 
     const { data, error } = await adminClient
       .from('hs_import_runs')
@@ -154,7 +192,7 @@ function createHighSchoolImportRepository(adminClient) {
         games_processed: processed,
         games_succeeded: succeeded,
         games_failed: failed,
-        result_summary: { processed, succeeded, failed },
+        result_summary: { processed, succeeded, failed, skipped, rejected },
       })
       .eq('org_id', orgId)
       .eq('id', importRunId)
@@ -399,6 +437,22 @@ function createHighSchoolImportRepository(adminClient) {
   // publish_hs_verified_totals-shaped RPC) that this slice is explicitly
   // NOT authorized to add. See this repository's PR description for the
   // recommendation to build one in a later slice.
+  //
+  // ── Concurrent publisher detection ───────────────────────────────────
+  // Step (2)'s update filters by BOTH id AND is_current=true, and its
+  // result is inspected for exactly one affected row -- not just "no
+  // error". A plain `.eq('id', existingCurrent.id)` update (the earlier
+  // version of this function) would report success even if a CONCURRENT
+  // publish had already superseded (or otherwise altered) that exact row
+  // between step (1)'s select and step (2)'s update: an UPDATE matching
+  // zero rows is not a Postgres error, so that race would have gone
+  // completely undetected, and this function would have proceeded to
+  // insert a second row that (depending on timing) could either violate
+  // the current-row unique index against the competing publisher's own
+  // new row, or -- worse -- silently create a state this function had no
+  // way to reason about. Detecting the race explicitly (rather than
+  // silently succeeding or producing a misleading error) is the most this
+  // module can do without the same atomic RPC referenced above.
   async function publishCurrentRow({ table, currentLookup, newRow }) {
     let query = adminClient.from(table).select('id').eq('is_current', true);
     for (const [column, value] of Object.entries(currentLookup)) query = query.eq(column, value);
@@ -406,11 +460,21 @@ function createHighSchoolImportRepository(adminClient) {
     if (selectError) throw persistenceFailed(table, selectError);
 
     if (existingCurrent) {
-      const { error: supersedeError } = await adminClient
+      const { data: supersededRows, error: supersedeError } = await adminClient
         .from(table)
         .update({ is_current: false, superseded_at: new Date().toISOString() })
-        .eq('id', existingCurrent.id);
+        .eq('id', existingCurrent.id)
+        .eq('is_current', true)
+        .select('id');
       if (supersedeError) throw persistenceFailed(table, supersedeError);
+      const supersededCount = Array.isArray(supersededRows) ? supersededRows.length : 0;
+      if (supersededCount !== 1) {
+        throw importError(
+          'CONCURRENT_PUBLICATION_CONFLICT',
+          `Another publish altered the current row in ${table} between lookup and update; retry the publish`,
+          { statusCode: 409, retryable: true, context: { table } }
+        );
+      }
     }
 
     const { data: inserted, error: insertError } = await adminClient
