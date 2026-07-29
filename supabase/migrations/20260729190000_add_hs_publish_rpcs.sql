@@ -87,10 +87,13 @@
 -- already rejects, client-side, BEFORE the repository call: incomplete
 -- box-score coverage, any mismatched game, and unresolved side
 -- attribution. This function independently re-derives the first two of
--- those three directly from the same aggregate numbers being persisted
--- (p_games/p_box_score_games/p_mismatch_games are hs_verified_totals'
--- own columns) so a client-side bug or a direct RPC caller cannot publish
--- a total that contradicts its own persisted coverage numbers. The third
+-- those three directly from the same aggregate numbers being persisted.
+-- The persisted counts also retain summarizeTeamValidation's authoritative
+-- partition: box-score/play-by-play counts are subsets of games, while
+-- validated and mismatched games are the two exhaustive play-by-play
+-- outcomes (validated_games + mismatch_games = play_by_play_games). This
+-- lets the database reject impossible aggregates independently of the
+-- application. The third
 -- check (resolved side attribution) is NOT re-derived here: it depends on
 -- hs_game_validation_results rows keyed by hs_game_id, which this
 -- function's parameters (a team-season AGGREGATE, not a list of games)
@@ -163,6 +166,30 @@ begin
   end if;
   if p_games < 0 or p_box_score_games < 0 or p_play_by_play_games < 0 or p_validated_games < 0 or p_mismatch_games < 0 then
     raise exception 'game counts must be non-negative' using errcode = '22003';
+  end if;
+  -- summarizeTeamValidation derives each coverage count from the same
+  -- gameResults array. Check those caller-controlled relationships before
+  -- taking any row lock or performing any publication mutation.
+  if p_box_score_games > p_games then
+    raise exception 'invalid_verified_totals_counts: box_score_games (%) cannot exceed games (%)', p_box_score_games, p_games using errcode = 'P0001';
+  end if;
+  if p_play_by_play_games > p_games then
+    raise exception 'invalid_verified_totals_counts: play_by_play_games (%) cannot exceed games (%)', p_play_by_play_games, p_games using errcode = 'P0001';
+  end if;
+  if p_validated_games > p_games then
+    raise exception 'invalid_verified_totals_counts: validated_games (%) cannot exceed games (%)', p_validated_games, p_games using errcode = 'P0001';
+  end if;
+  if p_mismatch_games > p_games then
+    raise exception 'invalid_verified_totals_counts: mismatch_games (%) cannot exceed games (%)', p_mismatch_games, p_games using errcode = 'P0001';
+  end if;
+  if p_validated_games > p_play_by_play_games then
+    raise exception 'invalid_verified_totals_counts: validated_games (%) cannot exceed play_by_play_games (%)', p_validated_games, p_play_by_play_games using errcode = 'P0001';
+  end if;
+  if p_mismatch_games > p_play_by_play_games then
+    raise exception 'invalid_verified_totals_counts: mismatch_games (%) cannot exceed play_by_play_games (%)', p_mismatch_games, p_play_by_play_games using errcode = 'P0001';
+  end if;
+  if p_validated_games + p_mismatch_games <> p_play_by_play_games then
+    raise exception 'invalid_verified_totals_counts: validated_games (%) plus mismatch_games (%) must equal play_by_play_games (%)', p_validated_games, p_mismatch_games, p_play_by_play_games using errcode = 'P0001';
   end if;
   if p_confidence is null or p_confidence not in ('low', 'medium', 'high') then
     raise exception 'confidence must be one of low/medium/high' using errcode = '22023';

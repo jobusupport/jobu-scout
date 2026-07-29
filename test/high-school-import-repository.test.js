@@ -503,6 +503,54 @@ test('publishVerifiedTotals propagates an RPC failure as a thrown error and leav
   assert.equal(rows[0].superseded_at, null);
 });
 
+test('the fake publishing RPC rejects every impossible verified-totals count relationship without superseding the current row', async () => {
+  const invalidAggregates = [
+    { games: 1, boxScoreGames: 1, playByPlayGames: 2, validatedGames: 2, mismatchGames: 0 },
+    { games: 1, boxScoreGames: 1, playByPlayGames: 1, validatedGames: 2, mismatchGames: 0 },
+    { games: 1, boxScoreGames: 1, playByPlayGames: 1, validatedGames: 0, mismatchGames: 2 },
+    { games: 2, boxScoreGames: 2, playByPlayGames: 2, validatedGames: 1, mismatchGames: 0 },
+  ];
+
+  for (const aggregate of invalidAggregates) {
+    const { repo, client } = setup();
+    const before = await repo.publishVerifiedTotals({
+      ...ctxA(), importRunId: null,
+      aggregate: {
+        games: 1, boxScoreGames: 1, playByPlayGames: 0, validatedGames: 0, mismatchGames: 0,
+        officialBatting: { hits: 7 }, warnings: ['prior'], confidence: 'low',
+      },
+    });
+
+    await assert.rejects(
+      () => repo.publishVerifiedTotals({ ...ctxA(), importRunId: null, aggregate: { ...aggregate, confidence: 'low' } }),
+      (err) => { assert.equal(err.code, 'INVALID_VERIFIED_TOTALS_COUNTS'); return true; }
+    );
+
+    const rows = client.__getRows('hs_verified_totals');
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].id, before.id);
+    assert.equal(rows[0].is_current, true);
+    assert.equal(rows[0].superseded_at, null);
+    assert.equal(rows[0].games, 1);
+    assert.deepEqual(rows[0].batting_official, { hits: 7 });
+    assert.deepEqual(rows[0].warnings, ['prior']);
+  }
+});
+
+test('the fake publishing RPC accepts covered counts at the games boundary when the play-by-play partition is complete', async () => {
+  const { repo } = setup();
+  const row = await repo.publishVerifiedTotals({
+    ...ctxA(), importRunId: null,
+    aggregate: {
+      games: 3, boxScoreGames: 3, playByPlayGames: 3, validatedGames: 3, mismatchGames: 0,
+      confidence: 'high',
+    },
+  });
+  assert.equal(row.games, 3);
+  assert.equal(row.play_by_play_games, 3);
+  assert.equal(row.validated_games, 3);
+});
+
 // The RPC-specific error-message prefixes this repository maps to typed
 // codes (see PUBLISH_RPC_ERRORS in src/high-school-import-repository.js)
 // propagate with their documented code and retryable flag, exactly as

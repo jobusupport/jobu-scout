@@ -199,6 +199,34 @@ function unknownStatFieldError(key) {
   return { code: 'P0001', message: `unknown_stat_field: ${key} is not a recognized field` };
 }
 
+function invalidVerifiedTotalsCountsError(message) {
+  return { code: 'P0001', message: `invalid_verified_totals_counts: ${message}` };
+}
+
+function validateVerifiedTotalsCounts(params) {
+  const games = params.p_games;
+  const box = params.p_box_score_games;
+  const pbp = params.p_play_by_play_games;
+  const validated = params.p_validated_games;
+  const mismatch = params.p_mismatch_games;
+  if (box > games) return invalidVerifiedTotalsCountsError(`box_score_games (${box}) cannot exceed games (${games})`);
+  if (pbp > games) return invalidVerifiedTotalsCountsError(`play_by_play_games (${pbp}) cannot exceed games (${games})`);
+  if (validated > games) return invalidVerifiedTotalsCountsError(`validated_games (${validated}) cannot exceed games (${games})`);
+  if (mismatch > games) return invalidVerifiedTotalsCountsError(`mismatch_games (${mismatch}) cannot exceed games (${games})`);
+  if (validated > pbp) return invalidVerifiedTotalsCountsError(`validated_games (${validated}) cannot exceed play_by_play_games (${pbp})`);
+  if (mismatch > pbp) return invalidVerifiedTotalsCountsError(`mismatch_games (${mismatch}) cannot exceed play_by_play_games (${pbp})`);
+  if (validated + mismatch !== pbp) {
+    return invalidVerifiedTotalsCountsError(`validated_games (${validated}) plus mismatch_games (${mismatch}) must equal play_by_play_games (${pbp})`);
+  }
+  if (box !== games) {
+    return { code: 'P0001', message: `incomplete_box_score_coverage: ${games - box} of ${games} game(s) missing a box score` };
+  }
+  if (mismatch > 0) {
+    return { code: 'P0001', message: `unresolved_mismatch: ${mismatch} game(s) have an unresolved play-by-play/box-score mismatch` };
+  }
+  return null;
+}
+
 function buildPublishNewRow(table, params, nowIso) {
   if (table === 'hs_verified_totals') {
     return {
@@ -246,6 +274,11 @@ function buildPublishNewRow(table, params, nowIso) {
 function executePublishRpc(state, rpcName, params) {
   const table = PUBLISH_RPC_TABLE[rpcName];
   if (!table) return { data: null, error: { message: `fake client: unknown rpc "${rpcName}"` } };
+
+  if (table === 'hs_verified_totals') {
+    const countError = validateVerifiedTotalsCounts(params);
+    if (countError) return { data: null, error: countError };
+  }
 
   if (table === 'hs_player_advanced_stats' || table === 'hs_pitcher_advanced_stats') {
     const allowed = table === 'hs_player_advanced_stats' ? PLAYER_STAT_ALLOWED_COLUMNS : PITCHER_STAT_ALLOWED_COLUMNS;

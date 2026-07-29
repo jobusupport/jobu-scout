@@ -326,6 +326,93 @@ test('publishVerifiedTotals rejects any unresolved mismatch even if called direc
   );
 });
 
+async function assertInvalidVerifiedCountsLeaveCurrentUntouched(overrides, messagePattern) {
+  const priorAggregate = {
+    games: 4, boxScoreGames: 4, playByPlayGames: 2, validatedGames: 2, mismatchGames: 0,
+    officialBatting: { hits: 17 }, officialPitching: { strikeouts: 9 },
+    reconstructedBatting: { hits: 17 }, reconstructedPitchingDefense: { wildPitches: 1 },
+    tendencies: { direction: 'pull' }, warnings: ['prior row sentinel'], confidence: 'high',
+  };
+  const before = await repo.publishVerifiedTotals({
+    orgId: orgAId, programId: programAId, teamId: teamAId, seasonId: seasonAId, importRunId: null,
+    aggregate: priorAggregate,
+  });
+  const { data: rowsBefore, error: beforeError } = await adminClient.from('hs_verified_totals')
+    .select('*').eq('team_id', teamAId).eq('season_id', seasonAId);
+  assert.equal(beforeError, null);
+
+  await assert.rejects(
+    () => repo.publishVerifiedTotals({
+      orgId: orgAId, programId: programAId, teamId: teamAId, seasonId: seasonAId, importRunId: null,
+      aggregate: { ...priorAggregate, ...overrides },
+    }),
+    (err) => {
+      assert.equal(err.code, 'INVALID_VERIFIED_TOTALS_COUNTS');
+      assert.match(err.message, messagePattern);
+      return true;
+    }
+  );
+
+  const { data: rowsAfter, error: afterError } = await adminClient.from('hs_verified_totals')
+    .select('*').eq('team_id', teamAId).eq('season_id', seasonAId);
+  assert.equal(afterError, null);
+  assert.equal(rowsAfter.length, rowsBefore.length, 'a rejected aggregate must not insert a replacement');
+  const current = rowsAfter.filter((row) => row.is_current);
+  assert.equal(current.length, 1);
+  assert.equal(current[0].id, before.id);
+  assert.equal(current[0].superseded_at, null);
+  for (const column of [
+    'games', 'box_score_games', 'play_by_play_games', 'validated_games', 'mismatch_games',
+    'batting_official', 'pitching_official', 'batting_reconstructed',
+    'pitching_reconstructed', 'tendencies', 'warnings', 'confidence',
+  ]) {
+    assert.deepEqual(current[0][column], before[column], `${column} must remain unchanged`);
+  }
+}
+
+test('publishVerifiedTotals rejects play_by_play_games above games before mutation', { skip }, async () => {
+  await assertInvalidVerifiedCountsLeaveCurrentUntouched(
+    { games: 1, boxScoreGames: 1, playByPlayGames: 2, validatedGames: 2, mismatchGames: 0 },
+    /play_by_play_games \(2\) cannot exceed games \(1\)/
+  );
+});
+
+test('publishVerifiedTotals rejects validated_games above games before mutation', { skip }, async () => {
+  await assertInvalidVerifiedCountsLeaveCurrentUntouched(
+    { games: 1, boxScoreGames: 1, playByPlayGames: 1, validatedGames: 2, mismatchGames: 0 },
+    /validated_games \(2\) cannot exceed games \(1\)/
+  );
+});
+
+test('publishVerifiedTotals independently rejects mismatch_games above games before the zero-mismatch gate', { skip }, async () => {
+  await assertInvalidVerifiedCountsLeaveCurrentUntouched(
+    { games: 1, boxScoreGames: 1, playByPlayGames: 1, validatedGames: 0, mismatchGames: 2 },
+    /mismatch_games \(2\) cannot exceed games \(1\)/
+  );
+});
+
+test('publishVerifiedTotals rejects an incomplete validated/mismatched play-by-play partition before mutation', { skip }, async () => {
+  await assertInvalidVerifiedCountsLeaveCurrentUntouched(
+    { games: 3, boxScoreGames: 3, playByPlayGames: 2, validatedGames: 1, mismatchGames: 0 },
+    /validated_games \(1\) plus mismatch_games \(0\) must equal play_by_play_games \(2\)/
+  );
+});
+
+test('publishVerifiedTotals accepts all coverage counts at the games boundary when every play-by-play game validates', { skip }, async () => {
+  const row = await repo.publishVerifiedTotals({
+    orgId: orgAId, programId: programAId, teamId: teamAId, seasonId: seasonAId, importRunId: null,
+    aggregate: {
+      games: 3, boxScoreGames: 3, playByPlayGames: 3, validatedGames: 3, mismatchGames: 0,
+      confidence: 'high',
+    },
+  });
+  assert.equal(row.games, 3);
+  assert.equal(row.box_score_games, 3);
+  assert.equal(row.play_by_play_games, 3);
+  assert.equal(row.validated_games, 3);
+  assert.equal(row.mismatch_games, 0);
+});
+
 test('publishPlayerAdvancedStats rejects a stats blob containing a reserved/unknown field', { skip }, async () => {
   await assert.rejects(
     () => repo.publishPlayerAdvancedStats({

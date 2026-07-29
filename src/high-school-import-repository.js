@@ -454,6 +454,7 @@ function createHighSchoolImportRepository(adminClient) {
     { prefix: 'import_run_not_found_for_org_team', code: 'IMPORT_RUN_NOT_FOUND_FOR_ORG_TEAM', statusCode: 404 },
     { prefix: 'incomplete_box_score_coverage', code: 'INCOMPLETE_BOX_SCORE_COVERAGE', statusCode: 409 },
     { prefix: 'unresolved_mismatch', code: 'UNRESOLVED_MISMATCH', statusCode: 409 },
+    { prefix: 'invalid_verified_totals_counts', code: 'INVALID_VERIFIED_TOTALS_COUNTS', statusCode: 409 },
     { prefix: 'invalid_import_run_state', code: 'INVALID_IMPORT_RUN_STATE', statusCode: 409 },
     { prefix: 'stale_import_run_publication', code: 'STALE_IMPORT_RUN_PUBLICATION', statusCode: 409 },
     { prefix: 'unknown_stat_field', code: 'UNKNOWN_STAT_FIELD', statusCode: 400 },
