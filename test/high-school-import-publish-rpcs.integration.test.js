@@ -320,7 +320,7 @@ test('publishVerifiedTotals rejects any unresolved mismatch even if called direc
   await assert.rejects(
     () => repo.publishVerifiedTotals({
       orgId: orgAId, programId: programAId, teamId: teamAId, seasonId: seasonAId, importRunId: null,
-      aggregate: { games: 2, boxScoreGames: 2, playByPlayGames: 1, validatedGames: 1, mismatchGames: 1, confidence: 'medium' },
+      aggregate: { games: 2, boxScoreGames: 2, playByPlayGames: 2, validatedGames: 1, mismatchGames: 1, confidence: 'medium' },
     }),
     (err) => { assert.equal(err.code, 'UNRESOLVED_MISMATCH'); return true; }
   );
