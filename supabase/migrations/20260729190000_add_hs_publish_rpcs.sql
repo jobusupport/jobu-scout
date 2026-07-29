@@ -64,12 +64,12 @@
 -- is therefore enforced two ways: (1) only the trusted Express layer can
 -- call this function at all, and (2) even so, EVERY id this function
 -- receives (team_id, season_id, player_id, import_run_id) is independently
--- re-verified below to actually belong to p_org_id/p_program_id via a
--- locked, schema-qualified lookup -- never assumed correct merely because
--- it was passed in. A caller (correct or buggy) cannot use p_org_id to
--- publish into another organization's team/season/player/run, because
--- every one of those parent rows must independently match p_org_id or the
--- call raises P0002 before any write.
+-- re-verified below via locked, schema-qualified lookups -- never assumed
+-- correct merely because it was passed in. In particular, an import run
+-- must match the complete caller-supplied organization/program/team/season
+-- hierarchy. A caller (correct or buggy) cannot attach a run from another
+-- hierarchy to a publication because every parent row must match before
+-- any write or the call raises P0002.
 --
 -- ── SECURITY DEFINER hardening ───────────────────────────────────────────
 -- SET search_path = '' + fully schema-qualified references (public.*)
@@ -198,7 +198,11 @@ begin
   if p_import_run_id is not null then
     select * into v_run
       from public.hs_import_runs
-     where id = p_import_run_id and org_id = p_org_id and team_id = p_team_id
+     where id = p_import_run_id
+       and org_id = p_org_id
+       and program_id = p_program_id
+       and team_id = p_team_id
+       and season_id = p_season_id
      for update;
     if not found then
       raise exception 'import_run_not_found_for_org_team: %', p_import_run_id using errcode = 'P0002';
@@ -338,7 +342,11 @@ begin
   if p_import_run_id is not null then
     select * into v_run
       from public.hs_import_runs
-     where id = p_import_run_id and org_id = p_org_id and team_id = p_team_id
+     where id = p_import_run_id
+       and org_id = p_org_id
+       and program_id = p_program_id
+       and team_id = p_team_id
+       and season_id = p_season_id
      for update;
     if not found then
       raise exception 'import_run_not_found_for_org_team: %', p_import_run_id using errcode = 'P0002';
@@ -486,7 +494,11 @@ begin
   if p_import_run_id is not null then
     select * into v_run
       from public.hs_import_runs
-     where id = p_import_run_id and org_id = p_org_id and team_id = p_team_id
+     where id = p_import_run_id
+       and org_id = p_org_id
+       and program_id = p_program_id
+       and team_id = p_team_id
+       and season_id = p_season_id
      for update;
     if not found then
       raise exception 'import_run_not_found_for_org_team: %', p_import_run_id using errcode = 'P0002';

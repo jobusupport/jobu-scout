@@ -56,7 +56,7 @@ const skip = pointsAtProduction
 
 let adminClient;
 let repo;
-let orgAId, orgBId, programAId, programBId, seasonAId, teamAId, teamBId, playerAId, runAId, runBId;
+let orgAId, orgBId, programAId, programBId, programOtherId, seasonAId, seasonBId, teamAId, teamBId, playerAId, runAId, runBId;
 
 if (canRun) {
   const { createClient } = require('@supabase/supabase-js');
@@ -90,13 +90,15 @@ test.before(async () => {
   };
   programAId = await program(orgAId, 'a');
   programBId = await program(orgBId, 'b');
+  programOtherId = await program(orgAId, 'other');
 
-  const season = async (orgId, programId) => {
-    const { data, error } = await adminClient.from('hs_seasons').insert({ org_id: orgId, program_id: programId, name: `Season ${suffix}`, school_year: '2025-2026' }).select('id').single();
+  const season = async (orgId, programId, label, schoolYear) => {
+    const { data, error } = await adminClient.from('hs_seasons').insert({ org_id: orgId, program_id: programId, name: `Season ${label} ${suffix}`, school_year: schoolYear }).select('id').single();
     assert.equal(error, null, error?.message);
     return data.id;
   };
-  seasonAId = await season(orgAId, programAId);
+  seasonAId = await season(orgAId, programAId, 'a', '2025-2026');
+  seasonBId = await season(orgAId, programAId, 'b', '2026-2027');
 
   const team = async (orgId, programId, label) => {
     const { data, error } = await adminClient.from('hs_teams').insert({ org_id: orgId, program_id: programId, level: 'varsity', name: `Team ${label} ${suffix}` }).select('id').single();
@@ -206,6 +208,120 @@ test('publishVerifiedTotals rejects an import run belonging to a different team/
     );
   } finally {
     await adminClient.from('hs_import_runs').delete().eq('id', otherRun.id);
+  }
+});
+
+test('publishVerifiedTotals rejects a running import run from another season without changing the current row', { skip }, async () => {
+  const before = await repo.publishVerifiedTotals({
+    orgId: orgAId, programId: programAId, teamId: teamAId, seasonId: seasonBId, importRunId: null,
+    aggregate: { games: 4, boxScoreGames: 4, playByPlayGames: 0, validatedGames: 0, mismatchGames: 0, confidence: 'low' },
+  });
+
+  await assert.rejects(
+    () => repo.publishVerifiedTotals({
+      orgId: orgAId, programId: programAId, teamId: teamAId, seasonId: seasonBId, importRunId: runAId,
+      aggregate: { games: 9, boxScoreGames: 9, playByPlayGames: 0, validatedGames: 0, mismatchGames: 0, confidence: 'high' },
+    }),
+    (err) => { assert.equal(err.code, 'IMPORT_RUN_NOT_FOUND_FOR_ORG_TEAM'); return true; }
+  );
+
+  const { data: rows, error } = await adminClient.from('hs_verified_totals')
+    .select('id, is_current, superseded_at, games, confidence')
+    .eq('team_id', teamAId).eq('season_id', seasonBId);
+  assert.equal(error, null);
+  assert.equal(rows.length, 1, 'a rejected cross-season publish must not insert a replacement');
+  assert.equal(rows[0].id, before.id);
+  assert.equal(rows[0].is_current, true);
+  assert.equal(rows[0].superseded_at, null);
+  assert.equal(rows[0].games, 4);
+  assert.equal(rows[0].confidence, 'low');
+});
+
+test('publishPlayerAdvancedStats rejects a running import run from another season without changing the current row', { skip }, async () => {
+  const before = await repo.publishPlayerAdvancedStats({
+    orgId: orgAId, programId: programAId, teamId: teamAId, seasonId: seasonBId, importRunId: null,
+    playerId: playerAId, stats: { games: 6, gb: 2 },
+  });
+
+  await assert.rejects(
+    () => repo.publishPlayerAdvancedStats({
+      orgId: orgAId, programId: programAId, teamId: teamAId, seasonId: seasonBId, importRunId: runAId,
+      playerId: playerAId, stats: { games: 10, gb: 8 },
+    }),
+    (err) => { assert.equal(err.code, 'IMPORT_RUN_NOT_FOUND_FOR_ORG_TEAM'); return true; }
+  );
+
+  const { data: rows, error } = await adminClient.from('hs_player_advanced_stats')
+    .select('id, is_current, superseded_at, games, gb')
+    .eq('player_id', playerAId).eq('team_id', teamAId).eq('season_id', seasonBId);
+  assert.equal(error, null);
+  assert.equal(rows.length, 1, 'a rejected cross-season publish must not insert a replacement');
+  assert.equal(rows[0].id, before.id);
+  assert.equal(rows[0].is_current, true);
+  assert.equal(rows[0].superseded_at, null);
+  assert.equal(rows[0].games, 6);
+  assert.equal(rows[0].gb, 2);
+});
+
+test('publishPitcherAdvancedStats rejects a running import run from another season without changing the current row', { skip }, async () => {
+  const before = await repo.publishPitcherAdvancedStats({
+    orgId: orgAId, programId: programAId, teamId: teamAId, seasonId: seasonBId, importRunId: null,
+    playerId: playerAId, stats: { games: 3, strikes: 21 },
+  });
+
+  await assert.rejects(
+    () => repo.publishPitcherAdvancedStats({
+      orgId: orgAId, programId: programAId, teamId: teamAId, seasonId: seasonBId, importRunId: runAId,
+      playerId: playerAId, stats: { games: 8, strikes: 55 },
+    }),
+    (err) => { assert.equal(err.code, 'IMPORT_RUN_NOT_FOUND_FOR_ORG_TEAM'); return true; }
+  );
+
+  const { data: rows, error } = await adminClient.from('hs_pitcher_advanced_stats')
+    .select('id, is_current, superseded_at, games, strikes')
+    .eq('player_id', playerAId).eq('team_id', teamAId).eq('season_id', seasonBId);
+  assert.equal(error, null);
+  assert.equal(rows.length, 1, 'a rejected cross-season publish must not insert a replacement');
+  assert.equal(rows[0].id, before.id);
+  assert.equal(rows[0].is_current, true);
+  assert.equal(rows[0].superseded_at, null);
+  assert.equal(rows[0].games, 3);
+  assert.equal(rows[0].strikes, 21);
+});
+
+test('publishVerifiedTotals rejects a same-organization import run from another program without changing the current row', { skip }, async () => {
+  const { data: otherProgramRun, error: runError } = await adminClient.from('hs_import_runs').insert({
+    org_id: orgAId, program_id: programOtherId, team_id: teamAId, season_id: seasonAId,
+    source_provider: 'gamechanger', trigger_kind: 'manual', status: 'running', started_at: new Date().toISOString(),
+  }).select('id').single();
+  assert.equal(runError, null);
+
+  const before = await repo.publishVerifiedTotals({
+    orgId: orgAId, programId: programAId, teamId: teamAId, seasonId: seasonAId, importRunId: null,
+    aggregate: { games: 5, boxScoreGames: 5, playByPlayGames: 0, validatedGames: 0, mismatchGames: 0, confidence: 'medium' },
+  });
+
+  try {
+    await assert.rejects(
+      () => repo.publishVerifiedTotals({
+        orgId: orgAId, programId: programAId, teamId: teamAId, seasonId: seasonAId, importRunId: otherProgramRun.id,
+        aggregate: { games: 11, boxScoreGames: 11, playByPlayGames: 0, validatedGames: 0, mismatchGames: 0, confidence: 'high' },
+      }),
+      (err) => { assert.equal(err.code, 'IMPORT_RUN_NOT_FOUND_FOR_ORG_TEAM'); return true; }
+    );
+
+    const { data: rows, error } = await adminClient.from('hs_verified_totals')
+      .select('id, is_current, superseded_at, games, confidence')
+      .eq('team_id', teamAId).eq('season_id', seasonAId).eq('is_current', true);
+    assert.equal(error, null);
+    assert.equal(rows.length, 1, 'a rejected cross-program publish must not insert a replacement');
+    assert.equal(rows[0].id, before.id);
+    assert.equal(rows[0].is_current, true);
+    assert.equal(rows[0].superseded_at, null);
+    assert.equal(rows[0].games, 5);
+    assert.equal(rows[0].confidence, 'medium');
+  } finally {
+    await adminClient.from('hs_import_runs').delete().eq('id', otherProgramRun.id);
   }
 });
 
