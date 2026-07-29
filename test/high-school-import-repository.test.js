@@ -434,15 +434,21 @@ test('publishPlayerAdvancedStats supersedes the prior current row for the same (
   assert.equal(rows.find((r) => r.id === first.id).is_current, false);
 });
 
-test('publishPlayerAdvancedStats strips reserved/identity columns out of a caller-supplied stats blob rather than letting them override hierarchy context', async () => {
+// Slice 1A.1: the RPC now REJECTS a reserved/identity key inside the stats
+// blob outright (UNKNOWN_STAT_FIELD) rather than Slice 1A's own JS-level
+// silent-strip -- see src/high-school-import-repository.js's
+// publishPlayerAdvancedStats comment for why an explicit rejection is
+// preferable to a caller never finding out their org_id/is_current/
+// player_id override was silently discarded.
+test('publishPlayerAdvancedStats rejects a stats blob containing a reserved/identity key rather than silently stripping it', async () => {
   const { repo } = setup();
-  const row = await repo.publishPlayerAdvancedStats({
-    ...ctxA(), importRunId: RUN_1, playerId: PLAYER_1,
-    stats: { games: 3, org_id: 'attacker-org', is_current: false, player_id: 'someone-else' },
-  });
-  assert.equal(row.org_id, ORG_A);
-  assert.equal(row.player_id, PLAYER_1);
-  assert.equal(row.is_current, true);
+  await assert.rejects(
+    () => repo.publishPlayerAdvancedStats({
+      ...ctxA(), importRunId: RUN_1, playerId: PLAYER_1,
+      stats: { games: 3, org_id: 'attacker-org', is_current: false, player_id: 'someone-else' },
+    }),
+    (err) => { assert.equal(err.code, 'UNKNOWN_STAT_FIELD'); return true; }
+  );
 });
 
 test('publishPitcherAdvancedStats follows the same current/superseded and hierarchy rules as player stats', async () => {
@@ -455,87 +461,117 @@ test('publishPitcherAdvancedStats follows the same current/superseded and hierar
   assert.equal(currentRows[0].id, second.id);
 });
 
-// ── documented non-atomicity of the supersede-then-insert sequence ───────
-
-test('publishVerifiedTotals surfaces a distinct, documented error (not a silent success) if the insert step fails AFTER the old row was already superseded', async () => {
-  const { repo, client } = setup();
-  await repo.publishVerifiedTotals({ ...ctxA(), importRunId: null, aggregate: { games: 1, boxScoreGames: 1, playByPlayGames: 0, validatedGames: 0, mismatchGames: 0, confidence: 'low' } });
-
-  // Let select/update through untouched (so the supersede step genuinely
-  // succeeds) but force the immediately-following INSERT on this table to
-  // fail -- simulating "the insert step fails for any reason after the
-  // supersede step already succeeded" without disturbing any other table.
-  const originalFrom = client.from.bind(client);
-  client.from = (table) => {
-    const builder = originalFrom(table);
-    if (table === 'hs_verified_totals') {
-      const originalThen = builder.then.bind(builder);
-      builder.then = (resolve, reject) => {
-        if (builder.operation === 'insert') {
-          return Promise.resolve({ data: null, error: { message: 'simulated insert failure' } }).then(resolve, reject);
-        }
-        return originalThen(resolve, reject);
-      };
-    }
-    return builder;
-  };
-
-  await assert.rejects(
-    () => repo.publishVerifiedTotals({ ...ctxA(), importRunId: null, aggregate: { games: 2, boxScoreGames: 2, playByPlayGames: 0, validatedGames: 0, mismatchGames: 0, confidence: 'low' } }),
-    (err) => {
-      assert.equal(err.code, 'CURRENT_ROW_SUPERSESSION_INCOMPLETE');
-      assert.equal(err.retryable, true);
-      return true;
-    }
-  );
-
-  // The prior row (from the FIRST publish above) is indeed already superseded --
-  // this proves the gap is real and left visible, not hidden.
-  const afterRows = client.__getRows('hs_verified_totals').filter((r) => r.team_id === TEAM_A && r.season_id === SEASON_A);
-  assert.equal(afterRows.filter((r) => r.is_current).length, 0, 'no current row exists for this identity after the failed replacement -- the documented gap');
-});
-
-// A concurrent publisher altering the "current" row between this
-// function's own select and its own update must be DETECTED, not silently
-// treated as if the demotion succeeded (a Postgres UPDATE matching zero
-// rows is not an error -- only checking the affected-row count catches
-// this). __mutateRow simulates the concurrent write landing in that exact
-// window, which a single-threaded JS test cannot otherwise produce.
-test('publishVerifiedTotals detects a concurrent publisher that already altered the current row, rather than silently proceeding', async () => {
+// ── Slice 1A.1: atomic publish via RPC (was "documented non-atomicity") ──
+//
+// Slice 1A's own repository made a THREE-call sequence (select, update,
+// insert) and could only document -- never close -- the gap where an
+// insert failure after a successful supersede left zero current rows.
+// Slice 1A.1 (supabase/migrations/20260729190000_add_hs_publish_rpcs.sql)
+// replaces that sequence with a single `adminClient.rpc(...)` call, so
+// there is no longer a client-visible partial state to simulate via
+// `.from()` monkey-patching -- proving true transactional rollback (a bad
+// row leaving the database completely unchanged) requires a real Postgres
+// transaction, which this fake cannot fabricate. That proof lives in
+// test/high-school-import-publish-rpcs.integration.test.js (real Supabase
+// preview branch). What THIS fake-client-level test proves instead is the
+// repository's own contract: an RPC failure of any kind propagates as a
+// thrown, typed error, and the fake's in-memory state (which never
+// diverges mid-call, since `executePublishRpc` runs synchronously
+// start-to-finish with no await in the middle) is left with the prior
+// current row intact.
+test('publishVerifiedTotals propagates an RPC failure as a thrown error and leaves the prior current row untouched', async () => {
   const { repo, client } = setup();
   const first = await repo.publishVerifiedTotals({ ...ctxA(), importRunId: null, aggregate: { games: 1, boxScoreGames: 1, playByPlayGames: 0, validatedGames: 0, mismatchGames: 0, confidence: 'low' } });
 
-  const originalFrom = client.from.bind(client);
-  client.from = (table) => {
-    const builder = originalFrom(table);
-    if (table === 'hs_verified_totals') {
-      const originalThen = builder.then.bind(builder);
-      builder.then = (resolve, reject) => {
-        const wasSelect = builder.operation === 'select';
-        // originalThen computes the REAL select result first (correctly
-        // finding `first` as current); only once that has resolved does
-        // the "concurrent" publisher supersede it -- landing exactly in
-        // the window between our own select and our own subsequent update.
-        return originalThen((result) => {
-          if (wasSelect) {
-            client.__mutateRow('hs_verified_totals', first.id, { is_current: false, superseded_at: new Date().toISOString() });
-          }
-          return resolve ? resolve(result) : result;
-        }, reject);
-      };
+  const originalRpc = client.rpc.bind(client);
+  client.rpc = (name, params) => {
+    if (name === 'publish_hs_verified_totals') {
+      return Promise.resolve({ data: null, error: { message: 'simulated_rpc_failure: forced for this test' } });
     }
-    return builder;
+    return originalRpc(name, params);
   };
 
   await assert.rejects(
     () => repo.publishVerifiedTotals({ ...ctxA(), importRunId: null, aggregate: { games: 2, boxScoreGames: 2, playByPlayGames: 0, validatedGames: 0, mismatchGames: 0, confidence: 'low' } }),
-    (err) => { assert.equal(err.code, 'CONCURRENT_PUBLICATION_CONFLICT'); assert.equal(err.retryable, true); return true; }
+    (err) => { assert.equal(err.code, 'PERSISTENCE_FAILED'); return true; }
   );
 
-  // No second current row was inserted despite the race -- the conflict
-  // was detected and stopped, not silently worked around.
-  const currentRows = client.__getRows('hs_verified_totals').filter((r) => r.is_current);
-  assert.equal(currentRows.length, 0);
+  const rows = client.__getRows('hs_verified_totals').filter((r) => r.team_id === TEAM_A && r.season_id === SEASON_A);
+  assert.equal(rows.length, 1, 'no new row was inserted');
+  assert.equal(rows[0].id, first.id);
+  assert.equal(rows[0].is_current, true, 'the prior current row must remain current -- an RPC failure never partially supersedes it');
+  assert.equal(rows[0].superseded_at, null);
+});
+
+test('the fake publishing RPC rejects every impossible verified-totals count relationship without superseding the current row', async () => {
+  const invalidAggregates = [
+    { games: 1, boxScoreGames: 1, playByPlayGames: 2, validatedGames: 2, mismatchGames: 0 },
+    { games: 1, boxScoreGames: 1, playByPlayGames: 1, validatedGames: 2, mismatchGames: 0 },
+    { games: 1, boxScoreGames: 1, playByPlayGames: 1, validatedGames: 0, mismatchGames: 2 },
+    { games: 2, boxScoreGames: 2, playByPlayGames: 2, validatedGames: 1, mismatchGames: 0 },
+  ];
+
+  for (const aggregate of invalidAggregates) {
+    const { repo, client } = setup();
+    const before = await repo.publishVerifiedTotals({
+      ...ctxA(), importRunId: null,
+      aggregate: {
+        games: 1, boxScoreGames: 1, playByPlayGames: 0, validatedGames: 0, mismatchGames: 0,
+        officialBatting: { hits: 7 }, warnings: ['prior'], confidence: 'low',
+      },
+    });
+
+    await assert.rejects(
+      () => repo.publishVerifiedTotals({ ...ctxA(), importRunId: null, aggregate: { ...aggregate, confidence: 'low' } }),
+      (err) => { assert.equal(err.code, 'INVALID_VERIFIED_TOTALS_COUNTS'); return true; }
+    );
+
+    const rows = client.__getRows('hs_verified_totals');
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].id, before.id);
+    assert.equal(rows[0].is_current, true);
+    assert.equal(rows[0].superseded_at, null);
+    assert.equal(rows[0].games, 1);
+    assert.deepEqual(rows[0].batting_official, { hits: 7 });
+    assert.deepEqual(rows[0].warnings, ['prior']);
+  }
+});
+
+test('the fake publishing RPC accepts covered counts at the games boundary when the play-by-play partition is complete', async () => {
+  const { repo } = setup();
+  const row = await repo.publishVerifiedTotals({
+    ...ctxA(), importRunId: null,
+    aggregate: {
+      games: 3, boxScoreGames: 3, playByPlayGames: 3, validatedGames: 3, mismatchGames: 0,
+      confidence: 'high',
+    },
+  });
+  assert.equal(row.games, 3);
+  assert.equal(row.play_by_play_games, 3);
+  assert.equal(row.validated_games, 3);
+});
+
+// The RPC-specific error-message prefixes this repository maps to typed
+// codes (see PUBLISH_RPC_ERRORS in src/high-school-import-repository.js)
+// propagate with their documented code and retryable flag, exactly as
+// Slice 1A's own CONCURRENT_PUBLICATION_CONFLICT did -- proving the
+// mapping itself, not the underlying database race (which this fake
+// cannot produce; see the real, disposable-Postgres integration test for
+// that).
+test('a concurrent_publication_conflict-prefixed RPC error is surfaced as the documented, retryable CONCURRENT_PUBLICATION_CONFLICT code', async () => {
+  const { repo, client } = setup();
+  const originalRpc = client.rpc.bind(client);
+  client.rpc = (name, params) => {
+    if (name === 'publish_hs_verified_totals') {
+      return Promise.resolve({ data: null, error: { message: 'concurrent_publication_conflict: could not supersede the current row for team x/season y' } });
+    }
+    return originalRpc(name, params);
+  };
+
+  await assert.rejects(
+    () => repo.publishVerifiedTotals({ ...ctxA(), importRunId: null, aggregate: { games: 1, boxScoreGames: 1, playByPlayGames: 0, validatedGames: 0, mismatchGames: 0, confidence: 'low' } }),
+    (err) => { assert.equal(err.code, 'CONCURRENT_PUBLICATION_CONFLICT'); assert.equal(err.retryable, true); return true; }
+  );
 });
 
 // ── item 23: repository failures propagate, never silently succeed ───────
