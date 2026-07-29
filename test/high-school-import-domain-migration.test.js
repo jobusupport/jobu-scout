@@ -473,8 +473,25 @@ test('the migration contains no HTTP/browser-automation call of any kind', () =>
 });
 
 // ── 20. No application/route/UI/importer implementation is included ─────
+//
+// This check was written for the Slice 0B PR itself ("schema-only,
+// nothing references these tables yet") and was true of that PR's own
+// diff. Slice 1A (a separate, later, explicitly authorized PR) adds
+// exactly the High School importer persistence layer this migration's own
+// header comment always said was future work -- so "nothing ever
+// references these tables" is no longer the right invariant to hold
+// forever. What Slice 0B's own scope boundary actually cared about --
+// "only the importer persistence layer touches these tables; no UI, no
+// unrelated route, no other module" -- still holds and is still checked
+// below, now scoped to the three files Slice 1A's own PR describes as its
+// entire application-code surface.
+const SLICE_1A_PERSISTENCE_FILES = [
+  path.join('src', 'high-school-import-service.js'),
+  path.join('src', 'high-school-import-repository.js'),
+  path.join('src', 'high-school-import-sanitizer.js'),
+];
 
-test('no source or UI file references the new tables (schema-only slice)', () => {
+test('no source or UI file OTHER THAN the Slice 1A importer persistence layer references the new tables', () => {
   const searchDirs = ['src', 'dashboard'];
   const forbiddenPattern = new RegExp(NEW_TABLES.join('|'));
   for (const dir of searchDirs) {
@@ -490,11 +507,13 @@ test('no source or UI file references the new tables (schema-only slice)', () =>
       return matches;
     };
     for (const filePath of walk(dirPath)) {
+      const relativePath = path.relative(REPO_ROOT, filePath);
+      if (SLICE_1A_PERSISTENCE_FILES.includes(relativePath)) continue;
       const contents = fs.readFileSync(filePath, 'utf8');
       assert.doesNotMatch(
         contents,
         forbiddenPattern,
-        `expected no application/UI reference to Slice 0B tables in ${path.relative(REPO_ROOT, filePath)}`
+        `expected no application/UI reference to Slice 0B tables outside the Slice 1A persistence layer in ${relativePath}`
       );
     }
   }
