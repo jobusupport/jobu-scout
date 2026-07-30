@@ -519,7 +519,7 @@ test('no source or UI file OTHER THAN the Slice 1A importer persistence layer re
   }
 });
 
-// ── Importer ownership contract (repo-wide, call-shape based) ───────────
+// ── Importer ownership contract (repo-wide, indirection-resistant) ──────
 //
 // The check above proves its own, narrower claim: no file in src/ or
 // dashboard/ OTHER THAN the three listed persistence files even mentions
@@ -532,17 +532,28 @@ test('no source or UI file OTHER THAN the Slice 1A importer persistence layer re
 // comment mentions hs_verified_totals in passing" -- so it is both too
 // narrow in scope and too blunt in what it actually proves.
 //
-// This test supplements (does not replace) the one above with a clearer,
-// two-part ownership contract: walk EVERY .js/.html file in the repo
-// (excluding node_modules, .git, coverage, supabase/, and this project's
-// own test/ directory, none of which are application code that could
-// write to these tables), and assert that a WRITE-shaped call
-// (`.from('hs_<table>')` immediately followed, anywhere in the same
-// statement chain, by `.insert(`/`.update(`/`.upsert(`/`.delete(`, or the
-// three publish RPC names) appears only inside the same three Slice 1A
-// persistence files. This is what "only the importer persistence layer
-// writes to these tables" actually means, expressed directly as a write-
-// call-shape predicate rather than inferred from a blanket string ban.
+// An EARLIER version of this test tried to fix blind spot (2) directly, by
+// matching a literal `.from('hs_<table>')` immediately followed by
+// `.insert(`/`.update(`/`.upsert(`/`.delete(`. That is trivially
+// bypassable: a variable table name (`const t = 'hs_games'; .from(t)`), a
+// helper function taking `table` as a parameter, a template-literal table
+// name, or bracket-notation (`adminClient['from'](...)`) all evade a regex
+// anchored on a literal quoted string directly inside `.from(...)`, and
+// `adminClient` is already legitimately imported in several other files
+// (high-school-api.js, admin-api.js, ...) so the ingredients for exactly
+// that bypass already exist elsewhere in this repo.
+//
+// The fix: stop trying to prove "this is specifically a WRITE call" via
+// call-shape matching (a text scan cannot reliably tell a literal from an
+// aliased reference once indirection is allowed) and instead go back to
+// the strictly stronger property blind spot (1) already established works
+// -- a plain, repo-wide, no-adjacency-required mention of the table/RPC
+// name -- since every bypass above (variable assignment, helper call site,
+// template literal, bracket notation) still leaves the literal
+// table/RPC-name STRING somewhere in the file as plain text. This is the
+// same tradeoff (and same low false-positive risk, given how distinctive
+// these identifiers are) the existing, already-accepted src/dashboard-only
+// check above has always made -- just widened to the whole repository.
 const REPO_WIDE_EXCLUDED_DIRS = new Set(['node_modules', '.git', 'coverage', 'supabase', 'test', '.claude']);
 
 function walkRepoJsAndHtmlFiles(dir) {
@@ -564,19 +575,18 @@ const HS_IMPORT_RPC_NAMES = [
   'publish_hs_pitcher_advanced_stats',
 ];
 
-test('no file anywhere in the repository (outside the Slice 1A persistence layer) makes a write-shaped call against a High School import table or its publish RPCs', () => {
-  const fromWritePattern = new RegExp(
-    `\\.from\\(\\s*['"](${NEW_TABLES.join('|')})['"]\\s*\\)[^;]{0,200}?\\.(insert|update|upsert|delete)\\s*\\(`,
-    's'
-  );
-  const rpcPattern = new RegExp(`\\.rpc\\(\\s*['"](${HS_IMPORT_RPC_NAMES.join('|')})['"]`);
+test('no file anywhere in the repository (outside the Slice 1A persistence layer) references a High School import table or its publish RPCs, by any name, alias, or indirection', () => {
+  const forbiddenPattern = new RegExp(NEW_TABLES.concat(HS_IMPORT_RPC_NAMES).join('|'));
 
   for (const filePath of walkRepoJsAndHtmlFiles(REPO_ROOT)) {
     const relativePath = path.relative(REPO_ROOT, filePath);
     if (SLICE_1A_PERSISTENCE_FILES.includes(relativePath)) continue;
     const contents = fs.readFileSync(filePath, 'utf8');
-    assert.doesNotMatch(contents, fromWritePattern, `expected no write-shaped .from(...).insert/update/upsert/delete(...) call against a Slice 1A table outside the persistence layer in ${relativePath}`);
-    assert.doesNotMatch(contents, rpcPattern, `expected no direct .rpc(...) call to a Slice 1A publish RPC outside the persistence layer in ${relativePath}`);
+    assert.doesNotMatch(
+      contents,
+      forbiddenPattern,
+      `expected no reference (literal, aliased, template-literal, or bracket-notation) to a Slice 1A table or publish RPC outside the persistence layer in ${relativePath}`
+    );
   }
 });
 
