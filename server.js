@@ -46,6 +46,7 @@ const express   = require('express');
 const path      = require('path');
 const fs        = require('fs');
 const { spawn } = require('child_process');
+const { createJobRecord, findJobForOrg } = require('./src/job-store');
 let SQLiteDatabase = null;
 
 // ── Stripe ───────────────────────────────────────────────────────────────────
@@ -132,12 +133,9 @@ app.get(['/travel', '/travel/*splat', '/high-school', '/high-school/*splat'], (r
 
 // ── Job store ───────────────────────────────────────────────────────────────
 const jobs = {};
-let jobSeq = 1;
 
-function createJob(label) {
-  const id = String(jobSeq++);
-  jobs[id] = { id, label, status: 'running', logs: [], startedAt: Date.now(), pid: null, proc: null };
-  return id;
+function createJob(label, orgId, createdByUserId = null) {
+  return createJobRecord(jobs, label, orgId, { createdByUserId });
 }
 function appendLog(id, line) {
   if (jobs[id]) jobs[id].logs.push({ t: Date.now(), line });
@@ -657,6 +655,23 @@ async function requireTravelAccess(req, res, next) {
     return sendResolverError(res, err, 'requireTravelAccess');
   }
   return requireTravelProductAccess(req, res, next);
+}
+
+// Object-level authorization for the process-local Travel job store. This
+// deliberately returns the same 404 for missing, malformed/unowned, and
+// foreign-organization jobs so job IDs cannot be used for tenant discovery.
+// It must run after authentication, support-session resolution (where the
+// client supports that header), and the Travel entitlement gate.
+async function requireJobOwnership(req, res, next) {
+  try {
+    const orgId = await getRequestOrgId(req);
+    const job = findJobForOrg(jobs, req.params.id, orgId);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    req.job = job;
+    next();
+  } catch (err) {
+    return sendResolverError(res, err, 'requireJobOwnership');
+  }
 }
 
 app.use('/api/admin', createAdminRouter({ requireAuth }));
@@ -1277,9 +1292,8 @@ app.get('/api/teams/:id/summary', requireAuth, resolveSupportSession, requireTra
 
 app.get('/api/reports', requireAuth, resolveSupportSession, requireTravelAccess, (req, res) => res.json(getReports()));
 
-app.get('/api/jobs/:id', requireAuth, resolveSupportSession, requireTravelAccess, (req, res) => {
-  const job = jobs[req.params.id];
-  if (!job) return res.status(404).json({ error: 'Job not found' });
+app.get('/api/jobs/:id', requireAuth, resolveSupportSession, requireTravelAccess, requireJobOwnership, (req, res) => {
+  const job = req.job;
   res.json({ ...job, proc: undefined }); // don't serialize proc
 });
 
@@ -1304,9 +1318,8 @@ async function requireStreamAuth(req, res, next) {
   next();
 }
 
-app.get('/api/jobs/:id/stream', requireStreamAuth, requireTravelAccess, async (req, res) => {
-  const job = jobs[req.params.id];
-  if (!job) return res.status(404).end();
+app.get('/api/jobs/:id/stream', requireStreamAuth, requireTravelAccess, requireJobOwnership, async (req, res) => {
+  const job = req.job;
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
@@ -1324,9 +1337,8 @@ app.get('/api/jobs/:id/stream', requireStreamAuth, requireTravelAccess, async (r
 });
 
 // POST /api/jobs/:id/stop
-app.post('/api/jobs/:id/stop', requireAuth, resolveSupportSession, requireTravelAccess, (req, res) => {
-  const job = jobs[req.params.id];
-  if (!job) return res.status(404).json({ error: 'Job not found' });
+app.post('/api/jobs/:id/stop', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, requireJobOwnership, (req, res) => {
+  const job = req.job;
   if (job.status !== 'running') return res.json({ ok: true, message: 'Job already finished' });
 
   job.stopping = true;
@@ -1349,7 +1361,7 @@ app.post('/api/run/gc-scraper', requireAuth, resolveSupportSession, requireTrave
   await assertOrgActive(req);
   const team = (await getTeams(req)).find(t => t.id == req.body.teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
-  const id = createJob(`PSG Analysis — ${team.team_name}`);
+  const id = createJob(`PSG Analysis — ${team.team_name}`, await getRequestOrgId(req), req.user?.id);
   appendLog(id, `Starting PSG analysis for: ${team.team_name}`);
   if (!team.gc_team_url && await hasGameUrls(team.id)) {
     appendLog(id, `No team URL — analyzing via individual game URLs`);
@@ -1368,7 +1380,7 @@ app.post('/api/run/pg-scraper', requireAuth, resolveSupportSession, requireTrave
   await assertOrgActive(req);
   const team = (await getTeams(req)).find(t => t.id == req.body.teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
-  const id = createJob(`PSP Analysis — ${team.team_name}`);
+  const id = createJob(`PSP Analysis — ${team.team_name}`, await getRequestOrgId(req), req.user?.id);
   appendLog(id, `Starting PSP analysis for: ${team.team_name}`);
   spawnJob(id, 'node', ['perfectgame-scraper.js', team.pg_team_url || '', team.team_name],
     path.join(ROOT, 'perfectgame-scraper'));
@@ -1380,7 +1392,7 @@ app.post('/api/run/reingest', requireAuth, resolveSupportSession, requireTravelA
   await assertOrgActive(req);
   const team  = req.body.teamId ? (await getTeams(req)).find(t => t.id == req.body.teamId) : null;
   const label = team ? `Reingest — ${team.team_name}` : 'Reingest — All Teams';
-  const id    = createJob(label);
+  const id    = createJob(label, await getRequestOrgId(req), req.user?.id);
   appendLog(id, label);
   spawnJob(id, 'node', team ? ['reingest-games.js', team.team_name] : ['reingest-games.js', '--all'], ROOT);
   res.json({ jobId: id });
@@ -1415,7 +1427,7 @@ app.post('/api/run/report', requireAuth, resolveSupportSession, requireTravelAcc
   } catch (err) {
     return sendResolverError(res, err, 'api/run/report');
   }
-  const id = createJob(title);
+  const id = createJob(title, await getRequestOrgId(req), req.user?.id);
   appendLog(id, `Generating scouting report for: ${team.team_name}`);
   if (req.body.gameLocation) appendLog(id, `Game location: ${req.body.gameLocation}`);
   if (req.body.gameTime)     appendLog(id, `Game time: ${req.body.gameTime}`);
@@ -1434,7 +1446,7 @@ app.post('/api/run/self-scout', requireAuth, resolveSupportSession, requireTrave
   } catch (err) {
     return sendResolverError(res, err, 'api/run/self-scout');
   }
-  const id = createJob('Self-Scout Report');
+  const id = createJob('Self-Scout Report', await getRequestOrgId(req), req.user?.id);
   appendLog(id, 'Generating self-scout report for our own team');
   const env = { ...buildReportContextEnv({ ...req.body, gameScope: 'self' }), ...buildUsageEnv(req, quota) };
   if (req.body.ourTeamId) env.OUR_TEAM_ID = req.body.ourTeamId;
@@ -1454,7 +1466,7 @@ app.post('/api/run/matchup', requireAuth, resolveSupportSession, requireTravelAc
   } catch (err) {
     return sendResolverError(res, err, 'api/run/matchup');
   }
-  const id = createJob(`Matchup — ${team.team_name}`);
+  const id = createJob(`Matchup — ${team.team_name}`, await getRequestOrgId(req), req.user?.id);
   appendLog(id, `Generating matchup report: our team vs ${team.team_name}`);
   const env = { ...buildReportContextEnv({ ...req.body, gameScope: 'matchup' }), ...buildUsageEnv(req, quota) };
   if (req.body.ourTeamId) env.OUR_TEAM_ID = req.body.ourTeamId;
@@ -1473,7 +1485,7 @@ app.post('/api/run/full-pipeline', requireAuth, resolveSupportSession, requireTr
   } catch (err) {
     return sendResolverError(res, err, 'api/run/full-pipeline');
   }
-  const id      = createJob(`Full Pipeline — ${team.team_name}`);
+  const id      = createJob(`Full Pipeline — ${team.team_name}`, await getRequestOrgId(req), req.user?.id);
   const pgRoot  = path.join(ROOT, 'perfectgame-scraper');
   const noGC    = !team.gc_team_url && await hasGameUrls(team.id);
   const runStep = makeRunStep(id);
@@ -1514,7 +1526,7 @@ app.post('/api/run/all-gc', requireAuth, resolveSupportSession, requireTravelAcc
   const teamsWithUrlFlags = await Promise.all(allTeams.map(async t => ({ ...t, _hasGameUrls: await hasGameUrls(t.id) })));
   const teams   = teamsWithUrlFlags.filter(t => t.gc_team_url || t._hasGameUrls);
   if (!teams.length) return res.status(400).json({ error: 'No teams with GC URLs or game URLs' });
-  const id      = createJob(`PSG Analysis — All (${teams.length} teams)`);
+  const id      = createJob(`PSG Analysis — All (${teams.length} teams)`, await getRequestOrgId(req), req.user?.id);
   const runStep = makeRunStep(id);
   appendLog(id, `Queuing PSG analysis for ${teams.length} team(s)...`);
   (async () => {
@@ -1547,7 +1559,7 @@ app.post('/api/run/all-pg', requireAuth, resolveSupportSession, requireTravelAcc
   await assertOrgActive(req);
   const teams   = (await getTeams(req)).filter(t => t.pg_team_url);
   if (!teams.length) return res.status(400).json({ error: 'No teams with PG URLs' });
-  const id      = createJob(`PSP Analysis — All (${teams.length} teams)`);
+  const id      = createJob(`PSP Analysis — All (${teams.length} teams)`, await getRequestOrgId(req), req.user?.id);
   const pgRoot  = path.join(ROOT, 'perfectgame-scraper');
   const runStep = makeRunStep(id);
   appendLog(id, `Queuing PSP analysis for ${teams.length} team(s)...`);
@@ -1573,7 +1585,7 @@ app.post('/api/run/all-pg', requireAuth, resolveSupportSession, requireTravelAcc
 app.post('/api/run/all-reports', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   const teams   = (await getTeams(req)).filter(t => t.game_count > 0);
   if (!teams.length) return res.status(400).json({ error: 'No teams with game data' });
-  const id      = createJob(`Reports All (${teams.length} teams)`);
+  const id      = createJob(`Reports All (${teams.length} teams)`, await getRequestOrgId(req), req.user?.id);
   const runStep = makeRunStep(id);
   appendLog(id, `Generating reports for ${teams.length} team(s)...`);
   (async () => {

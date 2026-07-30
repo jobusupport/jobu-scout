@@ -239,7 +239,31 @@ test('the SSE job-stream route authenticates via a mandatory token before requir
 test('POST /api/jobs/:id/stop now requires authentication (it previously had none at all)', () => {
   const stopLine = serverLines.find((l) => l.includes("app.post('/api/jobs/:id/stop'"));
   assert.ok(stopLine, 'expected to find the job-stop route registration');
-  assert.match(stopLine, /requireAuth,\s*resolveSupportSession,\s*requireTravelAccess/);
+  assert.match(
+    stopLine,
+    /requireAuth,\s*resolveSupportSession,\s*requireTravelAccess,\s*blockWriteDuringReadOnlySupport,\s*requireJobOwnership/
+  );
+});
+
+test('every externally reachable job operation uses the canonical ownership guard', () => {
+  for (const signature of [
+    "app.get('/api/jobs/:id'",
+    "app.get('/api/jobs/:id/stream'",
+    "app.post('/api/jobs/:id/stop'",
+  ]) {
+    const line = serverLines.find((candidate) => candidate.includes(signature));
+    assert.ok(line, `expected to find ${signature}`);
+    assert.match(line, /requireJobOwnership/);
+  }
+});
+
+test('every run route binds new jobs to the authoritative request organization', () => {
+  const creationLines = serverLines.filter((line) => line.includes('createJob(') && !line.includes('function createJob'));
+  assert.equal(creationLines.length, 10);
+  for (const line of creationLines) {
+    assert.match(line, /await getRequestOrgId\(req\)/);
+    assert.doesNotMatch(line, /req\.(body|query|params|headers).*org/i);
+  }
 });
 
 // ── Canonical reuse, not a competing algorithm ───────────────────────────
