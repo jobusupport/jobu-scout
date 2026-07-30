@@ -1,7 +1,7 @@
 'use strict';
 
 // Database-free, always-executing tests proving every Travel-specific
-// authenticated API route in server.js is protected by the new
+// authenticated API route in server.js and the extracted job-route module is protected by the new
 // requireTravelAccess guard, that no shared/High-School/admin/public route
 // was accidentally gated, and that a future route added to server.js
 // without an explicit classification below fails this suite loudly rather
@@ -10,10 +10,11 @@
 // server.js is not `require`d here -- it unconditionally calls app.listen()
 // and performs other real startup side effects at module load (see
 // test/product-aware-routing.test.js's own header for the same reasoning).
-// These are text-level assertions against the route registrations
+// These are supplemental text-level assertions against the route registrations
 // themselves, the established convention this repo already uses for
 // exactly this class of check (test/product-aware-routing.test.js,
-// test/admin-api-product-route-wiring.test.js). Live accept/deny behavior
+// test/admin-api-product-route-wiring.test.js). Actual Express behavior is
+// covered by test/travel-job-routes.test.js. Live entitlement behavior
 // against a real database is covered, gated by default, in
 // test/travel-api-entitlement-gates.integration.test.js -- mirroring how
 // test/api-product-capabilities.test.js and
@@ -27,8 +28,11 @@ const fs = require('fs');
 const path = require('path');
 
 const SERVER_PATH = path.join(__dirname, '..', 'server.js');
+const JOB_ROUTES_PATH = path.join(__dirname, '..', 'src', 'travel-job-routes.js');
 const serverSrc = fs.readFileSync(SERVER_PATH, 'utf8');
 const serverLines = serverSrc.split('\n');
+const jobRoutesSrc = fs.readFileSync(JOB_ROUTES_PATH, 'utf8');
+const jobRouteLines = jobRoutesSrc.split('\n');
 
 // ── Route inventory ──────────────────────────────────────────────────────
 //
@@ -43,11 +47,13 @@ const ROUTE_LINE_RE = /^app\.(get|post|put|patch|delete)\((?:\[[^\]]*\]|'([^']+)
 
 function findRouteRegistrations() {
   const routes = [];
-  for (let i = 0; i < serverLines.length; i++) {
-    const line = serverLines[i];
-    const match = line.match(/^app\.(get|post|put|patch|delete)\(/);
-    if (!match) continue;
-    routes.push({ line, lineNumber: i + 1, method: match[1] });
+  for (const [file, lines] of [['server.js', serverLines], ['src/travel-job-routes.js', jobRouteLines]]) {
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const match = line.match(/^\s*app\.(get|post|put|patch|delete)\(/);
+      if (!match) continue;
+      routes.push({ line: line.trim(), file, lineNumber: i + 1, method: match[1] });
+    }
   }
   return routes;
 }
@@ -106,6 +112,7 @@ const CLASSIFICATION = {
   "app.get('/api/teams/:id/summary'": 'travel',
   "app.get('/api/reports'": 'travel',
   "app.get('/api/jobs/:id'": 'travel',
+  "app.post('/api/jobs/:id/stream-credential'": 'travel',
   "app.get('/api/jobs/:id/stream'": 'travel',
   "app.post('/api/jobs/:id/stop'": 'travel',
   "app.post('/api/run/gc-scraper'": 'travel',
@@ -142,7 +149,7 @@ function classify(line) {
   return null;
 }
 
-test('route inventory: every app.<method>(...) registration in server.js has an explicit classification', () => {
+test('route inventory: every server and extracted job route has an explicit classification', () => {
   const routes = findRouteRegistrations();
   assert.ok(routes.length > 30, 'sanity check: expected to find a substantial number of route registrations');
 
@@ -151,7 +158,7 @@ test('route inventory: every app.<method>(...) registration in server.js has an 
     .filter((r) => r.classification === null);
 
   assert.deepEqual(
-    unclassified.map((r) => `line ${r.lineNumber}: ${r.line.slice(0, 80)}`),
+    unclassified.map((r) => `${r.file}:${r.lineNumber}: ${r.line.slice(0, 80)}`),
     [],
     'a route was added to server.js with no explicit travel/exempt classification in this test file -- classify it above before merging'
   );
@@ -160,7 +167,7 @@ test('route inventory: every app.<method>(...) registration in server.js has an 
 test('route inventory: every route classified "travel" is gated by requireTravelAccess', () => {
   const routes = findRouteRegistrations();
   const travelRoutes = routes.filter((r) => classify(r.line) === 'travel');
-  assert.ok(travelRoutes.length >= 25, 'sanity check: expected at least 25 Travel-classified routes');
+  assert.equal(travelRoutes.length, 32);
 
   const missingGate = travelRoutes.filter((r) => !r.line.includes('requireTravelAccess'));
   assert.deepEqual(
@@ -220,24 +227,24 @@ test('every Travel mutation route runs requireTravelAccess before blockWriteDuri
   }
 });
 
-test('the SSE job-stream route authenticates via a mandatory token before requireTravelAccess (no more optional/bypassable auth)', () => {
-  const streamLine = serverLines.find((l) => l.includes("app.get('/api/jobs/:id/stream'"));
+test('the SSE job-stream route resolves support after stream authentication and before Travel access', () => {
+  const streamLine = jobRouteLines.find((l) => l.includes("app.get('/api/jobs/:id/stream'"));
   assert.ok(streamLine, 'expected to find the job-stream route registration');
-  assert.match(streamLine, /requireStreamAuth,\s*requireTravelAccess/);
+  assert.match(streamLine, /requireStreamAuth,\s*resolveSupportSession,\s*requireTravelAccess,\s*requireJobOwnership/);
 
   // The old pattern made the token check conditional on the token being
   // present at all (`if (token && adminClient)`), so omitting the query
   // param entirely bypassed authentication. Confirm that shape is gone from
   // requireStreamAuth's own definition.
-  const defStart = serverSrc.indexOf('async function requireStreamAuth');
+  const defStart = jobRoutesSrc.indexOf('function requireStreamAuth');
   assert.ok(defStart >= 0, 'expected to find requireStreamAuth\'s definition');
-  const defSrc = serverSrc.slice(defStart, defStart + 700);
-  assert.doesNotMatch(defSrc, /if \(token && adminClient\)/);
-  assert.match(defSrc, /if \(!token \|\| !adminClient\)/);
+  const defSrc = jobRoutesSrc.slice(defStart, defStart + 600);
+  assert.match(defSrc, /streamCredentials\.resolve\(req\.query\.stream_token, req\.params\.id\)/);
+  assert.doesNotMatch(defSrc, /adminClient|req\.query\.(?:org|supported_org)/);
 });
 
 test('POST /api/jobs/:id/stop now requires authentication (it previously had none at all)', () => {
-  const stopLine = serverLines.find((l) => l.includes("app.post('/api/jobs/:id/stop'"));
+  const stopLine = jobRouteLines.find((l) => l.includes("app.post('/api/jobs/:id/stop'"));
   assert.ok(stopLine, 'expected to find the job-stop route registration');
   assert.match(
     stopLine,
@@ -251,7 +258,7 @@ test('every externally reachable job operation uses the canonical ownership guar
     "app.get('/api/jobs/:id/stream'",
     "app.post('/api/jobs/:id/stop'",
   ]) {
-    const line = serverLines.find((candidate) => candidate.includes(signature));
+    const line = jobRouteLines.find((candidate) => candidate.includes(signature));
     assert.ok(line, `expected to find ${signature}`);
     assert.match(line, /requireJobOwnership/);
   }
@@ -262,8 +269,20 @@ test('every run route binds new jobs to the authoritative request organization',
   assert.equal(creationLines.length, 10);
   for (const line of creationLines) {
     assert.match(line, /await getRequestOrgId\(req\)/);
+    assert.match(line, /req\.user\?\.id/);
     assert.doesNotMatch(line, /req\.(body|query|params|headers).*org/i);
   }
+});
+
+test('the browser requests a short-lived stream credential and never puts the Supabase access token in EventSource URLs', () => {
+  const dashboardSrc = fs.readFileSync(path.join(__dirname, '..', 'dashboard', 'index.html'), 'utf8');
+  const match = dashboardSrc.match(/<script type="__bundler\/template">\s*([\s\S]*?)\s*<\/script>/);
+  assert.ok(match, 'expected the bundled dashboard template');
+  const template = JSON.parse(match[1]);
+  assert.match(template, /POST|method: 'POST'/);
+  assert.match(template, /\/stream-credential/);
+  assert.match(template, /stream\?stream_token=/);
+  assert.doesNotMatch(template, /stream\?token=/);
 });
 
 // ── Canonical reuse, not a competing algorithm ───────────────────────────

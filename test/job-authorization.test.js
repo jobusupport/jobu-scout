@@ -4,30 +4,71 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createJobRecord, findJobForOrg } = require('../src/job-store');
 
+const CREATOR_ID = 'abcdefab-cdef-4abc-8def-abcdefabcdef';
+
 function createFixture(orgId = 'org-a', extra = {}) {
   const jobs = {};
-  const id = createJobRecord(jobs, 'Travel job', orgId, extra);
+  const id = createJobRecord(jobs, 'Travel job', orgId, {
+    createdByUserId: CREATOR_ID,
+    ...extra,
+  });
   return { jobs, id, job: jobs[id] };
 }
 
-test('job creation binds the authoritative organization and creator', () => {
-  const { job } = createFixture('org-a', { createdByUserId: 'user-1' });
+test('job creation binds authoritative organization and creator metadata', () => {
+  const { job } = createFixture('org-a');
   assert.equal(job.org_id, 'org-a');
-  assert.equal(job.created_by_user_id, 'user-1');
+  assert.equal(job.created_by_user_id, CREATOR_ID);
+  for (const property of ['org_id', 'created_by_user_id']) {
+    assert.deepEqual(Object.getOwnPropertyDescriptor(job, property), {
+      value: property === 'org_id' ? 'org-a' : CREATOR_ID,
+      enumerable: true,
+      writable: false,
+      configurable: false,
+    });
+  }
 });
 
-test('job ownership is immutable through lifecycle updates', () => {
+test('job ownership and creator metadata resist assignment, deletion, and redefinition', () => {
   const { job } = createFixture();
   assert.throws(() => { job.org_id = 'org-b'; }, TypeError);
+  assert.throws(() => { job.created_by_user_id = '22222222-2222-4222-8222-222222222222'; }, TypeError);
+  assert.throws(() => { delete job.org_id; }, TypeError);
+  assert.throws(() => { delete job.created_by_user_id; }, TypeError);
+  assert.throws(() => Object.defineProperty(job, 'org_id', { value: 'org-b' }), TypeError);
+  assert.throws(
+    () => Object.defineProperty(job, 'created_by_user_id', {
+      value: '22222222-2222-4222-8222-222222222222',
+    }),
+    TypeError
+  );
+  assert.equal(job.org_id, 'org-a');
+  assert.equal(job.created_by_user_id, CREATOR_ID);
+});
+
+test('job ownership metadata survives progress, completion, failure, and stop-style updates', () => {
+  const { job } = createFixture();
   job.logs.push({ line: 'progress' });
   job.status = 'done';
   job.finishedAt = Date.now();
+  job.error = 'failure';
+  job.stopping = true;
   assert.equal(job.org_id, 'org-a');
+  assert.equal(job.created_by_user_id, CREATOR_ID);
 });
 
 test('job creation rejects missing or malformed organization ownership', () => {
   for (const orgId of [null, undefined, '', '   ', 42]) {
     assert.throws(() => createJobRecord({}, 'Travel job', orgId), /determine the organization/);
+  }
+});
+
+test('job creation rejects missing, malformed, or ambiguous authoritative creator identity', () => {
+  for (const creatorId of [null, undefined, '', '   ', 42, {}, 'user-1']) {
+    assert.throws(
+      () => createJobRecord({}, 'Travel job', 'org-a', { createdByUserId: creatorId }),
+      /authenticated creator/
+    );
   }
 });
 
@@ -58,43 +99,9 @@ test('caller-controlled ownership fields cannot override the authoritative argum
   const jobs = {};
   const id = createJobRecord(jobs, 'Travel job', 'org-a', {
     org_id: 'org-b',
-    createdByUserId: 'user-1',
+    created_by_user_id: '22222222-2222-4222-8222-222222222222',
+    createdByUserId: CREATOR_ID,
   });
   assert.equal(jobs[id].org_id, 'org-a');
-});
-
-test('foreign status rejection occurs before job serialization', () => {
-  const { jobs, id } = createFixture('org-a');
-  let serialized = false;
-  const job = findJobForOrg(jobs, id, 'org-b');
-  if (job) {
-    JSON.stringify(job);
-    serialized = true;
-  }
-  assert.equal(job, null);
-  assert.equal(serialized, false);
-});
-
-test('foreign stream rejection occurs before headers or listeners', () => {
-  const { jobs, id } = createFixture('org-a');
-  let headersCommitted = false;
-  let listenerAttached = false;
-  const job = findJobForOrg(jobs, id, 'org-b');
-  if (job) {
-    headersCommitted = true;
-    listenerAttached = true;
-  }
-  assert.equal(job, null);
-  assert.equal(headersCommitted, false);
-  assert.equal(listenerAttached, false);
-});
-
-test('foreign stop rejection occurs before cancellation side effects', () => {
-  const { jobs, id } = createFixture('org-a');
-  let stopInvoked = false;
-  const job = findJobForOrg(jobs, id, 'org-b');
-  if (job) stopInvoked = true;
-  assert.equal(job, null);
-  assert.equal(stopInvoked, false);
-  assert.equal(jobs[id].status, 'running');
+  assert.equal(jobs[id].created_by_user_id, CREATOR_ID);
 });

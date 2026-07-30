@@ -47,6 +47,10 @@ const path      = require('path');
 const fs        = require('fs');
 const { spawn } = require('child_process');
 const { createJobRecord, findJobForOrg } = require('./src/job-store');
+const {
+  createStreamCredentialStore,
+  registerTravelJobRoutes,
+} = require('./src/travel-job-routes');
 let SQLiteDatabase = null;
 
 // ── Stripe ───────────────────────────────────────────────────────────────────
@@ -133,6 +137,7 @@ app.get(['/travel', '/travel/*splat', '/high-school', '/high-school/*splat'], (r
 
 // ── Job store ───────────────────────────────────────────────────────────────
 const jobs = {};
+const streamCredentials = createStreamCredentialStore();
 
 function createJob(label, orgId, createdByUserId = null) {
   return createJobRecord(jobs, label, orgId, { createdByUserId });
@@ -655,23 +660,6 @@ async function requireTravelAccess(req, res, next) {
     return sendResolverError(res, err, 'requireTravelAccess');
   }
   return requireTravelProductAccess(req, res, next);
-}
-
-// Object-level authorization for the process-local Travel job store. This
-// deliberately returns the same 404 for missing, malformed/unowned, and
-// foreign-organization jobs so job IDs cannot be used for tenant discovery.
-// It must run after authentication, support-session resolution (where the
-// client supports that header), and the Travel entitlement gate.
-async function requireJobOwnership(req, res, next) {
-  try {
-    const orgId = await getRequestOrgId(req);
-    const job = findJobForOrg(jobs, req.params.id, orgId);
-    if (!job) return res.status(404).json({ error: 'Job not found' });
-    req.job = job;
-    next();
-  } catch (err) {
-    return sendResolverError(res, err, 'requireJobOwnership');
-  }
 }
 
 app.use('/api/admin', createAdminRouter({ requireAuth }));
@@ -1292,68 +1280,19 @@ app.get('/api/teams/:id/summary', requireAuth, resolveSupportSession, requireTra
 
 app.get('/api/reports', requireAuth, resolveSupportSession, requireTravelAccess, (req, res) => res.json(getReports()));
 
-app.get('/api/jobs/:id', requireAuth, resolveSupportSession, requireTravelAccess, requireJobOwnership, (req, res) => {
-  const job = req.job;
-  res.json({ ...job, proc: undefined }); // don't serialize proc
-});
-
-// GET /api/jobs/:id/stream can't use requireAuth's header-based check --
-// EventSource cannot send a custom Authorization header, which is why this
-// route already accepted a query-string token before this change. That
-// check was previously OPTIONAL (only verified when a token was present at
-// all, so a request that omitted it entirely bypassed auth completely) --
-// now mandatory, matching requireAuth's own 401-on-missing/invalid-token
-// behavior, so requireTravelAccess (mounted right after) always has a
-// verified req.user to resolve an organization and its Travel entitlement
-// from. No support-session support here: resolveSupportSession is
-// header-based (X-Support-Session) and EventSource can't send that either;
-// this stream is only ever opened by a signed-in customer watching their
-// own job, never by an admin support session (pre-existing scope, unchanged).
-async function requireStreamAuth(req, res, next) {
-  const token = req.query.token;
-  if (!token || !adminClient) return res.status(401).end();
-  const { data, error } = await adminClient.auth.getUser(token);
-  if (error || !data?.user) return res.status(401).end();
-  req.user = data.user;
-  next();
-}
-
-app.get('/api/jobs/:id/stream', requireStreamAuth, requireTravelAccess, requireJobOwnership, async (req, res) => {
-  const job = req.job;
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  let cursor = 0;
-  const send = () => {
-    while (cursor < job.logs.length) res.write(`data: ${JSON.stringify(job.logs[cursor++])}\n\n`);
-    if (job.status !== 'running') {
-      res.write(`data: ${JSON.stringify({ done: true, status: job.status })}\n\n`);
-      clearInterval(timer); res.end();
-    }
-  };
-  const timer = setInterval(send, 300);
-  send();
-  req.on('close', () => clearInterval(timer));
-});
-
-// POST /api/jobs/:id/stop
-app.post('/api/jobs/:id/stop', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, requireJobOwnership, (req, res) => {
-  const job = req.job;
-  if (job.status !== 'running') return res.json({ ok: true, message: 'Job already finished' });
-
-  job.stopping = true;
-  appendLog(req.params.id, '✗ Stop requested by user');
-
-  try {
-    const stopped = stopJobProcess(job);
-    if (!stopped) appendLog(req.params.id, 'No active child process was attached to this job.');
-    finishJob(req.params.id, false, -1);
-    return res.json({ ok: true, stopped });
-  } catch (err) {
-    appendLog(req.params.id, `Stop failed: ${err.message}`);
-    finishJob(req.params.id, false, -1);
-    return res.status(500).json({ error: err.message });
-  }
+registerTravelJobRoutes(app, {
+  jobs,
+  requireAuth,
+  resolveSupportSession,
+  requireTravelAccess,
+  blockWriteDuringReadOnlySupport,
+  getRequestOrgId,
+  findJobForOrg,
+  sendResolverError,
+  stopJobProcess,
+  appendLog,
+  finishJob,
+  streamCredentials,
 });
 
 // POST /api/run/gc-scraper
