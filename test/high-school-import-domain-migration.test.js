@@ -519,6 +519,77 @@ test('no source or UI file OTHER THAN the Slice 1A importer persistence layer re
   }
 });
 
+// ── Importer ownership contract (repo-wide, indirection-resistant) ──────
+//
+// The check above proves its own, narrower claim: no file in src/ or
+// dashboard/ OTHER THAN the three listed persistence files even mentions
+// one of these table names as a string. That leaves two real blind spots:
+// (1) it never walks the repo root (server.js, the one-off migration/repair
+// scripts like sync-to-supabase.js, rebuild-team-from-json.js) or admin/,
+// where a legacy or admin-tooling script could add a stray write without
+// this test ever seeing it; (2) a bare string-mention check can't
+// distinguish "this file WRITES to hs_verified_totals" from "this file's
+// comment mentions hs_verified_totals in passing" -- so it is both too
+// narrow in scope and too blunt in what it actually proves.
+//
+// An EARLIER version of this test tried to fix blind spot (2) directly, by
+// matching a literal `.from('hs_<table>')` immediately followed by
+// `.insert(`/`.update(`/`.upsert(`/`.delete(`. That is trivially
+// bypassable: a variable table name (`const t = 'hs_games'; .from(t)`), a
+// helper function taking `table` as a parameter, a template-literal table
+// name, or bracket-notation (`adminClient['from'](...)`) all evade a regex
+// anchored on a literal quoted string directly inside `.from(...)`, and
+// `adminClient` is already legitimately imported in several other files
+// (high-school-api.js, admin-api.js, ...) so the ingredients for exactly
+// that bypass already exist elsewhere in this repo.
+//
+// The fix: stop trying to prove "this is specifically a WRITE call" via
+// call-shape matching (a text scan cannot reliably tell a literal from an
+// aliased reference once indirection is allowed) and instead go back to
+// the strictly stronger property blind spot (1) already established works
+// -- a plain, repo-wide, no-adjacency-required mention of the table/RPC
+// name -- since every bypass above (variable assignment, helper call site,
+// template literal, bracket notation) still leaves the literal
+// table/RPC-name STRING somewhere in the file as plain text. This is the
+// same tradeoff (and same low false-positive risk, given how distinctive
+// these identifiers are) the existing, already-accepted src/dashboard-only
+// check above has always made -- just widened to the whole repository.
+const REPO_WIDE_EXCLUDED_DIRS = new Set(['node_modules', '.git', 'coverage', 'supabase', 'test', '.claude']);
+
+function walkRepoJsAndHtmlFiles(dir) {
+  const matches = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      if (REPO_WIDE_EXCLUDED_DIRS.has(entry.name)) continue;
+      matches.push(...walkRepoJsAndHtmlFiles(path.join(dir, entry.name)));
+    } else if (/\.(js|html)$/.test(entry.name)) {
+      matches.push(path.join(dir, entry.name));
+    }
+  }
+  return matches;
+}
+
+const HS_IMPORT_RPC_NAMES = [
+  'publish_hs_verified_totals',
+  'publish_hs_player_advanced_stats',
+  'publish_hs_pitcher_advanced_stats',
+];
+
+test('no file anywhere in the repository (outside the Slice 1A persistence layer) references a High School import table or its publish RPCs, by any name, alias, or indirection', () => {
+  const forbiddenPattern = new RegExp(NEW_TABLES.concat(HS_IMPORT_RPC_NAMES).join('|'));
+
+  for (const filePath of walkRepoJsAndHtmlFiles(REPO_ROOT)) {
+    const relativePath = path.relative(REPO_ROOT, filePath);
+    if (SLICE_1A_PERSISTENCE_FILES.includes(relativePath)) continue;
+    const contents = fs.readFileSync(filePath, 'utf8');
+    assert.doesNotMatch(
+      contents,
+      forbiddenPattern,
+      `expected no reference (literal, aliased, template-literal, or bracket-notation) to a Slice 1A table or publish RPC outside the persistence layer in ${relativePath}`
+    );
+  }
+});
+
 // ── Non-negative and consistency CHECK constraints ───────────────────────
 
 test('hs_import_runs count columns are non-negative', () => {
