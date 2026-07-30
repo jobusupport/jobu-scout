@@ -74,7 +74,7 @@ const {
 } = require('./src/admin-lib');
 
 // ── Product capabilities (Phase 2 Slice 1) ───────────────────────────────────
-const { getOrganizationCapabilities } = require('./src/product-capabilities');
+const { getOrganizationCapabilities, requireProductAccess } = require('./src/product-capabilities');
 
 // ── High School domain (read-only foundation) ────────────────────────────────
 const createHighSchoolRouter = require('./src/high-school-api');
@@ -627,6 +627,36 @@ async function requireAuth(req, res, next) {
   req.user = data.user;
   req.jwt  = jwt;
   next();
+}
+
+// ── Travel product-entitlement guard ─────────────────────────────────────────
+// Composes two already-canonical pieces -- getRequestOrgId (above; the same
+// support-session-aware, fail-closed org resolution every other Travel route
+// already used internally) and requireProductAccess('travel') (from
+// src/product-capabilities.js, the same middleware factory
+// src/high-school-api.js's requireHighSchoolAccess is the sibling of for the
+// High School side) -- rather than adding a third, competing entitlement
+// check. requireProductAccess('travel') itself never trusts anything but
+// req._orgId, so this wrapper's only job is making sure that field is
+// populated (via the exact same resolution every Travel route handler below
+// already performs, memoized so this never causes a second database query)
+// before delegating the actual travel-entitlement decision to it.
+//
+// Mounted after requireAuth and resolveSupportSession on every Travel route
+// below: resolveSupportSession, when a support session is active, already
+// pins req._orgId to the TARGET customer's org before this runs --
+// resolveTrustedOrgId's own short-circuit (`if (req?._orgId) return
+// req._orgId`) then trusts that value unchanged, so a support session can
+// never see broader Travel access than the customer it's viewing actually
+// has, exactly like the existing High School guard.
+const requireTravelProductAccess = requireProductAccess('travel'); // validated once, at startup, matching requireProductAccess's own fail-loudly-at-definition design
+async function requireTravelAccess(req, res, next) {
+  try {
+    await getRequestOrgId(req);
+  } catch (err) {
+    return sendResolverError(res, err, 'requireTravelAccess');
+  }
+  return requireTravelProductAccess(req, res, next);
 }
 
 app.use('/api/admin', createAdminRouter({ requireAuth }));
@@ -1215,7 +1245,7 @@ app.get('/api/debug/auth', (req, res) => {
   res.json({ authPath, exists, cwd, storageContents, appContents });
 });
 
-app.get('/api/teams', requireAuth, resolveSupportSession, asyncHandler(async (req, res) => {
+app.get('/api/teams', requireAuth, resolveSupportSession, requireTravelAccess, asyncHandler(async (req, res) => {
   try {
     const includeArchived = req.query.includeArchived === 'true';
     const rawTeams = await getTeams(req, includeArchived);
@@ -1236,7 +1266,7 @@ app.get('/api/teams', requireAuth, resolveSupportSession, asyncHandler(async (re
 }));
 
 
-app.get('/api/teams/:id/summary', requireAuth, resolveSupportSession, async (req, res) => {
+app.get('/api/teams/:id/summary', requireAuth, resolveSupportSession, requireTravelAccess, async (req, res) => {
   try {
     if (USE_SUPABASE) await assertTeamInRequestOrg(req, req.params.id);
     res.json(await getTeamSummary(req.params.id));
@@ -1245,22 +1275,36 @@ app.get('/api/teams/:id/summary', requireAuth, resolveSupportSession, async (req
   }
 });
 
-app.get('/api/reports', requireAuth, resolveSupportSession, (req, res) => res.json(getReports()));
+app.get('/api/reports', requireAuth, resolveSupportSession, requireTravelAccess, (req, res) => res.json(getReports()));
 
-app.get('/api/jobs/:id', requireAuth, (req, res) => {
+app.get('/api/jobs/:id', requireAuth, resolveSupportSession, requireTravelAccess, (req, res) => {
   const job = jobs[req.params.id];
   if (!job) return res.status(404).json({ error: 'Job not found' });
   res.json({ ...job, proc: undefined }); // don't serialize proc
 });
 
-app.get('/api/jobs/:id/stream', async (req, res) => {
-  // EventSource can't send custom headers — accept token via query param
+// GET /api/jobs/:id/stream can't use requireAuth's header-based check --
+// EventSource cannot send a custom Authorization header, which is why this
+// route already accepted a query-string token before this change. That
+// check was previously OPTIONAL (only verified when a token was present at
+// all, so a request that omitted it entirely bypassed auth completely) --
+// now mandatory, matching requireAuth's own 401-on-missing/invalid-token
+// behavior, so requireTravelAccess (mounted right after) always has a
+// verified req.user to resolve an organization and its Travel entitlement
+// from. No support-session support here: resolveSupportSession is
+// header-based (X-Support-Session) and EventSource can't send that either;
+// this stream is only ever opened by a signed-in customer watching their
+// own job, never by an admin support session (pre-existing scope, unchanged).
+async function requireStreamAuth(req, res, next) {
   const token = req.query.token;
-  if (token && adminClient) {
-    const { data, error } = await adminClient.auth.getUser(token);
-    if (error || !data?.user) return res.status(401).end();
-  }
+  if (!token || !adminClient) return res.status(401).end();
+  const { data, error } = await adminClient.auth.getUser(token);
+  if (error || !data?.user) return res.status(401).end();
+  req.user = data.user;
+  next();
+}
 
+app.get('/api/jobs/:id/stream', requireStreamAuth, requireTravelAccess, async (req, res) => {
   const job = jobs[req.params.id];
   if (!job) return res.status(404).end();
   res.setHeader('Content-Type', 'text/event-stream');
@@ -1280,7 +1324,7 @@ app.get('/api/jobs/:id/stream', async (req, res) => {
 });
 
 // POST /api/jobs/:id/stop
-app.post('/api/jobs/:id/stop', (req, res) => {
+app.post('/api/jobs/:id/stop', requireAuth, resolveSupportSession, requireTravelAccess, (req, res) => {
   const job = jobs[req.params.id];
   if (!job) return res.status(404).json({ error: 'Job not found' });
   if (job.status !== 'running') return res.json({ ok: true, message: 'Job already finished' });
@@ -1301,7 +1345,7 @@ app.post('/api/jobs/:id/stop', (req, res) => {
 });
 
 // POST /api/run/gc-scraper
-app.post('/api/run/gc-scraper', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+app.post('/api/run/gc-scraper', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   await assertOrgActive(req);
   const team = (await getTeams(req)).find(t => t.id == req.body.teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
@@ -1320,7 +1364,7 @@ app.post('/api/run/gc-scraper', requireAuth, resolveSupportSession, blockWriteDu
 }));
 
 // POST /api/run/pg-scraper
-app.post('/api/run/pg-scraper', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+app.post('/api/run/pg-scraper', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   await assertOrgActive(req);
   const team = (await getTeams(req)).find(t => t.id == req.body.teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
@@ -1332,7 +1376,7 @@ app.post('/api/run/pg-scraper', requireAuth, resolveSupportSession, blockWriteDu
 }));
 
 // POST /api/run/reingest
-app.post('/api/run/reingest', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+app.post('/api/run/reingest', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   await assertOrgActive(req);
   const team  = req.body.teamId ? (await getTeams(req)).find(t => t.id == req.body.teamId) : null;
   const label = team ? `Reingest — ${team.team_name}` : 'Reingest — All Teams';
@@ -1360,7 +1404,7 @@ function buildReportContextEnv(body = {}) {
 }
 
 // POST /api/run/report  { teamId, gameLocation?, gameDate?, gameTime?, humanObservations?, gameScope?, customPrompt? }
-app.post('/api/run/report', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+app.post('/api/run/report', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   const { teamId } = req.body;
   const team = (await getTeams(req)).find(t => t.id == teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
@@ -1383,7 +1427,7 @@ app.post('/api/run/report', requireAuth, resolveSupportSession, blockWriteDuring
 }));
 
 // POST /api/run/self-scout  { gameLocation?, gameDate?, gameTime?, humanObservations?, customPrompt?, ourTeamId? }
-app.post('/api/run/self-scout', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+app.post('/api/run/self-scout', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   let quota;
   try {
     quota = await enforceReportQuota(req, { reportType: 'self_scout', limitColumn: 'max_self_scout_reports_per_month', title: 'Self-Scout Report', linkedTeamId: req.body.ourTeamId });
@@ -1400,7 +1444,7 @@ app.post('/api/run/self-scout', requireAuth, resolveSupportSession, blockWriteDu
 
 // POST /api/run/matchup  { teamId, gameLocation?, gameDate?, gameTime?, humanObservations?, customPrompt?, ourTeamId? }
 // teamId is the OPPONENT team we're building the matchup game plan against.
-app.post('/api/run/matchup', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+app.post('/api/run/matchup', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   const { teamId } = req.body;
   const team = (await getTeams(req)).find(t => t.id == teamId);
   if (!team) return res.status(404).json({ error: 'Opponent team not found' });
@@ -1419,7 +1463,7 @@ app.post('/api/run/matchup', requireAuth, resolveSupportSession, blockWriteDurin
 }));
 
 // POST /api/run/full-pipeline  { teamId, gameLocation?, gameDate?, gameTime?, humanObservations?, gameScope?, customPrompt? }
-app.post('/api/run/full-pipeline', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+app.post('/api/run/full-pipeline', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   const { teamId, gameLocation, gameDate } = req.body;
   const team = (await getTeams(req)).find(t => t.id == teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
@@ -1464,7 +1508,7 @@ app.post('/api/run/full-pipeline', requireAuth, resolveSupportSession, blockWrit
 }));
 
 // POST /api/run/all-gc — scrape all teams GC
-app.post('/api/run/all-gc', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+app.post('/api/run/all-gc', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   await assertOrgActive(req);
   const allTeams = await getTeams(req);
   const teamsWithUrlFlags = await Promise.all(allTeams.map(async t => ({ ...t, _hasGameUrls: await hasGameUrls(t.id) })));
@@ -1499,7 +1543,7 @@ app.post('/api/run/all-gc', requireAuth, resolveSupportSession, blockWriteDuring
 }));
 
 // POST /api/run/all-pg — scrape all teams PG
-app.post('/api/run/all-pg', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+app.post('/api/run/all-pg', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   await assertOrgActive(req);
   const teams   = (await getTeams(req)).filter(t => t.pg_team_url);
   if (!teams.length) return res.status(400).json({ error: 'No teams with PG URLs' });
@@ -1526,7 +1570,7 @@ app.post('/api/run/all-pg', requireAuth, resolveSupportSession, blockWriteDuring
 }));
 
 // POST /api/run/all-reports — generate reports for all teams with games
-app.post('/api/run/all-reports', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+app.post('/api/run/all-reports', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   const teams   = (await getTeams(req)).filter(t => t.game_count > 0);
   if (!teams.length) return res.status(400).json({ error: 'No teams with game data' });
   const id      = createJob(`Reports All (${teams.length} teams)`);
@@ -1567,20 +1611,20 @@ app.post('/api/run/all-reports', requireAuth, resolveSupportSession, blockWriteD
 app.get('/', (req, res) => res.sendFile(path.join(ROOT, 'dashboard', 'index.html')));
 
 // ── Team Games ───────────────────────────────────────────────────────────────
-app.get('/api/teams/:id/games', requireAuth, resolveSupportSession, async (req, res) => {
+app.get('/api/teams/:id/games', requireAuth, resolveSupportSession, requireTravelAccess, async (req, res) => {
   try {
     res.json(await getTeamGames(req.params.id));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── Team Game URLs ───────────────────────────────────────────────────────────
-app.get('/api/teams/:id/game-urls', requireAuth, resolveSupportSession, async (req, res) => {
+app.get('/api/teams/:id/game-urls', requireAuth, resolveSupportSession, requireTravelAccess, async (req, res) => {
   try {
     res.json(await getTeamGameUrls(req.params.id));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/teams/:id/game-urls', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+app.post('/api/teams/:id/game-urls', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, async (req, res) => {
   const { gc_game_url, label = '', box_side = 'away' } = req.body;
   if (!['away','home'].includes(box_side)) return res.status(400).json({ error: 'box_side must be away or home' });
   try {
@@ -1604,7 +1648,7 @@ app.post('/api/teams/:id/game-urls', requireAuth, resolveSupportSession, blockWr
   } catch (err) { return sendResolverError(res, err, 'api/teams/:id/game-urls POST'); }
 });
 
-app.put('/api/teams/:id/game-urls/:urlId', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+app.put('/api/teams/:id/game-urls/:urlId', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, async (req, res) => {
   const { gc_game_url, label, box_side } = req.body;
   try {
     if (USE_SUPABASE) {
@@ -1635,7 +1679,7 @@ app.put('/api/teams/:id/game-urls/:urlId', requireAuth, resolveSupportSession, b
   } catch (err) { return sendResolverError(res, err, 'api/teams/:id/game-urls PUT'); }
 });
 
-app.delete('/api/teams/:id/game-urls/:urlId', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+app.delete('/api/teams/:id/game-urls/:urlId', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, async (req, res) => {
   try {
     if (USE_SUPABASE) {
       await assertTeamInRequestOrg(req, req.params.id);
@@ -1661,7 +1705,7 @@ function normalizePositions(value) {
   return parts.map(v => String(v).trim()).filter(Boolean).join(',');
 }
 
-app.get('/api/teams/:id/players', requireAuth, resolveSupportSession, async (req, res) => {
+app.get('/api/teams/:id/players', requireAuth, resolveSupportSession, requireTravelAccess, async (req, res) => {
   try {
     if (USE_SUPABASE) {
       await assertTeamInRequestOrg(req, req.params.id);
@@ -1681,7 +1725,7 @@ app.get('/api/teams/:id/players', requireAuth, resolveSupportSession, async (req
   } catch (err) { return sendResolverError(res, err, 'api/teams/:id/players GET'); }
 });
 
-app.post('/api/teams/:id/players', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+app.post('/api/teams/:id/players', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, async (req, res) => {
   const { firstName, lastName, jerseyNumber, handedness, positions, isPickup, availabilityStatus, unavailableUntil, injuryReturnDate } = req.body;
   if (!firstName || !lastName) return res.status(400).json({ error: 'firstName and lastName are required' });
   if (availabilityStatus !== undefined && !['available', 'unavailable', 'injured'].includes(availabilityStatus)) {
@@ -1729,7 +1773,7 @@ app.post('/api/teams/:id/players', requireAuth, resolveSupportSession, blockWrit
   } catch (err) { return sendResolverError(res, err, 'api/teams/:id/players POST'); }
 });
 
-app.put('/api/teams/:id/players/:playerId', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+app.put('/api/teams/:id/players/:playerId', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, async (req, res) => {
   const { firstName, lastName, jerseyNumber, handedness, positions, isPickup, availabilityStatus, unavailableUntil, injuryReturnDate } = req.body;
   if (availabilityStatus !== undefined && !['available', 'unavailable', 'injured'].includes(availabilityStatus)) {
     return res.status(400).json({ error: 'availabilityStatus must be available, unavailable, or injured' });
@@ -1791,7 +1835,7 @@ app.put('/api/teams/:id/players/:playerId', requireAuth, resolveSupportSession, 
   } catch (err) { return sendResolverError(res, err, 'api/teams/:id/players/:playerId PUT'); }
 });
 
-app.delete('/api/teams/:id/players/:playerId', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+app.delete('/api/teams/:id/players/:playerId', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, async (req, res) => {
   try {
     if (USE_SUPABASE) {
       await assertTeamInRequestOrg(req, req.params.id);
@@ -1812,7 +1856,7 @@ app.delete('/api/teams/:id/players/:playerId', requireAuth, resolveSupportSessio
 // coach doesn't have to retype a whole lineup by hand. Skips anyone whose
 // first+last name already exists on the roster; jersey/handedness/positions
 // are left blank for the coach to fill in via edit.
-app.post('/api/teams/:id/players/seed-from-games', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+app.post('/api/teams/:id/players/seed-from-games', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, async (req, res) => {
   try {
     let existingNames, distinctNames;
 
@@ -1874,7 +1918,7 @@ app.post('/api/teams/:id/players/seed-from-games', requireAuth, resolveSupportSe
 });
 
 // ── Add Team ─────────────────────────────────────────────────────────────────
-app.post('/api/teams/add', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+app.post('/api/teams/add', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, async (req, res) => {
   const { teamName, gcTeamUrl, pgTeamUrl, isOurTeam, seasonYear, seasonType } = req.body;
   if (!teamName) return res.status(400).json({ error: 'teamName is required' });
 
@@ -1947,7 +1991,7 @@ app.post('/api/teams/add', requireAuth, resolveSupportSession, blockWriteDuringR
 
 
 // ── Edit / Remove Team ───────────────────────────────────────────────────────
-app.put('/api/teams/:id', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+app.put('/api/teams/:id', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, async (req, res) => {
   const { teamName, gcTeamUrl, pgTeamUrl, seasonYear, seasonType } = req.body;
   const teamId = req.params.id;
 
@@ -2006,7 +2050,7 @@ app.put('/api/teams/:id', requireAuth, resolveSupportSession, blockWriteDuringRe
   }
 });
 
-app.delete('/api/teams/:id', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+app.delete('/api/teams/:id', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, async (req, res) => {
   const teamId = req.params.id;
 
   try {
@@ -2051,7 +2095,7 @@ app.delete('/api/teams/:id', requireAuth, resolveSupportSession, blockWriteDurin
 // Archive (soft-hide) or restore a team without touching games/stats.
 // This is what the dashboard's "×" button calls now instead of DELETE —
 // DELETE remains available but stays blocked whenever games are attached.
-app.patch('/api/teams/:id/archive', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+app.patch('/api/teams/:id/archive', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, async (req, res) => {
   const teamId = req.params.id;
   const archived = req.body?.archived !== false; // default true
 
@@ -2080,7 +2124,7 @@ app.patch('/api/teams/:id/archive', requireAuth, resolveSupportSession, blockWri
 });
 
 // ── Sync Google Sheet ────────────────────────────────────────────────────────
-app.post('/api/settings/sheet', requireAuth, resolveSupportSession, blockWriteDuringReadOnlySupport, async (req, res) => {
+app.post('/api/settings/sheet', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, async (req, res) => {
   const { csvUrl, replace = false } = req.body;
   if (!csvUrl || !csvUrl.includes('output=csv')) {
     return res.status(400).json({ error: 'Must be a published Google Sheet CSV URL (must contain output=csv)' });
