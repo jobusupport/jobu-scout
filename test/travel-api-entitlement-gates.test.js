@@ -26,6 +26,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
+const vm = require('vm');
 
 const SERVER_PATH = path.join(__dirname, '..', 'server.js');
 const JOB_ROUTES_PATH = path.join(__dirname, '..', 'src', 'travel-job-routes.js');
@@ -239,7 +240,7 @@ test('the SSE job-stream route resolves support after stream authentication and 
   const defStart = jobRoutesSrc.indexOf('function requireStreamAuth');
   assert.ok(defStart >= 0, 'expected to find requireStreamAuth\'s definition');
   const defSrc = jobRoutesSrc.slice(defStart, defStart + 600);
-  assert.match(defSrc, /streamCredentials\.resolve\(req\.query\.stream_token, req\.params\.id\)/);
+  assert.match(defSrc, /streamCredentials\.consume\(req\.query\.stream_token, req\.params\.id\)/);
   assert.doesNotMatch(defSrc, /adminClient|req\.query\.(?:org|supported_org)/);
 });
 
@@ -283,6 +284,88 @@ test('the browser requests a short-lived stream credential and never puts the Su
   assert.match(template, /\/stream-credential/);
   assert.match(template, /stream\?stream_token=/);
   assert.doesNotMatch(template, /stream\?token=/);
+});
+
+test('the browser closes consumed EventSource URLs and reconnects only through bounded authenticated bootstrap requests', async () => {
+  const dashboardSrc = fs.readFileSync(path.join(__dirname, '..', 'dashboard', 'index.html'), 'utf8');
+  const match = dashboardSrc.match(/<script type="__bundler\/template">\s*([\s\S]*?)\s*<\/script>/);
+  const template = JSON.parse(match[1]);
+  const start = template.indexOf('async function openAuthorizedJobStream(jobId) {');
+  const end = template.indexOf('\n}\n\n// Persisted options', start);
+  assert.ok(start >= 0 && end > start);
+  const helperSource = template.slice(start, end + 2);
+
+  const bootstrapTokens = ['bootstrap-1', 'bootstrap-2', 'bootstrap-3'];
+  const bootstrapCalls = [];
+  const sources = [];
+  const timers = [];
+  class FakeEventSource {
+    constructor(url) {
+      this.url = url;
+      this.closed = false;
+      sources.push(this);
+    }
+    close() { this.closed = true; }
+  }
+  const context = {
+    apiFetch: async (url, options) => {
+      bootstrapCalls.push({ url, options });
+      const token = bootstrapTokens.shift();
+      return {
+        ok: true,
+        json: async () => ({ streamToken: token }),
+      };
+    },
+    EventSource: FakeEventSource,
+    encodeURIComponent,
+    clearTimeout: (timer) => { timer.cancelled = true; },
+    setTimeout: (callback, delay) => {
+      const timer = { callback, delay, cancelled: false };
+      timers.push(timer);
+      return timer;
+    },
+  };
+  const openAuthorizedJobStream = vm.runInNewContext(`(${helperSource})`, context);
+  const controller = await openAuthorizedJobStream('job-1');
+  assert.equal(bootstrapCalls.length, 1);
+  assert.equal(bootstrapCalls[0].options.method, 'POST');
+  assert.equal(sources.length, 1);
+  assert.match(sources[0].url, /stream_token=bootstrap-1$/);
+
+  const queuedMessages = [];
+  sources[0].onmessage({ data: 'queued' });
+  controller.onmessage = (event) => queuedMessages.push(event.data);
+  assert.deepEqual(queuedMessages, ['queued']);
+
+  sources[0].onerror();
+  assert.equal(sources[0].closed, true);
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].delay, 250);
+  timers[0].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(bootstrapCalls.length, 2);
+  assert.equal(sources.length, 2);
+  assert.match(sources[1].url, /stream_token=bootstrap-2$/);
+
+  sources[1].onerror();
+  assert.equal(sources[1].closed, true);
+  assert.equal(timers[1].delay, 500);
+  timers[1].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(bootstrapCalls.length, 3);
+  assert.equal(sources.length, 3);
+  assert.match(sources[2].url, /stream_token=bootstrap-3$/);
+
+  let terminalErrors = 0;
+  controller.onerror = () => { terminalErrors += 1; };
+  sources[2].onerror();
+  assert.equal(sources[2].closed, true);
+  assert.equal(terminalErrors, 1);
+  assert.equal(timers.length, 2);
+  for (const source of sources) {
+    assert.doesNotMatch(source.url, /access_token|support|org_id|supported_org/i);
+  }
+  controller.close();
 });
 
 // ── Canonical reuse, not a competing algorithm ───────────────────────────

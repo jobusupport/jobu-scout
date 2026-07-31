@@ -30,9 +30,17 @@ const SUPPORT = {
   'support-b-write': { orgId: 'org-b', mode: 'interactive' },
 };
 
-async function startFixture() {
+async function startFixture(overrides = {}) {
   const jobs = {};
-  const metrics = { timers: 0, clears: 0, stops: 0, serializations: 0 };
+  const metrics = {
+    timers: 0,
+    clears: 0,
+    expiryTimers: 0,
+    expiryClears: 0,
+    opened: 0,
+    stops: 0,
+    serializations: 0,
+  };
   const streamCredentials = createStreamCredentialStore();
 
   const createJob = (orgId, status = 'running') => {
@@ -102,6 +110,16 @@ async function startFixture() {
       metrics.clears += 1;
       clearInterval(timer);
     },
+    setTimeoutFn: (callback, delay) => {
+      metrics.expiryTimers += 1;
+      return setTimeout(callback, delay);
+    },
+    clearTimeoutFn: (timer) => {
+      metrics.expiryClears += 1;
+      clearTimeout(timer);
+    },
+    onStreamOpened: () => { metrics.opened += 1; },
+    ...overrides,
   });
 
   const server = await new Promise((resolve) => {
@@ -224,6 +242,7 @@ test('actual stream route uses job-bound short-lived credentials and authorizes 
   const foreignCredential = f.streamCredentials.issue({
     user: { id: USERS.b },
     jobId: id,
+    orgId: 'org-b',
   });
   const timersBeforeForeign = f.metrics.timers;
   const rejected = await f.request(
@@ -239,6 +258,201 @@ test('actual stream route uses job-bound short-lived credentials and authorizes 
   );
   assert.equal(mismatched.status, 401);
   assert.equal(f.metrics.timers, timersBeforeForeign);
+});
+
+test('one-time bootstrap rejects sequential HTTP replay without new SSE setup', async (t) => {
+  const f = await startFixture();
+  t.after(() => f.close());
+  const id = f.createJob('org-a', 'done');
+  const issued = await issueStream(f, id, 'a');
+  const path = `/api/jobs/${id}/stream?stream_token=${encodeURIComponent(issued.body.streamToken)}`;
+
+  const first = await f.request(path);
+  assert.equal(first.status, 200);
+  assert.match(await first.text(), /"done":true/);
+  const openedAfterFirst = f.metrics.opened;
+  const timersAfterFirst = f.metrics.timers;
+
+  const replay = await f.request(path);
+  assert.equal(replay.status, 401);
+  assert.equal(replay.headers.has('content-type'), false);
+  assert.equal(await replay.text(), '');
+  assert.equal(f.metrics.opened, openedAfterFirst);
+  assert.equal(f.metrics.timers, timersAfterFirst);
+  assert.equal(f.streamCredentials.size(), 0);
+  assert.equal(f.streamCredentials.activeSize(), 0);
+});
+
+test('issuing a newer bootstrap invalidates the older unconsumed generation', async (t) => {
+  const f = await startFixture();
+  t.after(() => f.close());
+  const id = f.createJob('org-a', 'done');
+  const older = await issueStream(f, id, 'a');
+  const latest = await issueStream(f, id, 'a');
+
+  const stale = await f.request(
+    `/api/jobs/${id}/stream?stream_token=${encodeURIComponent(older.body.streamToken)}`
+  );
+  assert.equal(stale.status, 401);
+  assert.equal(f.metrics.opened, 0);
+
+  const current = await f.request(
+    `/api/jobs/${id}/stream?stream_token=${encodeURIComponent(latest.body.streamToken)}`
+  );
+  assert.equal(current.status, 200);
+  assert.match(await current.text(), /"done":true/);
+  assert.equal(f.metrics.opened, 1);
+});
+
+test('two genuinely overlapping HTTP presentations atomically permit exactly one stream', async (t) => {
+  let releaseFirst;
+  let markConsumed;
+  const firstConsumed = new Promise((resolve) => { markConsumed = resolve; });
+  const barrier = new Promise((resolve) => { releaseFirst = resolve; });
+  let hookCalls = 0;
+  const f = await startFixture({
+    afterStreamCredentialConsumed: async () => {
+      hookCalls += 1;
+      markConsumed();
+      await barrier;
+    },
+  });
+  t.after(() => f.close());
+  const id = f.createJob('org-a', 'done');
+  const issued = await issueStream(f, id, 'a');
+  const path = `/api/jobs/${id}/stream?stream_token=${encodeURIComponent(issued.body.streamToken)}`;
+
+  const firstPromise = f.request(path);
+  await firstConsumed;
+  const second = await f.request(path);
+  assert.equal(second.status, 401);
+  assert.equal(await second.text(), '');
+  assert.equal(f.metrics.opened, 0);
+  assert.equal(f.metrics.timers, 0);
+  assert.equal(hookCalls, 1);
+
+  releaseFirst();
+  const first = await firstPromise;
+  assert.equal(first.status, 200);
+  assert.match(await first.text(), /"done":true/);
+  assert.equal(f.metrics.opened, 1);
+  assert.equal(f.metrics.timers, 1);
+  assert.equal(f.streamCredentials.activeSize(), 0);
+});
+
+test('deliberate reconnect requires a fresh authenticated bootstrap and stale generations fail', async (t) => {
+  const f = await startFixture();
+  t.after(() => f.close());
+  const id = f.createJob('org-a');
+
+  const initial = await issueStream(f, id, 'a');
+  const initialPath = `/api/jobs/${id}/stream?stream_token=${encodeURIComponent(initial.body.streamToken)}`;
+  const firstController = new AbortController();
+  const first = await f.request(initialPath, { signal: firstController.signal });
+  assert.equal(first.status, 200);
+  await first.body.getReader().read();
+  assert.equal(f.streamCredentials.activeSize(), 1);
+  firstController.abort();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(f.streamCredentials.activeSize(), 0);
+
+  const stale = await f.request(initialPath);
+  assert.equal(stale.status, 401);
+
+  const reconnect = await issueStream(f, id, 'a');
+  const reconnectPath = `/api/jobs/${id}/stream?stream_token=${encodeURIComponent(reconnect.body.streamToken)}`;
+  const reconnectController = new AbortController();
+  const connected = await f.request(reconnectPath, { signal: reconnectController.signal });
+  assert.equal(connected.status, 200);
+  await connected.body.getReader().read();
+  assert.equal(f.streamCredentials.activeSize(), 1);
+  reconnectController.abort();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(f.streamCredentials.activeSize(), 0);
+
+  const reconnectReplay = await f.request(reconnectPath);
+  assert.equal(reconnectReplay.status, 401);
+  assert.equal(f.metrics.opened, 2);
+  assert.equal(f.metrics.timers, 2);
+  assert.ok(f.metrics.clears >= 2);
+  assert.ok(f.metrics.expiryClears >= 2);
+});
+
+test('fresh authenticated bootstrap revokes an older active generation for race recovery', async (t) => {
+  const f = await startFixture();
+  t.after(() => f.close());
+  const id = f.createJob('org-a');
+  const firstToken = await issueStream(f, id, 'a');
+  const first = await f.request(
+    `/api/jobs/${id}/stream?stream_token=${encodeURIComponent(firstToken.body.streamToken)}`
+  );
+  const firstReader = first.body.getReader();
+  await firstReader.read();
+  assert.equal(f.streamCredentials.activeSize(), 1);
+
+  const replacement = await issueStream(f, id, 'a');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(f.streamCredentials.activeSize(), 0);
+  const replacementController = new AbortController();
+  const recovered = await f.request(
+    `/api/jobs/${id}/stream?stream_token=${encodeURIComponent(replacement.body.streamToken)}`,
+    { signal: replacementController.signal }
+  );
+  assert.equal(recovered.status, 200);
+  await recovered.body.getReader().read();
+  assert.equal(f.streamCredentials.activeSize(), 1);
+  replacementController.abort();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(f.streamCredentials.activeSize(), 0);
+  await firstReader.cancel().catch(() => {});
+});
+
+test('reconnect revalidates support revocation, Travel entitlement, and effective ownership', async (t) => {
+  const f = await startFixture();
+  t.after(() => f.close());
+  const id = f.createJob('org-a', 'done');
+
+  const supportBootstrap = await issueStream(f, id, 'admin', 'support-a-read');
+  const savedSupport = SUPPORT['support-a-read'];
+  delete SUPPORT['support-a-read'];
+  try {
+    const revoked = await f.request(
+      `/api/jobs/${id}/stream?stream_token=${encodeURIComponent(supportBootstrap.body.streamToken)}`
+    );
+    assert.equal(revoked.status, 401);
+    assert.equal(f.metrics.opened, 0);
+  } finally {
+    SUPPORT['support-a-read'] = savedSupport;
+  }
+
+  const entitlementBootstrap = await issueStream(f, id, 'a');
+  const savedOrg = USER_ORGS[USERS.a];
+  USER_ORGS[USERS.a] = 'org-no-travel';
+  try {
+    const denied = await f.request(
+      `/api/jobs/${id}/stream?stream_token=${encodeURIComponent(entitlementBootstrap.body.streamToken)}`
+    );
+    assert.equal(denied.status, 403);
+    assert.equal(f.metrics.opened, 0);
+  } finally {
+    USER_ORGS[USERS.a] = savedOrg;
+  }
+  const consumedAfterDenial = await f.request(
+    `/api/jobs/${id}/stream?stream_token=${encodeURIComponent(entitlementBootstrap.body.streamToken)}`
+  );
+  assert.equal(consumedAfterDenial.status, 401);
+
+  const ownershipBootstrap = await issueStream(f, id, 'a');
+  USER_ORGS[USERS.a] = 'org-b';
+  try {
+    const foreign = await f.request(
+      `/api/jobs/${id}/stream?stream_token=${encodeURIComponent(ownershipBootstrap.body.streamToken)}`
+    );
+    assert.equal(foreign.status, 404);
+    assert.equal(f.metrics.opened, 0);
+  } finally {
+    USER_ORGS[USERS.a] = savedOrg;
+  }
 });
 
 test('authorized running stream removes its real interval when the client disconnects', async (t) => {
@@ -265,10 +479,23 @@ test('authorized running stream removes its real interval when the client discon
 test('stream credential expiry and support-session binding fail closed', () => {
   let now = 1_000;
   const store = createStreamCredentialStore({ now: () => now, ttlMs: 50 });
-  const issued = store.issue({ user: { id: USERS.admin }, jobId: 'job', supportSessionToken: 'support-a-read' });
-  assert.equal(store.resolve(issued.token, 'job').supportSessionToken, 'support-a-read');
+  const issued = store.issue({
+    user: { id: USERS.admin },
+    jobId: 'job',
+    orgId: 'org-a',
+    supportSessionToken: 'support-a-read',
+  });
+  assert.equal(store.consume(issued.token, 'wrong-job'), null);
+  assert.equal(store.consume(issued.token, 'job').supportSessionToken, 'support-a-read');
+  assert.equal(store.consume(issued.token, 'job'), null);
+  const expiring = store.issue({ user: { id: USERS.admin }, jobId: 'job', orgId: 'org-a' });
+  const entry = store.consume(expiring.token, 'job');
+  let closed = 0;
+  assert.ok(store.activate(entry, () => { closed += 1; }));
+  assert.equal(store.activeSize(), 1);
   now += 51;
-  assert.equal(store.resolve(issued.token, 'job'), null);
+  assert.equal(store.activeSize(), 0);
+  assert.equal(closed, 1);
   assert.equal(store.size(), 0);
 });
 
