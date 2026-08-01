@@ -38,6 +38,7 @@ const { getOrganizationCapabilities } = require('./product-capabilities');
 const { resolveTrustedOrgId, buildAcceptedMembershipsQuery, mapErrorToResponse } = require('./org-resolution');
 const { asyncHandler } = require('./express-helpers');
 const rosterService = require('./high-school-roster-service');
+const { registerHighSchoolImportRoutes } = require('./high-school-import-routes');
 
 // Same tolerance rule server.js's own isMissingRelationError/selectSafe/
 // maybeSingleSafe apply to every other org-scoped query in this codebase
@@ -148,7 +149,7 @@ async function getHsProgram(orgId) {
   );
 }
 
-module.exports = function createHighSchoolRouter({ requireAuth }) {
+module.exports = function createHighSchoolRouter({ requireAuth, jobs, appendLog, finishJob, attachJobProcess, stopJobProcess }) {
   const router = express.Router();
 
   // ── Program ──────────────────────────────────────────────────────────
@@ -428,6 +429,26 @@ module.exports = function createHighSchoolRouter({ requireAuth }) {
       return sendResolverError(res, err, 'api/high-school/teams/:teamId/roster/:membershipId (remove)');
     }
   }));
+
+  // GameChanger ingestion (source-team binding, import runs, publication,
+  // stat viewing) -- kept in its own module (src/high-school-import-routes.js)
+  // rather than inline here, since it's substantially new surface area with
+  // its own job-spawning/policy concerns, but mounted onto this SAME router
+  // so it inherits requireAuth/resolveSupportSession/requireHighSchoolAccess
+  // from the exact same call sites above, never a re-declared copy.
+  registerHighSchoolImportRoutes(router, {
+    adminClient,
+    resolveSupportSession,
+    blockWriteDuringReadOnlySupport,
+    requireHighSchoolAccess,
+    asyncHandler,
+    requireAuth,
+    jobs,
+    appendLog,
+    finishJob,
+    attachJobProcess,
+    stopJobProcess,
+  });
 
   return router;
 };

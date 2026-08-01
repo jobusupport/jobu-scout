@@ -88,6 +88,48 @@ function createHighSchoolImportService({ repository }) {
     return repository.recordDiscoveredCount({ orgId, importRunId, count });
   }
 
+  // ── Read-side: import status/review, used by the GameChanger-ingestion
+  // HTTP routes so those routes never query hs_import_runs/
+  // hs_import_run_games/hs_game_validation_results/hs_verified_totals/
+  // hs_player_advanced_stats/hs_pitcher_advanced_stats directly -- every
+  // reference to those tables stays inside this service+repository pair. ──
+
+  async function listImportRuns({ orgId, teamId, seasonId }) {
+    requireUuid(orgId, 'orgId');
+    requireUuid(teamId, 'teamId');
+    requireUuid(seasonId, 'seasonId');
+    return repository.listImportRuns({ orgId, teamId, seasonId });
+  }
+
+  async function getImportRunDetail({ orgId, importRunId }) {
+    requireUuid(orgId, 'orgId');
+    requireUuid(importRunId, 'importRunId');
+    const [run, games, validations] = await Promise.all([
+      repository.getImportRun({ orgId, importRunId }),
+      repository.listRunGames({ orgId, importRunId }),
+      repository.listGameValidationResults({ orgId, importRunId }),
+    ]);
+    return { run, games, validations };
+  }
+
+  async function getCapturedGamesForRun({ orgId, importRunId }) {
+    requireUuid(orgId, 'orgId');
+    requireUuid(importRunId, 'importRunId');
+    return repository.getCapturedGamesForRun({ orgId, importRunId });
+  }
+
+  async function getPublishedStats({ orgId, teamId, seasonId }) {
+    requireUuid(orgId, 'orgId');
+    requireUuid(teamId, 'teamId');
+    requireUuid(seasonId, 'seasonId');
+    const [verifiedTotals, playerAdvancedStats, pitcherAdvancedStats] = await Promise.all([
+      repository.getCurrentVerifiedTotals({ orgId, teamId, seasonId }),
+      repository.listCurrentPlayerAdvancedStats({ orgId, teamId, seasonId }),
+      repository.listCurrentPitcherAdvancedStats({ orgId, teamId, seasonId }),
+    ]);
+    return { verifiedTotals, playerAdvancedStats, pitcherAdvancedStats };
+  }
+
   async function completeImportRun({ orgId, importRunId }) {
     requireUuid(orgId, 'orgId');
     requireUuid(importRunId, 'importRunId');
@@ -390,6 +432,10 @@ function createHighSchoolImportService({ repository }) {
     invertRowOwnershipForReconstruction,
     toReconstructionInput,
     assertVerifiedTotalsPublishable,
+    listImportRuns,
+    getImportRunDetail,
+    getCapturedGamesForRun,
+    getPublishedStats,
   };
 }
 

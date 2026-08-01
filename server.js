@@ -83,6 +83,8 @@ const { getOrganizationCapabilities, requireProductAccess } = require('./src/pro
 
 // ── High School domain (read-only foundation) ────────────────────────────────
 const createHighSchoolRouter = require('./src/high-school-api');
+const { createHighSchoolImportRepository } = require('./src/high-school-import-repository');
+const { createHighSchoolImportService } = require('./src/high-school-import-service');
 
 // ── Trusted organization resolution (extracted for database-free testing) ────
 const { resolveTrustedOrgId, buildAcceptedMembershipsQuery, mapErrorToResponse } = require('./src/org-resolution');
@@ -663,7 +665,19 @@ async function requireTravelAccess(req, res, next) {
 }
 
 app.use('/api/admin', createAdminRouter({ requireAuth }));
-app.use('/api/high-school', createHighSchoolRouter({ requireAuth }));
+
+// The High School GameChanger import service is constructed once, here,
+// against the same service-role adminClient every other org-scoped query
+// in this file already uses, and handed to the router via app.locals --
+// the established pattern this codebase already uses for a
+// request-handler-reachable, non-per-request singleton (see Express's own
+// app.locals convention; no new dependency-injection mechanism invented).
+if (adminClient) {
+  app.locals.highSchoolImportService = createHighSchoolImportService({
+    repository: createHighSchoolImportRepository(adminClient),
+  });
+}
+app.use('/api/high-school', createHighSchoolRouter({ requireAuth, jobs, appendLog, finishJob, attachJobProcess, stopJobProcess }));
 
 // ── Auth routes ──────────────────────────────────────────────────────────────
 

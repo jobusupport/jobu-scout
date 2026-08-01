@@ -3252,7 +3252,15 @@ console.log('[browser] Chromium launched successfully.');
   }
 }
 
-// ── Exports for scrape-game-urls.js ──────────────────────────────────────────
+// ── Exports for scrape-game-urls.js and src/high-school-gc-import.js ────────
+// The High School GameChanger ingestion adapter (src/high-school-gc-import.js)
+// reuses the pure DOM-extraction and schedule-discovery functions below
+// unmodified -- GameChanger's page structure (box-score AG-Grid, plays feed,
+// completed-game score-badge convention) is the same regardless of team
+// type, per the compatibility analysis in that module's own header comment.
+// Nothing about these three additional exports changes any existing
+// behavior for scrape-game-urls.js or this file's own CLI entry point --
+// this is strictly additive to the export object.
 if (require.main !== module) {
   module.exports = {
     extractGameData,
@@ -3262,5 +3270,8 @@ if (require.main !== module) {
     extractGameIdFromUrl,
     getTeamOutputDir,
     scrapeTeamById,   // ← add this
+    normalizeTeamUrl,
+    getVisibleCompletedGameCount,
+    getVisibleCompletedGameEntries,
   };
 }
