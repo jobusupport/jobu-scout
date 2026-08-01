@@ -106,7 +106,11 @@ const CLASSIFICATION = {
 
   // ── Public/system -- no user JWT involved ──
   "app.post('/api/webhooks/stripe'": 'exempt',
-  "app.get('/api/debug/auth'": 'exempt', // pre-existing, unrelated info-disclosure risk -- flagged in this task's report, out of scope to fix here
+  // app.get('/api/debug/auth', ...) was removed entirely (unauthenticated
+  // filesystem-path and directory-listing disclosure) -- see
+  // test/debug-auth-removed.test.js for the real-HTTP proof it no longer
+  // exists. No classification entry remains for it here on purpose: this
+  // inventory only classifies routes it actually finds in server.js today.
 
   // ── Travel-specific: teams, rosters, games, reports, scrape/report jobs ──
   "app.get('/api/teams'": 'travel',
