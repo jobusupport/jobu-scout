@@ -4,15 +4,19 @@ if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
 }
 
-// Write GC auth session from environment variable on startup
-const gcAuthPath = '/app/storage/gamechanger-auth.json';
+// Write GC auth session from environment variable on startup -- the
+// destination is resolved through the same shared helper every other
+// GameChanger session producer/consumer uses (src/gc-session-loader.js),
+// so GC_AUTH_FILE_PATH is a real, single, end-to-end configurable session
+// location rather than a value this file independently guesses at. Never
+// logs the resolved path or session content; a write failure is reported
+// generically (the underlying fs error message can include the path).
 if (process.env.GC_AUTH_JSON) {
   try {
-    require('fs').mkdirSync('/app/storage', { recursive: true });
-    require('fs').writeFileSync(gcAuthPath, process.env.GC_AUTH_JSON, 'utf8');
-    console.log('[startup] GC auth written from env var');
+    require('./src/gc-session-loader').materializeStorageStateFromEnvValue(process.env.GC_AUTH_JSON);
+    console.log('[startup] GC auth session written from environment configuration');
   } catch (e) {
-    console.error('[startup] Failed to write GC auth:', e.message);
+    console.error('[startup] Failed to write GC auth session (check path/permissions configuration).');
   }
 }
 // Railway should provide USE_SUPABASE=true, but production should still use

@@ -8,10 +8,16 @@ const { getTeamsFromGoogleSheet } = require("./read-teams-from-sheet");
 const pipeline = require("./pipeline");
 const db = require("./db");
 const { captureTeamHandednessByUrl } = require("./scrape-handedness");
+const { getStorageStatePath } = require("./gc-session-loader");
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const STORAGE_STATE = path.join(__dirname, "..", "storage", "gamechanger-auth.json");
+// Resolved through the single shared helper (src/gc-session-loader.js) every
+// other GameChanger session producer/consumer uses -- GC_AUTH_FILE_PATH is a
+// real, end-to-end configurable location, not a value only some callers
+// understand. Defaults to the exact same repo-relative path this constant
+// always resolved to, so existing deployments are unaffected.
+const STORAGE_STATE = getStorageStatePath();
 const TEST_TEAM_CONTAINS = process.env.GC_TEST_TEAM_CONTAINS || "";
 const OUTPUT_DIR = path.join(__dirname, "..", "output");
 const FAILED_MATCHES_DIR = path.join(OUTPUT_DIR, "_failed-team-matches");

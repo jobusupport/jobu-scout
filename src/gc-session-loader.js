@@ -11,9 +11,18 @@
 // wherever a given deployment platform materializes injected secrets)
 // without any code change. When unset, this falls back to the same
 // repo-relative location the codebase has always used
-// (storage/gamechanger-auth.json, matching src/search-gamechanger-teams.js's
-// own STORAGE_STATE and server.js's own startup GC_AUTH_JSON-to-file
-// writer) -- so existing deployments keep working unchanged.
+// (storage/gamechanger-auth.json) -- so existing deployments keep working
+// unchanged.
+//
+// This is the SINGLE, canonical resolver for that path -- every producer
+// and consumer of the GameChanger session file (server.js's own startup
+// GC_AUTH_JSON-to-file writer, src/search-gamechanger-teams.js's Travel
+// scraper, and src/high-school-gc-import.js's collector) calls
+// getStorageStatePath()/materializeStorageStateFromEnvValue() from here
+// rather than independently computing or hardcoding the location, so
+// GC_AUTH_FILE_PATH is a real, end-to-end operational control and not a
+// value only the newest caller happens to understand. No caller maintains
+// its own fallback constant.
 //
 // Nothing in this module ever includes the resolved file path, cookie
 // values, tokens, or any other session content in a thrown error message --
@@ -37,6 +46,34 @@ function getStorageStatePath() {
   const configured = process.env.GC_AUTH_FILE_PATH;
   if (configured && configured.trim()) return configured.trim();
   return path.join(__dirname, '..', 'storage', 'gamechanger-auth.json');
+}
+
+// The write side's counterpart to getStorageStatePath() -- materializes
+// secret session content (e.g. from a GC_AUTH_JSON-shaped environment
+// variable, this codebase's existing secret-injection convention for
+// platforms without native secret-file mounting) at the resolved
+// destination, so a producer (server.js's own startup handling) and every
+// reader share the exact same location without either side maintaining
+// its own copy of the path logic.
+//
+// Creates only the necessary parent directory. Writes with owner-only
+// permissions where the platform honors Node's `mode` option (POSIX);
+// Windows has no equivalent simple permission-bit story via Node's fs and
+// silently ignores this, which is expected, not a defect. Never logs or
+// returns the resolved path or the written content -- callers own their
+// own (sanitized) success/failure logging.
+//
+// Returns false without writing anything when envValue is empty/nullish
+// (nothing configured to materialize); returns true on a successful
+// write; throws the underlying fs error on failure, exactly like a
+// direct fs call would, so callers can apply their own sanitized
+// fail-safe handling rather than this module guessing what "safe to log"
+// means for an arbitrary caller.
+function materializeStorageStateFromEnvValue(envValue, targetPath = getStorageStatePath()) {
+  if (!envValue) return false;
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  fs.writeFileSync(targetPath, envValue, { encoding: 'utf8', mode: 0o600 });
+  return true;
 }
 
 // Validates the file at `filePath` (defaults to getStorageStatePath())
@@ -114,6 +151,7 @@ function assertLandedOnAuthenticatedGameChangerPage(landedUrl) {
 
 module.exports = {
   getStorageStatePath,
+  materializeStorageStateFromEnvValue,
   validateStorageStateFile,
   assertLandedOnAuthenticatedGameChangerPage,
   SessionValidationError,

@@ -336,6 +336,91 @@ test('discovery itself failing fails the run at the discovery stage without ever
   assert.equal(importService.failedWith[0]?.failureStage, 'discovery');
 });
 
+// ── Valid authenticated schedule with zero completed games, vs. an
+// expired/rejected session ──────────────────────────────────────────────
+//
+// These two failure-shaped-but-actually-different scenarios must be kept
+// behaviorally distinct: an authenticated schedule page that legitimately
+// has no completed games yet is a normal, honest, successful import
+// (gamesFound: 0) -- it must never be confused with a session that was
+// rejected/expired (which the CLI's own gc-session-loader.js detects via
+// assertLandedOnAuthenticatedGameChangerPage, a URL-shape check that runs
+// BEFORE discoverCompletedGames is ever called, see
+// test/gc-session-loader.test.js's own "rejects a login-page redirect"
+// coverage -- that check is what actually classifies "expired session,"
+// not anything in this orchestration function). This function's own job
+// is narrower: prove that when discovery legitimately returns zero
+// games (authentication already having succeeded, by construction, since
+// this function is never reached otherwise), the result is an honest
+// success, not a failure -- completed-game selectors are never used as a
+// stand-in for authentication proof anywhere in this loop.
+test('a valid authenticated schedule with zero completed games completes as an honest success, never a failure -- distinct from an expired/rejected session', async () => {
+  const importService = fakeImportService();
+  let collectGameCalled = false;
+  const progressEvents = [];
+  const summary = await runHighSchoolImportCollection({
+    ctx: CTX, importService, existingPlayers: [],
+    // Authentication/session validation and the landed-schedule check
+    // (gc-session-loader.js's assertLandedOnAuthenticatedGameChangerPage)
+    // are modeled as already having succeeded -- by the time this
+    // function is ever called in production, both already passed. This
+    // injected discoverCompletedGames stands in for a genuinely
+    // authenticated schedule page that simply has no completed games on
+    // it yet (e.g. the season just started).
+    discoverCompletedGames: async () => [],
+    collectGame: async (entry) => { collectGameCalled = true; return agreeingGame(entry.sourceGameRef); },
+    onProgress: (event) => progressEvents.push(event),
+    sleep: noSleep,
+  });
+
+  assert.equal(summary.gamesFound, 0);
+  assert.equal(summary.gamesImported, 0);
+  assert.equal(summary.gamesFailed, 0);
+  assert.equal(summary.stopped, null, 'a legitimately empty schedule is not a "stopped" run -- it ran to completion');
+
+  // completeImportRun (success), never failImportRun.
+  assert.equal(importService.completed, true, 'a valid empty schedule must complete successfully');
+  assert.equal(importService.failedWith.length, 0, 'failImportRun must never be called for a legitimately empty, authenticated schedule');
+
+  // No game capture/reconstruction/publication of any kind occurred --
+  // there was nothing to capture.
+  assert.equal(collectGameCalled, false, 'collectGame must never be invoked when discovery found zero games');
+  assert.ok(!importService.calls.some(([name]) => name === 'recordSourceGame'));
+  assert.ok(!importService.calls.some(([name]) => name === 'captureSnapshot'));
+  assert.ok(!importService.calls.some(([name]) => name === 'recordGameValidation'));
+
+  // No expired-session-shaped error anywhere in the emitted progress log.
+  const serializedProgress = JSON.stringify(progressEvents);
+  assert.doesNotMatch(serializedProgress, /expired|rejected|login/i);
+
+  // No session path, cookie, token, local-storage value, or stack-trace
+  // shape anywhere in the returned summary or captured progress log.
+  const serializedSummary = JSON.stringify(summary, (key, value) => (value instanceof Map ? [...value.entries()] : value));
+  for (const haystack of [serializedProgress, serializedSummary]) {
+    assert.doesNotMatch(haystack, /cookie|token|localStorage|storageState/i);
+    assert.doesNotMatch(haystack, /[a-zA-Z]:\\|\/(app|home|Users)\//);
+    assert.doesNotMatch(haystack, /at\s+\S+\s+\(.*:\d+:\d+\)/); // a raw stack-trace frame shape
+  }
+});
+
+test('an expired/rejected session is classified distinctly from a valid empty schedule (see gc-session-loader.js, tested directly in test/gc-session-loader.test.js) -- completed-game selectors play no role in that classification', () => {
+  // This orchestration function never itself decides "expired vs. valid" --
+  // that decision is made once, in the CLI entry point, via
+  // gc-session-loader.js#assertLandedOnAuthenticatedGameChangerPage,
+  // purely from the landed URL shape, BEFORE discoverCompletedGames (and
+  // therefore this function) is ever reached. Asserting that boundary
+  // here, alongside the "valid empty schedule" test above, keeps the two
+  // scenarios documented as deliberately separate rather than letting a
+  // future change quietly fold session-expiry detection into this loop's
+  // own (game-content-dependent) logic.
+  const { assertLandedOnAuthenticatedGameChangerPage, SessionValidationError } = require('../src/gc-session-loader');
+  assert.equal(assertLandedOnAuthenticatedGameChangerPage('https://web.gc.com/teams/synthetic-org/synthetic-team/schedule'), true, 'a genuine authenticated schedule URL (regardless of how many completed games it lists) must never be classified as expired');
+  assert.throws(
+    () => assertLandedOnAuthenticatedGameChangerPage('https://web.gc.com/login?next=%2Fteams%2Fsynthetic-org'),
+    (err) => { assert.ok(err instanceof SessionValidationError); return true; }
+  );
+});
+
 test('reconcilePlayers: a unique normalized-name match resolves to that player', () => {
   const existingPlayers = [{ id: 'p1', normalizedFirstName: 'alice', normalizedLastName: 'smith' }];
   const rows = [{ Player: 'Alice Smith', isHighSchoolTeam: true }];
