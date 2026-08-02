@@ -149,7 +149,7 @@ async function getHsProgram(orgId) {
   );
 }
 
-module.exports = function createHighSchoolRouter({ requireAuth, jobs, appendLog, finishJob, attachJobProcess, stopJobProcess }) {
+module.exports = function createHighSchoolRouter({ requireAuth, jobs, appendLog, finishJob, attachJobProcess, stopJobProcess, importService }) {
   const router = express.Router();
 
   // ── Program ──────────────────────────────────────────────────────────
@@ -436,7 +436,7 @@ module.exports = function createHighSchoolRouter({ requireAuth, jobs, appendLog,
   // its own job-spawning/policy concerns, but mounted onto this SAME router
   // so it inherits requireAuth/resolveSupportSession/requireHighSchoolAccess
   // from the exact same call sites above, never a re-declared copy.
-  registerHighSchoolImportRoutes(router, {
+  const { killSwitchWatchdogTick } = registerHighSchoolImportRoutes(router, {
     adminClient,
     resolveSupportSession,
     blockWriteDuringReadOnlySupport,
@@ -448,8 +448,10 @@ module.exports = function createHighSchoolRouter({ requireAuth, jobs, appendLog,
     finishJob,
     attachJobProcess,
     stopJobProcess,
+    importService,
   });
 
+  router.killSwitchWatchdogTick = killSwitchWatchdogTick;
   return router;
 };
 

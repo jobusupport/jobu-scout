@@ -119,6 +119,16 @@ async function runHighSchoolImportCollection({
   discoverCompletedGames, // async () => [{ sourceGameRef, sourceGameUrl, opponentName, gameDate }]
   collectGame, // async (gameEntry) => gameData { meta:{ourSide,...}, boxScore, plays }
   isCancelled = () => false,
+  // Defaults to the same live env re-check this always did before -- kept
+  // as the default so every pre-existing test (which flips
+  // process.env.GC_COLLECTION_ENABLED directly and expects this function to
+  // react) keeps working unchanged. In production, the CLI entry point at
+  // the bottom of this file overrides this with a predicate wired to a
+  // real IPC message pushed by the server's kill-switch watchdog
+  // (src/high-school-import-routes.js#killSwitchWatchdogTick) -- NOT this
+  // process's own frozen process.env, which can never observe a change
+  // made to the server's environment after this child was spawned.
+  isKillSwitchTriggered = () => !policy.isCollectionEnabled(),
   onProgress = () => {},
   sleep = defaultSleep,
   now = () => Date.now(),
@@ -134,7 +144,7 @@ async function runHighSchoolImportCollection({
     stopped: null, // null | 'kill_switch' | 'cancelled' | 'max_games'
   };
 
-  if (!policy.isCollectionEnabled()) {
+  if (isKillSwitchTriggered()) {
     summary.stopped = 'kill_switch';
     onProgress({ type: 'stopped', reason: 'kill_switch' });
     await importService.failImportRun({ orgId: ctx.orgId, importRunId: ctx.importRunId, failureStage: 'discovery', rawErrorMessage: 'Automated GameChanger collection is currently disabled.' });
@@ -163,7 +173,7 @@ async function runHighSchoolImportCollection({
       onProgress({ type: 'stopped', reason: 'cancelled' });
       break;
     }
-    if (!policy.isCollectionEnabled()) {
+    if (isKillSwitchTriggered()) {
       summary.stopped = 'kill_switch';
       onProgress({ type: 'stopped', reason: 'kill_switch' });
       break;
@@ -206,10 +216,26 @@ async function runHighSchoolImportCollection({
         const delay = policy.computeBackoffDelayMs(attempt);
         onProgress({ type: 'retry', game: entry.sourceGameRef, attempt, delayMs: delay });
         await sleep(delay);
+        // Checked after every backoff, not just between games -- a long
+        // backoff (up to getBackoffMaxMs()) must not be a window during
+        // which a cancel or kill-switch signal goes unnoticed.
+        if (isCancelled()) { summary.stopped = 'cancelled'; onProgress({ type: 'stopped', reason: 'cancelled' }); break; }
+        if (isKillSwitchTriggered()) { summary.stopped = 'kill_switch'; onProgress({ type: 'stopped', reason: 'kill_switch' }); break; }
       }
     }
 
-    if (summary.stopped === 'kill_switch') break;
+    if (summary.stopped === 'kill_switch' || summary.stopped === 'cancelled') {
+      // This game's own run-game row would otherwise be left at
+      // discovery_status 'discovered' forever (never reached an outcome) --
+      // close it out honestly rather than leaving a dangling pending row.
+      // (gameData is only ever still null here -- a successful collectGame
+      // already broke out of the retry loop above before either of the two
+      // new interruption checks could run.)
+      if (runGame?.id && !gameData) {
+        await importService.updateSourceGameOutcome({ orgId: ctx.orgId, runGameId: runGame.id, discoveryStatus: 'failed', gameOutcome: 'failed' });
+      }
+      break;
+    }
 
     if (!gameData) {
       await importService.updateSourceGameOutcome({ orgId: ctx.orgId, runGameId: runGame.id, discoveryStatus: 'failed', gameOutcome: 'failed' });
@@ -314,9 +340,33 @@ async function runHighSchoolImportCollection({
     onProgress({ type: 'game_imported', game: entry.sourceGameRef, validationStatus: validation.validation_status, confidence: validation.confidence });
 
     await sleep(policy.getMinRequestDelayMs());
+    // Checked once more, right before the loop would begin a new source
+    // request for the next game -- no additional request is ever made
+    // after a stop has been observed.
+    if (isCancelled()) { summary.stopped = 'cancelled'; onProgress({ type: 'stopped', reason: 'cancelled' }); break; }
+    if (isKillSwitchTriggered()) { summary.stopped = 'kill_switch'; onProgress({ type: 'stopped', reason: 'kill_switch' }); break; }
   }
 
-  await importService.completeImportRun({ orgId: ctx.orgId, importRunId: ctx.importRunId });
+  // An interrupted run (kill switch or user cancel) is never marked
+  // succeeded, even if every game actually attempted before the stop
+  // happened to succeed -- completeImportRun only knows about games that
+  // were actually recorded, so without this branch a run stopped after,
+  // say, 2 of 5 discovered games (both successful) would silently report
+  // 'succeeded' instead of reflecting that it never finished. Already-
+  // captured games/snapshots are untouched either way -- only this run's
+  // own terminal status is affected.
+  if (summary.stopped === 'kill_switch' || summary.stopped === 'cancelled') {
+    await importService.failImportRun({
+      orgId: ctx.orgId,
+      importRunId: ctx.importRunId,
+      failureStage: 'discovery',
+      rawErrorMessage: summary.stopped === 'kill_switch'
+        ? 'Automated GameChanger collection was disabled while this run was in progress.'
+        : 'Cancelled by user.',
+    });
+  } else {
+    await importService.completeImportRun({ orgId: ctx.orgId, importRunId: ctx.importRunId });
+  }
   onProgress({ type: 'complete', summary: summarizeForLog(summary) });
   return summary;
 }
@@ -337,27 +387,58 @@ function summarizeForLog(summary) {
   };
 }
 
+// Idempotent cleanup for the CLI entry point's browser instance --
+// extracted as its own directly-testable function (rather than left as an
+// inline closure only reachable by actually spawning the real CLI
+// subprocess) so its idempotency and error-swallowing behavior can be
+// proven with a fake browser double, independent of Playwright/Chromium
+// ever being involved. `getBrowser` is a function (not a value) because
+// the CLI's own `browser` variable is reassigned once chromium.launch()
+// resolves, and cleanup can legitimately be invoked (via SIGTERM/SIGINT)
+// before that assignment ever happens.
+function createIdempotentBrowserCleanup(getBrowser) {
+  let cleanedUp = false;
+  return async function cleanup() {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    const browser = getBrowser();
+    if (browser) {
+      try {
+        await browser.close();
+      } catch {
+        /* already closed, or never fully finished opening -- cleanup must
+           never itself throw, or it could mask the original error on
+           whichever exit path triggered it. */
+      }
+    }
+  };
+}
+
 module.exports = {
   runHighSchoolImportCollection,
   tagRowsWithOwnership,
   buildCapturedGame,
   reconcilePlayers,
   summarizeForLog,
+  createIdempotentBrowserCleanup,
 };
 
 // ── CLI entry point: wires the injectable loop above to the real
 // Playwright collector, the real Supabase-backed import service, and the
-// real gamechanger-auth.json session -- spawned as a child process by
-// src/high-school-import-routes.js, mirroring exactly how server.js spawns
-// src/search-gamechanger-teams.js for Travel's own /api/run/gc-scraper. ──
+// real authorized gamechanger-auth.json session -- spawned as a child
+// process by src/high-school-import-routes.js, mirroring exactly how
+// server.js spawns src/search-gamechanger-teams.js for Travel's own
+// /api/run/gc-scraper. Using an authenticated GameChanger session for this
+// licensed collector is authorized and expected; everything below is about
+// handling that session safely, not about avoiding it. ──
 if (require.main === module) {
   (async () => {
-    const path = require('path');
     const { chromium } = require('playwright');
     const { createClient } = require('@supabase/supabase-js');
     const { createHighSchoolImportRepository } = require('./high-school-import-repository');
     const { createHighSchoolImportService } = require('./high-school-import-service');
     const scraper = require('./search-gamechanger-teams');
+    const sessionLoader = require('./gc-session-loader');
 
     const ctx = {
       orgId: process.env.HS_IMPORT_ORG_ID,
@@ -379,19 +460,85 @@ if (require.main === module) {
     const repository = createHighSchoolImportRepository(adminClient);
     const importService = createHighSchoolImportService({ repository });
 
-    const STORAGE_STATE = path.join(__dirname, '..', 'storage', 'gamechanger-auth.json');
-    const browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext({ storageState: STORAGE_STATE });
-    const page = await context.newPage();
-    page.setDefaultTimeout(policy.getRequestTimeoutMs());
+    // A fatal error at ANY point below -- before or after the browser ever
+    // launches -- must still leave this run in a terminal (not stuck
+    // 'running' forever) state. Wrapped in its own try/catch so a SECOND
+    // failure here (e.g. Supabase itself unreachable) can never crash the
+    // process ungracefully or mask the original error.
+    async function markRunFailedSafely(rawErrorMessage) {
+      try {
+        await importService.failImportRun({ orgId: ctx.orgId, importRunId: ctx.importRunId, failureStage: 'discovery', rawErrorMessage });
+      } catch (markErr) {
+        console.error('[hs-gc-import] failed to mark run as failed:', policy.sanitizeCollectionErrorMessage(markErr?.message));
+      }
+    }
 
+    // Registered before anything else so a message sent the instant this
+    // process is spawned (or arriving while the browser is still starting)
+    // is never missed.
     let cancelled = false;
+    let killSwitchTriggered = false;
     process.on('message', (msg) => {
-      if (msg === 'cancel') cancelled = true;
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.type === 'cancel') cancelled = true;
+      if (msg.type === 'kill_switch_disabled') killSwitchTriggered = true;
     });
+    const isCancelled = () => cancelled;
+    const isKillSwitchTriggered = () => killSwitchTriggered || !policy.isCollectionEnabled();
+
+    // Checked before loading any session material or launching a browser
+    // at all -- the server already checked this immediately before
+    // spawning, but re-checking here closes the (small, honest) race where
+    // the switch was disabled in the moment between that check and this
+    // process actually starting to run.
+    if (isKillSwitchTriggered()) {
+      console.log('[hs-gc-import] kill switch disabled before launch; not loading session material or starting a browser.');
+      await markRunFailedSafely('Automated GameChanger collection is currently disabled.');
+      return;
+    }
+
+    let browser = null;
+    // Normal completion, cancellation, kill-switch shutdown, a startup
+    // failure after launch, and a signal can all race to trigger this;
+    // createIdempotentBrowserCleanup guarantees only the first one actually
+    // closes anything.
+    const cleanup = createIdempotentBrowserCleanup(() => browser);
+    process.on('SIGTERM', () => { cleanup().finally(() => process.exit(0)); });
+    process.on('SIGINT', () => { cleanup().finally(() => process.exit(0)); });
 
     try {
+      browser = await chromium.launch({ headless: true });
+
+      if (isCancelled() || isKillSwitchTriggered()) {
+        await markRunFailedSafely(isCancelled() ? 'Cancelled by user.' : 'Automated GameChanger collection was disabled while this run was starting.');
+        return;
+      }
+
+      // Validate the session file's existence/readability/shape BEFORE
+      // handing it to Playwright -- fails safely, with a fixed generic
+      // message, on a missing/unreadable/malformed/empty file rather than
+      // surfacing whatever raw error Playwright happens to throw.
+      const storageStatePath = sessionLoader.getStorageStatePath();
+      sessionLoader.validateStorageStateFile(storageStatePath);
+
+      const context = await browser.newContext({ storageState: storageStatePath });
+      const page = await context.newPage();
+      page.setDefaultTimeout(policy.getRequestTimeoutMs());
+
+      if (isCancelled() || isKillSwitchTriggered()) {
+        await markRunFailedSafely(isCancelled() ? 'Cancelled by user.' : 'Automated GameChanger collection was disabled while this run was starting.');
+        return;
+      }
+
       await page.goto(scraper.normalizeTeamUrl(gcTeamUrl.replace(/\/schedule.*$/, '') + '/schedule'));
+
+      // A well-formed session file that has actually expired or been
+      // revoked is only detectable once GameChanger itself rejects it --
+      // it redirects to a login page rather than returning an error
+      // status, so this is a landed-URL check, not a status-code check.
+      // Never surfaces the landed URL itself (it can carry query-string
+      // tokens) in any message.
+      sessionLoader.assertLandedOnAuthenticatedGameChangerPage(page.url());
 
       const discoverCompletedGames = async () => {
         const entries = await scraper.getVisibleCompletedGameEntries(page);
@@ -416,16 +563,18 @@ if (require.main === module) {
         existingPlayers,
         discoverCompletedGames,
         collectGame,
-        isCancelled: () => cancelled,
+        isCancelled,
+        isKillSwitchTriggered,
         onProgress: (event) => {
           console.log(`[hs-gc-import] ${JSON.stringify(event)}`);
         },
       });
     } catch (err) {
       console.error('[hs-gc-import] fatal:', policy.sanitizeCollectionErrorMessage(err?.message));
+      await markRunFailedSafely(err instanceof sessionLoader.SessionValidationError ? err.message : (err?.message || 'Collection failed.'));
       process.exitCode = 1;
     } finally {
-      await browser.close();
+      await cleanup();
     }
   })();
 }

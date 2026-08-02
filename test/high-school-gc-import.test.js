@@ -16,6 +16,7 @@ const {
   runHighSchoolImportCollection,
   reconcilePlayers,
   buildCapturedGame,
+  createIdempotentBrowserCleanup,
 } = require('../src/high-school-gc-import');
 const policy = require('../src/gc-collection-policy');
 
@@ -228,7 +229,7 @@ test('the kill switch is also polled mid-run (between games), stopping promptly 
   assert.equal(summary.stopped, 'kill_switch');
 });
 
-test('cancellation stops the run promptly and completes it (not silently, and not as a false success)', async () => {
+test('cancellation stops the run promptly and marks it failed/cancelled, not silently, and never as a false success', async () => {
   const importService = fakeImportService();
   let gamesSeen = 0;
   let cancelled = false;
@@ -247,7 +248,62 @@ test('cancellation stops the run promptly and completes it (not silently, and no
     sleep: noSleep,
   });
   assert.equal(summary.stopped, 'cancelled');
-  assert.equal(importService.completed, true, 'a cancelled run must still be explicitly completed, not left dangling');
+  // A cancelled run must be explicitly, terminally marked -- but never
+  // reported as a successful completion, even though the one game it did
+  // manage to process succeeded. completeImportRun (which would derive
+  // 'succeeded' from that one processed game) must never be called here.
+  assert.equal(importService.completed, false, 'a cancelled run must never be reported as a normal completion');
+  assert.equal(importService.failedWith.length, 1);
+  assert.match(importService.failedWith[0].rawErrorMessage, /cancelled/i);
+});
+
+test('a kill switch triggered mid-run marks the run failed/disabled, not succeeded, even though every attempted game succeeded', async () => {
+  const importService = fakeImportService();
+  let gamesSeen = 0;
+  let killSwitchTriggered = false;
+  const summary = await runHighSchoolImportCollection({
+    ctx: CTX, importService, existingPlayers: [],
+    discoverCompletedGames: async () => [
+      { sourceGameRef: 'gc-1', sourceGameUrl: 'x' },
+      { sourceGameRef: 'gc-2', sourceGameUrl: 'y' },
+    ],
+    collectGame: async (entry) => {
+      gamesSeen += 1;
+      killSwitchTriggered = true; // disabled after the first game is requested
+      return agreeingGame(entry.sourceGameRef);
+    },
+    isKillSwitchTriggered: () => killSwitchTriggered && gamesSeen >= 1,
+    sleep: noSleep,
+  });
+  assert.equal(summary.stopped, 'kill_switch');
+  assert.equal(importService.completed, false, 'a kill-switch-interrupted run must never be reported as a normal completion');
+  assert.equal(importService.failedWith.length, 1);
+  assert.match(importService.failedWith[0].rawErrorMessage, /disabled/i);
+});
+
+test('a cancel/kill-switch signal arriving mid-retry (after a backoff sleep, before the next attempt) is honored immediately, not only between games', async () => {
+  const importService = fakeImportService();
+  let attempts = 0;
+  let cancelled = false;
+  const summary = await runHighSchoolImportCollection({
+    ctx: CTX, importService, existingPlayers: [],
+    discoverCompletedGames: async () => [{ sourceGameRef: 'gc-1', sourceGameUrl: 'x' }],
+    collectGame: async () => {
+      attempts += 1;
+      cancelled = true; // cancel after the first failed attempt, during the backoff that follows
+      const err = new Error('temporary network hiccup');
+      throw err;
+    },
+    isCancelled: () => cancelled,
+    sleep: noSleep,
+  });
+  assert.equal(attempts, 1, 'must not attempt a second retry once cancellation was observed during backoff');
+  assert.equal(summary.stopped, 'cancelled');
+  // The one run-game row that was opened for this attempt must be closed
+  // out rather than left dangling in a pending 'discovered' state forever.
+  const outcomeCalls = importService.calls.filter(([name]) => name === 'updateSourceGameOutcome');
+  assert.equal(outcomeCalls.length, 1);
+  assert.equal(outcomeCalls[0][1].gameOutcome, 'failed');
 });
 
 test('the max-games-per-run limit bounds how many discovered games are actually processed', async () => {
@@ -382,4 +438,50 @@ test('no captured or logged event ever contains a credential/session-shaped subs
   const serialized = JSON.stringify(progressEvents);
   assert.ok(!serialized.includes('secret-token-value'));
   assert.ok(!/bearer/i.test(serialized));
+});
+
+// ── createIdempotentBrowserCleanup ──────────────────────────────────────
+// Proves the CLI entry point's own cleanup guarantee (browser closed
+// exactly once, on every exit path, never throwing) without needing a real
+// Playwright browser or a real spawned subprocess -- a fake object
+// implementing just the .close() shape stands in for a real Browser.
+
+function fakeBrowser({ closeShouldThrow = false } = {}) {
+  const browser = { closeCallCount: 0 };
+  browser.close = async () => {
+    browser.closeCallCount += 1;
+    if (closeShouldThrow) throw new Error('already closed');
+  };
+  return browser;
+}
+
+test('createIdempotentBrowserCleanup: closes the browser exactly once even when called multiple times', async () => {
+  const browser = fakeBrowser();
+  const cleanup = createIdempotentBrowserCleanup(() => browser);
+  await cleanup();
+  await cleanup();
+  await cleanup();
+  assert.equal(browser.closeCallCount, 1, 'competing exit paths (SIGTERM, SIGINT, normal completion, a startup failure) must never close the browser more than once');
+});
+
+test('createIdempotentBrowserCleanup: does nothing (never throws) when the browser was never launched', async () => {
+  const cleanup = createIdempotentBrowserCleanup(() => null);
+  await assert.doesNotReject(() => cleanup());
+});
+
+test('createIdempotentBrowserCleanup: swallows a close() failure rather than throwing (never masks the original error on whichever exit path triggered it)', async () => {
+  const browser = fakeBrowser({ closeShouldThrow: true });
+  const cleanup = createIdempotentBrowserCleanup(() => browser);
+  await assert.doesNotReject(() => cleanup());
+  assert.equal(browser.closeCallCount, 1);
+});
+
+test('createIdempotentBrowserCleanup: reads the CURRENT browser at call time, not a value captured once at creation (cleanup can be registered for SIGTERM/SIGINT before chromium.launch() has resolved)', async () => {
+  let currentBrowser = null;
+  const cleanup = createIdempotentBrowserCleanup(() => currentBrowser);
+  // Simulate cleanup being registered (e.g. for a signal handler) before
+  // the browser variable is actually assigned.
+  currentBrowser = fakeBrowser();
+  await cleanup();
+  assert.equal(currentBrowser.closeCallCount, 1);
 });

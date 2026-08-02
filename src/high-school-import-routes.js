@@ -19,18 +19,23 @@
 // silently diverge from the tenant-isolation guarantee those functions
 // already provide.
 //
-// Import jobs reuse src/job-store.js's createJobRecord/findJobForOrg
-// unmodified (already product-neutral, already the tenant-binding
-// mechanism PR #21 hardened for Travel) against the SAME shared in-memory
-// `jobs` object server.js already owns -- passed in as a dependency here,
-// the same way server.js already passes it to registerTravelJobRoutes.
+// Import jobs reuse src/job-store.js's createJobRecord unmodified (already
+// product-neutral, already the tenant-binding mechanism PR #21 hardened for
+// Travel) against the SAME shared in-memory `jobs` object server.js already
+// owns -- passed in as a dependency here, the same way server.js already
+// passes it to registerTravelJobRoutes. Job lookups in THIS file (cancel,
+// status, the kill-switch watchdog) search by import-run id rather than
+// job id, so they use an inline `Object.values(jobs).find(...)` scoped by
+// `j.org_id === req._orgId` instead of job-store's own findJobForOrg (which
+// looks up by job id, a different key this file never has on hand) --
+// the org_id-scoping guarantee is the same either way.
 
 const path = require('path');
 const { spawn: realSpawn } = require('child_process');
 const policy = require('./gc-collection-policy');
 const { mapErrorToResponse } = require('./org-resolution');
 const rosterService = require('./high-school-roster-service');
-const { createJobRecord, findJobForOrg } = require('./job-store');
+const { createJobRecord } = require('./job-store');
 
 const GC_TEAM_URL_RE = /^https:\/\/web\.gc\.com\/teams\/([^/]+)\/([^/?#]+)/i;
 
@@ -75,8 +80,95 @@ function registerHighSchoolImportRoutes(router, deps) {
     finishJob,
     attachJobProcess,
     stopJobProcess,
+    importService: sharedImportService, // direct reference for the watchdog, which runs outside any request and has no `req.app.locals` to read
     spawn = realSpawn, // overridable in tests only -- production always uses the real child_process.spawn
   } = deps;
+
+  // ── Genuine, runtime-responsive kill-switch propagation ────────────────
+  //
+  // The spawned collector child receives a ONE-TIME copy of process.env at
+  // spawn -- it can never observe a later change to the server's own
+  // environment on its own. Making GC_COLLECTION_ENABLED an actual runtime
+  // control (not just a boot-time value a fresh process happens to read)
+  // means the LONG-LIVED SERVER PROCESS -- which always sees a fresh
+  // policy.isCollectionEnabled() on every call -- has to be the one that
+  // notices the switch flip and PUSHES a stop signal to every active job,
+  // rather than a child ever polling its own frozen copy. This function is
+  // that push: called on a bounded interval by the real setInterval set up
+  // in server.js (see gc-collection-policy.getKillSwitchWatchdogIntervalMs),
+  // and callable directly and synchronously by tests to simulate a tick
+  // without any real timer or wall-clock wait.
+  //
+  // This never waits for a user to open a status or list endpoint -- it is
+  // not triggered by any HTTP request at all.
+  function gracefulStopThenEscalate(job, { reason = 'cancel' } = {}) {
+    const proc = job.proc;
+    job.stopping = true;
+    if (!proc || !proc.pid) return false;
+
+    let settled = false;
+    try { proc.once('exit', () => { settled = true; }); } catch { /* proc may already be gone */ }
+
+    if (typeof proc.send === 'function' && proc.connected) {
+      try {
+        proc.send({ type: reason === 'kill_switch' ? 'kill_switch_disabled' : 'cancel' });
+      } catch {
+        /* IPC channel may already be closed -- the escalation timer below
+           still guarantees the process is stopped either way. */
+      }
+    }
+
+    const graceMs = policy.getCancelGraceMs();
+    const escalationTarget = { proc, pid: proc.pid, status: 'running' };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      stopJobProcess(escalationTarget);
+    }, graceMs);
+    timer.unref?.();
+
+    return true;
+  }
+
+  // Authoritative for BOTH why a run stopped and what its final persisted
+  // status is -- this never depends on the child process cooperating,
+  // finishing its own bookkeeping, or even still existing by the time this
+  // resolves. The child's own graceful shutdown (see high-school-gc-import.js)
+  // is still valuable for finishing the in-flight game cleanly, but DB
+  // correctness never depends on it.
+  async function markInterruptedRun(job, { rawErrorMessage }) {
+    const importService = sharedImportService;
+    if (!importService || !job.org_id || !job.importRunId) return;
+    try {
+      await importService.failImportRun({
+        orgId: job.org_id,
+        importRunId: job.importRunId,
+        failureStage: 'discovery',
+        rawErrorMessage,
+      });
+    } catch (err) {
+      console.error('[hs-gc-import-watchdog] failed to mark interrupted run', err);
+    }
+  }
+
+  // Called on a bounded interval (see server.js). Idempotent per job via
+  // killSwitchHandled -- a job is signaled and marked exactly once, not
+  // repeatedly on every subsequent tick while it winds down. Returns the
+  // list of affected job ids, useful for tests and observability.
+  function killSwitchWatchdogTick() {
+    if (policy.isCollectionEnabled()) return [];
+    const affected = [];
+    for (const job of Object.values(jobs)) {
+      if (job.productKind !== 'high_school_gc_import') continue;
+      if (job.status !== 'running') continue;
+      if (job.killSwitchHandled) continue;
+      job.killSwitchHandled = true;
+      affected.push(job.id);
+      markInterruptedRun(job, { rawErrorMessage: 'Automated GameChanger collection was disabled by an operator while this run was in progress.' });
+      gracefulStopThenEscalate(job, { reason: 'kill_switch' });
+      finishJob(job.id, false, -1);
+    }
+    return affected;
+  }
 
   async function loadTeamAndSeason(orgId, teamId, seasonId) {
     const team = await rosterService.getTeamInOrg({ orgId, teamId, adminClient });
@@ -201,6 +293,16 @@ function registerHighSchoolImportRoutes(router, deps) {
           HS_IMPORT_GC_TEAM_URL: team.gc_team_url,
           HS_IMPORT_EXISTING_PLAYERS_JSON: JSON.stringify(existingPlayers),
         },
+        // 'ipc' makes proc.send()/process.on('message', ...) actually work
+        // between this server and the child -- without it, send() is
+        // silently undefined and a graceful cancel/kill-switch message can
+        // never be delivered (see gracefulStopThenEscalate above). detached
+        // (non-Windows only, matching server.js's own spawnJob/makeRunStep
+        // pattern) puts the child in its own process group so a later
+        // process-group kill (stopJobProcess) reaches Playwright's Chromium
+        // descendant too, not just the immediate Node child.
+        stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
+        detached: process.platform !== 'win32',
       });
       attachJobProcess(jobId, child);
       child.stdout.on('data', (chunk) => String(chunk).split('\n').filter(Boolean).forEach((l) => appendLog(jobId, policy.sanitizeCollectionErrorMessage(l))));
@@ -290,15 +392,15 @@ function registerHighSchoolImportRoutes(router, deps) {
       if (!liveJob || liveJob.status !== 'running') {
         return res.status(409).json({ error: 'This import is not currently running.' });
       }
-      liveJob.stopping = true;
-      if (liveJob.proc?.send) {
-        try { liveJob.proc.send('cancel'); } catch { /* process may have exited between the status check and here */ }
-      }
-      const stopped = stopJobProcess(liveJob);
+      // The run's persisted status is marked here, synchronously, before
+      // this route even attempts to stop the process -- correctness never
+      // depends on the child cooperating with the graceful IPC message or
+      // even still existing by the time the grace period elapses.
       const importService = req.app.locals.highSchoolImportService;
       await importService.failImportRun({ orgId: req._orgId, importRunId: req.params.runId, failureStage: 'discovery', rawErrorMessage: 'Cancelled by user.' });
+      const initiated = gracefulStopThenEscalate(liveJob, { reason: 'cancel' });
       finishJob(liveJob.id, false, -1);
-      res.json({ ok: true, stopped });
+      res.json({ ok: true, stopped: initiated });
     } catch (err) {
       return sendResolverError(res, err, 'api/high-school/import-runs/:runId/cancel');
     }
@@ -396,6 +498,13 @@ function registerHighSchoolImportRoutes(router, deps) {
       return sendResolverError(res, err, 'api/high-school/teams/:teamId/seasons/:seasonId/stats');
     }
   }));
+
+  // Returned so the caller (src/high-school-api.js -> server.js) can wire
+  // killSwitchWatchdogTick to a real setInterval -- this function itself
+  // never starts a timer, so calling registerHighSchoolImportRoutes never
+  // has a global-timer side effect, and tests can invoke the tick directly
+  // and synchronously without any real wall-clock wait or leaked interval.
+  return { killSwitchWatchdogTick };
 }
 
 module.exports = { registerHighSchoolImportRoutes, normalizeAndValidateGcTeamUrl };

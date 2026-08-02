@@ -75,6 +75,28 @@ function getRequestTimeoutMs() {
   return envInt('GC_REQUEST_TIMEOUT_MS', 30000);
 }
 
+// How often the server-side watchdog (src/high-school-import-routes.js's
+// killSwitchWatchdogTick) checks for active High School GC import jobs that
+// need to be stopped because the switch has been disabled. This is what
+// makes the kill switch a genuine runtime control rather than a value a
+// spawned child can only observe once, at its own process start: the
+// watchdog runs on a bounded interval INSIDE THE LONG-LIVED SERVER PROCESS
+// (which always sees a fresh process.env on every call, unlike a child that
+// received a one-time env copy at spawn) and proactively pushes an IPC stop
+// signal to every active job -- it never waits for a user to open a status
+// or list endpoint.
+function getKillSwitchWatchdogIntervalMs() {
+  return envInt('GC_KILL_SWITCH_WATCHDOG_INTERVAL_MS', 2000);
+}
+
+// Grace period given to a collector child to exit on its own after being
+// asked (via IPC) to cancel or stop for the kill switch, before the server
+// escalates to a hard OS-level process-tree kill. Bounded and short so
+// "promptly stops" is a real guarantee, not just a request.
+function getCancelGraceMs() {
+  return envInt('GC_CANCEL_GRACE_MS', 5000);
+}
+
 // Exponential backoff with bounded jitter -- attempt is 1-indexed (the
 // first retry is attempt=1). Never used to defeat a rate limit faster;
 // only ever to wait LONGER between attempts, capped at getBackoffMaxMs().
@@ -165,6 +187,8 @@ module.exports = {
   getBackoffJitterMs,
   getMaxGamesPerRun,
   getRequestTimeoutMs,
+  getKillSwitchWatchdogIntervalMs,
+  getCancelGraceMs,
   computeBackoffDelayMs,
   classifyCollectionFailure,
   sanitizeCollectionErrorMessage,

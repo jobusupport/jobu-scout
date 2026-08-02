@@ -401,8 +401,9 @@ test('the admin router mount is unchanged (still gated entirely by requireJobuAd
   assert.match(serverSrc, /app\.use\('\/api\/admin', createAdminRouter\(\{ requireAuth \}\)\)/);
 });
 
-test('the High School router mount still passes requireAuth (plus the job-management deps its own GameChanger-import routes need), and requireTravelAccess does not appear anywhere in src/high-school-api.js', () => {
-  assert.match(serverSrc, /app\.use\('\/api\/high-school', createHighSchoolRouter\(\{ requireAuth, jobs, appendLog, finishJob, attachJobProcess, stopJobProcess \}\)\)/);
+test('the High School router mount still passes requireAuth (plus the job-management/import-service deps its own GameChanger-import routes and kill-switch watchdog need), and requireTravelAccess does not appear anywhere in src/high-school-api.js', () => {
+  assert.match(serverSrc, /const highSchoolRouter = createHighSchoolRouter\(\{\s*requireAuth, jobs, appendLog, finishJob, attachJobProcess, stopJobProcess,\s*importService: app\.locals\.highSchoolImportService,\s*\}\);/);
+  assert.match(serverSrc, /app\.use\('\/api\/high-school', highSchoolRouter\);/);
   const hsSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'high-school-api.js'), 'utf8');
   assert.doesNotMatch(hsSrc, /requireTravelAccess/);
   // Its own, separate, pre-existing canonical guard must still be present and unchanged.

@@ -85,6 +85,7 @@ const { getOrganizationCapabilities, requireProductAccess } = require('./src/pro
 const createHighSchoolRouter = require('./src/high-school-api');
 const { createHighSchoolImportRepository } = require('./src/high-school-import-repository');
 const { createHighSchoolImportService } = require('./src/high-school-import-service');
+const gcCollectionPolicy = require('./src/gc-collection-policy');
 
 // ── Trusted organization resolution (extracted for database-free testing) ────
 const { resolveTrustedOrgId, buildAcceptedMembershipsQuery, mapErrorToResponse } = require('./src/org-resolution');
@@ -677,7 +678,29 @@ if (adminClient) {
     repository: createHighSchoolImportRepository(adminClient),
   });
 }
-app.use('/api/high-school', createHighSchoolRouter({ requireAuth, jobs, appendLog, finishJob, attachJobProcess, stopJobProcess }));
+const highSchoolRouter = createHighSchoolRouter({
+  requireAuth, jobs, appendLog, finishJob, attachJobProcess, stopJobProcess,
+  importService: app.locals.highSchoolImportService,
+});
+app.use('/api/high-school', highSchoolRouter);
+
+// Runtime-responsive kill-switch watchdog: proactively pushes a stop
+// signal to every active High School GameChanger import the moment
+// GC_COLLECTION_ENABLED is observed disabled -- this is what makes the
+// switch an actual runtime control rather than a value a spawned child can
+// only ever see once, at its own process start (a child's process.env is a
+// one-time copy taken at spawn; it never inherits a later change to this
+// server's own environment). Runs on a bounded interval, never tied to a
+// user opening a status or list endpoint. unref() so this timer never
+// keeps the process alive on its own (matches every other interval this
+// codebase already uses this way).
+if (highSchoolRouter.killSwitchWatchdogTick) {
+  const watchdogTimer = setInterval(
+    highSchoolRouter.killSwitchWatchdogTick,
+    gcCollectionPolicy.getKillSwitchWatchdogIntervalMs()
+  );
+  watchdogTimer.unref?.();
+}
 
 // ── Auth routes ──────────────────────────────────────────────────────────────
 

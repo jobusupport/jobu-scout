@@ -369,6 +369,26 @@ class FakeQueryBuilder {
     return this;
   }
 
+  // Narrow additions for the High School GameChanger import read functions
+  // (src/high-school-import-repository.js's listImportRuns/
+  // getCapturedGamesForRun/etc.) -- .in() and .order()/.limit() are the
+  // only additional query-builder surface those functions actually use
+  // beyond what this fake already supported.
+  in(column, values) {
+    this.filters.push({ type: 'in', column, values: values || [] });
+    return this;
+  }
+
+  order(column, { ascending = true } = {}) {
+    this._orderBy = { column, ascending };
+    return this;
+  }
+
+  limit(n) {
+    this._limit = n;
+    return this;
+  }
+
   single() {
     this.singleMode = 'single';
     return this;
@@ -395,6 +415,7 @@ class FakeQueryBuilder {
   _matches(row) {
     return this.filters.every((f) => {
       if (f.type === 'is') return f.value === null ? row[f.column] == null : row[f.column] === f.value;
+      if (f.type === 'in') return f.values.includes(row[f.column]);
       return row[f.column] === f.value;
     });
   }
@@ -447,7 +468,19 @@ class FakeQueryBuilder {
   }
 
   _executeSelect() {
-    const rows = this._rows().filter((r) => this._matches(r));
+    let rows = this._rows().filter((r) => this._matches(r));
+    if (this._orderBy) {
+      const { column, ascending } = this._orderBy;
+      rows = [...rows].sort((a, b) => {
+        const av = a[column];
+        const bv = b[column];
+        if (av === bv) return 0;
+        if (av === undefined || av === null) return ascending ? -1 : 1;
+        if (bv === undefined || bv === null) return ascending ? 1 : -1;
+        return (av < bv ? -1 : 1) * (ascending ? 1 : -1);
+      });
+    }
+    if (typeof this._limit === 'number') rows = rows.slice(0, this._limit);
     if (this.singleMode === 'single') {
       if (rows.length !== 1) return { data: null, error: { message: `expected exactly one row, got ${rows.length}` } };
       return { data: FakeQueryBuilder.snapshot(rows[0]), error: null };
