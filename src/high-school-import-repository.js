@@ -123,6 +123,131 @@ function createHighSchoolImportRepository(adminClient) {
     return data;
   }
 
+  // The read-side counterpart of the write functions below -- kept in this
+  // same file specifically so every reference to hs_import_runs/
+  // hs_import_run_games/hs_game_validation_results/hs_verified_totals/
+  // hs_player_advanced_stats/hs_pitcher_advanced_stats stays confined to
+  // this one persistence layer (see the existing repo-wide test enforcing
+  // exactly that boundary) even for the new GameChanger-ingestion HTTP
+  // routes that need to show a coach an import's status/review/results.
+  async function listImportRuns({ orgId, teamId, seasonId, limit = 20 }) {
+    const { data, error } = await adminClient
+      .from('hs_import_runs')
+      .select('id, status, source_provider, trigger_kind, started_at, completed_at, games_discovered, games_processed, games_succeeded, games_failed, failure_stage, error_summary, created_at')
+      .eq('org_id', orgId)
+      .eq('team_id', teamId)
+      .eq('season_id', seasonId)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+    if (error) throw persistenceFailed('hs_import_runs', error);
+    return data || [];
+  }
+
+  async function listRunGames({ orgId, importRunId }) {
+    const { data, error } = await adminClient
+      .from('hs_import_run_games')
+      .select('id, source_game_ref, discovery_status, game_outcome, diagnostics, hs_game_id, created_at')
+      .eq('org_id', orgId)
+      .eq('import_run_id', importRunId);
+    if (error) throw persistenceFailed('hs_import_run_games', error);
+    return data || [];
+  }
+
+  // Rebuilds the exact { boxScore, plays } shape publishVerifiedTotals's
+  // reconstructTeamGames expects, per successfully-imported game in a run,
+  // from the ALREADY-CAPTURED (isHighSchoolTeam-tagged) raw snapshots this
+  // run's own ingestion wrote via captureRawSnapshot -- never re-scrapes,
+  // never accepts a caller-supplied payload. This is what makes "publish
+  // the exact reviewed server-side import" a real guarantee: the publish
+  // route has no field in its own request body that can influence any of
+  // this data.
+  async function getCapturedGamesForRun({ orgId, importRunId }) {
+    const { data: runGames, error: gamesError } = await adminClient
+      .from('hs_import_run_games')
+      .select('id, hs_game_id')
+      .eq('org_id', orgId)
+      .eq('import_run_id', importRunId)
+      .eq('game_outcome', 'inserted');
+    if (gamesError) throw persistenceFailed('hs_import_run_games', gamesError);
+
+    const eligible = (runGames || []).filter((g) => g.hs_game_id);
+    if (eligible.length === 0) return [];
+
+    const { data: snapshots, error: snapError } = await adminClient
+      .from('hs_raw_snapshots')
+      .select('import_run_game_id, snapshot_kind, payload, captured_at')
+      .eq('org_id', orgId)
+      .eq('import_run_id', importRunId)
+      .in('import_run_game_id', eligible.map((g) => g.id))
+      .in('snapshot_kind', ['box_score', 'play_by_play'])
+      .order('captured_at', { ascending: false });
+    if (snapError) throw persistenceFailed('hs_raw_snapshots', snapError);
+
+    // Most-recently-captured snapshot per (run_game, kind) wins -- relevant
+    // only if a game was somehow snapshotted more than once within the
+    // same run, which normal ingestion never does, but this keeps the read
+    // side correct rather than assuming exactly one row exists.
+    const latestByGameAndKind = new Map();
+    for (const snap of snapshots || []) {
+      const key = `${snap.import_run_game_id}:${snap.snapshot_kind}`;
+      if (!latestByGameAndKind.has(key)) latestByGameAndKind.set(key, snap.payload);
+    }
+
+    return eligible
+      .map((g) => ({
+        boxScore: latestByGameAndKind.get(`${g.id}:box_score`) || null,
+        plays: latestByGameAndKind.get(`${g.id}:play_by_play`)?.plays || [],
+      }))
+      .filter((g) => g.boxScore);
+  }
+
+  async function listGameValidationResults({ orgId, importRunId }) {
+    const { data, error } = await adminClient
+      .from('hs_game_validation_results')
+      .select('hs_game_id, has_box_score, has_play_by_play, batting_matches_box, confidence, validation_status, warnings')
+      .eq('org_id', orgId)
+      .eq('import_run_id', importRunId);
+    if (error) throw persistenceFailed('hs_game_validation_results', error);
+    return data || [];
+  }
+
+  async function getCurrentVerifiedTotals({ orgId, teamId, seasonId }) {
+    const { data, error } = await adminClient
+      .from('hs_verified_totals')
+      .select('*')
+      .eq('org_id', orgId)
+      .eq('team_id', teamId)
+      .eq('season_id', seasonId)
+      .eq('is_current', true)
+      .maybeSingle();
+    if (error) throw persistenceFailed('hs_verified_totals', error);
+    return data;
+  }
+
+  async function listCurrentPlayerAdvancedStats({ orgId, teamId, seasonId }) {
+    const { data, error } = await adminClient
+      .from('hs_player_advanced_stats')
+      .select('*')
+      .eq('org_id', orgId)
+      .eq('team_id', teamId)
+      .eq('season_id', seasonId)
+      .eq('is_current', true);
+    if (error) throw persistenceFailed('hs_player_advanced_stats', error);
+    return data || [];
+  }
+
+  async function listCurrentPitcherAdvancedStats({ orgId, teamId, seasonId }) {
+    const { data, error } = await adminClient
+      .from('hs_pitcher_advanced_stats')
+      .select('*')
+      .eq('org_id', orgId)
+      .eq('team_id', teamId)
+      .eq('season_id', seasonId)
+      .eq('is_current', true);
+    if (error) throw persistenceFailed('hs_pitcher_advanced_stats', error);
+    return data || [];
+  }
+
   async function recordDiscoveredCount({ orgId, importRunId, count }) {
     const { data, error } = await adminClient
       .from('hs_import_runs')
@@ -537,17 +662,24 @@ function createHighSchoolImportRepository(adminClient) {
   return {
     createImportRun,
     getImportRun,
+    listImportRuns,
     recordDiscoveredCount,
     completeImportRun,
     failImportRun,
     recordRunGame,
+    listRunGames,
+    getCapturedGamesForRun,
     updateRunGameOutcome,
     captureRawSnapshot,
     resolveOrCreateGame,
     insertGameValidationResult,
+    listGameValidationResults,
     publishVerifiedTotals,
     publishPlayerAdvancedStats,
     publishPitcherAdvancedStats,
+    getCurrentVerifiedTotals,
+    listCurrentPlayerAdvancedStats,
+    listCurrentPitcherAdvancedStats,
   };
 }
 

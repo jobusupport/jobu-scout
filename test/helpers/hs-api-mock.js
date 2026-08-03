@@ -16,7 +16,17 @@ let idCounter = 100;
 function nextId() { return 'test-' + (++idCounter); }
 
 function freshDb() {
-  return { program: null, seasons: [], teams: [], players: [], roster: [] };
+  return {
+    program: null, seasons: [], teams: [], players: [], roster: [],
+    // GameChanger import mock state -- deliberately separate from the
+    // Slice 1A CRUD state above. importRuns/collectionEnabled/publishedStats
+    // are mutated directly by tests (not just through routes) so a test can
+    // drive a run through review -> ready-to-publish -> published without
+    // needing a real collector or Supabase behind it.
+    importRuns: [],
+    collectionEnabled: true,
+    publishedStats: { verifiedTotals: null, playerAdvancedStats: [], pitcherAdvancedStats: [] },
+  };
 }
 
 async function readJsonBody(route) {
@@ -236,6 +246,111 @@ async function installHsApiMock(page, { capabilities, forbidden = false } = {}) 
       if (body.jerseyNumber !== undefined) row.jerseyNumber = body.jerseyNumber;
       if (body.status !== undefined) row.status = body.status;
       return json(route, { membership: row }, 200);
+    }
+
+    // ── GameChanger import mock surface (Slice 1A.2) -- matches
+    // src/high-school-import-routes.js's real contract: same paths, same
+    // status codes, same response field names. Kept in this same
+    // catch-all so every existing test (which never touches these routes)
+    // is completely unaffected.
+    m = pathname.match(/^\/api\/high-school\/teams\/([^/]+)\/gc-source$/);
+    if (m && method === 'PATCH') {
+      const team = db.teams.find((t) => t.id === m[1]);
+      if (!team) return json(route, { error: 'Team not found' }, 404);
+      const body = await readJsonBody(route);
+      if (!body.gcTeamUrl) return json(route, { error: 'gcTeamUrl is required' }, 400);
+      if (!/^https:\/\/web\.gc\.com\/teams\/[^/]+\/[^/?#]+/i.test(body.gcTeamUrl)) {
+        return json(route, { error: 'gcTeamUrl must be a GameChanger team URL (https://web.gc.com/teams/<org>/<team>).' }, 400);
+      }
+      const externalTeamId = body.gcTeamUrl.split('/').filter(Boolean).pop();
+      const conflict = db.teams.find((t) => t.id !== team.id && t.gc_external_team_id === externalTeamId);
+      if (conflict) return json(route, { error: 'This GameChanger team is already bound to another team in your organization.' }, 409);
+      team.gc_team_url = body.gcTeamUrl.split(/[?#]/)[0];
+      team.gc_external_team_id = externalTeamId;
+      return json(route, { team }, 200);
+    }
+
+    m = pathname.match(/^\/api\/high-school\/teams\/([^/]+)\/seasons\/([^/]+)\/import-runs$/);
+    if (m && method === 'GET') {
+      const [, teamId, seasonId] = m;
+      const runs = db.importRuns.filter((r) => r.team_id === teamId && r.season_id === seasonId);
+      return json(route, { importRuns: runs, collectionEnabled: db.collectionEnabled }, 200);
+    }
+    if (m && method === 'POST') {
+      const [, teamId, seasonId] = m;
+      const team = db.teams.find((t) => t.id === teamId);
+      if (!team?.gc_team_url) return json(route, { error: 'This team has no GameChanger source connected yet.' }, 400);
+      if (!db.collectionEnabled) return json(route, { error: 'Automated GameChanger collection is currently disabled.' }, 503);
+      const run = {
+        id: nextId(), team_id: teamId, season_id: seasonId, status: 'running',
+        games_discovered: null, games_processed: null, games_succeeded: null, games_failed: null,
+        created_at: new Date().toISOString(),
+        reconciliation: { matched: [], ambiguous: [], unmatched: [] },
+        validations: [], publishable: false, games: [],
+      };
+      db.importRuns.unshift(run);
+      return json(route, { importRun: run, jobId: nextId() }, 201);
+    }
+
+    m = pathname.match(/^\/api\/high-school\/teams\/([^/]+)\/seasons\/([^/]+)\/import-runs\/([^/]+)$/);
+    if (m && method === 'GET') {
+      const [, , , runId] = m;
+      const run = db.importRuns.find((r) => r.id === runId);
+      if (!run) return json(route, { error: 'Import run not found' }, 404);
+      return json(route, {
+        importRun: run,
+        games: run.games || [],
+        validations: run.validations || [],
+        reconciliation: run.reconciliation || { matched: [], ambiguous: [], unmatched: [] },
+        publishable: !!run.publishable,
+        liveJob: run.liveJob || null,
+      }, 200);
+    }
+
+    m = pathname.match(/^\/api\/high-school\/teams\/([^/]+)\/seasons\/([^/]+)\/import-runs\/([^/]+)\/cancel$/);
+    if (m && method === 'POST') {
+      const run = db.importRuns.find((r) => r.id === m[3]);
+      if (!run || run.status !== 'running') return json(route, { error: 'This import is not currently running.' }, 409);
+      run.status = 'failed';
+      run.error_summary = 'Cancelled by user.';
+      return json(route, { ok: true, stopped: true }, 200);
+    }
+
+    m = pathname.match(/^\/api\/high-school\/teams\/([^/]+)\/seasons\/([^/]+)\/import-runs\/([^/]+)\/retry$/);
+    if (m && method === 'POST') {
+      const [, teamId, seasonId, runId] = m;
+      const prior = db.importRuns.find((r) => r.id === runId);
+      if (!prior) return json(route, { error: 'Import run not found' }, 404);
+      if (!['failed', 'partial'].includes(prior.status)) return json(route, { error: 'Only a failed or partial import run can be retried.' }, 409);
+      if (!db.collectionEnabled) return json(route, { error: 'Automated GameChanger collection is currently disabled.' }, 503);
+      const run = {
+        id: nextId(), team_id: teamId, season_id: seasonId, status: 'running',
+        games_discovered: null, games_processed: null, games_succeeded: null, games_failed: null,
+        created_at: new Date().toISOString(),
+        reconciliation: { matched: [], ambiguous: [], unmatched: [] },
+        validations: [], publishable: false, games: [],
+      };
+      db.importRuns.unshift(run);
+      return json(route, { importRun: run, jobId: nextId() }, 201);
+    }
+
+    m = pathname.match(/^\/api\/high-school\/teams\/([^/]+)\/seasons\/([^/]+)\/import-runs\/([^/]+)\/publish$/);
+    if (m && method === 'POST') {
+      const run = db.importRuns.find((r) => r.id === m[3]);
+      if (!run) return json(route, { error: 'Import run not found' }, 404);
+      if (run.status !== 'succeeded') return json(route, { error: 'Only a fully succeeded import run can be published.' }, 409);
+      if (!run.publishable) return json(route, { error: 'This import is not ready to publish (validation issues remain unresolved).' }, 409);
+      db.publishedStats = {
+        verifiedTotals: { games: run.games_succeeded ?? run.games?.length ?? 0, confidence: 'high', updated_at: new Date().toISOString() },
+        playerAdvancedStats: (run.reconciliation?.matched || []).map((p) => ({ playerId: p.playerId, k_pct: 18.2, bb_pct: 9.4 })),
+        pitcherAdvancedStats: [],
+      };
+      return json(route, { verifiedTotals: db.publishedStats.verifiedTotals, publishedPlayers: (run.reconciliation?.matched || []).map((p) => ({ playerId: p.playerId, published: true })) }, 200);
+    }
+
+    m = pathname.match(/^\/api\/high-school\/teams\/([^/]+)\/seasons\/([^/]+)\/stats$/);
+    if (m && method === 'GET') {
+      return json(route, db.publishedStats, 200);
     }
 
     return json(route, { error: 'Not found (test mock)' }, 404);

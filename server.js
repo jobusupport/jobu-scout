@@ -4,15 +4,19 @@ if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
 }
 
-// Write GC auth session from environment variable on startup
-const gcAuthPath = '/app/storage/gamechanger-auth.json';
+// Write GC auth session from environment variable on startup -- the
+// destination is resolved through the same shared helper every other
+// GameChanger session producer/consumer uses (src/gc-session-loader.js),
+// so GC_AUTH_FILE_PATH is a real, single, end-to-end configurable session
+// location rather than a value this file independently guesses at. Never
+// logs the resolved path or session content; a write failure is reported
+// generically (the underlying fs error message can include the path).
 if (process.env.GC_AUTH_JSON) {
   try {
-    require('fs').mkdirSync('/app/storage', { recursive: true });
-    require('fs').writeFileSync(gcAuthPath, process.env.GC_AUTH_JSON, 'utf8');
-    console.log('[startup] GC auth written from env var');
+    require('./src/gc-session-loader').materializeStorageStateFromEnvValue(process.env.GC_AUTH_JSON);
+    console.log('[startup] GC auth session written from environment configuration');
   } catch (e) {
-    console.error('[startup] Failed to write GC auth:', e.message);
+    console.error('[startup] Failed to write GC auth session (check path/permissions configuration).');
   }
 }
 // Railway should provide USE_SUPABASE=true, but production should still use
@@ -83,6 +87,9 @@ const { getOrganizationCapabilities, requireProductAccess } = require('./src/pro
 
 // ── High School domain (read-only foundation) ────────────────────────────────
 const createHighSchoolRouter = require('./src/high-school-api');
+const { createHighSchoolImportRepository } = require('./src/high-school-import-repository');
+const { createHighSchoolImportService } = require('./src/high-school-import-service');
+const gcCollectionPolicy = require('./src/gc-collection-policy');
 
 // ── Trusted organization resolution (extracted for database-free testing) ────
 const { resolveTrustedOrgId, buildAcceptedMembershipsQuery, mapErrorToResponse } = require('./src/org-resolution');
@@ -663,7 +670,41 @@ async function requireTravelAccess(req, res, next) {
 }
 
 app.use('/api/admin', createAdminRouter({ requireAuth }));
-app.use('/api/high-school', createHighSchoolRouter({ requireAuth }));
+
+// The High School GameChanger import service is constructed once, here,
+// against the same service-role adminClient every other org-scoped query
+// in this file already uses, and handed to the router via app.locals --
+// the established pattern this codebase already uses for a
+// request-handler-reachable, non-per-request singleton (see Express's own
+// app.locals convention; no new dependency-injection mechanism invented).
+if (adminClient) {
+  app.locals.highSchoolImportService = createHighSchoolImportService({
+    repository: createHighSchoolImportRepository(adminClient),
+  });
+}
+const highSchoolRouter = createHighSchoolRouter({
+  requireAuth, jobs, appendLog, finishJob, attachJobProcess, stopJobProcess,
+  importService: app.locals.highSchoolImportService,
+});
+app.use('/api/high-school', highSchoolRouter);
+
+// Runtime-responsive kill-switch watchdog: proactively pushes a stop
+// signal to every active High School GameChanger import the moment
+// GC_COLLECTION_ENABLED is observed disabled -- this is what makes the
+// switch an actual runtime control rather than a value a spawned child can
+// only ever see once, at its own process start (a child's process.env is a
+// one-time copy taken at spawn; it never inherits a later change to this
+// server's own environment). Runs on a bounded interval, never tied to a
+// user opening a status or list endpoint. unref() so this timer never
+// keeps the process alive on its own (matches every other interval this
+// codebase already uses this way).
+if (highSchoolRouter.killSwitchWatchdogTick) {
+  const watchdogTimer = setInterval(
+    highSchoolRouter.killSwitchWatchdogTick,
+    gcCollectionPolicy.getKillSwitchWatchdogIntervalMs()
+  );
+  watchdogTimer.unref?.();
+}
 
 // ── Auth routes ──────────────────────────────────────────────────────────────
 

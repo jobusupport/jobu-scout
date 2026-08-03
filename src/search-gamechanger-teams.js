@@ -8,10 +8,16 @@ const { getTeamsFromGoogleSheet } = require("./read-teams-from-sheet");
 const pipeline = require("./pipeline");
 const db = require("./db");
 const { captureTeamHandednessByUrl } = require("./scrape-handedness");
+const { getStorageStatePath } = require("./gc-session-loader");
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const STORAGE_STATE = path.join(__dirname, "..", "storage", "gamechanger-auth.json");
+// Resolved through the single shared helper (src/gc-session-loader.js) every
+// other GameChanger session producer/consumer uses -- GC_AUTH_FILE_PATH is a
+// real, end-to-end configurable location, not a value only some callers
+// understand. Defaults to the exact same repo-relative path this constant
+// always resolved to, so existing deployments are unaffected.
+const STORAGE_STATE = getStorageStatePath();
 const TEST_TEAM_CONTAINS = process.env.GC_TEST_TEAM_CONTAINS || "";
 const OUTPUT_DIR = path.join(__dirname, "..", "output");
 const FAILED_MATCHES_DIR = path.join(OUTPUT_DIR, "_failed-team-matches");
@@ -3252,7 +3258,15 @@ console.log('[browser] Chromium launched successfully.');
   }
 }
 
-// ── Exports for scrape-game-urls.js ──────────────────────────────────────────
+// ── Exports for scrape-game-urls.js and src/high-school-gc-import.js ────────
+// The High School GameChanger ingestion adapter (src/high-school-gc-import.js)
+// reuses the pure DOM-extraction and schedule-discovery functions below
+// unmodified -- GameChanger's page structure (box-score AG-Grid, plays feed,
+// completed-game score-badge convention) is the same regardless of team
+// type, per the compatibility analysis in that module's own header comment.
+// Nothing about these three additional exports changes any existing
+// behavior for scrape-game-urls.js or this file's own CLI entry point --
+// this is strictly additive to the export object.
 if (require.main !== module) {
   module.exports = {
     extractGameData,
@@ -3262,5 +3276,8 @@ if (require.main !== module) {
     extractGameIdFromUrl,
     getTeamOutputDir,
     scrapeTeamById,   // ← add this
+    normalizeTeamUrl,
+    getVisibleCompletedGameCount,
+    getVisibleCompletedGameEntries,
   };
 }

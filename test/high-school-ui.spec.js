@@ -585,3 +585,248 @@ test.describe('Travel Baseball regression', () => {
     expect(parts[0]).toBe('280px');
   });
 });
+
+test.describe('Import & Stats (GameChanger)', () => {
+  async function setUpTeamAndSeason(page) {
+    await createProgram(page);
+    await page.evaluate(() => switchHsTab('teams'));
+    await page.click('#hs-pane-teams button:has-text("Add Team")');
+    await page.fill('#hsTeamName', 'Varsity Baseball');
+    await page.click('#hsTeamModal button:has-text("Save Team")');
+
+    await page.evaluate(() => switchHsTab('seasons'));
+    await page.click('#hs-pane-seasons button:has-text("Add Season")');
+    await page.fill('#hsSeasonName', 'Spring 2027');
+    await page.fill('#hsSeasonSchoolYear', '2026-2027');
+    await page.check('#hsSeasonIsCurrent');
+    await page.click('#hsSeasonModal button:has-text("Save Season")');
+  }
+
+  test('no-source state, then source binding, then a started import shows a running state -- never implying it is already published', async ({ page }) => {
+    await seedSession(page);
+    const db = await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+    await setUpTeamAndSeason(page);
+
+    await page.evaluate(() => switchHsTab('import'));
+    await expect(page.locator('#hs-pane-import')).toContainText('No GameChanger source connected');
+    await expect(page.locator('#hs-pane-import button:has-text("Start Import")')).toBeDisabled();
+
+    page.once('dialog', (d) => d.accept('https://web.gc.com/teams/synthetic-org/synthetic-team'));
+    await page.click('#hs-pane-import button:has-text("Connect GameChanger Team")');
+    await expect(page.locator('#hsGcSourceWrap')).toContainText('GameChanger source connected');
+    await expect(page.locator('#hsGcSourceWrap')).toContainText('web.gc.com/teams/synthetic-org/synthetic-team');
+    await expect(page.locator('#hs-pane-import button:has-text("Start Import")')).toBeEnabled();
+
+    await page.click('#hs-pane-import button:has-text("Start Import")');
+    await expect(page.locator('#hsImportRunsWrap')).toContainText('Collecting', { timeout: 5000 });
+    await expect(page.locator('#hs-pane-import')).not.toContainText('Published Season Statistics');
+    expect(db.importRuns.length).toBe(1);
+  });
+
+  test('review surfaces imported/skipped/failed counts, matched/unmatched/ambiguous players, validation confidence, and blocking reasons -- publish stays disabled until the server says publishable', async ({ page }) => {
+    await seedSession(page);
+    const db = await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+    await setUpTeamAndSeason(page);
+    db.teams[0].gc_team_url = 'https://web.gc.com/teams/synthetic-org/synthetic-team';
+
+    db.importRuns.push({
+      id: 'run-review-1', team_id: db.teams[0].id, season_id: db.seasons[0].id, status: 'succeeded',
+      games_discovered: 3, games_succeeded: 2, games_failed: 1, created_at: new Date().toISOString(),
+      reconciliation: {
+        matched: [{ playerId: 'p-1', name: 'Synthetic Matched Player' }],
+        ambiguous: [{ name: 'Synthetic Ambiguous Player', candidatePlayerIds: ['p-2', 'p-3'] }],
+        unmatched: [{ name: 'Synthetic Unmatched Player' }],
+      },
+      validations: [{ validation_status: 'mismatched', has_box_score: true }],
+      publishable: false,
+      games: [],
+    });
+
+    await page.evaluate(() => switchHsTab('import'));
+    await page.click('#hs-pane-import button:has-text("Review")');
+    const detail = page.locator('#hsImportDetailWrap');
+    await expect(detail).toContainText('Imported: 2');
+    await expect(detail).toContainText('Failed: 1');
+    await expect(detail).toContainText('Matched players: 1');
+    await expect(detail).toContainText('Unmatched players: 1');
+    await expect(detail).toContainText('Ambiguous players: 1');
+    await expect(detail).toContainText('Synthetic Unmatched Player');
+    await expect(detail).toContainText('Synthetic Ambiguous Player');
+    await expect(detail.locator('button:has-text("Publish")')).toHaveCount(0);
+    await expect(detail).toContainText('Not yet publishable');
+  });
+
+  test('publish is only ever sent after the server marks the run publishable, and season stats appear only after a real publish response', async ({ page }) => {
+    await seedSession(page);
+    const db = await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+    await setUpTeamAndSeason(page);
+    db.teams[0].gc_team_url = 'https://web.gc.com/teams/synthetic-org/synthetic-team';
+    db.importRuns.push({
+      id: 'run-publishable-1', team_id: db.teams[0].id, season_id: db.seasons[0].id, status: 'succeeded',
+      games_discovered: 2, games_succeeded: 2, games_failed: 0, created_at: new Date().toISOString(),
+      reconciliation: { matched: [{ playerId: 'p-1', name: 'Synthetic Player' }], ambiguous: [], unmatched: [] },
+      validations: [{ validation_status: 'validated', has_box_score: true }],
+      publishable: true,
+      games: [],
+    });
+
+    await page.evaluate(() => switchHsTab('import'));
+    await page.click('#hs-pane-import button:has-text("Review")');
+    await expect(page.locator('#hsImportDetailWrap')).not.toContainText('Published Season Statistics');
+    await expect(page.locator('#hs-pane-import')).not.toContainText('Published Season Statistics');
+
+    page.once('dialog', (d) => d.accept());
+    await page.click('#hsImportDetailWrap button:has-text("Publish")');
+    await expect(page.locator('#hsImportStatsWrap')).toContainText('Published Season Statistics', { timeout: 5000 });
+    await expect(page.locator('#hsImportStatsWrap')).toContainText('high', { ignoreCase: true });
+  });
+
+  test('cancellation stops a running import and reflects a non-running state, never a false success', async ({ page }) => {
+    await seedSession(page);
+    const db = await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+    await setUpTeamAndSeason(page);
+    db.teams[0].gc_team_url = 'https://web.gc.com/teams/synthetic-org/synthetic-team';
+    db.importRuns.push({
+      id: 'run-cancel-1', team_id: db.teams[0].id, season_id: db.seasons[0].id, status: 'running',
+      games_discovered: 5, games_succeeded: 1, games_failed: 0, created_at: new Date().toISOString(),
+      reconciliation: { matched: [], ambiguous: [], unmatched: [] }, validations: [], publishable: false, games: [],
+    });
+
+    await page.evaluate(() => switchHsTab('import'));
+    await page.click('#hs-pane-import button:has-text("Review")');
+    await expect(page.locator('#hsImportDetailWrap')).toContainText('Collecting');
+
+    page.once('dialog', (d) => d.accept());
+    await page.click('#hsImportDetailWrap button:has-text("Cancel")');
+    await expect(page.locator('#hsImportDetailWrap')).not.toContainText('Ready to review');
+    expect(db.importRuns.find((r) => r.id === 'run-cancel-1').status).toBe('failed');
+  });
+
+  test('retry is offered for a failed/partial run and starts a fresh run', async ({ page }) => {
+    await seedSession(page);
+    const db = await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+    await setUpTeamAndSeason(page);
+    db.teams[0].gc_team_url = 'https://web.gc.com/teams/synthetic-org/synthetic-team';
+    db.importRuns.push({
+      id: 'run-failed-1', team_id: db.teams[0].id, season_id: db.seasons[0].id, status: 'partial',
+      games_discovered: 4, games_succeeded: 2, games_failed: 2, created_at: new Date().toISOString(),
+      reconciliation: { matched: [], ambiguous: [], unmatched: [] }, validations: [], publishable: false, games: [],
+    });
+
+    await page.evaluate(() => switchHsTab('import'));
+    await page.click('#hs-pane-import button:has-text("Review")');
+    await page.click('#hsImportDetailWrap button:has-text("Retry")');
+    await expect(page.locator('#hsImportDetailWrap')).toContainText('Collecting', { timeout: 5000 });
+    expect(db.importRuns.length).toBe(2);
+  });
+
+  test('a read-only support session can view import status and stats but every mutation control (connect source, start, cancel, retry, publish) is hidden', async ({ page }) => {
+    await seedSession(page);
+    await seedSupportSession(page, { mode: 'read_only' });
+    const db = await installHsApiMock(page, { capabilities: HS_CAPS });
+    // Read-only support cannot use any "Add"/"Set Up" control (proven by
+    // the pre-existing 'support sessions' describe block above), so
+    // program/team/season are seeded directly into the mock's db rather
+    // than through UI creation, mirroring that block's own convention.
+    db.program = { id: 'prog-readonly', name: 'Central High Baseball', school_name: null, is_active: true };
+    db.seasons = [{ id: 'season-readonly', name: 'Spring 2027', school_year: '2026-2027', is_current: true }];
+    db.teams = [{ id: 'team-readonly', name: 'Varsity Baseball', level: null, is_active: true, gc_team_url: 'https://web.gc.com/teams/synthetic-org/synthetic-team', gc_external_team_id: 'synthetic-team' }];
+    db.importRuns.push({
+      id: 'run-readonly-1', team_id: 'team-readonly', season_id: 'season-readonly', status: 'succeeded',
+      games_discovered: 1, games_succeeded: 1, games_failed: 0, created_at: new Date().toISOString(),
+      reconciliation: { matched: [], ambiguous: [], unmatched: [] }, validations: [], publishable: true, games: [],
+    });
+    await page.goto('/high-school');
+    // Confirms the app's own initial program/team/season load has actually
+    // completed (this test seeds data directly into the mock rather than
+    // through UI creation, so there is no natural UI wait to piggyback on)
+    // before driving it into the Import tab.
+    await expect(page.locator('#mainPanel')).toContainText('Central High Baseball');
+
+    await page.evaluate(() => switchHsTab('import'));
+    await expect(page.locator('#hs-pane-import button:has-text("Connect GameChanger Team")')).toHaveCount(0);
+    await expect(page.locator('#hs-pane-import button:has-text("Start Import")')).toHaveCount(0);
+    await page.click('#hs-pane-import button:has-text("Review")');
+    await expect(page.locator('#hsImportDetailWrap')).toContainText('Ready to review');
+    await expect(page.locator('#hsImportDetailWrap button:has-text("Publish")')).toHaveCount(0);
+    await expect(page.locator('#hsImportDetailWrap button:has-text("Cancel")')).toHaveCount(0);
+  });
+
+  test('collection-disabled state is shown plainly and never silently hidden', async ({ page }) => {
+    await seedSession(page);
+    const db = await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+    await setUpTeamAndSeason(page);
+    db.teams[0].gc_team_url = 'https://web.gc.com/teams/synthetic-org/synthetic-team';
+    db.collectionEnabled = false;
+
+    await page.evaluate(() => switchHsTab('import'));
+    await expect(page.locator('#hs-pane-import')).toContainText('Automated GameChanger collection is currently disabled');
+  });
+
+  test('an entitlement denial for the organization is surfaced the same way as every other High School tab, never a silent blank screen', async ({ page }) => {
+    await seedSession(page);
+    await installHsApiMock(page, { capabilities: HS_CAPS, forbidden: true });
+    await page.goto('/high-school');
+    await expect(page.locator('#hs-pane-program')).toContainText('This organization does not have High School access.');
+  });
+
+  test('a sanitized job failure message never surfaces a raw path, cookie, token, or stack trace in the UI', async ({ page }) => {
+    await seedSession(page);
+    const db = await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+    await setUpTeamAndSeason(page);
+    db.teams[0].gc_team_url = 'https://web.gc.com/teams/synthetic-org/synthetic-team';
+    db.importRuns.push({
+      id: 'run-failed-sanitized', team_id: db.teams[0].id, season_id: db.seasons[0].id, status: 'failed',
+      games_discovered: 1, games_succeeded: 0, games_failed: 1, created_at: new Date().toISOString(),
+      reconciliation: { matched: [], ambiguous: [], unmatched: [] }, validations: [], publishable: false, games: [],
+      error_summary: 'GameChanger access was rate-limited or challenged; collection stopped safely.',
+    });
+
+    await page.evaluate(() => switchHsTab('import'));
+    const pageText = await page.locator('#hs-pane-import').innerText();
+    expect(pageText).not.toMatch(/[a-zA-Z]:\\|\/(app|home|Users)\//);
+    expect(pageText.toLowerCase()).not.toMatch(/authorization: ?bearer|session_token|set-cookie/);
+    expect(pageText).not.toMatch(/at\s+\S+\s+\(.*:\d+:\d+\)/);
+  });
+
+  test('a publication conflict from the server is shown as an error, not silently treated as success', async ({ page }) => {
+    await seedSession(page);
+    const db = await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+    await setUpTeamAndSeason(page);
+    db.teams[0].gc_team_url = 'https://web.gc.com/teams/synthetic-org/synthetic-team';
+    db.importRuns.push({
+      id: 'run-conflict-1', team_id: db.teams[0].id, season_id: db.seasons[0].id, status: 'succeeded',
+      games_discovered: 1, games_succeeded: 1, games_failed: 0, created_at: new Date().toISOString(),
+      reconciliation: { matched: [], ambiguous: [], unmatched: [] }, validations: [], publishable: true, games: [],
+    });
+    await page.route('**/api/high-school/teams/*/seasons/*/import-runs/run-conflict-1/publish', (route) =>
+      route.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: 'This import run is stale -- a newer run has already been published for this team and season.' }) }));
+
+    await page.evaluate(() => switchHsTab('import'));
+    await page.click('#hs-pane-import button:has-text("Review")');
+    page.once('dialog', (d) => d.accept());
+    await page.click('#hsImportDetailWrap button:has-text("Publish")');
+    await page.waitForTimeout(300);
+    await expect(page.locator('#hs-pane-import')).not.toContainText('Published Season Statistics');
+  });
+
+  test('authenticated season stat viewing reflects only what the server has actually published', async ({ page }) => {
+    await seedSession(page);
+    const db = await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+    await setUpTeamAndSeason(page);
+    db.publishedStats = { verifiedTotals: { games: 7, confidence: 'medium', updated_at: new Date().toISOString() }, playerAdvancedStats: [], pitcherAdvancedStats: [] };
+
+    await page.evaluate(() => switchHsTab('import'));
+    await expect(page.locator('#hsImportStatsWrap')).toContainText('7 game(s)');
+    await expect(page.locator('#hsImportStatsWrap')).toContainText('medium', { ignoreCase: true });
+  });
+});

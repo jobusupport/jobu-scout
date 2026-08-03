@@ -20,16 +20,18 @@ const path         = require('path');
 const fs           = require('fs');
 const Database     = require('better-sqlite3');
 const pipeline     = require('./pipeline');
+const { getStorageStatePath } = require('./gc-session-loader');
 
-const STORAGE_STATE = path.join(__dirname, '..', 'storage', 'gamechanger-auth.json');
+// Resolved through the single shared helper (src/gc-session-loader.js) every
+// other GameChanger session producer/consumer uses -- GC_AUTH_FILE_PATH is a
+// real, end-to-end configurable location, not a value only some callers
+// understand. Defaults to the exact same repo-relative path this constant
+// always resolved to, so existing deployments (including server.js's own
+// POST /api/run/gc-scraper spawnJob call, which invokes this exact file)
+// are unaffected. No separate fallback constant is maintained here.
+const STORAGE_STATE = getStorageStatePath();
 const DB_PATH       = path.join(__dirname, '..', 'voodoo-scout.db');
 const OUTPUT_DIR    = path.join(__dirname, '..', 'output');
-
-const teamNameArg = (process.argv[2] || '').replace(/^"|"$/g, '').trim();
-if (!teamNameArg) {
-  console.error('Usage: node src/scrape-game-urls.js <teamName>');
-  process.exit(1);
-}
 
 // ── DB helpers ────────────────────────────────────────────────────────────────
 function getGameUrls(teamName) {
@@ -104,102 +106,120 @@ function overrideSide(gameData, forcedSide, teamName) {
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
-(async () => {
-  const result = getGameUrls(teamNameArg);
-  if (!result || !result.urls || !result.urls.length) {
-    console.log(`No game URLs found for team: ${teamNameArg}`);
-    process.exit(0);
-  }
-
-  const { teamId, urls } = result;
-  console.log(`Found ${urls.length} game URL(s) for: ${teamNameArg}`);
-
-  // Initialize pipeline/DB
-  pipeline.init(DB_PATH);
-
-  // Ensure output dir exists
-  const teamOutputDir = path.join(OUTPUT_DIR, teamNameArg.replace(/[<>:"/\\|?*]/g, ''));
-  if (!fs.existsSync(teamOutputDir)) fs.mkdirSync(teamOutputDir, { recursive: true });
-
-  // Import extractGameData from the main scraper
-  // It handles all HTML extraction — we just override the side assignment after
-  let extractGameData;
-  try {
-    const mainScraper = require('./search-gamechanger-teams');
-    extractGameData   = mainScraper.extractGameData;
-    if (typeof extractGameData !== 'function') throw new Error('extractGameData not exported');
-  } catch (err) {
-    console.error(`Cannot import extractGameData: ${err.message}`);
-    console.error(`Make sure search-gamechanger-teams.js exports: module.exports = { extractGameData }`);
+// Guarded by require.main===module (the same convention
+// src/search-gamechanger-teams.js already uses for its own CLI entry
+// point) so this file can be safely require()'d as a module -- e.g. by a
+// test proving STORAGE_STATE resolution -- without launching a real
+// browser, touching the real Travel SQLite database, or contacting
+// GameChanger. Production behavior is unchanged: server.js's own
+// spawnJob call always runs this file via `node src/scrape-game-urls.js
+// <teamName>`, which is always require.main === module.
+if (require.main === module) {
+  const teamNameArg = (process.argv[2] || '').replace(/^"|"$/g, '').trim();
+  if (!teamNameArg) {
+    console.error('Usage: node src/scrape-game-urls.js <teamName>');
     process.exit(1);
   }
 
-  if (!fs.existsSync(STORAGE_STATE)) {
-    throw new Error(`Missing auth file: ${STORAGE_STATE}. Run npm run login first.`);
-  }
-
-  const browser = await chromium.launch({ headless: true });
-  const context  = await browser.newContext({ storageState: STORAGE_STATE });
-  const page     = await context.newPage();
-
-  let successCount = 0;
-  let failCount    = 0;
-
-  for (const row of urls) {
-    console.log(`\n── Processing: ${row.label || row.gc_game_url} ──`);
-    console.log(`  URL:  ${row.gc_game_url}`);
-    console.log(`  Side: ${row.box_side} (${row.box_side === 'away' ? 'Left / Away' : 'Right / Home'})`);
-
-    if (!row.gc_game_url || !row.gc_game_url.startsWith('http')) {
-      console.error(`  ✗ Invalid URL — skipping`);
-      failCount++;
-      continue;
+  (async () => {
+    const result = getGameUrls(teamNameArg);
+    if (!result || !result.urls || !result.urls.length) {
+      console.log(`No game URLs found for team: ${teamNameArg}`);
+      process.exit(0);
     }
 
+    const { teamId, urls } = result;
+    console.log(`Found ${urls.length} game URL(s) for: ${teamNameArg}`);
+
+    // Initialize pipeline/DB
+    pipeline.init(DB_PATH);
+
+    // Ensure output dir exists
+    const teamOutputDir = path.join(OUTPUT_DIR, teamNameArg.replace(/[<>:"/\\|?*]/g, ''));
+    if (!fs.existsSync(teamOutputDir)) fs.mkdirSync(teamOutputDir, { recursive: true });
+
+    // Import extractGameData from the main scraper
+    // It handles all HTML extraction — we just override the side assignment after
+    let extractGameData;
     try {
-      await page.goto(row.gc_game_url, { waitUntil: 'networkidle', timeout: 45000 });
-      await page.waitForTimeout(2000);
-
-      // Pass a synthetic team object — extractGameData will auto-detect side by name
-      // then we override with the user's explicit selection
-      const fakeTeam = {
-        teamName:    teamNameArg,
-        rawTeamName: teamNameArg,
-      };
-
-      const captureResult = await extractGameData(page, fakeTeam);
-
-      if (!captureResult || !captureResult.success) {
-        throw new Error('extractGameData returned failure');
-      }
-
-      // Override the side assignment with user's explicit selection
-      const correctedData = overrideSide(captureResult.gameData, row.box_side, teamNameArg);
-
-      // Update the saved JSON with corrected side data
-      if (captureResult.jsonFile && correctedData) {
-        fs.writeFileSync(captureResult.jsonFile, JSON.stringify(correctedData, null, 2), 'utf8');
-        console.log(`  Side corrected and saved: ${captureResult.jsonFile}`);
-      }
-
-      // Process through normalizer → DB
-      pipeline.processExtractResult(captureResult, teamId);
-
-      markProcessed(row.id);
-      console.log(`  ✓ Processed successfully`);
-      successCount++;
-
+      const mainScraper = require('./search-gamechanger-teams');
+      extractGameData   = mainScraper.extractGameData;
+      if (typeof extractGameData !== 'function') throw new Error('extractGameData not exported');
     } catch (err) {
-      console.error(`  ✗ Failed: ${err.message}`);
-      failCount++;
+      console.error(`Cannot import extractGameData: ${err.message}`);
+      console.error(`Make sure search-gamechanger-teams.js exports: module.exports = { extractGameData }`);
+      process.exit(1);
     }
-  }
 
-  await browser.close();
+    if (!fs.existsSync(STORAGE_STATE)) {
+      throw new Error(`Missing auth file: ${STORAGE_STATE}. Run npm run login first.`);
+    }
 
-  console.log(`\n── Summary ──`);
-  console.log(`  ✓ ${successCount} game(s) processed`);
-  if (failCount) console.log(`  ✗ ${failCount} game(s) failed`);
+    const browser = await chromium.launch({ headless: true });
+    const context  = await browser.newContext({ storageState: STORAGE_STATE });
+    const page     = await context.newPage();
 
-  process.exit(failCount > 0 && successCount === 0 ? 1 : 0);
-})();
+    let successCount = 0;
+    let failCount    = 0;
+
+    for (const row of urls) {
+      console.log(`\n── Processing: ${row.label || row.gc_game_url} ──`);
+      console.log(`  URL:  ${row.gc_game_url}`);
+      console.log(`  Side: ${row.box_side} (${row.box_side === 'away' ? 'Left / Away' : 'Right / Home'})`);
+
+      if (!row.gc_game_url || !row.gc_game_url.startsWith('http')) {
+        console.error(`  ✗ Invalid URL — skipping`);
+        failCount++;
+        continue;
+      }
+
+      try {
+        await page.goto(row.gc_game_url, { waitUntil: 'networkidle', timeout: 45000 });
+        await page.waitForTimeout(2000);
+
+        // Pass a synthetic team object — extractGameData will auto-detect side by name
+        // then we override with the user's explicit selection
+        const fakeTeam = {
+          teamName:    teamNameArg,
+          rawTeamName: teamNameArg,
+        };
+
+        const captureResult = await extractGameData(page, fakeTeam);
+
+        if (!captureResult || !captureResult.success) {
+          throw new Error('extractGameData returned failure');
+        }
+
+        // Override the side assignment with user's explicit selection
+        const correctedData = overrideSide(captureResult.gameData, row.box_side, teamNameArg);
+
+        // Update the saved JSON with corrected side data
+        if (captureResult.jsonFile && correctedData) {
+          fs.writeFileSync(captureResult.jsonFile, JSON.stringify(correctedData, null, 2), 'utf8');
+          console.log(`  Side corrected and saved: ${captureResult.jsonFile}`);
+        }
+
+        // Process through normalizer → DB
+        pipeline.processExtractResult(captureResult, teamId);
+
+        markProcessed(row.id);
+        console.log(`  ✓ Processed successfully`);
+        successCount++;
+
+      } catch (err) {
+        console.error(`  ✗ Failed: ${err.message}`);
+        failCount++;
+      }
+    }
+
+    await browser.close();
+
+    console.log(`\n── Summary ──`);
+    console.log(`  ✓ ${successCount} game(s) processed`);
+    if (failCount) console.log(`  ✗ ${failCount} game(s) failed`);
+
+    process.exit(failCount > 0 && successCount === 0 ? 1 : 0);
+  })();
+}
+
+module.exports = { STORAGE_STATE };

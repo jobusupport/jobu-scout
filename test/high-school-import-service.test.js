@@ -663,3 +663,81 @@ test('no Slice 1A source file launches a browser or references GameChanger netwo
     assert.doesNotMatch(code, /gamechanger\.com/i, `${relativePath} must not reference a GameChanger URL`);
   }
 });
+
+// ── New read-side wrappers (listImportRuns, getImportRunDetail,
+// getCapturedGamesForRun, getPublishedStats) ────────────────────────────
+// These are thin validating wrappers around the repository's own new read
+// functions (see test/high-school-import-repository-read-functions.test.js
+// for direct repository-level coverage) -- this block proves the SERVICE
+// layer's own job: rejecting malformed/missing identifiers with a typed,
+// safe error BEFORE ever reaching the repository/database, exactly the
+// same requireUuid discipline every other service function in this file
+// already has covered.
+
+test('listImportRuns rejects a non-UUID orgId before ever touching the repository', async () => {
+  const { service } = setup();
+  await assert.rejects(
+    () => service.listImportRuns({ orgId: 'not-a-uuid', teamId: TEAM_ID, seasonId: SEASON_ID }),
+    (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; }
+  );
+});
+
+test('listImportRuns returns an empty array (not an error) when no runs exist yet for this team/season', async () => {
+  const { service } = setup();
+  const runs = await service.listImportRuns({ orgId: ORG_ID, teamId: TEAM_ID, seasonId: SEASON_ID });
+  assert.deepEqual(runs, []);
+});
+
+test('getImportRunDetail rejects a non-UUID importRunId before ever touching the repository', async () => {
+  const { service } = setup();
+  await assert.rejects(
+    () => service.getImportRunDetail({ orgId: ORG_ID, importRunId: 'not-a-uuid' }),
+    (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; }
+  );
+});
+
+test('getImportRunDetail returns the run alongside its games and validations for a real run', async () => {
+  const { service, repository } = setup();
+  const run = await repository.createImportRun({ ...ctx(), sourceProvider: 'gamechanger', triggerKind: 'manual', config: {} });
+  await repository.recordRunGame({ orgId: ORG_ID, importRunId: run.id, sourceGameRef: 'gc-1', discoveryStatus: 'processed', gameOutcome: 'inserted' });
+  const detail = await service.getImportRunDetail({ orgId: ORG_ID, importRunId: run.id });
+  assert.equal(detail.run.id, run.id);
+  assert.equal(detail.games.length, 1);
+  assert.deepEqual(detail.validations, []);
+});
+
+test('getCapturedGamesForRun rejects a non-UUID importRunId before ever touching the repository', async () => {
+  const { service } = setup();
+  await assert.rejects(
+    () => service.getCapturedGamesForRun({ orgId: ORG_ID, importRunId: 'not-a-uuid' }),
+    (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; }
+  );
+});
+
+test('getPublishedStats rejects a non-UUID seasonId before ever touching the repository', async () => {
+  const { service } = setup();
+  await assert.rejects(
+    () => service.getPublishedStats({ orgId: ORG_ID, teamId: TEAM_ID, seasonId: 'not-a-uuid' }),
+    (err) => { assert.equal(err.code, 'INVALID_FIELD'); return true; }
+  );
+});
+
+test('getPublishedStats returns null verifiedTotals and empty stat arrays when nothing has been published yet, not an error', async () => {
+  const { service } = setup();
+  const stats = await service.getPublishedStats({ orgId: ORG_ID, teamId: TEAM_ID, seasonId: SEASON_ID });
+  assert.equal(stats.verifiedTotals, null);
+  assert.deepEqual(stats.playerAdvancedStats, []);
+  assert.deepEqual(stats.pitcherAdvancedStats, []);
+});
+
+test('getPublishedStats never returns a foreign organization\'s published totals for the same team/season ids', async () => {
+  const { service, repository } = setup();
+  const run = await repository.createImportRun({ ...ctx(), sourceProvider: 'gamechanger', triggerKind: 'manual', config: {} });
+  await repository.publishVerifiedTotals({
+    ...ctx(), importRunId: run.id,
+    aggregate: { games: 1, boxScoreGames: 1, playByPlayGames: 0, validatedGames: 0, mismatchGames: 0, confidence: 'low' },
+  });
+  const FOREIGN_ORG = '99999999-9999-9999-9999-999999999999';
+  const stats = await service.getPublishedStats({ orgId: FOREIGN_ORG, teamId: TEAM_ID, seasonId: SEASON_ID });
+  assert.equal(stats.verifiedTotals, null);
+});
