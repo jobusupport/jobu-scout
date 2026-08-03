@@ -296,6 +296,11 @@ test('no production source file defines its own gamechanger-auth.json path.join(
     path.join(__dirname, '..', 'server.js'),
     path.join(__dirname, '..', 'src', 'search-gamechanger-teams.js'),
     path.join(__dirname, '..', 'src', 'high-school-gc-import.js'),
+    // A real production consumer, not a standalone dev utility --
+    // server.js's own POST /api/run/gc-scraper route spawns this file
+    // directly for any Travel team that has no gc_team_url but has rows
+    // in team_game_urls (a real, live-queried condition).
+    path.join(__dirname, '..', 'src', 'scrape-game-urls.js'),
   ];
   for (const file of filesRequiredToUseTheSharedResolver) {
     const source = fs.readFileSync(file, 'utf8');
@@ -364,6 +369,64 @@ test('search-gamechanger-teams.js: with GC_AUTH_FILE_PATH unset, the resolved pa
     if (original === undefined) delete process.env.GC_AUTH_FILE_PATH; else process.env.GC_AUTH_FILE_PATH = original;
     delete require.cache[require.resolve('../src/gc-session-loader')];
     delete require.cache[require.resolve('../src/search-gamechanger-teams')];
+  }
+});
+
+// ── src/scrape-game-urls.js -- a REAL production consumer (spawned
+// directly by server.js's POST /api/run/gc-scraper route for Travel teams
+// with no gc_team_url but existing team_game_urls rows), not a
+// standalone dev utility. Its top-level code previously ran an
+// unconditional async IIFE on require() -- launching a real browser,
+// opening the real Travel SQLite database, and calling process.exit()
+// on a missing argv[2] -- with no safe entry point for a test to use.
+// It is now guarded by the same require.main===module convention
+// src/search-gamechanger-teams.js already used, and exports its
+// resolved STORAGE_STATE directly, so a test can prove path selection
+// by simply requiring the module fresh -- no browser, no database, no
+// GameChanger request, no process.exit -- confirmed safe below before
+// relying on it in the two tests that follow.
+
+test('scrape-game-urls.js: requiring the module has no side effects (no browser, database, network, or process exit)', () => {
+  delete require.cache[require.resolve('../src/scrape-game-urls')];
+  // If this were still unguarded, requiring it with no argv[2] would call
+  // process.exit(1) and kill this entire test process -- reaching the
+  // next line at all is itself proof the guard works.
+  const scraper = require('../src/scrape-game-urls');
+  assert.equal(typeof scraper.STORAGE_STATE, 'string');
+  assert.ok(scraper.STORAGE_STATE.length > 0);
+  delete require.cache[require.resolve('../src/scrape-game-urls')];
+});
+
+test('scrape-game-urls.js: a synthetic GC_AUTH_FILE_PATH override is actually honored, not just structurally referenced', () => {
+  const original = process.env.GC_AUTH_FILE_PATH;
+  // A path that is never read from or written to by this test -- only
+  // compared as a string -- so no synthetic file needs to exist on disk.
+  const syntheticOverridePath = path.join(os.tmpdir(), 'synthetic-scrape-game-urls-gc-auth-test-path.json');
+  process.env.GC_AUTH_FILE_PATH = syntheticOverridePath;
+  try {
+    delete require.cache[require.resolve('../src/gc-session-loader')];
+    delete require.cache[require.resolve('../src/scrape-game-urls')];
+    const scraper = require('../src/scrape-game-urls');
+    assert.equal(scraper.STORAGE_STATE, syntheticOverridePath, 'the configured override must be the actual value the production module resolved to, not merely referenced in source');
+  } finally {
+    if (original === undefined) delete process.env.GC_AUTH_FILE_PATH; else process.env.GC_AUTH_FILE_PATH = original;
+    delete require.cache[require.resolve('../src/gc-session-loader')];
+    delete require.cache[require.resolve('../src/scrape-game-urls')];
+  }
+});
+
+test('scrape-game-urls.js: with GC_AUTH_FILE_PATH unset, the resolved path matches the pre-existing repo-relative default (backward compatible)', () => {
+  const original = process.env.GC_AUTH_FILE_PATH;
+  delete process.env.GC_AUTH_FILE_PATH;
+  try {
+    delete require.cache[require.resolve('../src/gc-session-loader')];
+    delete require.cache[require.resolve('../src/scrape-game-urls')];
+    const scraper = require('../src/scrape-game-urls');
+    assert.ok(scraper.STORAGE_STATE.endsWith(path.join('storage', 'gamechanger-auth.json')), 'must still resolve to the established default location');
+  } finally {
+    if (original === undefined) delete process.env.GC_AUTH_FILE_PATH; else process.env.GC_AUTH_FILE_PATH = original;
+    delete require.cache[require.resolve('../src/gc-session-loader')];
+    delete require.cache[require.resolve('../src/scrape-game-urls')];
   }
 });
 
