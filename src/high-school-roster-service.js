@@ -42,6 +42,11 @@
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TEAM_LEVELS = ['varsity', 'junior_varsity', 'freshman'];
 const ROSTER_STATUSES = ['active', 'inactive'];
+// Matches supabase/migrations/20260803120000_add_hs_player_lifecycle_status.sql's
+// hs_players_status_check exactly. is_active remains selectable/returned as
+// a database-generated column (status = 'active') -- never written to
+// directly by this module (see resolvePlayerStatusInput below).
+const PLAYER_STATUSES = ['active', 'graduated', 'transferred', 'not_participating', 'other_non_returning'];
 const UNIQUE_VIOLATION = '23505';
 
 function typedError(message, statusCode) {
@@ -330,25 +335,88 @@ function optionalGraduationYear(value) {
   return value;
 }
 
+// ── Player status / legacy is_active compatibility ─────────────────────
+//
+// hs_players.is_active is now a database-generated column (status = 'active')
+// -- see supabase/migrations/20260803120000_add_hs_player_lifecycle_status.sql.
+// This module never writes is_active directly (Postgres itself would reject
+// that, since it's `generated always as ... stored`); it always resolves an
+// incoming request to a `status` value before touching the database.
+//
+// `is_active` stays a fully accepted, permanent compatibility input on
+// create/update -- it is a live, currently-tested part of the API contract
+// (see test/high-school-api-integration.test.js's is_active-bearing
+// requests), not deprecated surface to remove.
+function legacyIsActiveToStatus(isActive) {
+  // Conservative on purpose: a legacy is_active=false caller never told us
+  // WHY the player is inactive, so it is never guessed as 'graduated' or
+  // 'transferred' -- only the schema's own conservative default for an
+  // unknown non-active reason.
+  return isActive ? 'active' : 'other_non_returning';
+}
+
+// A boolean agrees with a status at exactly the coarseness is_active is
+// capable of expressing: is_active=true means 'active' and nothing else;
+// is_active=false is compatible with ANY non-active status, since the
+// boolean alone can never say which one.
+function isActiveAgreesWithStatus(isActive, status) {
+  return isActive ? status === 'active' : status !== 'active';
+}
+
+// Pure. Resolves the effective `status` for a player create/update request
+// that may supply `status`, legacy `is_active`, both, or neither.
+//   - status only            -> validated status, used as-is.
+//   - is_active only         -> mapped via legacyIsActiveToStatus.
+//   - neither                -> returns undefined (caller decides: 'active'
+//                                default on create, "leave unchanged" on
+//                                update).
+//   - both, agreeing         -> accepted; `status` (the more specific of the
+//                                two signals) is used -- never a silent
+//                                override, since the two inputs already say
+//                                the same thing.
+//   - both, conflicting       -> throws 400 naming both fields. Never
+//                                silently prefers one over the other.
+// `isActive` must already be undefined-or-boolean (validate with
+// optionalBoolean before calling this).
+function resolvePlayerStatusInput({ status, isActive }) {
+  const hasStatus = status !== undefined;
+  const hasIsActive = isActive !== undefined;
+
+  if (hasStatus && !PLAYER_STATUSES.includes(status)) {
+    throw typedError(`status must be one of: ${PLAYER_STATUSES.join(', ')}`, 400);
+  }
+  if (!hasStatus && !hasIsActive) return undefined;
+  if (hasStatus && !hasIsActive) return status;
+  if (!hasStatus && hasIsActive) return legacyIsActiveToStatus(isActive);
+
+  // Both supplied.
+  if (!isActiveAgreesWithStatus(isActive, status)) {
+    throw typedError(`status and is_active disagree (status: '${status}', is_active: ${isActive}); provide only one`, 400);
+  }
+  return status;
+}
+
 function validatePlayerCreate(body) {
-  rejectUnknownFields(body, ['first_name', 'last_name', 'preferred_name', 'graduation_year', 'is_active']);
+  rejectUnknownFields(body, ['first_name', 'last_name', 'preferred_name', 'graduation_year', 'is_active', 'status']);
   const firstName = requireNonEmptyString(body?.first_name, 'first_name');
   const lastName = requireNonEmptyString(body?.last_name, 'last_name');
   const preferredName = optionalString(body?.preferred_name, 'preferred_name');
   const graduationYear = optionalGraduationYear(body?.graduation_year);
-  const isActive = optionalBoolean(body?.is_active, 'is_active') ?? true;
-  return { first_name: firstName, last_name: lastName, preferred_name: preferredName, graduation_year: graduationYear, is_active: isActive };
+  const isActive = optionalBoolean(body?.is_active, 'is_active');
+  const status = resolvePlayerStatusInput({ status: body?.status, isActive }) ?? 'active';
+  return { first_name: firstName, last_name: lastName, preferred_name: preferredName, graduation_year: graduationYear, status };
 }
 
 function validatePlayerUpdate(body) {
-  rejectUnknownFields(body, ['first_name', 'last_name', 'preferred_name', 'graduation_year', 'is_active']);
+  rejectUnknownFields(body, ['first_name', 'last_name', 'preferred_name', 'graduation_year', 'is_active', 'status']);
   const patch = {};
   if (body?.first_name !== undefined) patch.first_name = requireNonEmptyString(body.first_name, 'first_name');
   if (body?.last_name !== undefined) patch.last_name = requireNonEmptyString(body.last_name, 'last_name');
   if (body?.preferred_name !== undefined) patch.preferred_name = optionalString(body.preferred_name, 'preferred_name');
   if (body?.graduation_year !== undefined) patch.graduation_year = optionalGraduationYear(body.graduation_year);
   const isActive = optionalBoolean(body?.is_active, 'is_active');
-  if (isActive !== undefined) patch.is_active = isActive;
+  const status = resolvePlayerStatusInput({ status: body?.status, isActive });
+  if (status !== undefined) patch.status = status;
   if (Object.keys(patch).length === 0) {
     throw typedError('At least one field must be provided.', 400);
   }
@@ -363,7 +431,7 @@ async function createPlayer({ orgId, body, adminClient, getProgram }) {
   const { data, error } = await adminClient
     .from('hs_players')
     .insert({ org_id: orgId, program_id: program.id, ...validated })
-    .select('id, program_id, first_name, last_name, preferred_name, graduation_year, is_active')
+    .select('id, program_id, first_name, last_name, preferred_name, graduation_year, status, is_active')
     .single();
   if (error) return mapWriteError(error, { conflictMessage: 'Unable to create player.' });
   return data;
@@ -373,7 +441,7 @@ async function getPlayerInOrg({ orgId, playerId, adminClient }) {
   requireUuid(playerId, 'playerId');
   const { data, error } = await adminClient
     .from('hs_players')
-    .select('id, program_id, first_name, last_name, preferred_name, graduation_year, is_active')
+    .select('id, program_id, first_name, last_name, preferred_name, graduation_year, status, is_active')
     .eq('id', playerId)
     .eq('org_id', orgId)
     .maybeSingle();
@@ -392,7 +460,7 @@ async function updatePlayer({ orgId, playerId, body, adminClient }) {
     .update(patch)
     .eq('org_id', orgId)
     .eq('id', playerId)
-    .select('id, program_id, first_name, last_name, preferred_name, graduation_year, is_active')
+    .select('id, program_id, first_name, last_name, preferred_name, graduation_year, status, is_active')
     .single();
   if (error) return mapWriteError(error, { conflictMessage: 'Unable to update player.' });
   return data;
@@ -408,7 +476,7 @@ function escapeIlike(s) {
 async function listPlayers({ orgId, search, adminClient }) {
   let query = adminClient
     .from('hs_players')
-    .select('id, program_id, first_name, last_name, preferred_name, graduation_year, is_active')
+    .select('id, program_id, first_name, last_name, preferred_name, graduation_year, status, is_active')
     .eq('org_id', orgId)
     .order('last_name')
     .order('first_name');
@@ -469,14 +537,20 @@ function toRosterMembershipResponse(row) {
 // duplicated checks).
 //
 // Both the team and the player must currently be active. An archived
-// (is_active=false) team or player is still fully readable -- nothing here
-// hides it -- but new roster memberships are exactly the kind of write an
-// archival flag exists to prevent going forward; both hs_teams.is_active
-// and hs_players.is_active already exist for this in the deployed schema,
-// so this is enforced in application code, not a new migration. Seasons
-// have no is_active column at all (see high-school-roster-service's own
-// header/PR notes), so no equivalent check exists for season -- there is
-// nothing to check.
+// (is_active=false) team or non-active player is still fully readable --
+// nothing here hides it -- but new roster memberships are exactly the kind
+// of write an archival flag exists to prevent going forward; both
+// hs_teams.is_active and hs_players.is_active already exist for this in the
+// deployed schema, so this is enforced in application code, not a new
+// migration. hs_players.is_active is now a database-generated column
+// (status = 'active') -- this check reads exactly the same way for a
+// player whose status is 'graduated', 'transferred', 'not_participating',
+// or 'other_non_returning'; none of the five statuses other than 'active'
+// can ever produce is_active=true (see
+// supabase/migrations/20260803120000_add_hs_player_lifecycle_status.sql).
+// Seasons have no is_active column at all (see high-school-roster-service's
+// own header/PR notes), so no equivalent check exists for season -- there
+// is nothing to check.
 async function addRosterMembership({ orgId, teamId, body, adminClient }) {
   const validated = validateRosterAdd(body);
 
@@ -563,6 +637,10 @@ module.exports = {
   UUID_RE,
   TEAM_LEVELS,
   ROSTER_STATUSES,
+  PLAYER_STATUSES,
+  legacyIsActiveToStatus,
+  isActiveAgreesWithStatus,
+  resolvePlayerStatusInput,
   isValidUuid,
   requireUuid,
   typedError,
