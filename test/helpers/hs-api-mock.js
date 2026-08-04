@@ -57,6 +57,62 @@ function unknownFieldError(body, allowedKeys) {
   return null;
 }
 
+// ── Player status / legacy is_active compatibility ──────────────────────
+//
+// Mirrors src/high-school-roster-service.js's PLAYER_STATUSES /
+// legacyIsActiveToStatus / isActiveAgreesWithStatus / resolvePlayerStatusInput
+// EXACTLY, for the same reason unknownFieldError above duplicates
+// rejectUnknownFields rather than importing it (see this file's own header
+// comment: no runtime coupling to server code, but the mock must never grow
+// behavior the real server doesn't have -- if that module's five statuses or
+// its agreement/conflict rule ever changes, this block must change with it).
+// hs_players.is_active is a database-generated column (status = 'active') in
+// the real schema -- this mock reproduces that by treating `status` as the
+// only field ever stored, and always DERIVING is_active from it (never
+// storing is_active directly, never trusting a caller-supplied is_active
+// past the point where it's been resolved into a status), so no player
+// object this mock returns can ever have an inconsistent status/is_active
+// pair.
+const PLAYER_STATUSES = ['active', 'graduated', 'transferred', 'not_participating', 'other_non_returning'];
+
+function legacyIsActiveToStatus(isActive) {
+  return isActive ? 'active' : 'other_non_returning';
+}
+
+function isActiveAgreesWithStatus(isActive, status) {
+  return isActive ? status === 'active' : status !== 'active';
+}
+
+function deriveIsActive(status) {
+  return status === 'active';
+}
+
+// Returns { status } (status may be undefined, meaning "not supplied --
+// caller decides the default/unchanged behavior", exactly like the real
+// resolvePlayerStatusInput) or { error } shaped for a 400 response. Unlike
+// the real function (which throws a typedError), this returns a value --
+// matching every other handler in this file, none of which throw.
+function resolvePlayerStatus({ status, isActive }) {
+  const hasStatus = status !== undefined;
+  const hasIsActive = isActive !== undefined;
+
+  if (hasIsActive && typeof isActive !== 'boolean') {
+    return { error: { error: 'is_active must be a boolean' } };
+  }
+  if (hasStatus && !PLAYER_STATUSES.includes(status)) {
+    return { error: { error: `status must be one of: ${PLAYER_STATUSES.join(', ')}` } };
+  }
+  if (!hasStatus && !hasIsActive) return { status: undefined };
+  if (hasStatus && !hasIsActive) return { status };
+  if (!hasStatus && hasIsActive) return { status: legacyIsActiveToStatus(isActive) };
+
+  // Both supplied.
+  if (!isActiveAgreesWithStatus(isActive, status)) {
+    return { error: { error: `status and is_active disagree (status: '${status}', is_active: ${isActive}); provide only one` } };
+  }
+  return { status };
+}
+
 // capabilities: the GET /api/product/capabilities response this org should
 // see. Pass enabledProducts without 'high_school' to simulate a
 // Travel-only/unentitled org.
@@ -180,16 +236,19 @@ async function installHsApiMock(page, { capabilities, forbidden = false } = {}) 
       }
       if (method === 'POST') {
         const body = await readJsonBody(route);
-        const unknownErr = unknownFieldError(body, ['first_name', 'last_name', 'preferred_name', 'graduation_year', 'is_active']);
+        const unknownErr = unknownFieldError(body, ['first_name', 'last_name', 'preferred_name', 'graduation_year', 'is_active', 'status']);
         if (unknownErr) return json(route, unknownErr, 400);
         if (!db.program) return json(route, { error: 'Create a program before adding players.' }, 404);
         if (!body.first_name || !body.last_name) {
           return json(route, { error: 'first_name is required and must be a non-empty string' }, 400);
         }
+        const resolved = resolvePlayerStatus({ status: body.status, isActive: body.is_active });
+        if (resolved.error) return json(route, resolved.error, 400);
+        const status = resolved.status ?? 'active';
         const player = {
           id: nextId(), first_name: body.first_name, last_name: body.last_name,
           preferred_name: body.preferred_name || null, graduation_year: body.graduation_year || null,
-          is_active: body.is_active !== undefined ? body.is_active : true,
+          status, is_active: deriveIsActive(status),
         };
         db.players.push(player);
         return json(route, { player }, 201);
@@ -198,11 +257,23 @@ async function installHsApiMock(page, { capabilities, forbidden = false } = {}) 
     m = pathname.match(/^\/api\/high-school\/players\/([^/]+)$/);
     if (m && method === 'PATCH') {
       const body = await readJsonBody(route);
-      const unknownErr = unknownFieldError(body, ['first_name', 'last_name', 'preferred_name', 'graduation_year', 'is_active']);
+      const unknownErr = unknownFieldError(body, ['first_name', 'last_name', 'preferred_name', 'graduation_year', 'is_active', 'status']);
       if (unknownErr) return json(route, unknownErr, 400);
       const player = db.players.find((p) => p.id === m[1]);
       if (!player) return json(route, { error: 'Player not found' }, 404);
-      Object.assign(player, body);
+      const resolved = resolvePlayerStatus({ status: body.status, isActive: body.is_active });
+      if (resolved.error) return json(route, resolved.error, 400);
+      // Every non-status/is_active field merges the same way every other
+      // PATCH handler in this file does; status/is_active are handled
+      // separately so is_active is never set directly and can never drift
+      // from status -- the one place this resource's shape differs from
+      // every other PATCH handler here, because is_active is a generated
+      // column in the real schema and no other mocked resource has that
+      // property.
+      const { status: _ignoredStatus, is_active: _ignoredIsActive, ...rest } = body;
+      Object.assign(player, rest);
+      if (resolved.status !== undefined) player.status = resolved.status;
+      player.is_active = deriveIsActive(player.status);
       return json(route, { player }, 200);
     }
 

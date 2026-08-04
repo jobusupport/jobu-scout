@@ -259,6 +259,165 @@ test.describe('players', () => {
   });
 });
 
+// Exercises helpers/hs-api-mock.js's player status/is_active compatibility
+// contract THROUGH the real mocked route (apiFetch -> page.route
+// interception), the same way the roster module's own conflict test above
+// (`a duplicate active roster membership is rejected...`) proves a 409
+// without needing a form for it -- there is no UI control for `status` yet
+// (see hsPlayerModal, which only has first/last/preferred/grad-year
+// fields), so this is the only way to prove the mock's HTTP-level contract
+// end to end. Mirrors test/high-school-roster-service.test.js's own
+// coverage of src/high-school-roster-service.js's resolvePlayerStatusInput,
+// but through the mock, not the real module -- this is what actually
+// caught the mock/server drift the merge-gate review found.
+async function createPlayerViaFetch(page, body) {
+  return page.evaluate(async (body) => {
+    const res = await apiFetch('/api/high-school/players', { method: 'POST', body: JSON.stringify(body) });
+    return { status: res.status, body: await res.json() };
+  }, body);
+}
+
+async function patchPlayerViaFetch(page, playerId, body) {
+  return page.evaluate(async ({ playerId, body }) => {
+    const res = await apiFetch(`/api/high-school/players/${playerId}`, { method: 'PATCH', body: JSON.stringify(body) });
+    return { status: res.status, body: await res.json() };
+  }, { playerId, body });
+}
+
+test.describe('player lifecycle status (mock contract)', () => {
+  const PLAYER_STATUSES = ['active', 'graduated', 'transferred', 'not_participating', 'other_non_returning'];
+
+  test('every valid status can be set on create, and is_active is always the correct derivation', async ({ page }) => {
+    await seedSession(page);
+    await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+    await createProgram(page);
+
+    for (const status of PLAYER_STATUSES) {
+      const result = await createPlayerViaFetch(page, { first_name: 'Jo', last_name: `Status-${status}`, status });
+      expect(result.status).toBe(201);
+      expect(result.body.player.status).toBe(status);
+      expect(result.body.player.is_active).toBe(status === 'active');
+    }
+  });
+
+  test('create defaults to active when neither status nor is_active is supplied', async ({ page }) => {
+    await seedSession(page);
+    await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+    await createProgram(page);
+
+    const result = await createPlayerViaFetch(page, { first_name: 'Jo', last_name: 'Neither' });
+    expect(result.status).toBe(201);
+    expect(result.body.player.status).toBe('active');
+    expect(result.body.player.is_active).toBe(true);
+  });
+
+  test('an invalid status is rejected with 400 on both create and update', async ({ page }) => {
+    await seedSession(page);
+    await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+    await createProgram(page);
+
+    const createResult = await createPlayerViaFetch(page, { first_name: 'Jo', last_name: 'Bad', status: 'benched' });
+    expect(createResult.status).toBe(400);
+    expect(createResult.body.error).toMatch(/status must be one of/);
+
+    const valid = await createPlayerViaFetch(page, { first_name: 'Jo', last_name: 'Valid' });
+    const updateResult = await patchPlayerViaFetch(page, valid.body.player.id, { status: 'benched' });
+    expect(updateResult.status).toBe(400);
+    expect(updateResult.body.error).toMatch(/status must be one of/);
+  });
+
+  test('legacy is_active=true/false map to the correct status and derived is_active on create', async ({ page }) => {
+    await seedSession(page);
+    await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+    await createProgram(page);
+
+    const trueResult = await createPlayerViaFetch(page, { first_name: 'Jo', last_name: 'LegacyTrue', is_active: true });
+    expect(trueResult.body.player.status).toBe('active');
+    expect(trueResult.body.player.is_active).toBe(true);
+
+    const falseResult = await createPlayerViaFetch(page, { first_name: 'Jo', last_name: 'LegacyFalse', is_active: false });
+    expect(falseResult.body.player.status).toBe('other_non_returning');
+    expect(falseResult.body.player.is_active).toBe(false);
+  });
+
+  test('agreeing status + is_active is accepted deterministically; conflicting combinations are rejected with 400 in both directions', async ({ page }) => {
+    await seedSession(page);
+    await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+    await createProgram(page);
+
+    const agree = await createPlayerViaFetch(page, { first_name: 'Jo', last_name: 'Agree', status: 'transferred', is_active: false });
+    expect(agree.status).toBe(201);
+    expect(agree.body.player.status).toBe('transferred');
+    expect(agree.body.player.is_active).toBe(false);
+
+    const conflictNonActiveWithTrue = await createPlayerViaFetch(page, { first_name: 'Jo', last_name: 'Conflict1', status: 'graduated', is_active: true });
+    expect(conflictNonActiveWithTrue.status).toBe(400);
+    expect(conflictNonActiveWithTrue.body.error).toMatch(/disagree/);
+
+    const conflictActiveWithFalse = await createPlayerViaFetch(page, { first_name: 'Jo', last_name: 'Conflict2', status: 'active', is_active: false });
+    expect(conflictActiveWithFalse.status).toBe(400);
+    expect(conflictActiveWithFalse.body.error).toMatch(/disagree/);
+  });
+
+  test('update preserves the existing status when neither field is supplied, and accepts every valid status', async ({ page }) => {
+    await seedSession(page);
+    await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+    await createProgram(page);
+
+    const created = await createPlayerViaFetch(page, { first_name: 'Jo', last_name: 'Update', status: 'graduated' });
+    const preserved = await patchPlayerViaFetch(page, created.body.player.id, { first_name: 'Joanna' });
+    expect(preserved.status).toBe(200);
+    expect(preserved.body.player.first_name).toBe('Joanna');
+    expect(preserved.body.player.status).toBe('graduated');
+    expect(preserved.body.player.is_active).toBe(false);
+
+    for (const status of PLAYER_STATUSES) {
+      const updated = await patchPlayerViaFetch(page, created.body.player.id, { status });
+      expect(updated.status).toBe(200);
+      expect(updated.body.player.status).toBe(status);
+      expect(updated.body.player.is_active).toBe(status === 'active');
+    }
+  });
+
+  test('reactivation from every non-active status succeeds through the existing PATCH route', async ({ page }) => {
+    await seedSession(page);
+    await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+    await createProgram(page);
+
+    for (const status of PLAYER_STATUSES.filter((s) => s !== 'active')) {
+      const created = await createPlayerViaFetch(page, { first_name: 'Jo', last_name: `Reactivate-${status}`, status });
+      expect(created.body.player.is_active).toBe(false);
+      const reactivated = await patchPlayerViaFetch(page, created.body.player.id, { status: 'active' });
+      expect(reactivated.status).toBe(200);
+      expect(reactivated.body.player.status).toBe('active');
+      expect(reactivated.body.player.is_active).toBe(true);
+    }
+  });
+
+  test('an unknown field is still rejected on player create and update', async ({ page }) => {
+    await seedSession(page);
+    await installHsApiMock(page, { capabilities: HS_CAPS });
+    await page.goto('/high-school');
+    await createProgram(page);
+
+    const createResult = await createPlayerViaFetch(page, { first_name: 'Jo', last_name: 'Unknown', foo: 'bar' });
+    expect(createResult.status).toBe(400);
+    expect(createResult.body.error).toMatch(/Unknown field/);
+
+    const valid = await createPlayerViaFetch(page, { first_name: 'Jo', last_name: 'Valid2' });
+    const updateResult = await patchPlayerViaFetch(page, valid.body.player.id, { foo: 'bar' });
+    expect(updateResult.status).toBe(400);
+    expect(updateResult.body.error).toMatch(/Unknown field/);
+  });
+});
+
 async function setUpProgramTeamSeasonPlayer(page) {
   await createProgram(page);
   await page.evaluate(() => switchHsTab('teams'));

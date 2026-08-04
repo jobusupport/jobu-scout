@@ -228,6 +228,271 @@ test('validatePlayerCreate never accepts a record_source field (reserved for the
   assert.throws(() => svc.validatePlayerCreate({ first_name: 'Jo', last_name: 'Smith', record_source: 'gamechanger' }), /Unknown field/);
 });
 
+// ── Players: status lifecycle ────────────────────────────────────────────
+//
+// hs_players.is_active is a database-generated column (status = 'active') --
+// see supabase/migrations/20260803120000_add_hs_player_lifecycle_status.sql.
+// Fixtures below always set is_active consistently with status (never a
+// mismatched pair) to accurately represent what that generated column would
+// actually return -- the fake adminClient does not compute this for us, so
+// every fixture below does it by hand via playerRow/expectedIsActive.
+
+function expectedIsActive(status) {
+  return status === 'active';
+}
+
+function playerRow({ id = PLAYER_ID, status = 'active', ...rest } = {}) {
+  return {
+    id,
+    program_id: PROGRAM_ID,
+    first_name: 'Jo',
+    last_name: 'Smith',
+    preferred_name: null,
+    graduation_year: null,
+    status,
+    is_active: expectedIsActive(status),
+    ...rest,
+  };
+}
+
+// ── resolvePlayerStatusInput: pure resolution/conflict logic ────────────
+
+test('resolvePlayerStatusInput: status alone is used as-is when valid', () => {
+  for (const status of svc.PLAYER_STATUSES) {
+    assert.equal(svc.resolvePlayerStatusInput({ status, isActive: undefined }), status);
+  }
+});
+
+test('resolvePlayerStatusInput: an unrecognized status is rejected with 400', () => {
+  assert.throws(
+    () => svc.resolvePlayerStatusInput({ status: 'benched', isActive: undefined }),
+    (e) => e.statusCode === 400 && /status must be one of/.test(e.message)
+  );
+});
+
+test('resolvePlayerStatusInput: legacy is_active=true maps to active', () => {
+  assert.equal(svc.resolvePlayerStatusInput({ status: undefined, isActive: true }), 'active');
+});
+
+test('resolvePlayerStatusInput: legacy is_active=false maps to other_non_returning (conservative, never guessed)', () => {
+  assert.equal(svc.resolvePlayerStatusInput({ status: undefined, isActive: false }), 'other_non_returning');
+});
+
+test('resolvePlayerStatusInput: neither field returns undefined (caller decides the default/unchanged behavior)', () => {
+  assert.equal(svc.resolvePlayerStatusInput({ status: undefined, isActive: undefined }), undefined);
+});
+
+test('resolvePlayerStatusInput: is_active=true agrees only with status=active', () => {
+  assert.equal(svc.resolvePlayerStatusInput({ status: 'active', isActive: true }), 'active');
+});
+
+test('resolvePlayerStatusInput: is_active=false agrees with every non-active status', () => {
+  for (const status of svc.PLAYER_STATUSES.filter((s) => s !== 'active')) {
+    assert.equal(svc.resolvePlayerStatusInput({ status, isActive: false }), status);
+  }
+});
+
+test('resolvePlayerStatusInput: is_active=true with a non-active status conflicts (400, names both fields)', () => {
+  for (const status of svc.PLAYER_STATUSES.filter((s) => s !== 'active')) {
+    assert.throws(
+      () => svc.resolvePlayerStatusInput({ status, isActive: true }),
+      (e) => e.statusCode === 400 && /status/.test(e.message) && /is_active/.test(e.message)
+    );
+  }
+});
+
+test('resolvePlayerStatusInput: is_active=false with status=active conflicts (400, names both fields)', () => {
+  assert.throws(
+    () => svc.resolvePlayerStatusInput({ status: 'active', isActive: false }),
+    (e) => e.statusCode === 400 && /status/.test(e.message) && /is_active/.test(e.message)
+  );
+});
+
+test('legacyIsActiveToStatus / isActiveAgreesWithStatus: active <-> is_active=true, every non-active <-> is_active=false', () => {
+  assert.equal(svc.legacyIsActiveToStatus(true), 'active');
+  assert.equal(svc.legacyIsActiveToStatus(false), 'other_non_returning');
+  assert.equal(svc.isActiveAgreesWithStatus(true, 'active'), true);
+  for (const status of svc.PLAYER_STATUSES.filter((s) => s !== 'active')) {
+    assert.equal(svc.isActiveAgreesWithStatus(false, status), true);
+    assert.equal(svc.isActiveAgreesWithStatus(true, status), false);
+  }
+  assert.equal(svc.isActiveAgreesWithStatus(false, 'active'), false);
+});
+
+// ── validatePlayerCreate / validatePlayerUpdate: status + is_active ──────
+
+test('validatePlayerCreate accepts each of the five statuses and never writes is_active directly', () => {
+  for (const status of svc.PLAYER_STATUSES) {
+    const result = svc.validatePlayerCreate({ first_name: 'Jo', last_name: 'Smith', status });
+    assert.equal(result.status, status);
+    assert.equal('is_active' in result, false);
+  }
+});
+
+test('validatePlayerCreate defaults status to active when neither field is supplied', () => {
+  const result = svc.validatePlayerCreate({ first_name: 'Jo', last_name: 'Smith' });
+  assert.equal(result.status, 'active');
+});
+
+test('validatePlayerCreate maps legacy is_active=true/false to the correct status', () => {
+  assert.equal(svc.validatePlayerCreate({ first_name: 'Jo', last_name: 'Smith', is_active: true }).status, 'active');
+  assert.equal(svc.validatePlayerCreate({ first_name: 'Jo', last_name: 'Smith', is_active: false }).status, 'other_non_returning');
+});
+
+test('validatePlayerCreate accepts agreeing status + is_active and uses the more specific status', () => {
+  const result = svc.validatePlayerCreate({ first_name: 'Jo', last_name: 'Smith', status: 'transferred', is_active: false });
+  assert.equal(result.status, 'transferred');
+});
+
+test('validatePlayerCreate rejects conflicting status + is_active in both directions, 400 naming both fields', () => {
+  assert.throws(
+    () => svc.validatePlayerCreate({ first_name: 'Jo', last_name: 'Smith', status: 'graduated', is_active: true }),
+    (e) => e.statusCode === 400 && /status/.test(e.message) && /is_active/.test(e.message)
+  );
+  assert.throws(
+    () => svc.validatePlayerCreate({ first_name: 'Jo', last_name: 'Smith', status: 'active', is_active: false }),
+    (e) => e.statusCode === 400 && /status/.test(e.message) && /is_active/.test(e.message)
+  );
+});
+
+test('validatePlayerCreate rejects an invalid status value', () => {
+  assert.throws(() => svc.validatePlayerCreate({ first_name: 'Jo', last_name: 'Smith', status: 'benched' }), /status must be one of/);
+});
+
+test('validatePlayerUpdate leaves status unchanged when neither status nor is_active is supplied, but another field is', () => {
+  const result = svc.validatePlayerUpdate({ first_name: 'Jolene' });
+  assert.equal('status' in result, false);
+  assert.equal('is_active' in result, false);
+});
+
+test('validatePlayerUpdate accepts each of the five statuses', () => {
+  for (const status of svc.PLAYER_STATUSES) {
+    const result = svc.validatePlayerUpdate({ status });
+    assert.equal(result.status, status);
+  }
+});
+
+test('validatePlayerUpdate maps legacy is_active=true/false to the correct status', () => {
+  assert.equal(svc.validatePlayerUpdate({ is_active: true }).status, 'active');
+  assert.equal(svc.validatePlayerUpdate({ is_active: false }).status, 'other_non_returning');
+});
+
+test('validatePlayerUpdate accepts agreeing status + is_active', () => {
+  const result = svc.validatePlayerUpdate({ status: 'not_participating', is_active: false });
+  assert.equal(result.status, 'not_participating');
+});
+
+test('validatePlayerUpdate rejects conflicting status + is_active in both directions', () => {
+  assert.throws(
+    () => svc.validatePlayerUpdate({ status: 'transferred', is_active: true }),
+    (e) => e.statusCode === 400 && /status/.test(e.message) && /is_active/.test(e.message)
+  );
+  assert.throws(
+    () => svc.validatePlayerUpdate({ status: 'active', is_active: false }),
+    (e) => e.statusCode === 400 && /status/.test(e.message) && /is_active/.test(e.message)
+  );
+});
+
+test('validatePlayerUpdate validates a reactivation request ({status: "active"}) cleanly regardless of prior state', () => {
+  // Pure validation has no notion of "prior" state -- it only proves the
+  // resulting patch is well-formed. The orchestration tests below prove an
+  // actual reactivation write against a previously non-active row, for
+  // each of the four non-active statuses.
+  const result = svc.validatePlayerUpdate({ status: 'active' });
+  assert.equal(result.status, 'active');
+});
+
+// ── Players: orchestration ────────────────────────────────────────────────
+
+test('createPlayer writes status, never is_active, to the database (is_active is a generated column)', async () => {
+  const getProgram = async () => program;
+  const adminClient = makeFakeAdminClient({
+    hs_players: queued(ok(playerRow({ status: 'other_non_returning' }))),
+  });
+  await svc.createPlayer({ orgId: ORG_ID, body: { first_name: 'Jo', last_name: 'Smith', is_active: false }, adminClient, getProgram });
+  const insertCall = adminClient.calls.find((c) => c.method === 'insert');
+  assert.equal(insertCall.args.status, 'other_non_returning');
+  assert.equal('is_active' in insertCall.args, false);
+});
+
+test('createPlayer response includes both status and the derived is_active', async () => {
+  const getProgram = async () => program;
+  const adminClient = makeFakeAdminClient({
+    hs_players: queued(ok(playerRow({ status: 'graduated' }))),
+  });
+  const result = await svc.createPlayer({ orgId: ORG_ID, body: { first_name: 'Jo', last_name: 'Smith', status: 'graduated' }, adminClient, getProgram });
+  assert.equal(result.status, 'graduated');
+  assert.equal(result.is_active, false);
+});
+
+test('a validation conflict on createPlayer never reaches the database', async () => {
+  const getProgram = async () => program;
+  const adminClient = makeFakeAdminClient({});
+  await assert.rejects(
+    () => svc.createPlayer({ orgId: ORG_ID, body: { first_name: 'Jo', last_name: 'Smith', status: 'active', is_active: false }, adminClient, getProgram }),
+    (e) => e.statusCode === 400
+  );
+  assert.equal(adminClient.calls.length, 0);
+});
+
+test('updatePlayer writes status, never is_active, to the database', async () => {
+  const adminClient = makeFakeAdminClient({
+    hs_players: queued(
+      ok(playerRow({ status: 'graduated' })), // getPlayerInOrg existence check
+      ok(playerRow({ status: 'active' })), // the update itself
+    ),
+  });
+  await svc.updatePlayer({ orgId: ORG_ID, playerId: PLAYER_ID, body: { is_active: true }, adminClient });
+  const updateCall = adminClient.calls.find((c) => c.method === 'update');
+  assert.equal(updateCall.args.status, 'active');
+  assert.equal('is_active' in updateCall.args, false);
+});
+
+test('updatePlayer reactivates a player from each of the four non-active statuses via PATCH {status: "active"}', async () => {
+  for (const priorStatus of svc.PLAYER_STATUSES.filter((s) => s !== 'active')) {
+    const adminClient = makeFakeAdminClient({
+      hs_players: queued(
+        ok(playerRow({ status: priorStatus })),
+        ok(playerRow({ status: 'active' })),
+      ),
+    });
+    const result = await svc.updatePlayer({ orgId: ORG_ID, playerId: PLAYER_ID, body: { status: 'active' }, adminClient });
+    assert.equal(result.status, 'active');
+    assert.equal(result.is_active, true);
+  }
+});
+
+test('updatePlayer returns 404 for a player belonging to another organization', async () => {
+  const adminClient = makeFakeAdminClient({ hs_players: queued(ok(null)) });
+  await assert.rejects(
+    () => svc.updatePlayer({ orgId: ORG_ID, playerId: PLAYER_ID, body: { status: 'graduated' }, adminClient }),
+    (e) => e.statusCode === 404
+  );
+});
+
+test('a validation conflict on updatePlayer never reaches the database', async () => {
+  const adminClient = makeFakeAdminClient({});
+  await assert.rejects(
+    () => svc.updatePlayer({ orgId: ORG_ID, playerId: PLAYER_ID, body: { status: 'active', is_active: false }, adminClient }),
+    (e) => e.statusCode === 400
+  );
+  assert.equal(adminClient.calls.length, 0);
+});
+
+test('getPlayerInOrg response includes both status and is_active', async () => {
+  const adminClient = makeFakeAdminClient({ hs_players: queued(ok(playerRow({ status: 'not_participating' }))) });
+  const result = await svc.getPlayerInOrg({ orgId: ORG_ID, playerId: PLAYER_ID, adminClient });
+  assert.equal(result.status, 'not_participating');
+  assert.equal(result.is_active, false);
+});
+
+test('listPlayers response rows include both status and is_active', async () => {
+  const adminClient = makeFakeAdminClient({ hs_players: queued(ok([playerRow({ status: 'transferred' })])) });
+  const result = await svc.listPlayers({ orgId: ORG_ID, search: undefined, adminClient });
+  assert.equal(result[0].status, 'transferred');
+  assert.equal(result[0].is_active, false);
+});
+
 // ── Roster memberships: pure validation ──────────────────────────────────
 
 test('validateRosterAdd requires valid playerId and seasonId UUIDs', () => {
@@ -295,6 +560,20 @@ test('addRosterMembership rejects an inactive (archived) player (409, not silent
     () => svc.addRosterMembership({ orgId: ORG_ID, teamId: TEAM_ID, body: { playerId: PLAYER_ID, seasonId: SEASON_ID }, adminClient }),
     (e) => e.statusCode === 409 && /inactive player/.test(e.message)
   );
+});
+
+test('addRosterMembership rejects a player represented by a non-active status (e.g. graduated), not just a legacy is_active:false fixture', async () => {
+  for (const status of svc.PLAYER_STATUSES.filter((s) => s !== 'active')) {
+    const adminClient = makeFakeAdminClient({
+      hs_teams: queued(ok(ACTIVE_TEAM)),
+      hs_players: queued(ok(playerRow({ status }))),
+      hs_seasons: queued(ok({ id: SEASON_ID })),
+    });
+    await assert.rejects(
+      () => svc.addRosterMembership({ orgId: ORG_ID, teamId: TEAM_ID, body: { playerId: PLAYER_ID, seasonId: SEASON_ID }, adminClient }),
+      (e) => e.statusCode === 409 && /inactive player/.test(e.message)
+    );
+  }
 });
 
 test('addRosterMembership returns 404 when the season belongs to a different organization', async () => {
