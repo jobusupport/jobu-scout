@@ -15,6 +15,15 @@ const assert = require('node:assert/strict');
 
 const svc = require('../src/high-school-roster-service');
 
+// Every test in this file was written against and asserts on the lifecycle
+// hs_players schema (status + generated is_active) -- pre-seed the module's
+// deployment-compatibility capability cache accordingly so none of them
+// need to know about, or provide a fake response for, the capability probe
+// the legacy/lifecycle bridge now runs before every player operation. See
+// test/high-school-roster-service-legacy-schema.test.js for coverage of the
+// bridge itself (the legacy-schema path and the probe/capability logic).
+svc.__setSchemaCapabilityForTests(true);
+
 const ORG_ID = '11111111-1111-4111-8111-111111111111';
 const OTHER_ORG_ID = '99999999-9999-4999-8999-999999999999';
 const PROGRAM_ID = '22222222-2222-4222-8222-222222222222';

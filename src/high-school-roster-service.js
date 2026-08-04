@@ -396,6 +396,138 @@ function resolvePlayerStatusInput({ status, isActive }) {
   return status;
 }
 
+// ── Deployment-compatibility bridge: hs_players legacy/lifecycle schema ──
+//
+// Bridges the gap between production (which, as of this bridge's own PR,
+// still has the LEGACY schema -- a plain writable is_active boolean, no
+// status column) and the lifecycle schema merged in the prior PR (a status
+// column + generated is_active) -- see
+// supabase/migrations/20260803120000_add_hs_player_lifecycle_status.sql.
+// This lets the application deploy BEFORE that migration is applied to
+// production, keep working correctly against the legacy schema while it's
+// pending, and automatically switch to the lifecycle behavior once the
+// migration lands -- no second deploy or restart required. This whole
+// section (and every branch in createPlayer/getPlayerInOrg/updatePlayer/
+// listPlayers that reads hasStatusColumn) is a TEMPORARY bridge, meant to
+// be deleted in a follow-up cleanup PR once every environment has the
+// migration applied -- see this bridge's own PR description for the full
+// intended release sequence.
+//
+// ── Why a dedicated probe, not "try lifecycle, fall back on error" ──────
+// A capability PROBE (a cheap, zero-row, read-only select) is used instead
+// of attempting the real operation and falling back on failure, spec­
+// ifically so a CREATE never risks issuing a lifecycle insert, receiving an
+// ambiguous failure (e.g. a dropped response after the insert already
+// committed), and retrying with a second, legacy-shaped insert that could
+// duplicate an already-committed row. Capability is always known BEFORE any
+// write is attempted; exactly one insert/update is ever issued per call.
+//
+// ── Caching ───────────────────────────────────────────────────────────────
+// Once capability is known TRUE (status exists), it is cached permanently
+// for the life of this process -- a column, once added by a migration, is
+// never removed during normal operation, so there is nothing to re-check.
+// Once known FALSE (legacy schema), it is cached for only
+// CAPABILITY_RECHECK_INTERVAL_MS, so a long-running process picks up the
+// migration on its own, within a bounded window, without a restart --
+// never re-probed on every single request. A genuine probe failure (auth,
+// RLS, network, or any error that isn't the precise missing-status-column
+// shape) is never cached and never reinterpreted as "legacy" -- the next
+// call simply tries again.
+const CAPABILITY_RECHECK_INTERVAL_MS = 30000;
+
+let cachedHasStatusColumn = null; // null = unknown, true = lifecycle, false = legacy (bounded by cachedAt)
+let cachedHasStatusColumnAt = 0;
+let inFlightCapabilityProbe = null;
+
+// Deliberately NARROWER than src/high-school-api.js's own
+// isMissingRelationError (which exists for a different problem -- a whole
+// HS table not created yet). This one is scoped to exactly the failure
+// this bridge exists to handle -- requires the message to actually mention
+// "status" -- so an unrelated missing-column bug elsewhere is never
+// silently reinterpreted as "legacy schema."
+function isMissingStatusColumnError(err) {
+  const msg = String(err?.message || err || '').toLowerCase();
+  const code = String(err?.code || '').toUpperCase();
+  const looksLikeMissingColumn =
+    (msg.includes('column') && msg.includes('does not exist')) ||
+    (msg.includes('could not find') && msg.includes('column')) ||
+    code === '42703' ||
+    code === 'PGRST204';
+  return looksLikeMissingColumn && msg.includes('status');
+}
+
+async function probeHasStatusColumn(adminClient) {
+  const { error } = await adminClient.from('hs_players').select('status').limit(0);
+  if (!error) return true;
+  if (isMissingStatusColumnError(error)) return false;
+  console.error('[high-school-roster-service] schema-capability probe failed (not a missing-status-column error -- not treated as legacy schema):', error);
+  throw typedError('Something went wrong. Please try again.', 500);
+}
+
+async function hasStatusColumn(adminClient) {
+  const now = Date.now();
+  if (cachedHasStatusColumn === true) return true;
+  if (cachedHasStatusColumn === false && now - cachedHasStatusColumnAt < CAPABILITY_RECHECK_INTERVAL_MS) return false;
+  if (!inFlightCapabilityProbe) {
+    inFlightCapabilityProbe = probeHasStatusColumn(adminClient)
+      .then((result) => {
+        cachedHasStatusColumn = result;
+        cachedHasStatusColumnAt = Date.now();
+        return result;
+      })
+      .finally(() => { inFlightCapabilityProbe = null; });
+  }
+  return inFlightCapabilityProbe;
+}
+
+// Test-only control over the module-level capability cache. Not part of
+// the public runtime API -- exported solely so tests can force a fresh
+// probe or pre-seed a known state instead of depending on real elapsed
+// time against CAPABILITY_RECHECK_INTERVAL_MS.
+function __setSchemaCapabilityForTests(value) {
+  cachedHasStatusColumn = value;
+  cachedHasStatusColumnAt = value === false ? Date.now() : 0;
+  inFlightCapabilityProbe = null;
+}
+
+const LEGACY_PLAYER_SELECT_COLUMNS = 'id, program_id, first_name, last_name, preferred_name, graduation_year, is_active';
+const LIFECYCLE_PLAYER_SELECT_COLUMNS = 'id, program_id, first_name, last_name, preferred_name, graduation_year, status, is_active';
+
+function playerSelectColumns(hasStatus) {
+  return hasStatus ? LIFECYCLE_PLAYER_SELECT_COLUMNS : LEGACY_PLAYER_SELECT_COLUMNS;
+}
+
+// Converts a lifecycle-shaped write payload (containing `status`, produced
+// by validatePlayerCreate/validatePlayerUpdate -- unchanged by this bridge)
+// into a legacy-schema-safe one: never includes `status` (the column
+// doesn't exist yet), and maps status -> is_active the same coarse way
+// legacyIsActiveToStatus already does in reverse. This is a LOSSY, one-way
+// conversion for any of the four non-active reasons -- the legacy boolean
+// cannot record WHICH one was requested (see this bridge's own PR
+// description). Fields other than status pass through unchanged; a patch
+// with no status key at all (an update that didn't touch status) passes
+// through unchanged too, correctly leaving is_active untouched in the DB.
+function toLegacyPlayerWritePayload(validated) {
+  if (!('status' in validated)) return validated;
+  const { status, ...rest } = validated;
+  return { ...rest, is_active: status === 'active' };
+}
+
+// Legacy-schema response synthesis: is_active is the only fact the
+// database can express, so `status` is DERIVED at read time, never
+// persisted. Reuses legacyIsActiveToStatus (the exact same mapping already
+// used for legacy write-side compatibility) so a fresh read always reports
+// the same coarse status a fresh write would have produced -- never a
+// specific non-active reason that wasn't actually persisted.
+function synthesizeLegacyPlayerStatus(row) {
+  if (!row) return row;
+  return { ...row, status: legacyIsActiveToStatus(row.is_active) };
+}
+
+function normalizePlayerReadRow(row, hasStatus) {
+  return hasStatus ? row : synthesizeLegacyPlayerStatus(row);
+}
+
 function validatePlayerCreate(body) {
   rejectUnknownFields(body, ['first_name', 'last_name', 'preferred_name', 'graduation_year', 'is_active', 'status']);
   const firstName = requireNonEmptyString(body?.first_name, 'first_name');
@@ -428,25 +560,29 @@ async function createPlayer({ orgId, body, adminClient, getProgram }) {
   const program = await getProgram(orgId);
   if (!program) throw typedError('Create a program before adding players.', 404);
 
+  const hasStatus = await hasStatusColumn(adminClient);
+  const insertPayload = hasStatus ? validated : toLegacyPlayerWritePayload(validated);
+
   const { data, error } = await adminClient
     .from('hs_players')
-    .insert({ org_id: orgId, program_id: program.id, ...validated })
-    .select('id, program_id, first_name, last_name, preferred_name, graduation_year, status, is_active')
+    .insert({ org_id: orgId, program_id: program.id, ...insertPayload })
+    .select(playerSelectColumns(hasStatus))
     .single();
   if (error) return mapWriteError(error, { conflictMessage: 'Unable to create player.' });
-  return data;
+  return normalizePlayerReadRow(data, hasStatus);
 }
 
 async function getPlayerInOrg({ orgId, playerId, adminClient }) {
   requireUuid(playerId, 'playerId');
+  const hasStatus = await hasStatusColumn(adminClient);
   const { data, error } = await adminClient
     .from('hs_players')
-    .select('id, program_id, first_name, last_name, preferred_name, graduation_year, status, is_active')
+    .select(playerSelectColumns(hasStatus))
     .eq('id', playerId)
     .eq('org_id', orgId)
     .maybeSingle();
   if (error) { console.error('[high-school-roster-service] player lookup failed:', error); throw typedError('Something went wrong. Please try again.', 500); }
-  return data;
+  return normalizePlayerReadRow(data, hasStatus);
 }
 
 async function updatePlayer({ orgId, playerId, body, adminClient }) {
@@ -455,15 +591,18 @@ async function updatePlayer({ orgId, playerId, body, adminClient }) {
   const existing = await getPlayerInOrg({ orgId, playerId, adminClient });
   if (!existing) throw typedError('Player not found', 404);
 
+  const hasStatus = await hasStatusColumn(adminClient);
+  const updatePayload = hasStatus ? patch : toLegacyPlayerWritePayload(patch);
+
   const { data, error } = await adminClient
     .from('hs_players')
-    .update(patch)
+    .update(updatePayload)
     .eq('org_id', orgId)
     .eq('id', playerId)
-    .select('id, program_id, first_name, last_name, preferred_name, graduation_year, status, is_active')
+    .select(playerSelectColumns(hasStatus))
     .single();
   if (error) return mapWriteError(error, { conflictMessage: 'Unable to update player.' });
-  return data;
+  return normalizePlayerReadRow(data, hasStatus);
 }
 
 // Escapes PostgREST ilike wildcard/separator characters in free-text search
@@ -474,9 +613,10 @@ function escapeIlike(s) {
 }
 
 async function listPlayers({ orgId, search, adminClient }) {
+  const hasStatus = await hasStatusColumn(adminClient);
   let query = adminClient
     .from('hs_players')
-    .select('id, program_id, first_name, last_name, preferred_name, graduation_year, status, is_active')
+    .select(playerSelectColumns(hasStatus))
     .eq('org_id', orgId)
     .order('last_name')
     .order('first_name');
@@ -487,7 +627,7 @@ async function listPlayers({ orgId, search, adminClient }) {
   }
   const { data, error } = await query;
   if (error) { console.error('[high-school-roster-service] player list failed:', error); throw typedError('Something went wrong. Please try again.', 500); }
-  return data || [];
+  return (data || []).map((row) => normalizePlayerReadRow(row, hasStatus));
 }
 
 // ── Roster memberships ──────────────────────────────────────────────────
@@ -542,15 +682,16 @@ function toRosterMembershipResponse(row) {
 // of write an archival flag exists to prevent going forward; both
 // hs_teams.is_active and hs_players.is_active already exist for this in the
 // deployed schema, so this is enforced in application code, not a new
-// migration. hs_players.is_active is now a database-generated column
-// (status = 'active') -- this check reads exactly the same way for a
-// player whose status is 'graduated', 'transferred', 'not_participating',
-// or 'other_non_returning'; none of the five statuses other than 'active'
-// can ever produce is_active=true (see
-// supabase/migrations/20260803120000_add_hs_player_lifecycle_status.sql).
-// Seasons have no is_active column at all (see high-school-roster-service's
-// own header/PR notes), so no equivalent check exists for season -- there
-// is nothing to check.
+// migration. player.is_active is always correctly populated by
+// getPlayerInOrg regardless of which hs_players schema is currently live --
+// on the lifecycle schema it's the real generated column (status =
+// 'active'); on the legacy schema (see the deployment-compatibility bridge
+// above getPlayerInOrg) it's the plain boolean, with `status` synthesized
+// FROM it, never the other way around -- so this check reads correctly in
+// both cases without needing to know which schema is active. Seasons have
+// no is_active column at all (see high-school-roster-service's own
+// header/PR notes), so no equivalent check exists for season -- there is
+// nothing to check.
 async function addRosterMembership({ orgId, teamId, body, adminClient }) {
   const validated = validateRosterAdd(body);
 
@@ -641,6 +782,12 @@ module.exports = {
   legacyIsActiveToStatus,
   isActiveAgreesWithStatus,
   resolvePlayerStatusInput,
+  CAPABILITY_RECHECK_INTERVAL_MS,
+  isMissingStatusColumnError,
+  hasStatusColumn,
+  toLegacyPlayerWritePayload,
+  synthesizeLegacyPlayerStatus,
+  __setSchemaCapabilityForTests,
   isValidUuid,
   requireUuid,
   typedError,
