@@ -96,10 +96,51 @@ function unrelatedMissingColumnError() {
   return { code: '42703', message: 'column "foo" does not exist' };
 }
 
+// ── Transition-error fixtures ──────────────────────────────────────────
+//
+// The exact shapes captured directly against a real, disposable Supabase
+// Preview Branch (Postgres 17.6) during this bridge's own row-level
+// verification -- not invented. See
+// src/high-school-roster-service.js's isGeneratedIsActiveRejectionError
+// for the full citation.
+function generatedIsActiveInsertRejection() {
+  return { code: '428C9', message: 'cannot insert a non-DEFAULT value into column "is_active"', details: 'Column "is_active" is a generated column.' };
+}
+function generatedIsActiveUpdateRejection() {
+  return { code: '428C9', message: 'column "is_active" can only be updated to DEFAULT', details: 'Column "is_active" is a generated column.' };
+}
+// 428C9-shaped, but about a hypothetical DIFFERENT generated column --
+// must never be misclassified as the is_active recovery signal.
+function unrelatedGeneratedColumnRejection() {
+  return { code: '428C9', message: 'cannot insert a non-DEFAULT value into column "full_name"', details: 'Column "full_name" is a generated column.' };
+}
+// Same SQLSTATE as the real rejection, but missing the "generated column"
+// semantics -- must never be misclassified (proves code alone is not
+// sufficient).
+function wrongShaped428C9Error() {
+  return { code: '428C9', message: 'invalid column definition for "is_active"' };
+}
+// No code, no column/generated-column language at all -- a stand-in for a
+// statement timeout / connection drop / ambiguous partial-response
+// failure. Must never be classified as the recovery signal, and must
+// never be assumed to have failed to write (also never assumed to have
+// succeeded) -- it is simply surfaced as a genuine failure, exactly like
+// today.
+function ambiguousResponseFailure() {
+  return { message: 'canceling statement due to statement timeout' };
+}
+
 function legacyPlayerRow({ id = PLAYER_ID, is_active = true, ...rest } = {}) {
   return {
     id, program_id: PROGRAM_ID, first_name: 'Jo', last_name: 'Smith',
     preferred_name: null, graduation_year: null, is_active, ...rest,
+  };
+}
+
+function lifecyclePlayerRow({ id = PLAYER_ID, status = 'active', ...rest } = {}) {
+  return {
+    id, program_id: PROGRAM_ID, first_name: 'Jo', last_name: 'Smith',
+    preferred_name: null, graduation_year: null, status, is_active: status === 'active', ...rest,
   };
 }
 
@@ -517,4 +558,253 @@ test('an unrelated missing-column error (not about status) never triggers legacy
     (e) => e.statusCode === 500
   );
   assert.equal(adminClient.calls.filter((c) => c.method === 'insert' || c.method === 'update').length, 0);
+});
+
+// ── Transition recovery: legacy write hits the exact generated-is_active
+// rejection because the migration landed mid-flight ─────────────────────
+
+test('isGeneratedIsActiveRejectionError recognizes both real captured rejection shapes', () => {
+  assert.equal(svc.isGeneratedIsActiveRejectionError(generatedIsActiveInsertRejection()), true);
+  assert.equal(svc.isGeneratedIsActiveRejectionError(generatedIsActiveUpdateRejection()), true);
+});
+
+test('isGeneratedIsActiveRejectionError rejects a 428C9 for a different column, a wrongly-shaped 428C9, and unrelated errors', () => {
+  assert.equal(svc.isGeneratedIsActiveRejectionError(unrelatedGeneratedColumnRejection()), false);
+  assert.equal(svc.isGeneratedIsActiveRejectionError(wrongShaped428C9Error()), false);
+  assert.equal(svc.isGeneratedIsActiveRejectionError(rlsError()), false);
+  assert.equal(svc.isGeneratedIsActiveRejectionError(networkError()), false);
+  assert.equal(svc.isGeneratedIsActiveRejectionError(ambiguousResponseFailure()), false);
+  assert.equal(svc.isGeneratedIsActiveRejectionError(missingStatusColumnErrorPgrst()), false);
+});
+
+test('attemptLegacyThenRecoverToLifecycle: legacy attempt succeeds normally and is called exactly once (not retried)', async () => {
+  let calls = 0;
+  const attempt = async () => { calls += 1; return ok(legacyPlayerRow()); };
+  const result = await svc.attemptLegacyThenRecoverToLifecycle({ adminClient: makeFakeAdminClient({}), hasStatus: false, attempt });
+  assert.equal(calls, 1);
+  assert.equal(result.hasStatus, false);
+  assert.equal(result.error, null);
+});
+
+test('attemptLegacyThenRecoverToLifecycle: lifecycle attempt succeeds normally and is called exactly once (not retried)', async () => {
+  let calls = 0;
+  const attempt = async () => { calls += 1; return ok(lifecyclePlayerRow()); };
+  const result = await svc.attemptLegacyThenRecoverToLifecycle({ adminClient: makeFakeAdminClient({}), hasStatus: true, attempt });
+  assert.equal(calls, 1);
+  assert.equal(result.hasStatus, true);
+});
+
+test('createPlayer: the exact transition error recovers -- invalidates cache, confirms lifecycle, retries once with status (never is_active), creates exactly one row', async () => {
+  svc.__setSchemaCapabilityForTests(false);
+  const getProgram = async () => program;
+  const adminClient = makeFakeAdminClient({
+    hs_players: queued(
+      err(generatedIsActiveInsertRejection()), // rejected legacy insert
+      ok([]),                                   // fresh probe confirms status exists
+      ok(lifecyclePlayerRow({ status: 'active' })), // lifecycle retry succeeds
+    ),
+  });
+  const result = await svc.createPlayer({ orgId: ORG_ID, body: { first_name: 'Jo', last_name: 'Smith' }, adminClient, getProgram });
+
+  assert.equal(result.status, 'active');
+  assert.equal(result.is_active, true);
+
+  const insertCalls = adminClient.calls.filter((c) => c.method === 'insert');
+  assert.equal(insertCalls.length, 2, 'exactly one rejected legacy attempt plus one lifecycle attempt');
+  assert.equal('status' in insertCalls[0].args, false, 'the rejected legacy attempt must never have included status');
+  assert.equal(insertCalls[1].args.status, 'active', 'the retry must write status');
+  assert.equal('is_active' in insertCalls[1].args, false, 'the lifecycle retry must never write generated is_active');
+
+  // The capability cache is now positively (permanently) confirmed.
+  assert.equal(await svc.hasStatusColumn(adminClient), true);
+});
+
+test('updatePlayer: the exact transition error recovers -- retries once, preserves org_id/id predicates exactly, applies once', async () => {
+  svc.__setSchemaCapabilityForTests(false);
+  const adminClient = makeFakeAdminClient({
+    hs_players: queued(
+      ok(legacyPlayerRow({ is_active: true })),        // getPlayerInOrg existence read
+      err(generatedIsActiveUpdateRejection()),          // rejected legacy update
+      ok([]),                                           // fresh probe confirms status exists
+      ok(lifecyclePlayerRow({ status: 'graduated' })),  // lifecycle retry succeeds
+    ),
+  });
+  const result = await svc.updatePlayer({ orgId: ORG_ID, playerId: PLAYER_ID, body: { status: 'graduated' }, adminClient });
+
+  assert.equal(result.status, 'graduated');
+  assert.equal(result.is_active, false);
+
+  const updateCalls = adminClient.calls.filter((c) => c.method === 'update');
+  assert.equal(updateCalls.length, 2);
+  assert.equal('status' in updateCalls[0].args, false);
+  assert.equal(updateCalls[1].args.status, 'graduated');
+  assert.equal('is_active' in updateCalls[1].args, false);
+});
+
+test('createPlayer: all five lifecycle statuses survive transition recovery accurately', async () => {
+  const getProgram = async () => program;
+  for (const status of svc.PLAYER_STATUSES) {
+    svc.__setSchemaCapabilityForTests(false);
+    const adminClient = makeFakeAdminClient({
+      hs_players: queued(
+        err(generatedIsActiveInsertRejection()),
+        ok([]),
+        ok(lifecyclePlayerRow({ status })),
+      ),
+    });
+    const result = await svc.createPlayer({ orgId: ORG_ID, body: { first_name: 'Jo', last_name: `T-${status}`, status }, adminClient, getProgram });
+    assert.equal(result.status, status);
+    assert.equal(result.is_active, status === 'active');
+    const insertCalls = adminClient.calls.filter((c) => c.method === 'insert');
+    assert.equal(insertCalls.length, 2);
+    assert.equal(insertCalls[1].args.status, status);
+  }
+});
+
+test('createPlayer: a network-shaped (ambiguous) failure never triggers recovery', async () => {
+  svc.__setSchemaCapabilityForTests(false);
+  const getProgram = async () => program;
+  const adminClient = makeFakeAdminClient({ hs_players: queued(err(ambiguousResponseFailure())) });
+  await assert.rejects(
+    () => svc.createPlayer({ orgId: ORG_ID, body: { first_name: 'Jo', last_name: 'Smith' }, adminClient, getProgram }),
+    (e) => e.statusCode === 500
+  );
+  assert.equal(adminClient.calls.filter((c) => c.method === 'insert').length, 1, 'no retry -- exactly the one rejected attempt');
+});
+
+test('createPlayer: an RLS/authorization failure on the write never triggers recovery', async () => {
+  svc.__setSchemaCapabilityForTests(false);
+  const getProgram = async () => program;
+  const adminClient = makeFakeAdminClient({ hs_players: queued(err(rlsError())) });
+  await assert.rejects(
+    () => svc.createPlayer({ orgId: ORG_ID, body: { first_name: 'Jo', last_name: 'Smith' }, adminClient, getProgram }),
+    (e) => e.statusCode === 500
+  );
+  assert.equal(adminClient.calls.filter((c) => c.method === 'insert').length, 1);
+});
+
+test('createPlayer: a 428C9 for a different generated column never triggers recovery', async () => {
+  svc.__setSchemaCapabilityForTests(false);
+  const getProgram = async () => program;
+  const adminClient = makeFakeAdminClient({ hs_players: queued(err(unrelatedGeneratedColumnRejection())) });
+  await assert.rejects(
+    () => svc.createPlayer({ orgId: ORG_ID, body: { first_name: 'Jo', last_name: 'Smith' }, adminClient, getProgram }),
+    (e) => e.statusCode === 500
+  );
+  assert.equal(adminClient.calls.filter((c) => c.method === 'insert').length, 1);
+});
+
+test('createPlayer: a wrongly-shaped 428C9 (missing generated-column semantics) never triggers recovery', async () => {
+  svc.__setSchemaCapabilityForTests(false);
+  const getProgram = async () => program;
+  const adminClient = makeFakeAdminClient({ hs_players: queued(err(wrongShaped428C9Error())) });
+  await assert.rejects(
+    () => svc.createPlayer({ orgId: ORG_ID, body: { first_name: 'Jo', last_name: 'Smith' }, adminClient, getProgram }),
+    (e) => e.statusCode === 500
+  );
+  assert.equal(adminClient.calls.filter((c) => c.method === 'insert').length, 1);
+});
+
+test('attemptLegacyThenRecoverToLifecycle: a missing-status write error (not 428C9) never triggers a mutation retry', async () => {
+  let calls = 0;
+  const attempt = async () => { calls += 1; return err(missingStatusColumnErrorPgrst()); };
+  const result = await svc.attemptLegacyThenRecoverToLifecycle({ adminClient: makeFakeAdminClient({}), hasStatus: false, attempt });
+  assert.equal(calls, 1, 'no second attempt call');
+  assert.equal(result.error.code, 'PGRST204');
+});
+
+test('createPlayer: failure of the fresh capability probe (after the transition error) propagates without a mutation retry', async () => {
+  svc.__setSchemaCapabilityForTests(false);
+  const getProgram = async () => program;
+  const adminClient = makeFakeAdminClient({
+    hs_players: queued(
+      err(generatedIsActiveInsertRejection()), // rejected legacy insert
+      err(rlsError()),                          // the fresh recovery probe itself fails
+    ),
+  });
+  await assert.rejects(
+    () => svc.createPlayer({ orgId: ORG_ID, body: { first_name: 'Jo', last_name: 'Smith' }, adminClient, getProgram }),
+    (e) => e.statusCode === 500
+  );
+  assert.equal(adminClient.calls.filter((c) => c.method === 'insert').length, 1, 'never a second (lifecycle) insert attempt');
+});
+
+test('createPlayer: a fresh probe that still reports legacy mode surfaces the ORIGINAL rejection, never a second legacy attempt', async () => {
+  svc.__setSchemaCapabilityForTests(false);
+  const getProgram = async () => program;
+  const adminClient = makeFakeAdminClient({
+    hs_players: queued(
+      err(generatedIsActiveInsertRejection()),   // rejected legacy insert
+      err(missingStatusColumnErrorPgrst()),      // fresh probe -- still legacy (defensive, shouldn't happen)
+    ),
+  });
+  await assert.rejects(
+    () => svc.createPlayer({ orgId: ORG_ID, body: { first_name: 'Jo', last_name: 'Smith' }, adminClient, getProgram }),
+    (e) => e.statusCode === 500
+  );
+  assert.equal(adminClient.calls.filter((c) => c.method === 'insert').length, 1, 'no second legacy attempt, no loop');
+});
+
+test('createPlayer: a failure of the lifecycle retry itself is surfaced once and does not loop', async () => {
+  svc.__setSchemaCapabilityForTests(false);
+  const getProgram = async () => program;
+  const adminClient = makeFakeAdminClient({
+    hs_players: queued(
+      err(generatedIsActiveInsertRejection()), // rejected legacy insert
+      ok([]),                                   // fresh probe confirms lifecycle
+      err({ code: '23505', message: 'duplicate key value violates unique constraint' }), // the lifecycle retry itself fails
+    ),
+  });
+  await assert.rejects(
+    () => svc.createPlayer({ orgId: ORG_ID, body: { first_name: 'Jo', last_name: 'Smith' }, adminClient, getProgram }),
+    (e) => e.statusCode === 409
+  );
+  const insertCalls = adminClient.calls.filter((c) => c.method === 'insert');
+  assert.equal(insertCalls.length, 2, 'exactly one rejected legacy attempt plus one (failed) lifecycle attempt -- never a third');
+});
+
+test('positive capability caching (once confirmed by a recovery) prevents a subsequent request from attempting a legacy write at all', async () => {
+  svc.__setSchemaCapabilityForTests(false);
+  const getProgram = async () => program;
+  const firstClient = makeFakeAdminClient({
+    hs_players: queued(err(generatedIsActiveInsertRejection()), ok([]), ok(lifecyclePlayerRow({ status: 'active' }))),
+  });
+  await svc.createPlayer({ orgId: ORG_ID, body: { first_name: 'Jo', last_name: 'First' }, adminClient: firstClient, getProgram });
+
+  // A second, independent request on a fresh adminClient with only ONE
+  // queued response -- if this request attempted a legacy write (or
+  // re-probed) it would either get the wrong shape back or throw on an
+  // exhausted queue; succeeding proves it went straight to lifecycle mode.
+  const secondClient = makeFakeAdminClient({ hs_players: queued(ok(lifecyclePlayerRow({ status: 'graduated' }))) });
+  const result = await svc.createPlayer({ orgId: ORG_ID, body: { first_name: 'Jo', last_name: 'Second', status: 'graduated' }, adminClient: secondClient, getProgram });
+  assert.equal(result.status, 'graduated');
+  const insertCalls = secondClient.calls.filter((c) => c.method === 'insert');
+  assert.equal(insertCalls.length, 1, 'the second request never attempted a legacy write');
+  assert.equal(insertCalls[0].args.status, 'graduated');
+});
+
+test('concurrent transition recoveries share exactly one fresh probe and each createPlayer succeeds exactly once', async () => {
+  svc.__setSchemaCapabilityForTests(false);
+  const getProgram = async () => program;
+  const adminClient = makeFakeAdminClient({
+    hs_players: queued(
+      err(generatedIsActiveInsertRejection()), // request A's rejected legacy insert
+      err(generatedIsActiveInsertRejection()), // request B's rejected legacy insert
+      ok([]),                                   // the ONE shared fresh probe (deduplicated)
+      ok(lifecyclePlayerRow({ id: 'a', status: 'active' })),
+      ok(lifecyclePlayerRow({ id: 'b', status: 'active' })),
+    ),
+  });
+  const [resultA, resultB] = await Promise.all([
+    svc.createPlayer({ orgId: ORG_ID, body: { first_name: 'Jo', last_name: 'A' }, adminClient, getProgram }),
+    svc.createPlayer({ orgId: ORG_ID, body: { first_name: 'Jo', last_name: 'B' }, adminClient, getProgram }),
+  ]);
+  assert.equal(resultA.status, 'active');
+  assert.equal(resultB.status, 'active');
+
+  const insertCalls = adminClient.calls.filter((c) => c.method === 'insert');
+  assert.equal(insertCalls.length, 4, '2 rejected legacy attempts + 2 successful lifecycle attempts, never more');
+
+  const probeCalls = adminClient.calls.filter((c) => c.method === 'select' && c.args === 'status');
+  assert.equal(probeCalls.length, 1, 'the fresh recovery probe must be deduplicated across both concurrent recoveries, never issued twice');
 });
