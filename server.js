@@ -91,6 +91,9 @@ const { createHighSchoolImportRepository } = require('./src/high-school-import-r
 const { createHighSchoolImportService } = require('./src/high-school-import-service');
 const gcCollectionPolicy = require('./src/gc-collection-policy');
 
+// ── Opponent rosters + coach scouting intelligence (Travel domain) ──────────
+const createOpponentIntelligenceRouter = require('./src/opponent-intelligence-api');
+
 // ── Trusted organization resolution (extracted for database-free testing) ────
 const { resolveTrustedOrgId, buildAcceptedMembershipsQuery, mapErrorToResponse } = require('./src/org-resolution');
 const { asyncHandler, buildFinalErrorHandler } = require('./src/express-helpers');
@@ -687,6 +690,9 @@ const highSchoolRouter = createHighSchoolRouter({
   importService: app.locals.highSchoolImportService,
 });
 app.use('/api/high-school', highSchoolRouter);
+
+const opponentIntelligenceRouter = createOpponentIntelligenceRouter({ requireAuth });
+app.use('/api/opponent-intelligence', opponentIntelligenceRouter);
 
 // Runtime-responsive kill-switch watchdog: proactively pushes a stop
 // signal to every active High School GameChanger import the moment
@@ -1327,8 +1333,8 @@ app.post('/api/run/gc-scraper', requireAuth, resolveSupportSession, requireTrave
   await assertOrgActive(req);
   const team = (await getTeams(req)).find(t => t.id == req.body.teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
-  const id = createJob(`PSG Analysis — ${team.team_name}`, await getRequestOrgId(req), req.user?.id);
-  appendLog(id, `Starting PSG analysis for: ${team.team_name}`);
+  const id = createJob(`Analyze Opponent's Games — ${team.team_name}`, await getRequestOrgId(req), req.user?.id);
+  appendLog(id, `Starting opponent's-games analysis for: ${team.team_name}`);
   if (!team.gc_team_url && await hasGameUrls(team.id)) {
     appendLog(id, `No team URL — analyzing via individual game URLs`);
     spawnJob(id, 'node', ['src/scrape-game-urls.js', `"${cleanTeamName(team.team_name)}"`], ROOT);
@@ -1346,8 +1352,8 @@ app.post('/api/run/pg-scraper', requireAuth, resolveSupportSession, requireTrave
   await assertOrgActive(req);
   const team = (await getTeams(req)).find(t => t.id == req.body.teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
-  const id = createJob(`PSP Analysis — ${team.team_name}`, await getRequestOrgId(req), req.user?.id);
-  appendLog(id, `Starting PSP analysis for: ${team.team_name}`);
+  const id = createJob(`Analyze Opponent's Players — ${team.team_name}`, await getRequestOrgId(req), req.user?.id);
+  appendLog(id, `Starting opponent's-players analysis for: ${team.team_name}`);
   spawnJob(id, 'node', ['perfectgame-scraper.js', team.pg_team_url || '', team.team_name],
     path.join(ROOT, 'perfectgame-scraper'));
   res.json({ jobId: id });
@@ -1456,10 +1462,10 @@ app.post('/api/run/full-pipeline', requireAuth, resolveSupportSession, requireTr
   const noGC    = !team.gc_team_url && await hasGameUrls(team.id);
   const runStep = makeRunStep(id);
   appendLog(id, `Running full pipeline for: ${team.team_name}`);
-  appendLog(id, `Steps: PSG Analysis → PSP Analysis → Reingest → Generate Report`);
+  appendLog(id, `Steps: Analyze Opponent's Games → Analyze Opponent's Players → Reingest → Generate Report`);
   (async () => {
     try {
-      appendLog(id, '── Step 1/4: PSG Analysis ──');
+      appendLog(id, "── Step 1/4: Analyze Opponent's Games ──");
       if (noGC) {
         await runStep('node', ['src/scrape-game-urls.js', `"${cleanTeamName(team.team_name)}"`], ROOT);
       } else {
@@ -1468,7 +1474,7 @@ app.post('/api/run/full-pipeline', requireAuth, resolveSupportSession, requireTr
         gcEnv.GC_TEST_TEAM_CONTAINS = team.gc_search_name || team.team_name;
         await runStep('node', ['src/search-gamechanger-teams.js'], ROOT, gcEnv);
       }
-      appendLog(id, '── Step 2/4: PSP Analysis ──');
+      appendLog(id, "── Step 2/4: Analyze Opponent's Players ──");
       await runStep('node', ['perfectgame-scraper.js', team.pg_team_url || '', team.team_name], pgRoot);
       appendLog(id, '── Step 3/4: Reingest & Stats ──');
       await runStep('node', ['reingest-games.js', team.team_name], ROOT);
@@ -1492,9 +1498,9 @@ app.post('/api/run/all-gc', requireAuth, resolveSupportSession, requireTravelAcc
   const teamsWithUrlFlags = await Promise.all(allTeams.map(async t => ({ ...t, _hasGameUrls: await hasGameUrls(t.id) })));
   const teams   = teamsWithUrlFlags.filter(t => t.gc_team_url || t._hasGameUrls);
   if (!teams.length) return res.status(400).json({ error: 'No teams with GC URLs or game URLs' });
-  const id      = createJob(`PSG Analysis — All (${teams.length} teams)`, await getRequestOrgId(req), req.user?.id);
+  const id      = createJob(`Analyze Opponent's Games — All (${teams.length} teams)`, await getRequestOrgId(req), req.user?.id);
   const runStep = makeRunStep(id);
-  appendLog(id, `Queuing PSG analysis for ${teams.length} team(s)...`);
+  appendLog(id, `Queuing opponent's-games analysis for ${teams.length} team(s)...`);
   (async () => {
     let done = 0, failed = 0;
     for (const team of teams) {
@@ -1525,10 +1531,10 @@ app.post('/api/run/all-pg', requireAuth, resolveSupportSession, requireTravelAcc
   await assertOrgActive(req);
   const teams   = (await getTeams(req)).filter(t => t.pg_team_url);
   if (!teams.length) return res.status(400).json({ error: 'No teams with PG URLs' });
-  const id      = createJob(`PSP Analysis — All (${teams.length} teams)`, await getRequestOrgId(req), req.user?.id);
+  const id      = createJob(`Analyze Opponent's Players — All (${teams.length} teams)`, await getRequestOrgId(req), req.user?.id);
   const pgRoot  = path.join(ROOT, 'perfectgame-scraper');
   const runStep = makeRunStep(id);
-  appendLog(id, `Queuing PSP analysis for ${teams.length} team(s)...`);
+  appendLog(id, `Queuing opponent's-players analysis for ${teams.length} team(s)...`);
   (async () => {
     let done = 0, failed = 0;
     for (const team of teams) {
@@ -1829,7 +1835,7 @@ app.delete('/api/teams/:id/players/:playerId', requireAuth, resolveSupportSessio
   } catch (err) { return sendResolverError(res, err, 'api/teams/:id/players/:playerId DELETE'); }
 });
 
-// Seeds the roster from player names already captured by PSG analysis (distinct
+// Seeds the roster from player names already captured by Analyze Opponent's Games (distinct
 // player_name values on this team's own side of batting/pitching lines), so a
 // coach doesn't have to retype a whole lineup by hand. Skips anyone whose
 // first+last name already exists on the roster; jersey/handedness/positions

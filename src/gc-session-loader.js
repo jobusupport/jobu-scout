@@ -31,6 +31,25 @@
 // sanitization required (though callers should still route it through
 // gc-collection-policy's sanitizeCollectionErrorMessage as defense in
 // depth, the same as every other collection error).
+//
+// ── Test-mode fail-closed path resolution ─────────────────────────────────
+// An automated test run (NODE_ENV=test, set process-wide by
+// test/helpers/test-env-setup.js, preloaded via `node --test --require` for
+// every worker -- see package.json's test script) must never be able to
+// silently fall back to the real production default path
+// (storage/gamechanger-auth.json locally, /app/storage/gamechanger-auth.json
+// in the deployed container). A real credential happening to exist at that
+// exact path on a developer's machine -- which happened once, see the PR
+// history for this file -- must not become reachable by a test just because
+// nothing overrode GC_AUTH_FILE_PATH. In test mode, getStorageStatePath()
+// therefore REQUIRES an explicit GC_AUTH_FILE_PATH and throws a fail-closed,
+// generic SessionValidationError otherwise, before any fs/network operation
+// is even attempted. Outside test mode, resolution is byte-for-byte
+// unchanged from before -- GC_AUTH_FILE_PATH if set, else the same
+// repo-relative default -- so production behavior is not altered at all.
+function isAutomatedTestMode() {
+  return process.env.NODE_ENV === 'test';
+}
 
 const fs = require('fs');
 const path = require('path');
@@ -45,6 +64,11 @@ class SessionValidationError extends Error {
 function getStorageStatePath() {
   const configured = process.env.GC_AUTH_FILE_PATH;
   if (configured && configured.trim()) return configured.trim();
+  if (isAutomatedTestMode()) {
+    throw new SessionValidationError(
+      'Automated test mode requires an explicit GC_AUTH_FILE_PATH fixture. Refusing to resolve the production GameChanger session path during tests.'
+    );
+  }
   return path.join(__dirname, '..', 'storage', 'gamechanger-auth.json');
 }
 
@@ -154,5 +178,6 @@ module.exports = {
   materializeStorageStateFromEnvValue,
   validateStorageStateFile,
   assertLandedOnAuthenticatedGameChangerPage,
+  isAutomatedTestMode,
   SessionValidationError,
 };

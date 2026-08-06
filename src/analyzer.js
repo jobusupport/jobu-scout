@@ -10,6 +10,7 @@ const { getPGDataForTeam } = require('./pg-reader');
 const db       = require('./db');
 const pipeline = require('./pipeline');
 const { adminClient } = require('./supabase');
+const { buildOpponentIntelligenceContext } = require('./report-context-builder');
 
 const CLAUDE_MODEL = 'claude-sonnet-4-6';
 const MAX_TOKENS   = 20000;
@@ -618,6 +619,44 @@ function buildCoachContextBlock(options = {}) {
   return lines.join('\n') + '\n';
 }
 
+// Sync formatter over ALREADY-FETCHED data -- the actual async DB read
+// happens once per report in analyzeTeam/analyzeMatchup via
+// src/report-context-builder.js's buildOpponentIntelligenceContext, and is
+// threaded in as options.opponentIntelligence (mirrors buildCoachContextBlock's
+// own shape: this function never performs I/O itself). Returns '' when no
+// context was fetched (e.g. org_id unavailable, or the fetch failed and was
+// swallowed), exactly like buildCoachContextBlock returns '' when nothing
+// was supplied -- an opponent report must still generate successfully with
+// no roster/notes data.
+function buildOpponentIntelligenceBlock(options = {}) {
+  return options.opponentIntelligence?.promptBlock || '';
+}
+
+// Single fetch point for opponent-roster + coach-scouting-notes context,
+// reused by both analyzeTeam (opponent report) and analyzeMatchup (our team
+// vs. a specific opponent) -- analyzeSelfScout deliberately never calls
+// this, since a self-scout report has no opponent team_id.
+//
+// org_id is read from process.env.JOBU_USAGE_ORG_ID -- the exact same env
+// var server.js's buildUsageEnv already threads through to every spawned
+// report job for ai_usage_events attribution (see recordAiUsageEvent
+// above) -- reused here rather than adding a second org-id-passing
+// mechanism. When it's unavailable (e.g. a bare CLI invocation with no
+// server-issued job env), or the fetch itself fails for any reason, this
+// returns null and the report proceeds with an empty opponent-intelligence
+// block -- never a failed report merely because this context couldn't be
+// fetched.
+async function fetchOpponentIntelligenceSafely(opponentTeamId) {
+  const orgId = process.env.JOBU_USAGE_ORG_ID || null;
+  if (!orgId || !opponentTeamId) return null;
+  try {
+    return await buildOpponentIntelligenceContext({ orgId, opponentTeamId, adminClient });
+  } catch (err) {
+    console.error('[analyzer] failed to build opponent intelligence context (continuing without it):', err.message);
+    return null;
+  }
+}
+
 function buildAnalysisPrompt(bundle, options = {}) {
   const { team, games, tendencies, meta,
           playerAdvanced = [], oppPitchers = [] } = bundle;
@@ -633,6 +672,7 @@ function buildAnalysisPrompt(bundle, options = {}) {
 
   const { gameLocation = null, gameDate = null } = options;
   const coachContextBlock = buildCoachContextBlock(options);
+  const opponentIntelligenceBlock = buildOpponentIntelligenceBlock(options);
 
   const pgData      = getPGDataForTeam(team.team_name);
   const pitcherVelo = pgData ? pgData.pitcherVelo : {};
@@ -799,6 +839,7 @@ ${pitchSmartStr}
 
 ${weatherSection}
 
+${opponentIntelligenceBlock}
 ${coachContextBlock}
 Return this EXACT JSON schema — fill every field, null if truly unknown:
 
@@ -972,8 +1013,11 @@ async function analyzeTeam(teamId, options = {}) {
 
   console.log(`[analyzer] Sending to Jobu (${CLAUDE_MODEL})...`);
 
-  const analysis = await callClaude(SYSTEM_PROMPT, buildAnalysisPrompt(bundle, options));
+  const opponentIntelligence = await fetchOpponentIntelligenceSafely(teamId);
+  const promptOptions = { ...options, opponentIntelligence };
+  const analysis = await callClaude(SYSTEM_PROMPT, buildAnalysisPrompt(bundle, promptOptions));
   const pitchSmart = computePitchSmartEligibility(bundle, options);
+  analysis._opponentIntelligenceCounts = opponentIntelligence?.counts || null;
 
   analysis._pitchSmartEligibility = pitchSmart;
   analysis._gameContext = {
@@ -1285,7 +1329,7 @@ async function analyzeSelfScout(teamId, options = {}) {
   const bundle = await pipeline.getTeamBundle(teamId);
   if (!bundle || !bundle.team) throw new Error(`No team found with id: ${teamId}`);
   if (bundle.meta.gamesAnalyzed === 0) {
-    throw new Error(`${bundle.team.team_name} has no games yet. Run PSG analysis first.`);
+    throw new Error(`${bundle.team.team_name} has no games yet. Run Full Pipeline for this team first.`);
   }
 
   bundle.handedness = await db.getTeamHandedness(teamId).catch(() => []);
@@ -1327,6 +1371,7 @@ You respond ONLY with valid JSON matching the exact schema requested. No preambl
 function buildMatchupPrompt(ourBundle, oppBundle, options = {}) {
   const { gameLocation = null, gameDate = null } = options;
   const coachContextBlock = buildCoachContextBlock(options);
+  const opponentIntelligenceBlock = buildOpponentIntelligenceBlock(options);
 
   const ourTeam = ourBundle.team;
   const oppTeam = oppBundle.team;
@@ -1405,6 +1450,7 @@ ${pitchSmartStr}
 ${formatHandednessBlock(ourBundle.handedness, 'Our team')}
 ${formatHandednessBlock(oppBundle.handedness, 'Opponent')}
 
+${opponentIntelligenceBlock}
 ${coachContextBlock}
 Return this EXACT JSON schema — fill every field, null/empty-array if truly unknown. This must read as one game plan, not two reports stapled together:
 
@@ -1494,7 +1540,10 @@ async function analyzeMatchup(ourTeamId, opponentTeamId, options = {}) {
   console.log(`[analyzer] Our team: ${ourBundle.team.team_name} (${ourBundle.meta.gamesAnalyzed}g) vs Opponent: ${oppBundle.team.team_name} (${oppBundle.meta.gamesAnalyzed}g)`);
   console.log(`[analyzer] Sending to Jobu (${CLAUDE_MODEL})...`);
 
-  const analysis = await callClaude(MATCHUP_SYSTEM_PROMPT, buildMatchupPrompt(ourBundle, oppBundle, options));
+  const opponentIntelligence = await fetchOpponentIntelligenceSafely(opponentTeamId);
+  const promptOptions = { ...options, opponentIntelligence };
+  const analysis = await callClaude(MATCHUP_SYSTEM_PROMPT, buildMatchupPrompt(ourBundle, oppBundle, promptOptions));
+  analysis._opponentIntelligenceCounts = opponentIntelligence?.counts || null;
 
   analysis._reportType   = 'matchup';
   analysis._ourBundle    = ourBundle;
