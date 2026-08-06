@@ -15,3 +15,28 @@
 // able to silently disable the GameChanger test-mode safety guarantee this
 // establishes.
 process.env.NODE_ENV = 'test';
+
+// Propagate the GameChanger network guard (test/helpers/gc-network-guard.js)
+// to every CHILD Node process any test spawns, not just the current
+// process. `node --test --require X` only preloads X into THIS process --
+// a child started via child_process.spawn('node', [...]) does NOT inherit
+// CLI flags from its parent, only environment variables. Every spawn call
+// in this codebase that launches a GameChanger-touching child (see
+// src/high-school-import-routes.js's collector spawn) passes
+// `env: { ...process.env, ... }`, which DOES copy NODE_OPTIONS -- and
+// Node itself reads NODE_OPTIONS from its own environment at startup and
+// auto-applies any --require flags found there. Setting it here, once,
+// before any test file runs, means a real (not test-double) child process
+// accidentally spawned during a test run still has the network guard
+// installed the moment it starts, independent of whether that specific
+// test remembered to inject a fake spawn. Appends to (never clobbers) any
+// NODE_OPTIONS already present, and only appends once even if this module
+// is somehow evaluated more than once in the same process.
+const path = require('path');
+const GUARD_PATH = path.join(__dirname, 'gc-network-guard.js');
+const REQUIRE_FLAG = `--require ${GUARD_PATH}`;
+if (!(process.env.NODE_OPTIONS || '').includes(GUARD_PATH)) {
+  process.env.NODE_OPTIONS = process.env.NODE_OPTIONS
+    ? `${process.env.NODE_OPTIONS} ${REQUIRE_FLAG}`
+    : REQUIRE_FLAG;
+}

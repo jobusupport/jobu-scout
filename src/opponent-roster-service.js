@@ -275,11 +275,17 @@ async function applyImportedOpponentPlayerData({ orgId, playerId, importedFields
   return { data, conflicts: recordedConflicts };
 }
 
-// Reassigns every membership and note from mergePlayerId to keepPlayerId
-// (org-scoped, so a cross-org merge attempt structurally cannot happen),
-// unions confirmed_fields, then deletes the now-empty duplicate. Never
-// deletes keepPlayerId. Both players must already belong to the same org.
-async function mergeOpponentPlayers({ orgId, keepPlayerId, mergePlayerId, adminClient }) {
+// Shared by getOpponentMergePreview and mergeOpponentPlayers -- the preview
+// and the actual merge must apply IDENTICAL validation (uuid shape, distinct
+// players, org membership, and same-opponent-team membership), because the
+// preview's result is never trusted as authorization for the merge itself;
+// the merge re-derives and re-checks everything from the database at
+// execution time. Throws the same typed errors either caller already
+// exposes (404 org-scoped not-found, 400 same-player/wrong-team), so a
+// stale preview followed by an execution against changed data fails with
+// the same clear error a fresh preview would have shown.
+async function loadAndValidateMergePair({ orgId, teamId, keepPlayerId, mergePlayerId, adminClient }) {
+  requireUuid(teamId, 'teamId');
   requireUuid(keepPlayerId, 'keepPlayerId');
   requireUuid(mergePlayerId, 'mergePlayerId');
   if (keepPlayerId === mergePlayerId) throw typedError('keepPlayerId and mergePlayerId must be different players.', 400);
@@ -290,6 +296,45 @@ async function mergeOpponentPlayers({ orgId, keepPlayerId, mergePlayerId, adminC
   ]);
   if (!keepPlayer) throw typedError('keepPlayerId player not found', 404);
   if (!mergePlayer) throw typedError('mergePlayerId player not found', 404);
+  if (keepPlayer.team_id !== teamId || mergePlayer.team_id !== teamId) {
+    throw typedError('Both players must belong to the selected opponent team.', 400);
+  }
+  return { keepPlayer, mergePlayer };
+}
+
+// Read-only: counts what a merge of mergePlayerId into keepPlayerId would
+// affect, without changing anything. The UI's merge-confirmation dialog
+// calls this to show real counts instead of a generic description --
+// never computed from whatever subset of memberships/notes the browser
+// happens to already have loaded, always a fresh org-scoped count query.
+async function getOpponentMergePreview({ orgId, teamId, keepPlayerId, mergePlayerId, adminClient }) {
+  const { keepPlayer, mergePlayer } = await loadAndValidateMergePair({ orgId, teamId, keepPlayerId, mergePlayerId, adminClient });
+
+  const [membershipsResult, notesResult] = await Promise.all([
+    adminClient.from('opponent_roster_memberships').select('id').eq('org_id', orgId).eq('opponent_player_id', mergePlayerId),
+    adminClient.from('coach_scouting_notes').select('id').eq('org_id', orgId).eq('opponent_player_id', mergePlayerId),
+  ]);
+  if (membershipsResult.error) { console.error('[opponent-roster-service] merge preview: membership count failed:', membershipsResult.error); throw typedError('Something went wrong. Please try again.', 500); }
+  if (notesResult.error) { console.error('[opponent-roster-service] merge preview: note count failed:', notesResult.error); throw typedError('Something went wrong. Please try again.', 500); }
+
+  return {
+    survivor: { id: keepPlayer.id, first_name: keepPlayer.first_name, last_name: keepPlayer.last_name },
+    duplicate: { id: mergePlayer.id, first_name: mergePlayer.first_name, last_name: mergePlayer.last_name },
+    membershipCount: (membershipsResult.data || []).length,
+    noteCount: (notesResult.data || []).length,
+  };
+}
+
+// Reassigns every membership and note from mergePlayerId to keepPlayerId
+// (org- AND team-scoped, so a cross-org or cross-opponent merge attempt
+// structurally cannot happen), unions confirmed_fields, then deletes the
+// now-empty duplicate. Never deletes keepPlayerId. Independently re-runs
+// every check loadAndValidateMergePair applies -- never trusts a
+// previously returned preview, so a preview computed a moment earlier
+// (whose counts could already be stale by the time the coach clicks
+// confirm) cannot bypass this function's own authorization.
+async function mergeOpponentPlayers({ orgId, teamId, keepPlayerId, mergePlayerId, adminClient }) {
+  const { keepPlayer, mergePlayer } = await loadAndValidateMergePair({ orgId, teamId, keepPlayerId, mergePlayerId, adminClient });
 
   const { error: reassignMembershipsError } = await adminClient
     .from('opponent_roster_memberships')
@@ -496,6 +541,7 @@ module.exports = {
   updateOpponentPlayer,
   listOpponentPlayers,
   applyImportedOpponentPlayerData,
+  getOpponentMergePreview,
   mergeOpponentPlayers,
   validateMembershipCreate,
   validateMembershipUpdate,

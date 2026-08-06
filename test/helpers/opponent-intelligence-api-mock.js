@@ -122,19 +122,54 @@ async function installOppApiMock(page, { capabilities, teams, forbidden = false 
       return json(route, { player }, 200);
     }
 
-    m = pathname.match(/^\/api\/opponent-intelligence\/players\/([^/]+)\/merge$/);
-    if (m && method === 'POST') {
-      const keepPlayerId = m[1];
-      const body = await readJsonBody(route);
-      const mergePlayerId = body.mergePlayerId;
+    // Mirrors src/opponent-roster-service.js's loadAndValidateMergePair
+    // exactly: both players must exist in this org AND belong to the
+    // team named in the URL, or the request 400/404s -- shared by both
+    // the preview and the actual merge below, matching the real
+    // contract's own "the merge never trusts a previously returned
+    // preview" guarantee (each route call here re-validates from db.players
+    // fresh, never from anything the other route returned).
+    function validateMergePair(teamId, keepPlayerId, mergePlayerId) {
+      if (!keepPlayerId || !mergePlayerId) return { error: json(route, { error: 'keepPlayerId and mergePlayerId are required' }, 400) };
+      if (keepPlayerId === mergePlayerId) return { error: json(route, { error: 'keepPlayerId and mergePlayerId must be different players.' }, 400) };
       const keepPlayer = db.players.find((p) => p.id === keepPlayerId);
       const mergePlayer = db.players.find((p) => p.id === mergePlayerId);
-      if (!keepPlayer) return json(route, { error: 'keepPlayerId player not found' }, 404);
-      if (!mergePlayer) return json(route, { error: 'mergePlayerId player not found' }, 404);
-      db.memberships.forEach((mem) => { if (mem.opponent_player_id === mergePlayerId) mem.opponent_player_id = keepPlayerId; });
-      db.notes.forEach((n) => { if (n.opponent_player_id === mergePlayerId) n.opponent_player_id = keepPlayerId; });
+      if (!keepPlayer) return { error: json(route, { error: 'keepPlayerId player not found' }, 404) };
+      if (!mergePlayer) return { error: json(route, { error: 'mergePlayerId player not found' }, 404) };
+      if (keepPlayer.team_id !== teamId || mergePlayer.team_id !== teamId) {
+        return { error: json(route, { error: 'Both players must belong to the selected opponent team.' }, 400) };
+      }
+      return { keepPlayer, mergePlayer };
+    }
+
+    m = pathname.match(/^\/api\/opponent-intelligence\/teams\/([^/]+)\/merge-preview$/);
+    if (m && method === 'GET') {
+      const teamId = m[1];
+      const keepPlayerId = url.searchParams.get('keepPlayerId');
+      const mergePlayerId = url.searchParams.get('mergePlayerId');
+      const result = validateMergePair(teamId, keepPlayerId, mergePlayerId);
+      if (result.error) return result.error;
+      const { keepPlayer, mergePlayer } = result;
+      const membershipCount = db.memberships.filter((mm) => mm.opponent_player_id === mergePlayer.id).length;
+      const noteCount = db.notes.filter((n) => n.opponent_player_id === mergePlayer.id).length;
+      return json(route, {
+        survivor: { id: keepPlayer.id, first_name: keepPlayer.first_name, last_name: keepPlayer.last_name },
+        duplicate: { id: mergePlayer.id, first_name: mergePlayer.first_name, last_name: mergePlayer.last_name },
+        membershipCount, noteCount,
+      }, 200);
+    }
+
+    m = pathname.match(/^\/api\/opponent-intelligence\/teams\/([^/]+)\/merge$/);
+    if (m && method === 'POST') {
+      const teamId = m[1];
+      const body = await readJsonBody(route);
+      const result = validateMergePair(teamId, body.keepPlayerId, body.mergePlayerId);
+      if (result.error) return result.error;
+      const { keepPlayer, mergePlayer } = result;
+      db.memberships.forEach((mem) => { if (mem.opponent_player_id === mergePlayer.id) mem.opponent_player_id = keepPlayer.id; });
+      db.notes.forEach((n) => { if (n.opponent_player_id === mergePlayer.id) n.opponent_player_id = keepPlayer.id; });
       keepPlayer.confirmed_fields = Array.from(new Set([...(keepPlayer.confirmed_fields || []), ...(mergePlayer.confirmed_fields || [])]));
-      db.players = db.players.filter((p) => p.id !== mergePlayerId);
+      db.players = db.players.filter((p) => p.id !== mergePlayer.id);
       return json(route, { player: rosterViewOf(db, keepPlayer) }, 200);
     }
 
@@ -269,7 +304,10 @@ async function installOppApiMock(page, { capabilities, teams, forbidden = false 
       const included = notes.filter((n) => n.include_in_report);
       return json(route, {
         counts: { rosterIncluded: roster.length, notesIncluded: included.length },
-        truncated: { rosterOmitted: 0, notesOmitted: 0 },
+        // Tests can set db.forcedTruncated = { rosterOmitted, notesOmitted }
+        // to exercise the "older context omitted" indicator without needing
+        // 60+ synthetic notes or 100+ synthetic players.
+        truncated: db.forcedTruncated || { rosterOmitted: 0, notesOmitted: 0 },
       }, 200);
     }
 

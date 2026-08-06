@@ -115,13 +115,29 @@ module.exports = function createOpponentIntelligenceRouter({ requireAuth }) {
     }
   }));
 
-  router.post('/players/:playerId/merge', requireAuth, resolveSupportSession, requireTravelIntelligenceAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+  // Read-only preview of what merging mergePlayerId into keepPlayerId would
+  // affect (names + counts) -- never trusted as authorization for the
+  // actual merge below, which independently re-validates everything this
+  // reads. teamId scopes both players to the currently selected opponent,
+  // rejecting a player from a different opponent team even within the
+  // same org.
+  router.get('/teams/:teamId/merge-preview', requireAuth, resolveSupportSession, requireTravelIntelligenceAccess, asyncHandler(async (req, res) => {
     try {
-      const mergePlayerId = req.body?.mergePlayerId;
-      const player = await rosterService.mergeOpponentPlayers({ orgId: req._orgId, keepPlayerId: req.params.playerId, mergePlayerId, adminClient });
+      const { keepPlayerId, mergePlayerId } = req.query || {};
+      const preview = await rosterService.getOpponentMergePreview({ orgId: req._orgId, teamId: req.params.teamId, keepPlayerId, mergePlayerId, adminClient });
+      res.json(preview);
+    } catch (err) {
+      return sendResolverError(res, err, 'api/opponent-intelligence/teams/:teamId/merge-preview');
+    }
+  }));
+
+  router.post('/teams/:teamId/merge', requireAuth, resolveSupportSession, requireTravelIntelligenceAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+    try {
+      const { keepPlayerId, mergePlayerId } = req.body || {};
+      const player = await rosterService.mergeOpponentPlayers({ orgId: req._orgId, teamId: req.params.teamId, keepPlayerId, mergePlayerId, adminClient });
       res.json({ player });
     } catch (err) {
-      return sendResolverError(res, err, 'api/opponent-intelligence/players/:playerId/merge');
+      return sendResolverError(res, err, 'api/opponent-intelligence/teams/:teamId/merge');
     }
   }));
 

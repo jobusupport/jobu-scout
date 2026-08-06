@@ -199,7 +199,7 @@ test('applyImportedOpponentPlayerData records no conflict when the imported valu
 test('mergeOpponentPlayers rejects merging a player into itself', async () => {
   const adminClient = makeFakeAdminClient({});
   await assert.rejects(
-    () => svc.mergeOpponentPlayers({ orgId: ORG_ID, keepPlayerId: PLAYER_ID, mergePlayerId: PLAYER_ID, adminClient }),
+    () => svc.mergeOpponentPlayers({ orgId: ORG_ID, teamId: TEAM_ID, keepPlayerId: PLAYER_ID, mergePlayerId: PLAYER_ID, adminClient }),
     (e) => e.statusCode === 400
   );
 });
@@ -216,7 +216,7 @@ test('mergeOpponentPlayers reassigns memberships and notes, unions confirmed_fie
     opponent_roster_memberships: { data: [], error: null },
     coach_scouting_notes: { data: [], error: null },
   });
-  const result = await svc.mergeOpponentPlayers({ orgId: ORG_ID, keepPlayerId: PLAYER_ID, mergePlayerId: PLAYER2_ID, adminClient });
+  const result = await svc.mergeOpponentPlayers({ orgId: ORG_ID, teamId: TEAM_ID, keepPlayerId: PLAYER_ID, mergePlayerId: PLAYER2_ID, adminClient });
   assert.equal(result.id, PLAYER_ID);
   const membershipReassign = adminClient.calls.find((c) => c.table === 'opponent_roster_memberships' && c.method === 'update');
   assert.equal(membershipReassign.args.opponent_player_id, PLAYER_ID);
@@ -224,6 +224,120 @@ test('mergeOpponentPlayers reassigns memberships and notes, unions confirmed_fie
   assert.equal(noteReassign.args.opponent_player_id, PLAYER_ID);
   const deleteCall = adminClient.calls.find((c) => c.table === 'opponent_players' && c.method === 'delete');
   assert.ok(deleteCall, 'the duplicate player must be deleted after reassignment');
+});
+
+test('mergeOpponentPlayers rejects a player that does not belong to the selected opponent team, even within the same org', async () => {
+  const OTHER_TEAM_ID = '66666666-6666-4666-8666-666666666666';
+  const adminClient = makeFakeAdminClient({
+    opponent_players: queued(
+      ok(playerRow({ id: PLAYER_ID, team_id: TEAM_ID })),
+      ok(playerRow({ id: PLAYER2_ID, team_id: OTHER_TEAM_ID })), // belongs to a different opponent
+    ),
+  });
+  await assert.rejects(
+    () => svc.mergeOpponentPlayers({ orgId: ORG_ID, teamId: TEAM_ID, keepPlayerId: PLAYER_ID, mergePlayerId: PLAYER2_ID, adminClient }),
+    (e) => e.statusCode === 400 && /selected opponent team/.test(e.message)
+  );
+  // No mutation may have been attempted once the relationship check failed.
+  assert.equal(adminClient.calls.length, 0);
+});
+
+// ── Merge preview: read-only counts, never trusted by the merge itself ───
+
+test('getOpponentMergePreview returns survivor/duplicate names and real membership/note counts', async () => {
+  const adminClient = makeFakeAdminClient({
+    opponent_players: queued(
+      ok(playerRow({ id: PLAYER_ID, first_name: 'Jaylen', last_name: 'Marsh' })),
+      ok(playerRow({ id: PLAYER2_ID, first_name: 'Cole', last_name: 'Beringer' })),
+    ),
+    opponent_roster_memberships: { data: [{ id: 'm1' }, { id: 'm2' }], error: null },
+    coach_scouting_notes: { data: [{ id: 'n1' }], error: null },
+  });
+  const preview = await svc.getOpponentMergePreview({ orgId: ORG_ID, teamId: TEAM_ID, keepPlayerId: PLAYER_ID, mergePlayerId: PLAYER2_ID, adminClient });
+  assert.deepEqual(preview.survivor, { id: PLAYER_ID, first_name: 'Jaylen', last_name: 'Marsh' });
+  assert.deepEqual(preview.duplicate, { id: PLAYER2_ID, first_name: 'Cole', last_name: 'Beringer' });
+  assert.equal(preview.membershipCount, 2);
+  assert.equal(preview.noteCount, 1);
+});
+
+test('getOpponentMergePreview reports zero when the duplicate has no memberships or notes', async () => {
+  const adminClient = makeFakeAdminClient({
+    opponent_players: queued(ok(playerRow({ id: PLAYER_ID })), ok(playerRow({ id: PLAYER2_ID }))),
+    opponent_roster_memberships: { data: [], error: null },
+    coach_scouting_notes: { data: [], error: null },
+  });
+  const preview = await svc.getOpponentMergePreview({ orgId: ORG_ID, teamId: TEAM_ID, keepPlayerId: PLAYER_ID, mergePlayerId: PLAYER2_ID, adminClient });
+  assert.equal(preview.membershipCount, 0);
+  assert.equal(preview.noteCount, 0);
+});
+
+test('getOpponentMergePreview 404s when the duplicate player belongs to a different org (cross-org substitution)', async () => {
+  const adminClient = makeFakeAdminClient({
+    opponent_players: queued(ok(playerRow({ id: PLAYER_ID })), ok(null)), // org-scoped lookup finds nothing
+  });
+  await assert.rejects(
+    () => svc.getOpponentMergePreview({ orgId: ORG_ID, teamId: TEAM_ID, keepPlayerId: PLAYER_ID, mergePlayerId: PLAYER2_ID, adminClient }),
+    (e) => e.statusCode === 404
+  );
+});
+
+test('getOpponentMergePreview rejects a player belonging to a different opponent team in the same org', async () => {
+  const OTHER_TEAM_ID = '77777777-7777-4777-8777-777777777777';
+  const adminClient = makeFakeAdminClient({
+    opponent_players: queued(
+      ok(playerRow({ id: PLAYER_ID, team_id: TEAM_ID })),
+      ok(playerRow({ id: PLAYER2_ID, team_id: OTHER_TEAM_ID })),
+    ),
+  });
+  await assert.rejects(
+    () => svc.getOpponentMergePreview({ orgId: ORG_ID, teamId: TEAM_ID, keepPlayerId: PLAYER_ID, mergePlayerId: PLAYER2_ID, adminClient }),
+    (e) => e.statusCode === 400
+  );
+});
+
+test('getOpponentMergePreview rejects the same player supplied as both survivor and duplicate', async () => {
+  const adminClient = makeFakeAdminClient({});
+  await assert.rejects(
+    () => svc.getOpponentMergePreview({ orgId: ORG_ID, teamId: TEAM_ID, keepPlayerId: PLAYER_ID, mergePlayerId: PLAYER_ID, adminClient }),
+    (e) => e.statusCode === 400
+  );
+});
+
+test('getOpponentMergePreview surfaces a 500 when the count query itself fails, rather than a silent wrong count', async () => {
+  const adminClient = makeFakeAdminClient({
+    opponent_players: queued(ok(playerRow({ id: PLAYER_ID })), ok(playerRow({ id: PLAYER2_ID }))),
+    opponent_roster_memberships: { data: null, error: { message: 'db unavailable' } },
+    coach_scouting_notes: { data: [], error: null },
+  });
+  await assert.rejects(
+    () => svc.getOpponentMergePreview({ orgId: ORG_ID, teamId: TEAM_ID, keepPlayerId: PLAYER_ID, mergePlayerId: PLAYER2_ID, adminClient }),
+    (e) => e.statusCode === 500
+  );
+});
+
+test('a stale preview does not weaken the merge itself: even after a successful preview, mergeOpponentPlayers independently re-validates and rejects a cross-team pair', async () => {
+  const OTHER_TEAM_ID = '88888888-8888-4888-8888-888888888888';
+  // Simulate the exact sequence a stale-preview scenario would produce: a
+  // preview succeeded against the original state, then the duplicate
+  // player's team_id changed (e.g. reassigned) before the coach clicked
+  // confirm. The merge call is a fresh request with its own fresh lookups
+  // -- it must re-derive team membership from the database at execution
+  // time, not from anything the earlier preview returned.
+  const previewAdminClient = makeFakeAdminClient({
+    opponent_players: queued(ok(playerRow({ id: PLAYER_ID, team_id: TEAM_ID })), ok(playerRow({ id: PLAYER2_ID, team_id: TEAM_ID }))),
+    opponent_roster_memberships: { data: [], error: null },
+    coach_scouting_notes: { data: [], error: null },
+  });
+  const preview = await svc.getOpponentMergePreview({ orgId: ORG_ID, teamId: TEAM_ID, keepPlayerId: PLAYER_ID, mergePlayerId: PLAYER2_ID, adminClient: previewAdminClient });
+  assert.equal(preview.membershipCount, 0);
+
+  const mergeAdminClient = makeFakeAdminClient({
+    opponent_players: queued(ok(playerRow({ id: PLAYER_ID, team_id: TEAM_ID })), ok(playerRow({ id: PLAYER2_ID, team_id: OTHER_TEAM_ID }))),
+  });
+  await assert.rejects(
+    () => svc.mergeOpponentPlayers({ orgId: ORG_ID, teamId: TEAM_ID, keepPlayerId: PLAYER_ID, mergePlayerId: PLAYER2_ID, adminClient: mergeAdminClient }),
+    (e) => e.statusCode === 400
+  );
 });
 
 // ── Roster memberships: jersey changes, tenant predicates ────────────────
