@@ -18,8 +18,28 @@ const {
   materializeStorageStateFromEnvValue,
   validateStorageStateFile,
   assertLandedOnAuthenticatedGameChangerPage,
+  isAutomatedTestMode,
   SessionValidationError,
 } = require('../src/gc-session-loader');
+
+// test/helpers/test-env-setup.js (preloaded via `node --test --require`,
+// see package.json) forces NODE_ENV='test' for this entire process, which
+// is exactly what makes isAutomatedTestMode() true everywhere else in this
+// file by default -- correct, since that is the real, always-on safety
+// posture this suite exists to prove. The small number of tests that need
+// to assert PRODUCTION (non-test-mode) path-resolution behavior use this
+// helper to simulate being outside test mode for exactly one call, then
+// restore NODE_ENV=test immediately after -- never leaking a
+// non-test-mode window to any other test in this file or process.
+function withNonTestMode(fn) {
+  const original = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'production';
+  try {
+    return fn();
+  } finally {
+    process.env.NODE_ENV = original;
+  }
+}
 
 // Synchronous by design -- every pre-existing call site in this file
 // invokes this as a bare statement inside a synchronous test function
@@ -61,13 +81,70 @@ const SYNTHETIC_VALID_SESSION = {
   origins: [{ origin: 'https://web.gc.com', localStorage: [{ name: 'synthetic-test-key', value: 'synthetic-test-value' }] }],
 };
 
-test('getStorageStatePath: defaults to the established repo-relative storage/gamechanger-auth.json path when GC_AUTH_FILE_PATH is unset', () => {
+test('getStorageStatePath: OUTSIDE test mode, defaults to the established repo-relative storage/gamechanger-auth.json path when GC_AUTH_FILE_PATH is unset (production behavior, unchanged)', () => {
   const original = process.env.GC_AUTH_FILE_PATH;
   delete process.env.GC_AUTH_FILE_PATH;
   try {
-    const resolved = getStorageStatePath();
+    const resolved = withNonTestMode(() => getStorageStatePath());
     assert.ok(resolved.endsWith(path.join('storage', 'gamechanger-auth.json')));
   } finally {
+    if (original === undefined) delete process.env.GC_AUTH_FILE_PATH; else process.env.GC_AUTH_FILE_PATH = original;
+  }
+});
+
+test('getStorageStatePath: IN test mode (the default for this whole suite), an unset GC_AUTH_FILE_PATH fails closed BEFORE resolving any path -- never falls back to the production default', () => {
+  const original = process.env.GC_AUTH_FILE_PATH;
+  delete process.env.GC_AUTH_FILE_PATH;
+  try {
+    assert.equal(isAutomatedTestMode(), true, 'this whole suite must actually be running in test mode for this assertion to mean anything');
+    assert.throws(() => getStorageStatePath(), (err) => {
+      assert.ok(err instanceof SessionValidationError);
+      assert.match(err.message, /test mode/i);
+      assert.doesNotMatch(err.message, /storage[\\/]gamechanger-auth\.json/, 'the fail-closed error must never reveal the real default path');
+      return true;
+    });
+  } finally {
+    if (original === undefined) delete process.env.GC_AUTH_FILE_PATH; else process.env.GC_AUTH_FILE_PATH = original;
+  }
+});
+
+test('getStorageStatePath: IN test mode, an explicit synthetic GC_AUTH_FILE_PATH is honored exactly as before (this is the ONLY way a test process resolves a session path)', () => {
+  const original = process.env.GC_AUTH_FILE_PATH;
+  process.env.GC_AUTH_FILE_PATH = '/tmp/synthetic-test-only-gc-auth.json';
+  try {
+    assert.equal(isAutomatedTestMode(), true);
+    assert.equal(getStorageStatePath(), '/tmp/synthetic-test-only-gc-auth.json');
+  } finally {
+    if (original === undefined) delete process.env.GC_AUTH_FILE_PATH; else process.env.GC_AUTH_FILE_PATH = original;
+  }
+});
+
+// Proves guarantee: "a real-looking file sitting at the normal default
+// local path must not become reachable merely because it exists" -- not by
+// trusting that no such file happens to exist (that is exactly the
+// assumption that failed once already), but by placing a real-shaped
+// (still synthetic-content) file AT the literal default path and proving
+// test mode still refuses to resolve to it.
+test('getStorageStatePath: a real-looking file sitting at the actual default local path is structurally ignored in test mode', () => {
+  const defaultPath = path.join(__dirname, '..', 'storage', 'gamechanger-auth.json');
+  const alreadyExisted = fs.existsSync(defaultPath);
+  const original = process.env.GC_AUTH_FILE_PATH;
+  delete process.env.GC_AUTH_FILE_PATH;
+  let wrote = false;
+  try {
+    if (!alreadyExisted) {
+      fs.mkdirSync(path.dirname(defaultPath), { recursive: true });
+      fs.writeFileSync(defaultPath, JSON.stringify(SYNTHETIC_VALID_SESSION));
+      wrote = true;
+    }
+    assert.equal(isAutomatedTestMode(), true);
+    assert.throws(() => getStorageStatePath(), (err) => {
+      assert.ok(err instanceof SessionValidationError);
+      assert.match(err.message, /test mode/i);
+      return true;
+    }, 'a file existing at the default path must not change test-mode fail-closed behavior at all');
+  } finally {
+    if (wrote) fs.rmSync(defaultPath, { force: true });
     if (original === undefined) delete process.env.GC_AUTH_FILE_PATH; else process.env.GC_AUTH_FILE_PATH = original;
   }
 });
@@ -351,20 +428,52 @@ test('search-gamechanger-teams.js: a synthetic GC_AUTH_FILE_PATH override is act
   });
 });
 
-test('search-gamechanger-teams.js: with GC_AUTH_FILE_PATH unset, the resolved path matches the pre-existing repo-relative default (backward compatible)', async () => {
+test('search-gamechanger-teams.js: OUTSIDE test mode, with GC_AUTH_FILE_PATH unset, the resolved path matches the pre-existing repo-relative default (production behavior, unchanged)', async () => {
   const original = process.env.GC_AUTH_FILE_PATH;
   delete process.env.GC_AUTH_FILE_PATH;
   try {
+    await withNonTestMode(async () => {
+      delete require.cache[require.resolve('../src/gc-session-loader')];
+      delete require.cache[require.resolve('../src/search-gamechanger-teams')];
+      const scraper = require('../src/search-gamechanger-teams');
+      await assert.rejects(
+        () => scraper.scrapeTeamById({ id: 'synthetic-team-id', team_name: 'Synthetic Team', gc_team_url: 'https://web.gc.com/teams/x/y' }),
+        (err) => {
+          assert.ok(err.message.includes(path.join('storage', 'gamechanger-auth.json')), 'must still resolve to the established default location');
+          return true;
+        }
+      );
+    });
+  } finally {
+    if (original === undefined) delete process.env.GC_AUTH_FILE_PATH; else process.env.GC_AUTH_FILE_PATH = original;
     delete require.cache[require.resolve('../src/gc-session-loader')];
     delete require.cache[require.resolve('../src/search-gamechanger-teams')];
-    const scraper = require('../src/search-gamechanger-teams');
-    await assert.rejects(
-      () => scraper.scrapeTeamById({ id: 'synthetic-team-id', team_name: 'Synthetic Team', gc_team_url: 'https://web.gc.com/teams/x/y' }),
-      (err) => {
-        assert.ok(err.message.includes(path.join('storage', 'gamechanger-auth.json')), 'must still resolve to the established default location');
-        return true;
-      }
-    );
+  }
+});
+
+test('search-gamechanger-teams.js: IN test mode, with GC_AUTH_FILE_PATH unset, requiring the module fails closed before any browser/network operation, never resolving the production default', () => {
+  // search-gamechanger-teams.js computes STORAGE_STATE via
+  // getStorageStatePath() at module top-level (const STORAGE_STATE =
+  // getStorageStatePath();) -- the fail-closed throw happens synchronously
+  // at require() time, before scrapeTeamById could ever be called.
+  const original = process.env.GC_AUTH_FILE_PATH;
+  delete process.env.GC_AUTH_FILE_PATH;
+  try {
+    assert.equal(isAutomatedTestMode(), true);
+    delete require.cache[require.resolve('../src/gc-session-loader')];
+    delete require.cache[require.resolve('../src/search-gamechanger-teams')];
+    // Not an `instanceof SessionValidationError` check here: gc-session-loader
+    // was just evicted from require.cache above, so the class thrown by the
+    // freshly re-required module is a DIFFERENT identity than any
+    // SessionValidationError reference captured earlier in this file --
+    // the same reason the pre-existing tests in this file that also
+    // delete-cache-and-re-require assert on err.message, never instanceof.
+    assert.throws(() => require('../src/search-gamechanger-teams'), (err) => {
+      assert.equal(err.name, 'SessionValidationError');
+      assert.match(err.message, /test mode/i);
+      assert.doesNotMatch(err.message, /storage[\\/]gamechanger-auth\.json/);
+      return true;
+    });
   } finally {
     if (original === undefined) delete process.env.GC_AUTH_FILE_PATH; else process.env.GC_AUTH_FILE_PATH = original;
     delete require.cache[require.resolve('../src/gc-session-loader')];
@@ -387,14 +496,28 @@ test('search-gamechanger-teams.js: with GC_AUTH_FILE_PATH unset, the resolved pa
 // relying on it in the two tests that follow.
 
 test('scrape-game-urls.js: requiring the module has no side effects (no browser, database, network, or process exit)', () => {
-  delete require.cache[require.resolve('../src/scrape-game-urls')];
-  // If this were still unguarded, requiring it with no argv[2] would call
-  // process.exit(1) and kill this entire test process -- reaching the
-  // next line at all is itself proof the guard works.
-  const scraper = require('../src/scrape-game-urls');
-  assert.equal(typeof scraper.STORAGE_STATE, 'string');
-  assert.ok(scraper.STORAGE_STATE.length > 0);
-  delete require.cache[require.resolve('../src/scrape-game-urls')];
+  // A synthetic GC_AUTH_FILE_PATH is required here now: the module computes
+  // STORAGE_STATE via getStorageStatePath() at top-level on require(), and
+  // in test mode that call fails closed without an explicit fixture (see
+  // src/gc-session-loader.js) -- exactly the safety property this whole
+  // file exists to prove, so this test must supply one to still exercise
+  // "does requiring the module do anything beyond path resolution."
+  const original = process.env.GC_AUTH_FILE_PATH;
+  process.env.GC_AUTH_FILE_PATH = path.join(os.tmpdir(), 'synthetic-no-side-effects-gc-auth-test-path.json');
+  try {
+    delete require.cache[require.resolve('../src/gc-session-loader')];
+    delete require.cache[require.resolve('../src/scrape-game-urls')];
+    // If this were still unguarded, requiring it with no argv[2] would call
+    // process.exit(1) and kill this entire test process -- reaching the
+    // next line at all is itself proof the guard works.
+    const scraper = require('../src/scrape-game-urls');
+    assert.equal(typeof scraper.STORAGE_STATE, 'string');
+    assert.ok(scraper.STORAGE_STATE.length > 0);
+  } finally {
+    if (original === undefined) delete process.env.GC_AUTH_FILE_PATH; else process.env.GC_AUTH_FILE_PATH = original;
+    delete require.cache[require.resolve('../src/gc-session-loader')];
+    delete require.cache[require.resolve('../src/scrape-game-urls')];
+  }
 });
 
 test('scrape-game-urls.js: a synthetic GC_AUTH_FILE_PATH override is actually honored, not just structurally referenced', () => {
@@ -415,14 +538,37 @@ test('scrape-game-urls.js: a synthetic GC_AUTH_FILE_PATH override is actually ho
   }
 });
 
-test('scrape-game-urls.js: with GC_AUTH_FILE_PATH unset, the resolved path matches the pre-existing repo-relative default (backward compatible)', () => {
+test('scrape-game-urls.js: OUTSIDE test mode, with GC_AUTH_FILE_PATH unset, the resolved path matches the pre-existing repo-relative default (production behavior, unchanged)', () => {
   const original = process.env.GC_AUTH_FILE_PATH;
   delete process.env.GC_AUTH_FILE_PATH;
   try {
+    withNonTestMode(() => {
+      delete require.cache[require.resolve('../src/gc-session-loader')];
+      delete require.cache[require.resolve('../src/scrape-game-urls')];
+      const scraper = require('../src/scrape-game-urls');
+      assert.ok(scraper.STORAGE_STATE.endsWith(path.join('storage', 'gamechanger-auth.json')), 'must still resolve to the established default location');
+    });
+  } finally {
+    if (original === undefined) delete process.env.GC_AUTH_FILE_PATH; else process.env.GC_AUTH_FILE_PATH = original;
     delete require.cache[require.resolve('../src/gc-session-loader')];
     delete require.cache[require.resolve('../src/scrape-game-urls')];
-    const scraper = require('../src/scrape-game-urls');
-    assert.ok(scraper.STORAGE_STATE.endsWith(path.join('storage', 'gamechanger-auth.json')), 'must still resolve to the established default location');
+  }
+});
+
+test('scrape-game-urls.js: IN test mode, requiring the module with GC_AUTH_FILE_PATH unset fails closed rather than resolving the production default', () => {
+  const original = process.env.GC_AUTH_FILE_PATH;
+  delete process.env.GC_AUTH_FILE_PATH;
+  try {
+    assert.equal(isAutomatedTestMode(), true);
+    delete require.cache[require.resolve('../src/gc-session-loader')];
+    delete require.cache[require.resolve('../src/scrape-game-urls')];
+    // See the equivalent search-gamechanger-teams.js test above for why
+    // this checks err.name rather than instanceof SessionValidationError.
+    assert.throws(() => require('../src/scrape-game-urls'), (err) => {
+      assert.equal(err.name, 'SessionValidationError');
+      assert.match(err.message, /test mode/i);
+      return true;
+    });
   } finally {
     if (original === undefined) delete process.env.GC_AUTH_FILE_PATH; else process.env.GC_AUTH_FILE_PATH = original;
     delete require.cache[require.resolve('../src/gc-session-loader')];
@@ -466,4 +612,63 @@ test('server.js startup: a real spawned process writes synthetic GC_AUTH_JSON co
       child.kill('SIGKILL');
     }
   });
+});
+
+// ── Process-level GameChanger network guard ──────────────────────────────
+// test/helpers/gc-network-guard.js is preloaded (via `node --test
+// --require`, see package.json) for this entire process, before this or
+// any other test file runs -- these tests prove it actually does what it
+// claims, using the REAL, already-installed guard (never a re-imported or
+// re-instantiated copy), so a regression in the preload wiring itself
+// would be caught here too.
+
+const { isGameChangerUrl } = require('./helpers/gc-network-guard');
+
+test('gc-network-guard: classifies web.gc.com and other gc.com subdomains as GameChanger, and unrelated hosts (including "notgc.com") as not', () => {
+  assert.equal(isGameChangerUrl('https://web.gc.com/teams/x/y'), true);
+  assert.equal(isGameChangerUrl('https://api.gc.com/v1/foo'), true);
+  assert.equal(isGameChangerUrl('https://gc.com/'), true);
+  assert.equal(isGameChangerUrl('https://example.com/'), false);
+  assert.equal(isGameChangerUrl('https://notgc.com/'), false, 'must not match by substring -- only real gc.com and its subdomains');
+  assert.equal(isGameChangerUrl('not a url at all'), false);
+});
+
+// Launches a REAL Chromium browser (Playwright is already a project
+// dependency) specifically to prove the guard installed by the process-wide
+// preload actually intercepts and aborts navigation to a real GameChanger
+// URL -- this is the guarantee that a request never reaches GameChanger's
+// real servers even if some future code path resolved a real session. The
+// target URL is never actually reached; the assertion is that navigation
+// FAILS immediately, not that any real page content is observed.
+test('gc-network-guard: an actual Playwright navigation attempt to a real GameChanger URL is blocked immediately, never reaching the network', { timeout: 20000 }, async () => {
+  const { chromium } = require('playwright');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await assert.rejects(
+      () => page.goto('https://web.gc.com/teams/synthetic-org/synthetic-team/schedule', { timeout: 8000 }),
+      /net::ERR_BLOCKED_BY_CLIENT|net::ERR_FAILED|blockedbyclient/i,
+      'navigation to a real GameChanger URL must fail immediately (aborted by the guard), never succeed or hang waiting on real network I/O'
+    );
+  } finally {
+    await browser.close();
+  }
+});
+
+test('gc-network-guard: a non-GameChanger navigation is unaffected by the guard', { timeout: 20000 }, async () => {
+  const { chromium } = require('playwright');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    // data: URLs never touch the network at all -- this proves the guard's
+    // route handler correctly falls through for non-GameChanger requests
+    // rather than blocking everything indiscriminately.
+    await page.goto('data:text/html,<h1>synthetic local page</h1>');
+    const text = await page.locator('h1').textContent();
+    assert.equal(text, 'synthetic local page');
+  } finally {
+    await browser.close();
+  }
 });
