@@ -244,6 +244,12 @@ async function installOppApiMock(page, { capabilities, teams, forbidden = false 
       const text = typeof body.note_text === 'string' ? body.note_text.trim() : '';
       if (!text) return json(route, { error: 'note_text is required and must be a non-empty string' }, 400);
       if (text.length > NOTE_TEXT_MAX_LENGTH) return json(route, { error: `note_text must be ${NOTE_TEXT_MAX_LENGTH} characters or fewer` }, 400);
+      if (body.opponent_player_id) {
+        const referencedPlayer = db.players.find((p) => p.id === body.opponent_player_id);
+        if (!referencedPlayer || referencedPlayer.team_id !== teamId) {
+          return json(route, { error: 'opponent_player_id must belong to the selected opponent team.' }, 400);
+        }
+      }
       const note = {
         id: nextId(), org_id: 'test-org', author_user_id: 'test-user-1',
         opponent_team_id: teamId, opponent_player_id: body.opponent_player_id || null,

@@ -14,6 +14,7 @@
 -- teams/games tables are dropped last of all, after nothing new
 -- references them.
 
+drop function if exists public.merge_opponent_players(uuid, uuid, uuid, uuid);
 drop table if exists public.coach_scouting_notes;
 drop table if exists public.opponent_roster_import_conflicts;
 drop table if exists public.opponent_roster_memberships;

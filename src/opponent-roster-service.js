@@ -325,42 +325,56 @@ async function getOpponentMergePreview({ orgId, teamId, keepPlayerId, mergePlaye
   };
 }
 
-// Reassigns every membership and note from mergePlayerId to keepPlayerId
-// (org- AND team-scoped, so a cross-org or cross-opponent merge attempt
-// structurally cannot happen), unions confirmed_fields, then deletes the
-// now-empty duplicate. Never deletes keepPlayerId. Independently re-runs
-// every check loadAndValidateMergePair applies -- never trusts a
-// previously returned preview, so a preview computed a moment earlier
-// (whose counts could already be stale by the time the coach clicks
-// confirm) cannot bypass this function's own authorization.
+// Maps the stable, documented error-message prefixes
+// merge_opponent_players (supabase/migrations/20260806031303_...sql) raises
+// onto this module's typed errors -- never a raw Postgres message
+// forwarded as-is. Mirrors src/high-school-import-repository.js's
+// PUBLISH_RPC_ERRORS convention for the same reason: a database function's
+// internal error text is not a stable public API on its own, only the
+// prefix this module and the migration both commit to is.
+const MERGE_RPC_ERRORS = [
+  { prefix: 'keep_player_not_found_for_org', message: 'keepPlayerId player not found', statusCode: 404 },
+  { prefix: 'merge_player_not_found_for_org', message: 'mergePlayerId player not found', statusCode: 404 },
+  { prefix: 'keep_player_wrong_team', message: 'Both players must belong to the selected opponent team.', statusCode: 400 },
+  { prefix: 'merge_player_wrong_team', message: 'Both players must belong to the selected opponent team.', statusCode: 400 },
+  { prefix: 'players_must_differ', message: 'keepPlayerId and mergePlayerId must be different players.', statusCode: 400 },
+];
+
+// Reassigns every membership and note from mergePlayerId to keepPlayerId,
+// unions confirmed_fields, and deletes the now-empty duplicate as a SINGLE
+// atomic database transaction (the merge_opponent_players Postgres
+// function) -- not a sequence of independent PostgREST calls. Without this,
+// a failure between "reassign memberships" and "reassign notes" (or before
+// the final delete) could leave a player half-merged: memberships moved to
+// the survivor but notes still on the now-orphaned duplicate, or the
+// duplicate deleted before its data finished moving. The database
+// transaction guarantees all-or-nothing.
+//
+// loadAndValidateMergePair still runs first for the identical
+// uuid-shape/same-player/org+team-membership checks the preview endpoint
+// also applies (cheap, no lock contention, gives the same clear 400/404
+// before ever calling the RPC) -- the RPC independently re-verifies the
+// same ownership under row locks regardless, so this is defense-in-depth,
+// not the only check. Never trusts a previously returned preview: both
+// this pre-check and the RPC's own locked re-verification run fresh every
+// call, so a preview computed a moment earlier (whose data could already
+// be stale by the time the coach clicks confirm) cannot bypass either.
 async function mergeOpponentPlayers({ orgId, teamId, keepPlayerId, mergePlayerId, adminClient }) {
-  const { keepPlayer, mergePlayer } = await loadAndValidateMergePair({ orgId, teamId, keepPlayerId, mergePlayerId, adminClient });
+  await loadAndValidateMergePair({ orgId, teamId, keepPlayerId, mergePlayerId, adminClient });
 
-  const { error: reassignMembershipsError } = await adminClient
-    .from('opponent_roster_memberships')
-    .update({ opponent_player_id: keepPlayerId })
-    .eq('org_id', orgId)
-    .eq('opponent_player_id', mergePlayerId);
-  if (reassignMembershipsError) { console.error('[opponent-roster-service] merge: reassigning memberships failed:', reassignMembershipsError); throw typedError('Unable to merge opponent players.', 500); }
-
-  const { error: reassignNotesError } = await adminClient
-    .from('coach_scouting_notes')
-    .update({ opponent_player_id: keepPlayerId })
-    .eq('org_id', orgId)
-    .eq('opponent_player_id', mergePlayerId);
-  if (reassignNotesError) { console.error('[opponent-roster-service] merge: reassigning notes failed:', reassignNotesError); throw typedError('Unable to merge opponent players.', 500); }
-
-  const mergedConfirmedFields = Array.from(new Set([...(keepPlayer.confirmed_fields || []), ...(mergePlayer.confirmed_fields || [])]));
-  if (mergedConfirmedFields.length > (keepPlayer.confirmed_fields || []).length) {
-    await adminClient.from('opponent_players').update({ confirmed_fields: mergedConfirmedFields }).eq('org_id', orgId).eq('id', keepPlayerId);
+  const { error } = await adminClient.rpc('merge_opponent_players', {
+    p_org_id: orgId,
+    p_team_id: teamId,
+    p_keep_player_id: keepPlayerId,
+    p_merge_player_id: mergePlayerId,
+  });
+  if (error) {
+    const message = error.message || '';
+    const matched = MERGE_RPC_ERRORS.find((m) => message.startsWith(m.prefix));
+    if (matched) throw typedError(matched.message, matched.statusCode);
+    console.error('[opponent-roster-service] merge_opponent_players rpc failed:', error);
+    throw typedError('Unable to merge opponent players.', 500);
   }
-
-  const { error: deleteError } = await adminClient
-    .from('opponent_players')
-    .delete()
-    .eq('org_id', orgId)
-    .eq('id', mergePlayerId);
-  if (deleteError) { console.error('[opponent-roster-service] merge: deleting duplicate failed:', deleteError); throw typedError('Unable to merge opponent players.', 500); }
 
   return getOpponentPlayerInOrg({ orgId, playerId: keepPlayerId, adminClient });
 }

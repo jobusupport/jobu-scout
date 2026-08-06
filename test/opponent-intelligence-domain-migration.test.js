@@ -165,9 +165,19 @@ test('every new table enables RLS with exactly one SELECT-only policy, no INSERT
   for (const t of ['opponent_players', 'opponent_roster_memberships', 'opponent_roster_import_conflicts', 'coach_scouting_notes']) {
     assert.match(statementsLower, new RegExp(`alter table public\\.${t} enable row level security;`));
   }
-  assert.doesNotMatch(statementsLower, /for insert/);
-  assert.doesNotMatch(statementsLower, /for update/);
-  assert.doesNotMatch(statementsLower, /for delete/);
+  // Scoped to CREATE POLICY statements specifically, not the whole file --
+  // merge_opponent_players legitimately contains "for update" row-lock
+  // clauses (`select ... for update`), an entirely different SQL construct
+  // from a `create policy ... for update` RLS write policy that happens to
+  // share the same two words. A whole-file substring check can't tell
+  // those apart; scoping to "create policy" blocks can.
+  const policyStatements = statementsLower.match(/create policy [\s\S]*?;/g) || [];
+  assert.ok(policyStatements.length > 0, 'expected at least one CREATE POLICY statement to check');
+  for (const policy of policyStatements) {
+    assert.doesNotMatch(policy, /for insert/);
+    assert.doesNotMatch(policy, /for update/);
+    assert.doesNotMatch(policy, /for delete/);
+  }
 });
 
 test('every RLS policy checks org membership AND the travel product entitlement, matching the High School domain idiom', () => {
@@ -179,9 +189,23 @@ test('every RLS policy checks org membership AND the travel product entitlement,
   }
 });
 
-test('no GRANT/REVOKE statement is added -- matches the existing "RLS is what restricts access" convention', () => {
-  assert.doesNotMatch(statementsLower, /^\s*grant /m);
-  assert.doesNotMatch(statementsLower, /^\s*revoke /m);
+// No TABLE-level GRANT/REVOKE is added -- the four new tables still rely
+// purely on RLS (Supabase's standard anon/authenticated/service_role grant
+// set is auto-applied, matching the original "RLS is what restricts
+// access" convention this migration's header describes). The one
+// exception is the FUNCTION-level grant/revoke pair for
+// merge_opponent_players, required precisely because it's SECURITY
+// DEFINER -- separately verified in detail by the "EXECUTE on
+// merge_opponent_players..." test above, matching the same
+// grant/revoke-a-single-function pattern the HS publish RPCs migration
+// already established.
+test('no TABLE-level GRANT/REVOKE is added; the only grant/revoke pair targets the merge_opponent_players function', () => {
+  const grantLines = statementsLower.match(/^\s*grant .*$/gm) || [];
+  const revokeLines = statementsLower.match(/^\s*revoke .*$/gm) || [];
+  assert.equal(grantLines.length, 1);
+  assert.equal(revokeLines.length, 1);
+  assert.match(grantLines[0], /function public\.merge_opponent_players/);
+  assert.match(revokeLines[0], /function public\.merge_opponent_players/);
 });
 
 // ── Indexes on org_id for every new table ────────────────────────────────
@@ -194,10 +218,32 @@ test('every new table has an index on org_id', () => {
 
 // ── No destructive statement, no seed data, no secrets ───────────────────
 
-test('contains no DROP TABLE, DELETE, or TRUNCATE against any existing table', () => {
-  for (const keyword of ['drop table', 'delete from', 'truncate']) {
+// The blanket "no DELETE anywhere in this file" version of this check
+// predates merge_opponent_players, whose whole job is to atomically delete
+// exactly the just-verified duplicate row it merged (see that function's
+// own comment block). What this test actually needs to guarantee --
+// nothing in this migration destroys PRE-EXISTING data outside what this
+// same migration creates -- still holds: DROP TABLE/TRUNCATE appear
+// nowhere at all, and the one DELETE FROM only ever targets
+// opponent_players (a table this migration creates in the very same
+// statement batch), filtered by both org_id and id, never teams/games or
+// any other pre-existing table.
+test('contains no DROP TABLE or TRUNCATE anywhere, and the one DELETE only ever targets a table this migration itself creates', () => {
+  for (const keyword of ['drop table', 'truncate']) {
     assert.doesNotMatch(statementsLower, new RegExp(keyword));
   }
+  const deleteMatches = [...statementsLower.matchAll(/delete from ([a-z_.]+)/g)];
+  assert.equal(deleteMatches.length, 1, `expected exactly one DELETE statement, found: ${deleteMatches.map((m) => m[0]).join(', ')}`);
+  assert.equal(deleteMatches[0][1], 'public.opponent_players');
+  for (const preExistingTable of ['teams', 'games', 'organizations']) {
+    assert.doesNotMatch(statementsLower, new RegExp(`delete from public\\.?"?${preExistingTable}`));
+  }
+});
+
+test('the one DELETE inside merge_opponent_players is scoped by both org_id and id, never a blanket delete', () => {
+  const fnStart = statementsLower.indexOf('create or replace function public.merge_opponent_players');
+  const fnBody = statementsLower.slice(fnStart, statementsLower.indexOf('$function$;', fnStart) + 12);
+  assert.match(fnBody, /delete from public\.opponent_players\s+where org_id = p_org_id and id = p_merge_player_id;/);
 });
 
 test('contains no INSERT statement (no seed data)', () => {
@@ -214,8 +260,54 @@ test('contains no credential/token/cookie/session artifact', () => {
   }
 });
 
-test('contains no SECURITY DEFINER function', () => {
-  assert.doesNotMatch(statementsLower, /security definer/);
+// This migration originally added no functions at all -- every write went
+// through the service-role adminClient with RLS as defense-in-depth (see
+// the migration's own header). That changed when mergeOpponentPlayers
+// needed to be atomic (see merge_opponent_players's own comment block):
+// @supabase/supabase-js has no shared transaction across separate
+// .from(...).update()/.delete() calls, so reassigning memberships,
+// reassigning notes, unioning confirmed_fields, and deleting the duplicate
+// as independent PostgREST calls could fail partway through and leave a
+// player half-merged. A single SECURITY DEFINER function is the only way
+// to get one Postgres transaction across all of that -- the exact same
+// justification the pre-existing HS publish RPCs
+// (20260729190000_add_hs_publish_rpcs.sql) already established in this
+// codebase. Rather than merely deleting the old "no SECURITY DEFINER at
+// all" assertion, this proves the new function is exactly as narrowly
+// scoped and locked down as that precedent: hardened search_path, and
+// EXECUTE revoked from anon/authenticated (RLS's own SELECT-only policies
+// already make this unreachable for them regardless -- this is
+// defense-in-depth, not the only barrier) and granted only to
+// postgres/service_role.
+test('exactly one SECURITY DEFINER function is defined (merge_opponent_players, for atomic merge), and no other', () => {
+  const matches = [...statementsLower.matchAll(/create (?:or replace )?function public\.(\w+)\([^)]*\)[\s\S]*?security definer/g)];
+  assert.equal(matches.length, 1, `expected exactly one SECURITY DEFINER function, found: ${matches.map((m) => m[1]).join(', ')}`);
+  assert.equal(matches[0][1], 'merge_opponent_players');
+});
+
+test('merge_opponent_players sets search_path to empty (SECURITY DEFINER hardening, matches the HS publish RPCs precedent)', () => {
+  const fnStart = statementsLower.indexOf('create or replace function public.merge_opponent_players');
+  assert.ok(fnStart >= 0);
+  const fnBody = statementsLower.slice(fnStart, statementsLower.indexOf('$function$;', fnStart) + 12);
+  assert.match(fnBody, /set search_path = ''/);
+});
+
+test('EXECUTE on merge_opponent_players is revoked from public/anon/authenticated and granted only to postgres/service_role', () => {
+  assert.match(statementsLower, /revoke execute on function public\.merge_opponent_players\(uuid, uuid, uuid, uuid\) from public, anon, authenticated;/);
+  assert.match(statementsLower, /grant execute on function public\.merge_opponent_players\(uuid, uuid, uuid, uuid\) to postgres, service_role;/);
+});
+
+test('merge_opponent_players independently re-verifies both players belong to p_org_id AND p_team_id under row locks, never trusting the caller', () => {
+  const fnStart = statementsLower.indexOf('create or replace function public.merge_opponent_players');
+  const fnBody = statementsLower.slice(fnStart, statementsLower.indexOf('$function$;', fnStart) + 12);
+  // Both the keep and merge player lookups must filter by org_id, filter
+  // by team_id (or explicitly check it), and take a row lock.
+  const forUpdateCount = (fnBody.match(/for update/g) || []).length;
+  assert.equal(forUpdateCount, 2, 'expected a row lock on both the keep player and the merge player');
+  assert.match(fnBody, /where id = p_keep_player_id and org_id = p_org_id/);
+  assert.match(fnBody, /where id = p_merge_player_id and org_id = p_org_id/);
+  assert.match(fnBody, /v_keep\.team_id <> p_team_id/);
+  assert.match(fnBody, /v_merge\.team_id <> p_team_id/);
 });
 
 // ── Down migration ─────────────────────────────────────────────────────

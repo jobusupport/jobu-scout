@@ -131,12 +131,37 @@ async function getOpponentTeamInOrg({ orgId, opponentTeamId, adminClient }) {
   return data;
 }
 
+// Verifies playerId is an opponent_players row belonging to BOTH orgId
+// and opponentTeamId. The org half is already enforced by
+// coach_scouting_notes_org_player_fkey (a composite FK against
+// opponent_players(org_id, id)), but that constraint has no way to also
+// require the SAME opponent team as the note's own opponent_team_id --
+// without this check, a note could reference a player who belongs to a
+// DIFFERENT opponent within the same org (still no cross-org leak, since
+// both ids stay org-scoped, but a real cross-opponent data-consistency
+// gap: the note would list under one opponent while its player-scope
+// pointed at a different one).
+async function requirePlayerBelongsToOpponentTeam({ orgId, opponentTeamId, playerId, adminClient }) {
+  const { data, error } = await adminClient
+    .from('opponent_players')
+    .select('id')
+    .eq('id', playerId)
+    .eq('org_id', orgId)
+    .eq('team_id', opponentTeamId)
+    .maybeSingle();
+  if (error) { console.error('[coach-notes-service] player-team ownership check failed:', error); throw typedError('Something went wrong. Please try again.', 500); }
+  if (!data) throw typedError('opponent_player_id must belong to the selected opponent team.', 400);
+}
+
 async function createNote({ orgId, authorUserId, opponentTeamId, body, adminClient }) {
   requireUuid(authorUserId, 'authorUserId');
   const team = await getOpponentTeamInOrg({ orgId, opponentTeamId, adminClient });
   if (!team) throw typedError('Opponent team not found', 404);
 
   const validated = validateNoteCreate(body);
+  if (validated.opponent_player_id) {
+    await requirePlayerBelongsToOpponentTeam({ orgId, opponentTeamId, playerId: validated.opponent_player_id, adminClient });
+  }
   const { data, error } = await adminClient
     .from('coach_scouting_notes')
     .insert({
@@ -243,6 +268,7 @@ module.exports = {
   validateNoteCreate,
   validateNoteUpdate,
   getOpponentTeamInOrg,
+  requirePlayerBelongsToOpponentTeam,
   createNote,
   getNoteInOrg,
   updateNote,

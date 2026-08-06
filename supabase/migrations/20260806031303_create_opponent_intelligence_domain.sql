@@ -273,3 +273,98 @@ create policy "coach_scouting_notes_select" on public.coach_scouting_notes
 -- this), and RLS (enabled above, SELECT-only policies) is what actually
 -- restricts access -- matching the existing convention for every ordinary
 -- (non-SECURITY-DEFINER) table in this schema.
+
+-- ── merge_opponent_players ─────────────────────────────────────────────────
+-- Same architectural reason as publish_hs_verified_totals et al.
+-- (20260729190000_add_hs_publish_rpcs.sql's own header, reused verbatim):
+-- @supabase/supabase-js has no shared client-side transaction across
+-- separate .from(...).update()/.delete() calls. A merge that reassigns
+-- memberships, reassigns notes, unions confirmed_fields, and deletes the
+-- duplicate as four independent PostgREST calls could fail partway through
+-- (a crash, an RLS/permissions surprise, a transient network error) and
+-- leave a player half-merged -- memberships moved but notes not, or worse,
+-- the duplicate deleted before its data finished moving. This function
+-- performs the entire merge as one Postgres transaction: any failure
+-- anywhere inside it leaves BOTH players completely untouched.
+--
+-- Ownership is independently re-verified inside the function (both players
+-- must belong to p_org_id AND p_team_id) exactly like every other
+-- SECURITY DEFINER function in this schema -- never assumed correct merely
+-- because the caller passed matching IDs. `for update` locks on both player
+-- rows serialize a concurrent merge attempt against either player.
+--
+-- Authorization model identical to the HS publish RPCs: EXECUTE revoked
+-- from anon/authenticated, granted only to postgres/service_role, so only
+-- the trusted Express layer (src/opponent-roster-service.js) can call this
+-- at all -- RLS's own SELECT-only policies already make INSERT/UPDATE/DELETE
+-- unreachable for anon/authenticated regardless.
+create or replace function public.merge_opponent_players(
+  p_org_id uuid,
+  p_team_id uuid,
+  p_keep_player_id uuid,
+  p_merge_player_id uuid
+)
+returns public.opponent_players
+language plpgsql
+security definer
+set search_path = ''
+as $function$
+declare
+  v_keep public.opponent_players%rowtype;
+  v_merge public.opponent_players%rowtype;
+  v_merged_confirmed_fields text[];
+begin
+  if p_org_id is null or p_team_id is null or p_keep_player_id is null or p_merge_player_id is null then
+    raise exception 'org_id, team_id, keep_player_id, and merge_player_id are all required' using errcode = '22004';
+  end if;
+  if p_keep_player_id = p_merge_player_id then
+    raise exception 'players_must_differ: keep_player_id and merge_player_id must be different players' using errcode = 'P0001';
+  end if;
+
+  select * into v_keep from public.opponent_players
+   where id = p_keep_player_id and org_id = p_org_id
+   for update;
+  if not found then
+    raise exception 'keep_player_not_found_for_org: %', p_keep_player_id using errcode = 'P0002';
+  end if;
+  if v_keep.team_id <> p_team_id then
+    raise exception 'keep_player_wrong_team: % does not belong to team %', p_keep_player_id, p_team_id using errcode = 'P0002';
+  end if;
+
+  select * into v_merge from public.opponent_players
+   where id = p_merge_player_id and org_id = p_org_id
+   for update;
+  if not found then
+    raise exception 'merge_player_not_found_for_org: %', p_merge_player_id using errcode = 'P0002';
+  end if;
+  if v_merge.team_id <> p_team_id then
+    raise exception 'merge_player_wrong_team: % does not belong to team %', p_merge_player_id, p_team_id using errcode = 'P0002';
+  end if;
+
+  update public.opponent_roster_memberships
+     set opponent_player_id = p_keep_player_id
+   where org_id = p_org_id and opponent_player_id = p_merge_player_id;
+
+  update public.coach_scouting_notes
+     set opponent_player_id = p_keep_player_id
+   where org_id = p_org_id and opponent_player_id = p_merge_player_id;
+
+  select array_agg(distinct field) into v_merged_confirmed_fields
+    from unnest(coalesce(v_keep.confirmed_fields, '{}') || coalesce(v_merge.confirmed_fields, '{}')) as field;
+
+  update public.opponent_players
+     set confirmed_fields = coalesce(v_merged_confirmed_fields, '{}')
+   where org_id = p_org_id and id = p_keep_player_id;
+
+  delete from public.opponent_players
+   where org_id = p_org_id and id = p_merge_player_id;
+
+  select * into v_keep from public.opponent_players
+   where id = p_keep_player_id and org_id = p_org_id;
+
+  return v_keep;
+end;
+$function$;
+
+revoke execute on function public.merge_opponent_players(uuid, uuid, uuid, uuid) from public, anon, authenticated;
+grant execute on function public.merge_opponent_players(uuid, uuid, uuid, uuid) to postgres, service_role;

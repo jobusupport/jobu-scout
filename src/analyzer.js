@@ -1329,7 +1329,7 @@ async function analyzeSelfScout(teamId, options = {}) {
   const bundle = await pipeline.getTeamBundle(teamId);
   if (!bundle || !bundle.team) throw new Error(`No team found with id: ${teamId}`);
   if (bundle.meta.gamesAnalyzed === 0) {
-    throw new Error(`${bundle.team.team_name} has no games yet. Run PSG analysis first.`);
+    throw new Error(`${bundle.team.team_name} has no games yet. Run Full Pipeline for this team first.`);
   }
 
   bundle.handedness = await db.getTeamHandedness(teamId).catch(() => []);

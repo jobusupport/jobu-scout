@@ -19,8 +19,9 @@ const PLAYER_ID = '33333333-3333-4333-8333-333333333333';
 const PLAYER2_ID = '44444444-4444-4444-8444-444444444444';
 const MEMBERSHIP_ID = '55555555-5555-4555-8555-555555555555';
 
-function makeFakeAdminClient(queues) {
+function makeFakeAdminClient(queues, rpcQueues = {}) {
   const calls = [];
+  const rpcCalls = [];
   function consume(table) {
     const entry = queues[table];
     if (Array.isArray(entry)) return entry.shift() || { data: null, error: null };
@@ -44,7 +45,13 @@ function makeFakeAdminClient(queues) {
     };
     return builder;
   }
-  return { calls, from: (table) => builderFor(table) };
+  function rpc(name, params) {
+    rpcCalls.push({ name, params });
+    const entry = rpcQueues[name];
+    const result = Array.isArray(entry) ? (entry.shift() || { data: null, error: null }) : (entry || { data: null, error: null });
+    return Promise.resolve(result);
+  }
+  return { calls, rpcCalls, from: (table) => builderFor(table), rpc };
 }
 
 function queued(...results) { return results; }
@@ -204,26 +211,68 @@ test('mergeOpponentPlayers rejects merging a player into itself', async () => {
   );
 });
 
-test('mergeOpponentPlayers reassigns memberships and notes, unions confirmed_fields, then deletes the duplicate', async () => {
-  const adminClient = makeFakeAdminClient({
-    opponent_players: queued(
-      ok(playerRow({ id: PLAYER_ID, confirmed_fields: ['first_name'] })),   // keepPlayer lookup
-      ok(playerRow({ id: PLAYER2_ID, confirmed_fields: ['last_name'] })),   // mergePlayer lookup
-      ok(null), // confirmed_fields union update (bare await, no .single())
-      ok(null), // delete (bare await, no .single())
-      ok(playerRow({ id: PLAYER_ID, confirmed_fields: ['first_name', 'last_name'] })), // final re-fetch
-    ),
-    opponent_roster_memberships: { data: [], error: null },
-    coach_scouting_notes: { data: [], error: null },
-  });
+// Reassignment/union/deletion all happen inside merge_opponent_players (one
+// Postgres transaction -- see the migration's own header for why this is
+// no longer a sequence of independent PostgREST calls the way it
+// originally was). This test proves the RPC is called with exactly the
+// right parameters and that the service returns the survivor re-fetched
+// after the RPC succeeds -- the actual reassignment/union/delete behavior
+// itself is proven against a real database in
+// test/opponent-intelligence-domain-migration.test.js (structural) and the
+// isolated preview-branch rehearsal (behavioral), since a fake adminClient
+// cannot meaningfully simulate a real transaction's atomicity.
+test('mergeOpponentPlayers calls merge_opponent_players via one rpc with the right parameters and returns the re-fetched survivor', async () => {
+  const adminClient = makeFakeAdminClient(
+    {
+      opponent_players: queued(
+        ok(playerRow({ id: PLAYER_ID })),   // keepPlayer lookup (loadAndValidateMergePair)
+        ok(playerRow({ id: PLAYER2_ID })),  // mergePlayer lookup (loadAndValidateMergePair)
+        ok(playerRow({ id: PLAYER_ID, confirmed_fields: ['first_name', 'last_name'] })), // final re-fetch
+      ),
+    },
+    { merge_opponent_players: queued(ok(null)) },
+  );
   const result = await svc.mergeOpponentPlayers({ orgId: ORG_ID, teamId: TEAM_ID, keepPlayerId: PLAYER_ID, mergePlayerId: PLAYER2_ID, adminClient });
   assert.equal(result.id, PLAYER_ID);
-  const membershipReassign = adminClient.calls.find((c) => c.table === 'opponent_roster_memberships' && c.method === 'update');
-  assert.equal(membershipReassign.args.opponent_player_id, PLAYER_ID);
-  const noteReassign = adminClient.calls.find((c) => c.table === 'coach_scouting_notes' && c.method === 'update');
-  assert.equal(noteReassign.args.opponent_player_id, PLAYER_ID);
-  const deleteCall = adminClient.calls.find((c) => c.table === 'opponent_players' && c.method === 'delete');
-  assert.ok(deleteCall, 'the duplicate player must be deleted after reassignment');
+  assert.equal(adminClient.rpcCalls.length, 1);
+  assert.deepEqual(adminClient.rpcCalls[0], {
+    name: 'merge_opponent_players',
+    params: { p_org_id: ORG_ID, p_team_id: TEAM_ID, p_keep_player_id: PLAYER_ID, p_merge_player_id: PLAYER2_ID },
+  });
+  // No separate .from('opponent_players').update()/.delete() -- the merge
+  // is not performed as a sequence of independent PostgREST calls.
+  assert.equal(adminClient.calls.filter((c) => c.table === 'opponent_players').length, 0);
+});
+
+test('mergeOpponentPlayers maps each merge_opponent_players error prefix to the correct typed error', async () => {
+  const cases = [
+    ['keep_player_not_found_for_org: x', 404, /keepPlayerId player not found/],
+    ['merge_player_not_found_for_org: x', 404, /mergePlayerId player not found/],
+    ['keep_player_wrong_team: x', 400, /selected opponent team/],
+    ['merge_player_wrong_team: x', 400, /selected opponent team/],
+  ];
+  for (const [rawMessage, statusCode, messagePattern] of cases) {
+    const adminClient = makeFakeAdminClient(
+      { opponent_players: queued(ok(playerRow({ id: PLAYER_ID })), ok(playerRow({ id: PLAYER2_ID }))) },
+      { merge_opponent_players: queued(err({ message: rawMessage })) },
+    );
+    await assert.rejects(
+      () => svc.mergeOpponentPlayers({ orgId: ORG_ID, teamId: TEAM_ID, keepPlayerId: PLAYER_ID, mergePlayerId: PLAYER2_ID, adminClient }),
+      (e) => e.statusCode === statusCode && messagePattern.test(e.message),
+      `expected statusCode ${statusCode} and message matching ${messagePattern} for raw error "${rawMessage}"`
+    );
+  }
+});
+
+test('mergeOpponentPlayers surfaces a generic 500 for an unrecognized rpc error, never the raw Postgres message', async () => {
+  const adminClient = makeFakeAdminClient(
+    { opponent_players: queued(ok(playerRow({ id: PLAYER_ID })), ok(playerRow({ id: PLAYER2_ID }))) },
+    { merge_opponent_players: queued(err({ message: 'deadlock detected' })) },
+  );
+  await assert.rejects(
+    () => svc.mergeOpponentPlayers({ orgId: ORG_ID, teamId: TEAM_ID, keepPlayerId: PLAYER_ID, mergePlayerId: PLAYER2_ID, adminClient }),
+    (e) => e.statusCode === 500 && e.message === 'Unable to merge opponent players.' && !e.message.includes('deadlock')
+  );
 });
 
 test('mergeOpponentPlayers rejects a player that does not belong to the selected opponent team, even within the same org', async () => {

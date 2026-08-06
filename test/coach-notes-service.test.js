@@ -120,12 +120,36 @@ test('createNote supports team-level (no player/game), player-level, and game-le
   for (const extra of [{}, { opponent_player_id: PLAYER_ID }, { game_id: GAME_ID }]) {
     const adminClient = makeFakeAdminClient({
       teams: queued(ok(team)),
+      // Player-scoped notes run one extra ownership-check query
+      // (requirePlayerBelongsToOpponentTeam) before the insert.
+      opponent_players: queued(ok({ id: PLAYER_ID })),
       coach_scouting_notes: queued(ok(noteRow(extra))),
     });
     const note = await svc.createNote({ orgId: ORG_ID, authorUserId: USER_ID, opponentTeamId: TEAM_ID, body: { note_text: 'x', ...extra }, adminClient });
     if (extra.opponent_player_id) assert.equal(note.opponent_player_id, PLAYER_ID);
     if (extra.game_id) assert.equal(note.game_id, GAME_ID);
   }
+});
+
+// Cross-opponent leakage check: coach_scouting_notes_org_player_fkey (the
+// migration's composite FK) only guarantees the player belongs to the SAME
+// ORG as the note -- it has no way to also require the SAME opponent team.
+// Without an application-level check, a note could be created with
+// opponent_team_id pointing at one opponent while opponent_player_id
+// pointed at a player who actually belongs to a DIFFERENT opponent in the
+// same org. This never crosses the org boundary, but it is exactly the
+// cross-opponent data-consistency gap the merge feature's own
+// loadAndValidateMergePair closes for merges -- notes need the same check.
+test('createNote rejects an opponent_player_id belonging to a different opponent team, even within the same org', async () => {
+  const adminClient = makeFakeAdminClient({
+    teams: queued(ok(team)),
+    opponent_players: queued(ok(null)), // lookup scoped to (id, org_id, team_id) finds nothing
+  });
+  await assert.rejects(
+    () => svc.createNote({ orgId: ORG_ID, authorUserId: USER_ID, opponentTeamId: TEAM_ID, body: { note_text: 'x', opponent_player_id: PLAYER_ID }, adminClient }),
+    (e) => e.statusCode === 400 && /selected opponent team/.test(e.message)
+  );
+  assert.equal(adminClient.calls.some((c) => c.table === 'coach_scouting_notes' && c.method === 'insert'), false);
 });
 
 test('createNote defaults to included and not archived', async () => {
