@@ -1,7 +1,7 @@
 'use strict';
 
 // Focused text-level tests for
-// supabase/migrations/20260806031303_create_opponent_intelligence_domain.sql
+// supabase/migrations/20260806215516_create_opponent_intelligence_domain.sql
 // and its down migration. Mirrors the convention already used by
 // test/high-school-player-lifecycle-status-migration.test.js: these prove
 // the migration's SHAPE (tables, constraints, RLS, indexes) via statement
@@ -18,7 +18,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 
-const MIGRATION_PATH = path.join(__dirname, '..', 'supabase', 'migrations', '20260806031303_create_opponent_intelligence_domain.sql');
+const MIGRATION_PATH = path.join(__dirname, '..', 'supabase', 'migrations', '20260806215516_create_opponent_intelligence_domain.sql');
 const DOWN_MIGRATION_PATH = path.join(__dirname, '..', 'supabase', 'rollback', '20260806031303_create_opponent_intelligence_domain.down.sql');
 
 const sql = fs.readFileSync(MIGRATION_PATH, 'utf8');
@@ -271,7 +271,7 @@ test('contains no credential/token/cookie/session artifact', () => {
 // player half-merged. A single SECURITY DEFINER function is the only way
 // to get one Postgres transaction across all of that -- the exact same
 // justification the pre-existing HS publish RPCs
-// (20260729190000_add_hs_publish_rpcs.sql) already established in this
+// (20260730170431_add_hs_publish_rpcs.sql) already established in this
 // codebase. Rather than merely deleting the old "no SECURITY DEFINER at
 // all" assertion, this proves the new function is exactly as narrowly
 // scoped and locked down as that precedent: hardened search_path, and

@@ -52,7 +52,7 @@
 // NOT. publishVerifiedTotals/publishPlayerAdvancedStats/
 // publishPitcherAdvancedStats used to document exactly that gap inline
 // (a three-step, non-atomic sequence). Slice 1A.1
-// (supabase/migrations/20260729190000_add_hs_publish_rpcs.sql) closes it:
+// (supabase/migrations/20260730170431_add_hs_publish_rpcs.sql) closes it:
 // each of the three functions below now makes exactly ONE PostgREST call --
 // `adminClient.rpc(...)` against a SECURITY DEFINER Postgres function that
 // performs the whole find-current/supersede/insert sequence, plus
@@ -556,7 +556,7 @@ function createHighSchoolImportRepository(adminClient) {
   //
   // Every publish* function below makes exactly ONE `adminClient.rpc(...)`
   // call against a SECURITY DEFINER Postgres function
-  // (supabase/migrations/20260729190000_add_hs_publish_rpcs.sql) that
+  // (supabase/migrations/20260730170431_add_hs_publish_rpcs.sql) that
   // performs the entire find-current/supersede/insert sequence, plus
   // org/team/season/player/import-run ownership and lifecycle checks,
   // inside one database transaction. There is no longer a client-visible

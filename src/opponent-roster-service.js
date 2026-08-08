@@ -7,7 +7,7 @@
 // without a live database.
 //
 // An "opponent" is a `teams` row with is_our_team=false -- see
-// supabase/migrations/20260806031303_create_opponent_intelligence_domain.sql's
+// supabase/migrations/20260806215516_create_opponent_intelligence_domain.sql's
 // own header for why no separate "opponents" entity was introduced.
 //
 // ── Identity model ─────────────────────────────────────────────────────
@@ -326,7 +326,7 @@ async function getOpponentMergePreview({ orgId, teamId, keepPlayerId, mergePlaye
 }
 
 // Maps the stable, documented error-message prefixes
-// merge_opponent_players (supabase/migrations/20260806031303_...sql) raises
+// merge_opponent_players (supabase/migrations/20260806215516_...sql) raises
 // onto this module's typed errors -- never a raw Postgres message
 // forwarded as-is. Mirrors src/high-school-import-repository.js's
 // PUBLISH_RPC_ERRORS convention for the same reason: a database function's

@@ -6,7 +6,7 @@
 //
 // A note is scoped to an opponent team (required), and optionally to a
 // specific opponent player and/or game -- see
-// supabase/migrations/20260806031303_create_opponent_intelligence_domain.sql's
+// supabase/migrations/20260806215516_create_opponent_intelligence_domain.sql's
 // header for why a "play/situation" observation is just a game-scoped note
 // whose text names the specific play, rather than a fifth structural level.
 //

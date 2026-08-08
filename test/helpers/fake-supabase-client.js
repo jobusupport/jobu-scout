@@ -10,7 +10,7 @@
 // specifically because these are the properties this slice's own tests
 // depend on: the migration's unique constraints (including
 // partial/predicated ones, matched exactly against
-// supabase/migrations/20260728220000_create_high_school_import_domain.sql),
+// supabase/migrations/20260729010111_create_high_school_import_domain.sql),
 // UUID-typed columns (rejecting non-UUID-shaped values the way a real uuid
 // column would), and NOT NULL columns for the eight new tables, all
 // surfaced as Postgres-shaped errors (code '23505' for a unique violation,
@@ -151,7 +151,7 @@ const TABLES_WITH_UPDATED_AT = new Set([
 
 // ── Slice 1A.1 publish-RPC emulation ────────────────────────────────────
 //
-// Mirrors supabase/migrations/20260729190000_add_hs_publish_rpcs.sql at
+// Mirrors supabase/migrations/20260730170431_add_hs_publish_rpcs.sql at
 // EXACTLY the same fidelity level this fake already uses for `.from()`
 // (schema-shape NOT NULL/UUID checks, the migration's own partial unique
 // indexes) -- and, per this file's own "explicitly does NOT model" header

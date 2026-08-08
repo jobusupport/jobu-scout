@@ -466,7 +466,7 @@ test('publishPitcherAdvancedStats follows the same current/superseded and hierar
 // Slice 1A's own repository made a THREE-call sequence (select, update,
 // insert) and could only document -- never close -- the gap where an
 // insert failure after a successful supersede left zero current rows.
-// Slice 1A.1 (supabase/migrations/20260729190000_add_hs_publish_rpcs.sql)
+// Slice 1A.1 (supabase/migrations/20260730170431_add_hs_publish_rpcs.sql)
 // replaces that sequence with a single `adminClient.rpc(...)` call, so
 // there is no longer a client-visible partial state to simulate via
 // `.from()` monkey-patching -- proving true transactional rollback (a bad

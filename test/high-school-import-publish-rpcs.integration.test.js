@@ -1,7 +1,7 @@
 'use strict';
 
 // Integration tests for the Slice 1A.1 atomic publishing RPCs
-// (supabase/migrations/20260729190000_add_hs_publish_rpcs.sql):
+// (supabase/migrations/20260730170431_add_hs_publish_rpcs.sql):
 // publish_hs_verified_totals, publish_hs_player_advanced_stats,
 // publish_hs_pitcher_advanced_stats.
 //
@@ -16,7 +16,7 @@
 // lives entirely inside the database function, not in any HTTP route.
 //
 // Requires:
-//   1. supabase/migrations/20260729190000_add_hs_publish_rpcs.sql (and
+//   1. supabase/migrations/20260730170431_add_hs_publish_rpcs.sql (and
 //      every migration before it) applied to a NON-PRODUCTION Supabase
 //      project/branch.
 //   2. SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY in this process's own

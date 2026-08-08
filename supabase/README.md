@@ -81,6 +81,15 @@ Applied via the Supabase CLI or the project's MCP tooling
 actually live -- the discipline this convention exists to enforce is
 "nothing is applied that isn't committed here first."
 
+`apply_migration` records the actual application-time version, not whatever
+timestamp the file happened to be named at commit time. If the two differ,
+the repository file must be renamed in a follow-up repository change (a
+plain `git mv`, no database operation) to match the recorded production
+version -- `supabase migration list --linked` must show full alignment
+before the work is considered operationally complete. Do not run `db push`
+while local and remote histories diverge for a version that's already
+live: it will attempt to re-run an already-applied migration.
+
 ## Down migrations
 
 Each forward migration may have a matching `<same-name>.down.sql` under
