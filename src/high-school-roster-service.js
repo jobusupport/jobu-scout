@@ -42,7 +42,7 @@
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TEAM_LEVELS = ['varsity', 'junior_varsity', 'freshman'];
 const ROSTER_STATUSES = ['active', 'inactive'];
-// Matches supabase/migrations/20260803120000_add_hs_player_lifecycle_status.sql's
+// Matches supabase/migrations/20260805202830_add_hs_player_lifecycle_status.sql's
 // hs_players_status_check exactly. is_active remains selectable/returned as
 // a database-generated column (status = 'active') -- never written to
 // directly by this module (see resolvePlayerStatusInput below).
@@ -338,7 +338,7 @@ function optionalGraduationYear(value) {
 // ── Player status / legacy is_active compatibility ─────────────────────
 //
 // hs_players.is_active is a database-generated column (status = 'active')
-// -- see supabase/migrations/20260803120000_add_hs_player_lifecycle_status.sql,
+// -- see supabase/migrations/20260805202830_add_hs_player_lifecycle_status.sql,
 // applied to production 2026-08-05 (production version 20260805202830). This
 // module never writes is_active directly (Postgres itself rejects that,
 // since it's `generated always as ... stored`); it always resolves an

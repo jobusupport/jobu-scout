@@ -231,7 +231,7 @@ test('validatePlayerCreate never accepts a record_source field (reserved for the
 // ── Players: status lifecycle ────────────────────────────────────────────
 //
 // hs_players.is_active is a database-generated column (status = 'active') --
-// see supabase/migrations/20260803120000_add_hs_player_lifecycle_status.sql.
+// see supabase/migrations/20260805202830_add_hs_player_lifecycle_status.sql.
 // Fixtures below always set is_active consistently with status (never a
 // mismatched pair) to accurately represent what that generated column would
 // actually return -- the fake adminClient does not compute this for us, so

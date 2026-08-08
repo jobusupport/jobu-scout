@@ -1,7 +1,7 @@
 'use strict';
 
 // Real-Postgres relational integration tests for
-// supabase/migrations/20260807120000_create_hs_source_identity_foundation.sql.
+// supabase/migrations/20260808172649_create_hs_source_identity_foundation.sql.
 //
 // WRITTEN, EXECUTED, AND VERIFIED against a real, disposable, non-Docker
 // local Postgres 18 instance during development of this migration -- see

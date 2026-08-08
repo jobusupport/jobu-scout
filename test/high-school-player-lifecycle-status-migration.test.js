@@ -1,6 +1,6 @@
 'use strict';
 
-// Focused tests for supabase/migrations/20260803120000_add_hs_player_lifecycle_status.sql
+// Focused tests for supabase/migrations/20260805202830_add_hs_player_lifecycle_status.sql
 // and its down migration.
 //
 // ── What these tests do and do NOT prove ─────────────────────────────────
@@ -31,8 +31,8 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 
-const MIGRATION_PATH = path.join(__dirname, '..', 'supabase', 'migrations', '20260803120000_add_hs_player_lifecycle_status.sql');
-const DOWN_MIGRATION_PATH = path.join(__dirname, '..', 'supabase', 'rollback', '20260803120000_add_hs_player_lifecycle_status.down.sql');
+const MIGRATION_PATH = path.join(__dirname, '..', 'supabase', 'migrations', '20260805202830_add_hs_player_lifecycle_status.sql');
+const DOWN_MIGRATION_PATH = path.join(__dirname, '..', 'supabase', 'rollback', '20260805202830_add_hs_player_lifecycle_status.down.sql');
 
 const sql = fs.readFileSync(MIGRATION_PATH, 'utf8');
 const lowerSql = sql.toLowerCase();
@@ -206,7 +206,7 @@ test('contains no credential/token/cookie/session artifact', () => {
 
 test('the down migration lives under supabase/rollback/, not supabase/migrations/', () => {
   assert.ok(fs.existsSync(DOWN_MIGRATION_PATH), 'expected the down migration file to exist under supabase/rollback/');
-  assert.ok(!fs.existsSync(path.join(__dirname, '..', 'supabase', 'migrations', '20260803120000_add_hs_player_lifecycle_status.down.sql')));
+  assert.ok(!fs.existsSync(path.join(__dirname, '..', 'supabase', 'migrations', '20260805202830_add_hs_player_lifecycle_status.down.sql')));
 });
 
 test('the down migration restores is_active as a plain writable boolean, collapsing every non-active status to false', () => {

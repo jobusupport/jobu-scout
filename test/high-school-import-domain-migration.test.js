@@ -1,6 +1,6 @@
 'use strict';
 
-// Focused tests for supabase/migrations/20260728220000_create_high_school_import_domain.sql --
+// Focused tests for supabase/migrations/20260729010111_create_high_school_import_domain.sql --
 // the High School import-run and source-provenance domain (Slice 0B):
 // hs_games, hs_import_runs, hs_import_run_games, hs_raw_snapshots,
 // hs_game_validation_results, hs_verified_totals, hs_player_advanced_stats,
@@ -19,7 +19,7 @@ const fs = require('fs');
 const path = require('path');
 
 const REPO_ROOT = path.join(__dirname, '..');
-const MIGRATION_PATH = path.join(REPO_ROOT, 'supabase', 'migrations', '20260728220000_create_high_school_import_domain.sql');
+const MIGRATION_PATH = path.join(REPO_ROOT, 'supabase', 'migrations', '20260729010111_create_high_school_import_domain.sql');
 const sql = fs.readFileSync(MIGRATION_PATH, 'utf8');
 const lowerSql = sql.toLowerCase();
 

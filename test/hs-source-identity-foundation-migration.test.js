@@ -1,7 +1,7 @@
 'use strict';
 
 // Focused tests for
-// supabase/migrations/20260807120000_create_hs_source_identity_foundation.sql
+// supabase/migrations/20260808172649_create_hs_source_identity_foundation.sql
 // -- the GameChanger source-identity foundation (Slice 1 of the
 // schedule-driven onboarding / opponent-monitoring importer):
 // hs_source_teams, hs_source_team_contexts, hs_team_source_registrations,
@@ -25,7 +25,7 @@ const fs = require('fs');
 const path = require('path');
 
 const REPO_ROOT = path.join(__dirname, '..');
-const MIGRATION_PATH = path.join(REPO_ROOT, 'supabase', 'migrations', '20260807120000_create_hs_source_identity_foundation.sql');
+const MIGRATION_PATH = path.join(REPO_ROOT, 'supabase', 'migrations', '20260808172649_create_hs_source_identity_foundation.sql');
 const sql = fs.readFileSync(MIGRATION_PATH, 'utf8');
 
 // Statements only, comment lines stripped -- prose in header comments
