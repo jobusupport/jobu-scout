@@ -19,7 +19,7 @@ const fs = require('fs');
 const path = require('path');
 
 const MIGRATION_PATH = path.join(__dirname, '..', 'supabase', 'migrations', '20260806215516_create_opponent_intelligence_domain.sql');
-const DOWN_MIGRATION_PATH = path.join(__dirname, '..', 'supabase', 'rollback', '20260806031303_create_opponent_intelligence_domain.down.sql');
+const DOWN_MIGRATION_PATH = path.join(__dirname, '..', 'supabase', 'rollback', '20260806215516_create_opponent_intelligence_domain.down.sql');
 
 const sql = fs.readFileSync(MIGRATION_PATH, 'utf8');
 const lowerSql = sql.toLowerCase();
@@ -314,7 +314,7 @@ test('merge_opponent_players independently re-verifies both players belong to p_
 
 test('the down migration lives under supabase/rollback/, not supabase/migrations/', () => {
   assert.ok(fs.existsSync(DOWN_MIGRATION_PATH));
-  assert.ok(!fs.existsSync(path.join(__dirname, '..', 'supabase', 'migrations', '20260806031303_create_opponent_intelligence_domain.down.sql')));
+  assert.ok(!fs.existsSync(path.join(__dirname, '..', 'supabase', 'migrations', '20260806215516_create_opponent_intelligence_domain.down.sql')));
 });
 
 test('the down migration drops all four new tables and both new constraints, in dependency-safe order', () => {
