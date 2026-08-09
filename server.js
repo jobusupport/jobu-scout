@@ -1553,13 +1553,18 @@ app.post('/api/run/report', requireAuth, resolveSupportSession, requireTravelAcc
   } catch (err) {
     return sendResolverError(res, err, 'api/run/report');
   }
-  const id = createJob(title, await getRequestOrgId(req), req.user?.id);
+  // Security Slice T3D: resolved exactly once for this request; the same
+  // trusted value is used for job ownership AND propagated into the
+  // spawned report job's environment as JOBU_JOB_ORG_ID, which
+  // generate-report.js requires before it will resolve or list any team.
+  const orgId = await getRequestOrgId(req);
+  const id = createJob(title, orgId, req.user?.id);
   appendLog(id, `Generating scouting report for: ${team.team_name}`);
   if (req.body.gameLocation) appendLog(id, `Game location: ${req.body.gameLocation}`);
   if (req.body.gameTime)     appendLog(id, `Game time: ${req.body.gameTime}`);
   if (req.body.humanObservations) appendLog(id, `Coach observations provided (${req.body.humanObservations.length} chars)`);
   if (req.body.customPrompt)      appendLog(id, `Custom prompt provided (${req.body.customPrompt.length} chars)`);
-  const env = { ...buildReportContextEnv(req.body), ...buildUsageEnv(req, quota) };
+  const env = { ...buildReportContextEnv(req.body), ...buildUsageEnv(req, quota), JOBU_JOB_ORG_ID: orgId };
   spawnJob(id, 'node', ['src/generate-report.js', team.team_name], ROOT, env);
   res.json({ jobId: id });
 }));
@@ -1584,9 +1589,12 @@ app.post('/api/run/self-scout', requireAuth, resolveSupportSession, requireTrave
   } catch (err) {
     return sendResolverError(res, err, 'api/run/self-scout');
   }
-  const id = createJob('Self-Scout Report', await getRequestOrgId(req), req.user?.id);
+  // Security Slice T3D: see /api/run/report above for the same
+  // resolve-once-and-propagate rationale.
+  const orgId = await getRequestOrgId(req);
+  const id = createJob('Self-Scout Report', orgId, req.user?.id);
   appendLog(id, 'Generating self-scout report for our own team');
-  const env = { ...buildReportContextEnv({ ...req.body, gameScope: 'self' }), ...buildUsageEnv(req, quota) };
+  const env = { ...buildReportContextEnv({ ...req.body, gameScope: 'self' }), ...buildUsageEnv(req, quota), JOBU_JOB_ORG_ID: orgId };
   if (ownedOurTeamId) env.OUR_TEAM_ID = ownedOurTeamId;
   spawnJob(id, 'node', ['src/generate-report.js', '--self-scout'], ROOT, env);
   res.json({ jobId: id });
@@ -1616,9 +1624,12 @@ app.post('/api/run/matchup', requireAuth, resolveSupportSession, requireTravelAc
   } catch (err) {
     return sendResolverError(res, err, 'api/run/matchup');
   }
-  const id = createJob(`Matchup — ${team.team_name}`, await getRequestOrgId(req), req.user?.id);
+  // Security Slice T3D: see /api/run/report above for the same
+  // resolve-once-and-propagate rationale.
+  const orgId = await getRequestOrgId(req);
+  const id = createJob(`Matchup — ${team.team_name}`, orgId, req.user?.id);
   appendLog(id, `Generating matchup report: our team vs ${team.team_name}`);
-  const env = { ...buildReportContextEnv({ ...req.body, gameScope: 'matchup' }), ...buildUsageEnv(req, quota) };
+  const env = { ...buildReportContextEnv({ ...req.body, gameScope: 'matchup' }), ...buildUsageEnv(req, quota), JOBU_JOB_ORG_ID: orgId };
   if (ownedOurTeamId) env.OUR_TEAM_ID = ownedOurTeamId;
   spawnJob(id, 'node', ['src/generate-report.js', '--matchup', team.team_name], ROOT, env);
   res.json({ jobId: id });
@@ -1662,7 +1673,7 @@ app.post('/api/run/full-pipeline', requireAuth, resolveSupportSession, requireTr
       appendLog(id, '── Step 3/4: Reingest & Stats ──');
       await runStep('node', ['reingest-games.js', team.team_name], ROOT, { JOBU_JOB_ORG_ID: orgId });
       appendLog(id, '── Step 4/4: Generate Report ──');
-      const reportEnv = { ...buildReportContextEnv(req.body), ...buildUsageEnv(req, quota) };
+      const reportEnv = { ...buildReportContextEnv(req.body), ...buildUsageEnv(req, quota), JOBU_JOB_ORG_ID: orgId };
       await runStep('node', ['src/generate-report.js', team.team_name], ROOT, reportEnv);
       finishJob(id, true, 0);
       appendLog(id, `✓ Pipeline complete for ${team.team_name}`);
@@ -1744,7 +1755,11 @@ app.post('/api/run/all-pg', requireAuth, resolveSupportSession, requireTravelAcc
 app.post('/api/run/all-reports', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   const teams   = (await getTeams(req)).filter(t => t.game_count > 0);
   if (!teams.length) return res.status(400).json({ error: 'No teams with game data' });
-  const id      = createJob(`Reports All (${teams.length} teams)`, await getRequestOrgId(req), req.user?.id);
+  // Security Slice T3D: resolved exactly once for this request; the same
+  // trusted value is used for job ownership AND propagated into every
+  // spawned report job's environment as JOBU_JOB_ORG_ID below.
+  const orgId   = await getRequestOrgId(req);
+  const id      = createJob(`Reports All (${teams.length} teams)`, orgId, req.user?.id);
   const runStep = makeRunStep(id);
   appendLog(id, `Generating reports for ${teams.length} team(s)...`);
   (async () => {
@@ -1766,7 +1781,7 @@ app.post('/api/run/all-reports', requireAuth, resolveSupportSession, requireTrav
         break;
       }
       try {
-        await runStep('node', ['src/generate-report.js', team.team_name], ROOT, buildUsageEnv(req, quota));
+        await runStep('node', ['src/generate-report.js', team.team_name], ROOT, { ...buildUsageEnv(req, quota), JOBU_JOB_ORG_ID: orgId });
         appendLog(id, `✓ ${team.team_name} done`); done++;
       } catch (err) {
         appendLog(id, `✗ ${team.team_name} failed: ${err.message}`); failed++;
