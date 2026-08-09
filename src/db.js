@@ -1145,6 +1145,7 @@ function upsertPlayerGcSprayChart(teamId, entry) {
 
 module.exports = {
   init,
+  useSupabase,
   getDb,
   getRawBattingLines,
   // Teams

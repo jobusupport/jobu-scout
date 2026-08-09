@@ -1331,15 +1331,20 @@ registerTravelJobRoutes(app, {
 // POST /api/run/gc-scraper
 app.post('/api/run/gc-scraper', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   await assertOrgActive(req);
+  // Security Slice T2: resolved exactly once for this request; the same
+  // trusted value is used for job ownership AND, below, propagated into
+  // the spawned scraper's environment as JOBU_JOB_ORG_ID. Never sourced
+  // from req.body/req.query/req.headers.
+  const orgId = await getRequestOrgId(req);
   const team = (await getTeams(req)).find(t => t.id == req.body.teamId);
   if (!team) return res.status(404).json({ error: 'Team not found' });
-  const id = createJob(`Analyze Opponent's Games — ${team.team_name}`, await getRequestOrgId(req), req.user?.id);
+  const id = createJob(`Analyze Opponent's Games — ${team.team_name}`, orgId, req.user?.id);
   appendLog(id, `Starting opponent's-games analysis for: ${team.team_name}`);
   if (!team.gc_team_url && await hasGameUrls(team.id)) {
     appendLog(id, `No team URL — analyzing via individual game URLs`);
     spawnJob(id, 'node', ['src/scrape-game-urls.js', `"${cleanTeamName(team.team_name)}"`], ROOT);
   } else {
-    const env = {};
+    const env = { JOBU_JOB_ORG_ID: orgId };
     if (team.gc_team_url) env.GC_TEAM_URL = team.gc_team_url;
     env.GC_TEST_TEAM_CONTAINS = team.gc_search_name || team.team_name;
     spawnJob(id, 'node', ['src/search-gamechanger-teams.js'], ROOT, env);
@@ -1362,11 +1367,16 @@ app.post('/api/run/pg-scraper', requireAuth, resolveSupportSession, requireTrave
 // POST /api/run/reingest
 app.post('/api/run/reingest', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
   await assertOrgActive(req);
+  // Security Slice T2: resolved exactly once for this request; the same
+  // trusted value is used for job ownership AND propagated into the
+  // spawned reingest process's environment as JOBU_JOB_ORG_ID.
+  const orgId = await getRequestOrgId(req);
   const team  = req.body.teamId ? (await getTeams(req)).find(t => t.id == req.body.teamId) : null;
   const label = team ? `Reingest — ${team.team_name}` : 'Reingest — All Teams';
-  const id    = createJob(label, await getRequestOrgId(req), req.user?.id);
+  const id    = createJob(label, orgId, req.user?.id);
   appendLog(id, label);
-  spawnJob(id, 'node', team ? ['reingest-games.js', team.team_name] : ['reingest-games.js', '--all'], ROOT);
+  const env = { JOBU_JOB_ORG_ID: orgId };
+  spawnJob(id, 'node', team ? ['reingest-games.js', team.team_name] : ['reingest-games.js', '--all'], ROOT, env);
   res.json({ jobId: id });
 }));
 
@@ -1457,7 +1467,12 @@ app.post('/api/run/full-pipeline', requireAuth, resolveSupportSession, requireTr
   } catch (err) {
     return sendResolverError(res, err, 'api/run/full-pipeline');
   }
-  const id      = createJob(`Full Pipeline — ${team.team_name}`, await getRequestOrgId(req), req.user?.id);
+  // Security Slice T2: resolved exactly once for this request; the same
+  // trusted value is used for job ownership AND propagated into every
+  // spawned step's environment that touches team creation/resolution
+  // (steps 1 and 3, below) as JOBU_JOB_ORG_ID.
+  const orgId   = await getRequestOrgId(req);
+  const id      = createJob(`Full Pipeline — ${team.team_name}`, orgId, req.user?.id);
   const pgRoot  = path.join(ROOT, 'perfectgame-scraper');
   const noGC    = !team.gc_team_url && await hasGameUrls(team.id);
   const runStep = makeRunStep(id);
@@ -1469,7 +1484,7 @@ app.post('/api/run/full-pipeline', requireAuth, resolveSupportSession, requireTr
       if (noGC) {
         await runStep('node', ['src/scrape-game-urls.js', `"${cleanTeamName(team.team_name)}"`], ROOT);
       } else {
-        const gcEnv = {};
+        const gcEnv = { JOBU_JOB_ORG_ID: orgId };
         if (team.gc_team_url) gcEnv.GC_TEAM_URL = team.gc_team_url;
         gcEnv.GC_TEST_TEAM_CONTAINS = team.gc_search_name || team.team_name;
         await runStep('node', ['src/search-gamechanger-teams.js'], ROOT, gcEnv);
@@ -1477,7 +1492,7 @@ app.post('/api/run/full-pipeline', requireAuth, resolveSupportSession, requireTr
       appendLog(id, "── Step 2/4: Analyze Opponent's Players ──");
       await runStep('node', ['perfectgame-scraper.js', team.pg_team_url || '', team.team_name], pgRoot);
       appendLog(id, '── Step 3/4: Reingest & Stats ──');
-      await runStep('node', ['reingest-games.js', team.team_name], ROOT);
+      await runStep('node', ['reingest-games.js', team.team_name], ROOT, { JOBU_JOB_ORG_ID: orgId });
       appendLog(id, '── Step 4/4: Generate Report ──');
       const reportEnv = { ...buildReportContextEnv(req.body), ...buildUsageEnv(req, quota) };
       await runStep('node', ['src/generate-report.js', team.team_name], ROOT, reportEnv);
@@ -1498,7 +1513,11 @@ app.post('/api/run/all-gc', requireAuth, resolveSupportSession, requireTravelAcc
   const teamsWithUrlFlags = await Promise.all(allTeams.map(async t => ({ ...t, _hasGameUrls: await hasGameUrls(t.id) })));
   const teams   = teamsWithUrlFlags.filter(t => t.gc_team_url || t._hasGameUrls);
   if (!teams.length) return res.status(400).json({ error: 'No teams with GC URLs or game URLs' });
-  const id      = createJob(`Analyze Opponent's Games — All (${teams.length} teams)`, await getRequestOrgId(req), req.user?.id);
+  // Security Slice T2: resolved exactly once for this request; the same
+  // trusted value is used for job ownership AND propagated into every
+  // spawned scraper's environment below as JOBU_JOB_ORG_ID.
+  const orgId   = await getRequestOrgId(req);
+  const id      = createJob(`Analyze Opponent's Games — All (${teams.length} teams)`, orgId, req.user?.id);
   const runStep = makeRunStep(id);
   appendLog(id, `Queuing opponent's-games analysis for ${teams.length} team(s)...`);
   (async () => {
@@ -1510,7 +1529,7 @@ app.post('/api/run/all-gc', requireAuth, resolveSupportSession, requireTravelAcc
         if (!team.gc_team_url && team._hasGameUrls) {
           await runStep('node', ['src/scrape-game-urls.js', `"${cleanTeamName(team.team_name)}"`], ROOT);
         } else {
-          const env = {};
+          const env = { JOBU_JOB_ORG_ID: orgId };
           if (team.gc_team_url) env.GC_TEAM_URL = team.gc_team_url;
           env.GC_TEST_TEAM_CONTAINS = team.gc_search_name || team.team_name;
           await runStep('node', ['src/search-gamechanger-teams.js'], ROOT, env);

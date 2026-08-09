@@ -15,6 +15,7 @@
  */
 
 const { createClient } = require('@supabase/supabase-js');
+const { OrgContextRequiredError } = require('./org-context-errors');
 
 let _supabase = null;
 
@@ -123,30 +124,21 @@ async function getOrgIdForTeam(teamId) {
   return data.org_id;
 }
 
-async function getSingleOrgIdFallback() {
-  for (const tableName of ['orgs', 'organizations']) {
-    try {
-      const { data, error } = await getDb().from(tableName).select('id').limit(2);
-      if (isMissingColumnError(error, 'id')) continue;
-      if (error) {
-        const msg = String(error.message || '').toLowerCase();
-        if (msg.includes('could not find the table') || msg.includes('does not exist')) continue;
-        check(error, `${tableName} single-org fallback`);
-      }
-      if (Array.isArray(data) && data.length === 1 && data[0]?.id) return data[0].id;
-    } catch (err) {
-      const msg = String(err.message || '').toLowerCase();
-      if (msg.includes('does not exist') || msg.includes('could not find the table')) continue;
-      throw err;
-    }
-  }
-  return null;
-}
-
+// Security Slice T2: there is deliberately no "only one organization"
+// inference here (a prior getSingleOrgIdFallback did this and is why the
+// Travel tenant-isolation defect existed -- see security/
+// travel-tenant-isolation-write-path). The caller must supply an
+// already-verified team.orgId/team.org_id; anything else fails closed
+// before any query runs, regardless of how many organizations exist.
 async function resolveOrgIdForTeamUpsert(team) {
-  const provided = normalizeNullable(team.orgId || team.org_id);
-  if (provided) return provided;
-  return await getSingleOrgIdFallback();
+  const provided = normalizeNullable(team && (team.orgId || team.org_id));
+  if (!provided) {
+    throw new OrgContextRequiredError(
+      'resolveOrgIdForTeamUpsert requires team.orgId (or team.org_id) -- there is no ' +
+      'organization fallback. The caller must supply an already-verified organization id.'
+    );
+  }
+  return provided;
 }
 
 async function addOrgIdIfSupported(tableName, payload, orgId) {
@@ -265,8 +257,20 @@ function getProvidedBoolean(input, camelName, snakeName) {
   return null;
 }
 
+// Security Slice T2: an unscoped team lookup is never permitted, even
+// when the caller believes there is only one organization in the system
+// -- that exact assumption is what let one organization's scrape silently
+// reuse and overwrite a different organization's team row (see
+// resolveOrgIdForTeamUpsert's comment above). This throws before the
+// query is built rather than returning it unscoped, so findExistingTeam
+// cannot accidentally proceed without the filter.
 function applyOrgScope(query, params) {
-  return params.org_id ? query.eq('org_id', params.org_id) : query;
+  if (!params || !params.org_id) {
+    throw new OrgContextRequiredError(
+      'applyOrgScope requires params.org_id -- refusing to run an unscoped team lookup.'
+    );
+  }
+  return query.eq('org_id', params.org_id);
 }
 
 async function findExistingTeam(sb, params) {
