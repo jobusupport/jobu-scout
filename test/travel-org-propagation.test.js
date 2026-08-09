@@ -25,6 +25,7 @@ const path = require('path');
 const SERVER_SRC = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
 const SCRAPER_SRC = fs.readFileSync(path.join(__dirname, '..', 'src', 'search-gamechanger-teams.js'), 'utf8');
 const REINGEST_SRC = fs.readFileSync(path.join(__dirname, '..', 'reingest-games.js'), 'utf8');
+const GENERATE_REPORT_SRC = fs.readFileSync(path.join(__dirname, '..', 'src', 'generate-report.js'), 'utf8');
 
 function extractRouteBlock(source, marker) {
   const startIdx = source.indexOf(marker);
@@ -45,6 +46,11 @@ const ROUTES = [
   { name: 'reingest', marker: "app.post('/api/run/reingest'" },
   { name: 'full-pipeline', marker: "app.post('/api/run/full-pipeline'" },
   { name: 'all-gc', marker: "app.post('/api/run/all-gc'" },
+  // Security Slice T3D: the report-generation trigger routes.
+  { name: 'report', marker: "app.post('/api/run/report'" },
+  { name: 'self-scout', marker: "app.post('/api/run/self-scout'" },
+  { name: 'matchup', marker: "app.post('/api/run/matchup'" },
+  { name: 'all-reports', marker: "app.post('/api/run/all-reports'" },
 ];
 
 for (const { name, marker } of ROUTES) {
@@ -240,4 +246,126 @@ test('reingest-games.js: team matching and summary formatting are delegated to t
   assert.doesNotMatch(REINGEST_SRC, /existingTeams\.find\(/, 'the matching predicate must not be duplicated inline via existingTeams.find(...) in reingest-games.js');
   assert.doesNotMatch(REINGEST_SRC, /t\.team_name\.toLowerCase\(\)\.includes\(/, 'the team_name matching predicate must not be duplicated inline in reingest-games.js');
   assert.doesNotMatch(REINGEST_SRC, /`\s*\[\$\{t\.id\}\]/, 'the summary-line template must not be duplicated inline in reingest-games.js');
+});
+
+// ── Security Slice T3D: generate-report.js team resolution is scoped ────────
+//
+// generate-report.js previously resolved a coach-supplied team name/id
+// (findTeam), listed every team (listTeams/--list), and iterated every
+// team (--all) via the completely unscoped db.getAllTeams() -- a report
+// job for one organization could select, enumerate, or generate a report
+// for another organization's team. These tests prove all three call sites
+// now use the tenant-scoped src/db.js#listTeamsForOrg instead, that the
+// unscoped getAllTeams() is gone from this file entirely, that the job's
+// own JOBU_JOB_ORG_ID contract is validated (not just "present") before
+// any database access, and that every HTTP/background route that spawns
+// this script propagates JOBU_JOB_ORG_ID into its environment.
+
+test('generate-report.js: db.getAllTeams() is no longer called anywhere in this file', () => {
+  assert.doesNotMatch(GENERATE_REPORT_SRC, /db\.getAllTeams\(/, 'the unscoped global team query must not remain');
+});
+
+test('generate-report.js: all three team-discovery call sites (listTeams, findTeam, --all) use the ' +
+     'tenant-scoped db.listTeamsForOrg(JOB_ORG_ID)', () => {
+  const calls = GENERATE_REPORT_SRC.match(/db\.listTeamsForOrg\(JOB_ORG_ID\)/g) || [];
+  assert.equal(calls.length, 3, 'expected exactly three scoped calls: listTeams, findTeam, and the --all branch');
+});
+
+test('generate-report.js: requires job org context and validates it against the established UUID ' +
+     'contract before db.init() or any team query', () => {
+  assert.match(GENERATE_REPORT_SRC, /require\(['"]\.\/job-org-context['"]\)/, 'must reuse the shared job-org-context contract, not a new ad-hoc env read');
+  assert.match(GENERATE_REPORT_SRC, /const JOB_ORG_ID = requireJobOrgContext\(\)/);
+  assert.match(GENERATE_REPORT_SRC, /require\(['"]\.\/report-access['"]\)/, 'must reuse the existing isValidUuid helper, not a new ad-hoc regex');
+  assert.match(GENERATE_REPORT_SRC, /if\s*\(!isValidUuid\(JOB_ORG_ID\)\)/);
+
+  const jobOrgIdAssignIdx = GENERATE_REPORT_SRC.indexOf('const JOB_ORG_ID = requireJobOrgContext()');
+  const uuidCheckIdx = GENERATE_REPORT_SRC.indexOf('if (!isValidUuid(JOB_ORG_ID))');
+  const dbInitIdx = GENERATE_REPORT_SRC.indexOf('db.init(DB_PATH)');
+  const firstListTeamsIdx = GENERATE_REPORT_SRC.indexOf('db.listTeamsForOrg(JOB_ORG_ID)');
+
+  assert.ok(jobOrgIdAssignIdx !== -1 && uuidCheckIdx !== -1 && dbInitIdx !== -1 && firstListTeamsIdx !== -1);
+  assert.ok(jobOrgIdAssignIdx < uuidCheckIdx, 'the raw env value must be resolved before its format is validated');
+  assert.ok(uuidCheckIdx < dbInitIdx, 'format validation must happen before db.init()');
+  assert.ok(uuidCheckIdx < firstListTeamsIdx, 'format validation must happen before any team query');
+});
+
+test('generate-report.js: a malformed JOBU_JOB_ORG_ID fails closed (exits) rather than proceeding with ' +
+     'an unscoped or empty filter', () => {
+  const uuidCheckIdx = GENERATE_REPORT_SRC.indexOf('if (!isValidUuid(JOB_ORG_ID))');
+  const nextExitIdx = GENERATE_REPORT_SRC.indexOf('process.exit(1)', uuidCheckIdx);
+  assert.ok(uuidCheckIdx !== -1 && nextExitIdx !== -1 && nextExitIdx - uuidCheckIdx < 200,
+    'the malformed-org-id branch must exit(1) immediately, not fall through');
+});
+
+test('generate-report.js: team matching and list/ambiguity formatting are delegated to the REAL, ' +
+     'independently-tested src/report-team-selection.js -- not an inline duplicate predicate or template ' +
+     '(see test/report-team-selection.test.js and test/db-supabase-tenant-isolation.test.js for the ' +
+     'executable proof of their behavior)', () => {
+  assert.match(GENERATE_REPORT_SRC, /require\(['"]\.\/report-team-selection['"]\)/, 'must import the extracted helpers module');
+  assert.match(GENERATE_REPORT_SRC, /resolveTeamMatch\s*,\s*formatTeamListLine\s*,\s*formatAmbiguousMatchLine/, 'must destructure all three helpers from that module');
+
+  assert.match(GENERATE_REPORT_SRC, /resolveTeamMatch\(teams,\s*nameFragment\)/, 'findTeam must call the real matcher, not an inline .find(...)/.filter(...)');
+  assert.match(GENERATE_REPORT_SRC, /console\.log\(formatTeamListLine\(t,\s*games\)\)/, 'listTeams must call the real list-line formatter, not an inline template literal');
+  assert.match(GENERATE_REPORT_SRC, /console\.log\(formatAmbiguousMatchLine\(m\)\)/, 'the ambiguous-match loop must call the real formatter, not an inline template literal');
+
+  // No inline reimplementation of the matching predicate may remain --
+  // the exact-id/exact-name/partial-name logic must live only in
+  // src/report-team-selection.js.
+  assert.doesNotMatch(GENERATE_REPORT_SRC, /teams\.find\(t\s*=>\s*normalize/, 'the id-matching predicate must not be duplicated inline in generate-report.js');
+  assert.doesNotMatch(GENERATE_REPORT_SRC, /teams\.filter\(t\s*=>/, 'the exact/partial-name matching predicate must not be duplicated inline in generate-report.js');
+});
+
+test('generate-report.js: the job org id value is never interpolated into a console.log/console.error call', () => {
+  const loggingLines = GENERATE_REPORT_SRC.split('\n').filter((l) => /console\.(log|error|warn)\(/.test(l));
+  for (const line of loggingLines) {
+    assert.doesNotMatch(line, /\$\{JOB_ORG_ID\}/, `console output must never include the org id value: "${line.trim()}"`);
+  }
+});
+
+test('server.js: every route that spawns src/generate-report.js propagates JOBU_JOB_ORG_ID into its ' +
+     'environment (report, self-scout, matchup, full-pipeline step 4, all-reports)', () => {
+  // Matches only an actual spawnJob/runStep argument array literal (e.g.
+  // ['src/generate-report.js', ...]), not a prose comment mentioning the
+  // filename.
+  const spawnLines = SERVER_SRC.split('\n').filter((l) => /\[['"]src\/generate-report\.js['"]/.test(l));
+  assert.equal(spawnLines.length, 5, `expected exactly 5 generate-report.js spawn sites, found ${spawnLines.length}`);
+
+  // Each spawn call's env argument is built on the line(s) immediately
+  // above it (env / reportEnv) -- checked directly against the known
+  // route blocks rather than by proximity heuristics, since two spawn
+  // sites (full-pipeline, all-reports) build their env expression across
+  // more than one statement.
+  const reportBlock      = extractRouteBlock(SERVER_SRC, "app.post('/api/run/report'");
+  const selfScoutBlock   = extractRouteBlock(SERVER_SRC, "app.post('/api/run/self-scout'");
+  const matchupBlock     = extractRouteBlock(SERVER_SRC, "app.post('/api/run/matchup'");
+  const fullPipelineBlock = extractRouteBlock(SERVER_SRC, "app.post('/api/run/full-pipeline'");
+  const allReportsBlock  = extractRouteBlock(SERVER_SRC, "app.post('/api/run/all-reports'");
+
+  for (const [label, block] of [
+    ['report', reportBlock],
+    ['self-scout', selfScoutBlock],
+    ['matchup', matchupBlock],
+    ['full-pipeline', fullPipelineBlock],
+    ['all-reports', allReportsBlock],
+  ]) {
+    assert.match(block, /JOBU_JOB_ORG_ID:\s*orgId/, `${label}: env passed to generate-report.js must include JOBU_JOB_ORG_ID: orgId`);
+    assert.match(block, /\[['"]src\/generate-report\.js['"]/, `${label}: sanity check -- this block must actually spawn generate-report.js`);
+  }
+
+  // full-pipeline and all-reports build their env in a separate statement
+  // from the spawn call itself (reportEnv / the inline object literal) --
+  // pin those two down precisely so a future edit can't silently detach
+  // the JOBU_JOB_ORG_ID-bearing env from the generate-report.js spawn.
+  assert.match(fullPipelineBlock, /JOBU_JOB_ORG_ID:\s*orgId\s*\};\s*\r?\n\s*await runStep\('node', \['src\/generate-report\.js'/, 'full-pipeline step 4: reportEnv (with JOBU_JOB_ORG_ID) must be the object passed to the generate-report.js runStep call');
+  assert.match(allReportsBlock, /runStep\('node', \['src\/generate-report\.js', team\.team_name\], ROOT, \{ \.\.\.buildUsageEnv\(req, quota\), JOBU_JOB_ORG_ID: orgId \}\)/, 'all-reports route');
+});
+
+test('server.js: --all is never passed to generate-report.js from any HTTP/background route -- ' +
+     '"all teams for this organization" is expressed by looping getTeams(req) (already org-scoped) and ' +
+     'calling generate-report.js once per team, never by an org-less --all invocation', () => {
+  const generateReportInvocations = SERVER_SRC.match(/\[['"]src\/generate-report\.js['"][^\]]*\]/g) || [];
+  assert.ok(generateReportInvocations.length > 0, 'sanity check: this file does spawn generate-report.js somewhere');
+  for (const invocation of generateReportInvocations) {
+    assert.doesNotMatch(invocation, /--all|-a['"]/, `generate-report.js must never be invoked with --all from server.js: "${invocation}"`);
+  }
 });

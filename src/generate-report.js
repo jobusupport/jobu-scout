@@ -32,10 +32,27 @@ const db       = require('./db');
 const analyzer = require('./analyzer');
 const report   = require('./report');
 const { isValidUuid, resolveReportOutputDir } = require('./report-access');
+const { requireJobOrgContext } = require('./job-org-context');
+const { resolveTeamMatch, formatTeamListLine, formatAmbiguousMatchLine } = require('./report-team-selection');
 
 const DB_PATH     = path.join(__dirname, '..', 'voodoo-scout.db');
 const REPORTS_DIR = process.env.REPORTS_DIR || path.join(__dirname, '..', 'reports');
 const OUR_TEAM_ID = process.env.OUR_TEAM_ID || '489f5656-205a-49a5-a3de-d1c8c3f226b6';
+
+// Security Slice T3D: resolved and validated before ANY database access
+// (including db.init() below) -- this is the single trusted organization
+// every team lookup in this file is scoped to. Fails closed (throws
+// OrgContextRequiredError, an uncaught exception that exits the process
+// non-zero) if the server (or a trusted operator, for a bare CLI run) did
+// not set JOBU_JOB_ORG_ID. There is no fallback to "the only
+// organization," a client-supplied value, or a team-derived guess -- see
+// src/job-org-context.js and reingest-games.js, which establish this same
+// contract for the reingestion job.
+const JOB_ORG_ID = requireJobOrgContext();
+if (!isValidUuid(JOB_ORG_ID)) {
+  console.error('[report] JOBU_JOB_ORG_ID is not a valid organization id. Refusing to run.');
+  process.exit(1);
+}
 
 // Security Slice T3B: when this process is spawned by a server.js HTTP
 // route, JOBU_USAGE_ORG_ID / JOBU_USAGE_REPORT_ID are already set (see
@@ -55,17 +72,21 @@ const OUR_TEAM_ID = process.env.OUR_TEAM_ID || '489f5656-205a-49a5-a3de-d1c8c3f2
 // A bare CLI operator invocation (no HTTP job) has neither env var set:
 // it keeps writing to the flat REPORTS_DIR exactly as before, and there
 // is no `reports` row to update in that case either, so the DB update is
-// skipped entirely rather than attempted-and-failed. This does not change
-// team/organization RESOLUTION in any way -- that remains exactly as it
-// was before this slice (a separate, already-tracked follow-up).
+// skipped entirely rather than attempted-and-failed. Kept as a separate
+// USAGE_ORG_ID (distinct from the JOB_ORG_ID team-scoping context above,
+// which T3D introduces) -- these two ids are populated by server.js from
+// the same trusted getRequestOrgId(req)/quota.orgId source and are
+// expected to always agree for an HTTP-spawned job, but this file never
+// assumes that; each is used only for its own, already-established
+// purpose.
 function normalizeUuid(value) {
   return isValidUuid(value) ? value : null;
 }
 
-const JOB_ORG_ID    = normalizeUuid(process.env.JOBU_USAGE_ORG_ID);
+const USAGE_ORG_ID  = normalizeUuid(process.env.JOBU_USAGE_ORG_ID);
 const JOB_REPORT_ID = normalizeUuid(process.env.JOBU_USAGE_REPORT_ID);
 
-const OUTPUT_DIR = resolveReportOutputDir(REPORTS_DIR, JOB_ORG_ID, JOB_REPORT_ID) || REPORTS_DIR;
+const OUTPUT_DIR = resolveReportOutputDir(REPORTS_DIR, USAGE_ORG_ID, JOB_REPORT_ID) || REPORTS_DIR;
 
 // Records the outcome of a report generation attempt onto the report's
 // own `reports` row (status/storage_path/generated_at on success,
@@ -74,7 +95,7 @@ const OUTPUT_DIR = resolveReportOutputDir(REPORTS_DIR, JOB_ORG_ID, JOB_REPORT_ID
 // A bookkeeping failure here is logged but never allowed to crash an
 // otherwise-successful (or already-failed) report run.
 async function recordReportOutcome({ status, pdfPath, errorMessage }) {
-  if (!JOB_ORG_ID || !JOB_REPORT_ID) return;
+  if (!USAGE_ORG_ID || !JOB_REPORT_ID) return;
   if (typeof db.useSupabase !== 'function' || !db.useSupabase()) return;
 
   const patch = { status };
@@ -92,7 +113,7 @@ async function recordReportOutcome({ status, pdfPath, errorMessage }) {
       .from('reports')
       .update(patch)
       .eq('id', JOB_REPORT_ID)
-      .eq('org_id', JOB_ORG_ID);
+      .eq('org_id', USAGE_ORG_ID);
     if (error) console.error('[report] Failed to record report outcome:', error.message);
   } catch (err) {
     console.error('[report] Failed to record report outcome:', err.message);
@@ -134,12 +155,19 @@ if (analyzerOptions.customPrompt)      console.log(`[report] Custom prompt provi
 
 db.init(DB_PATH);
 
-function normalize(value) {
-  return String(value || '').toLowerCase().trim();
-}
+// Security Slice T3D: both team-discovery call sites below (and the
+// --all branch in main()) resolve teams exclusively through the
+// tenant-scoped listTeamsForOrg query (see src/db-supabase.js), the
+// scoped counterpart to the previously-used unscoped global team query --
+// so a report job for one organization can never resolve, list, or
+// process a different organization's team, whether by exact id, exact
+// name, partial name, or ambiguous-match/list output. Matching and
+// formatting logic itself lives in the pure, independently tested
+// src/report-team-selection.js so no inline duplicate predicate or log
+// template exists in this file.
 
 async function listTeams() {
-  const teams = await db.getAllTeams();
+  const teams = await db.listTeamsForOrg(JOB_ORG_ID);
 
   if (!Array.isArray(teams) || !teams.length) {
     console.log('\nNo teams in database yet. Run team analysis first.\n');
@@ -160,44 +188,26 @@ async function listTeams() {
       continue;
     }
 
-    console.log(`  [${t.id}] ${t.team_name} — ${games} game${games !== 1 ? 's' : ''}`);
+    console.log(formatTeamListLine(t, games));
   }
 
   console.log('');
 }
 
 async function findTeam(nameFragment) {
-  const teams = await db.getAllTeams();
+  const teams = await db.listTeamsForOrg(JOB_ORG_ID);
 
   if (!Array.isArray(teams)) {
-    throw new Error(`db.getAllTeams() did not return an array. Got: ${typeof teams}`);
+    throw new Error(`db.listTeamsForOrg() did not return an array. Got: ${typeof teams}`);
   }
 
-  const lower = normalize(nameFragment);
-
-  const byId = teams.find(t => normalize(t.id) === lower);
-  if (byId) return byId;
-
-  const exactMatches = teams.filter(t =>
-    normalize(t.team_name) === lower ||
-    normalize(t.raw_team_name) === lower
-  );
-
-  if (exactMatches.length === 1) return exactMatches[0];
-
-  const partialMatches = teams.filter(t =>
-    normalize(t.team_name).includes(lower) ||
-    normalize(t.raw_team_name).includes(lower)
-  );
-
-  const matches = exactMatches.length ? exactMatches : partialMatches;
-
-  if (matches.length === 1) return matches[0];
+  const { team, matches } = resolveTeamMatch(teams, nameFragment);
+  if (team) return team;
 
   if (matches.length > 1) {
     console.log(`\nMultiple teams match "${nameFragment}":`);
     for (const m of matches) {
-      console.log(`  [${m.id}] ${m.team_name}`);
+      console.log(formatAmbiguousMatchLine(m));
     }
     console.log('\nBe more specific or use the team ID.\n');
     process.exit(1);
@@ -313,7 +323,7 @@ async function main() {
   }
 
   if (args.includes('--all') || args.includes('-a')) {
-    const teams = await db.getAllTeams();
+    const teams = await db.listTeamsForOrg(JOB_ORG_ID);
 
     if (!Array.isArray(teams) || !teams.length) {
       console.log('\nNo teams in database. Run team analysis first.\n');

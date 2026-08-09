@@ -41,6 +41,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { findMatchingTeam, formatTeamSummaryLine } = require('../src/reingest-helpers');
+const { resolveTeamMatch, formatTeamListLine, formatAmbiguousMatchLine } = require('../src/report-team-selection');
 
 const SUPABASE_JS_PATH = require.resolve('@supabase/supabase-js');
 const DB_SUPABASE_PATH = require.resolve('../src/db-supabase');
@@ -484,5 +485,176 @@ test('formatTeamSummaryLine: zero scoped teams produces a safe, empty summary --
 
     assert.deepEqual(orgATeams, [], 'an org with no teams of its own gets an empty result, not org B\'s teams');
     assert.deepEqual(captured, [], 'zero teams must produce zero summary lines -- no global fallback output');
+  });
+});
+
+// ── Security Slice T3D: report-generation team resolution ───────────────────
+//
+// generate-report.js previously resolved a coach-supplied team name/id
+// (findTeam), listed every team (listTeams/--list), and iterated every
+// team (--all) via the completely unscoped db.getAllTeams() -- a tenant
+// could select, enumerate, or generate a report for another
+// organization's team by exact id, exact/raw name, partial name, or an
+// ambiguous-match/not-found listing. These tests prove the REAL
+// src/report-team-selection.js#resolveTeamMatch (the exact function
+// generate-report.js#findTeam calls) can only ever resolve to
+// organization A's own team when fed a REAL db.listTeamsForOrg(ORG_A)
+// result, even when organization B has an identically-named, identical-id-
+// colliding-by-guess, or substring-colliding team -- because organization
+// B's row is never present in the input list to begin with.
+
+test('resolveTeamMatch (REAL src/report-team-selection.js): organization B\'s team can never be selected ' +
+     'by its own exact id during an organization A run', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    const orgBTeamId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_B, teamName: 'Org B Tigers' }));
+    await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A, teamName: 'Org A Tigers' }));
+
+    const orgATeams = await dbSupabase.listTeamsForOrg(ORG_A);
+
+    const { team: matched } = resolveTeamMatch(orgATeams, orgBTeamId);
+    assert.equal(matched, null, 'org A must never be able to select org B\'s team by its real id');
+  });
+});
+
+test('resolveTeamMatch (REAL src/report-team-selection.js): an IDENTICALLY-named team in org B is never ' +
+     'selected for org A -- exclusion comes from listTeamsForOrg\'s org_id scoping, not from resolveTeamMatch', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    const orgBTeamId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_B, teamName: 'FS Bulldogs' }));
+    const orgATeamId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A, teamName: 'FS Bulldogs' }));
+
+    const orgATeams = await dbSupabase.listTeamsForOrg(ORG_A);
+    assert.equal(orgATeams.length, 1, 'org A must see exactly one "FS Bulldogs", never two');
+
+    const { team: matched } = resolveTeamMatch(orgATeams, 'FS Bulldogs');
+    assert.ok(matched, 'org A\'s own identically-named team must still resolve');
+    assert.equal(matched.id, orgATeamId);
+    assert.notEqual(matched.id, orgBTeamId);
+
+    // Negative control: resolveTeamMatch has no org filtering of its own --
+    // fed org B's row directly, it WOULD match it, proving isolation is
+    // listTeamsForOrg's property, not resolveTeamMatch's.
+    const { team: matchedAgainstOrgB } = resolveTeamMatch([{ id: orgBTeamId, team_name: 'FS Bulldogs' }], 'FS Bulldogs');
+    assert.equal(matchedAgainstOrgB.id, orgBTeamId, 'sanity: resolveTeamMatch matches whatever list it is given');
+  });
+});
+
+test('resolveTeamMatch (REAL src/report-team-selection.js): a substring-colliding org B team never ' +
+     'participates in org A\'s partial-name match or ambiguity calculation', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    // Both organizations have a team whose name contains "Clemens" -- if
+    // listTeamsForOrg ever leaked org B's row, this query would become
+    // ambiguous (2 matches) instead of resolving cleanly to org A's team.
+    await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_B, teamName: 'James Clemens Travel' }));
+    const orgATeamId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A, teamName: 'James Clemens Baseball' }));
+
+    const orgATeams = await dbSupabase.listTeamsForOrg(ORG_A);
+    assert.equal(orgATeams.length, 1);
+
+    const { team: matched, matches } = resolveTeamMatch(orgATeams, 'clemens');
+    assert.ok(matched, 'a single unambiguous match within org A\'s own scope must still resolve');
+    assert.equal(matched.id, orgATeamId);
+    assert.equal(matches.length, 1, 'org B\'s substring-colliding team must never inflate the match/ambiguity count');
+  });
+});
+
+test('resolveTeamMatch (REAL src/report-team-selection.js): ambiguity is calculated only among organization ' +
+     'A\'s own teams -- an org B team with a colliding partial name never appears in the ambiguous-match list', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    const orgATeamId1 = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A, teamName: 'James Clemens A' }));
+    const orgATeamId2 = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A, teamName: 'James Clemens B' }));
+    const orgBTeamId  = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_B, teamName: 'James Clemens C' }));
+
+    const orgATeams = await dbSupabase.listTeamsForOrg(ORG_A);
+
+    const { team: matched, matches } = resolveTeamMatch(orgATeams, 'james clemens');
+    assert.equal(matched, null, 'two org A candidates must be ambiguous, not silently resolved');
+    assert.equal(matches.length, 2, 'exactly org A\'s two matching teams, never org B\'s third');
+    const matchedIds = matches.map((m) => m.id);
+    assert.ok(matchedIds.includes(orgATeamId1) && matchedIds.includes(orgATeamId2));
+    assert.ok(!matchedIds.includes(orgBTeamId), 'org B\'s colliding team must never appear in the ambiguous list');
+  });
+});
+
+test('resolveTeamMatch (REAL src/report-team-selection.js): organization A with zero teams never broadens ' +
+     'to organization B\'s teams, even when the query is org B\'s own team name or id', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    const orgBTeamId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_B, teamName: 'Org B Only Team' }));
+
+    const orgATeams = await dbSupabase.listTeamsForOrg(ORG_A);
+    assert.deepEqual(orgATeams, []);
+
+    const byName = resolveTeamMatch(orgATeams, 'Org B Only Team');
+    assert.equal(byName.team, null);
+    assert.deepEqual(byName.matches, []);
+
+    const byId = resolveTeamMatch(orgATeams, orgBTeamId);
+    assert.equal(byId.team, null);
+  });
+});
+
+test('formatTeamListLine / formatAmbiguousMatchLine (REAL src/report-team-selection.js): capturing actual ' +
+     'console output built from a REAL listTeamsForOrg(ORG_A) result never emits org B\'s org id, team id, ' +
+     'team name, or GameChanger URL -- and never emits a GameChanger URL for org A\'s own team either', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    await dbSupabase.upsertTeam(syntheticTeam({
+      orgId: ORG_B,
+      teamName: 'FS Bulldogs', // identical name to org A's team below
+      gcTeamUrl: 'https://gc.example.test/org-b-secret-team-slug',
+    }));
+    const orgATeamId = await dbSupabase.upsertTeam(syntheticTeam({
+      orgId: ORG_A,
+      teamName: 'FS Bulldogs',
+      gcTeamUrl: 'https://gc.example.test/org-a-team-slug',
+    }));
+
+    const orgATeams = await dbSupabase.listTeamsForOrg(ORG_A);
+
+    const captured = [];
+    const originalLog = console.log;
+    console.log = (...args) => { captured.push(args.join(' ')); };
+    try {
+      // Mirrors generate-report.js#listTeams()'s own loop.
+      for (const t of orgATeams) {
+        console.log(formatTeamListLine(t, 0));
+      }
+      // Mirrors generate-report.js#findTeam()'s own ambiguous-match loop,
+      // fed the (deliberately) colliding query so both organizations'
+      // rows would appear here if listTeamsForOrg ever leaked org B's.
+      const { matches } = resolveTeamMatch(orgATeams, 'fs bulldogs');
+      for (const m of matches) {
+        console.log(formatAmbiguousMatchLine(m));
+      }
+    } finally {
+      console.log = originalLog;
+    }
+
+    const output = captured.join('\n');
+    assert.equal(orgATeams.length, 1);
+    assert.doesNotMatch(output, new RegExp(ORG_B), 'org B\'s organization id must never appear in captured output');
+    assert.doesNotMatch(output, /org-b-secret-team-slug/, 'org B\'s GameChanger URL must never appear in captured output');
+    assert.doesNotMatch(output, /org-a-team-slug/, 'no GameChanger URL is printed by these formatters, not even org A\'s own');
+    assert.match(output, new RegExp(orgATeamId), 'sanity: org A\'s own team id IS expected to appear (it is this org\'s own data)');
+  });
+});
+
+test('formatTeamListLine: zero scoped teams produces a safe, empty listing -- no global fallback output', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_B })); // some other org has teams
+
+    const orgATeams = await dbSupabase.listTeamsForOrg(ORG_A);
+
+    const captured = [];
+    const originalLog = console.log;
+    console.log = (...args) => { captured.push(args.join(' ')); };
+    try {
+      for (const t of orgATeams) {
+        console.log(formatTeamListLine(t, 0));
+      }
+    } finally {
+      console.log = originalLog;
+    }
+
+    assert.deepEqual(orgATeams, []);
+    assert.deepEqual(captured, [], 'zero teams must produce zero list lines -- no global fallback output');
   });
 });
