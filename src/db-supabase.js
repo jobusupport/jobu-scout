@@ -390,6 +390,26 @@ async function getAllTeams(includeArchived = false) {
   return data || [];
 }
 
+// Security Slice T3C: the tenant-scoped counterpart to getAllTeams(), for
+// callers (the automated GameChanger reingestion job) that must discover
+// only one organization's own teams -- never every organization's, the
+// way applyOrgScope already refuses to run an unscoped write-path lookup.
+// Fails closed (throws OrgContextRequiredError) rather than silently
+// falling back to every organization's teams when orgId is missing/blank.
+async function listTeamsForOrg(orgId, includeArchived = false) {
+  const normalizedOrgId = typeof orgId === 'string' ? orgId.trim() : orgId;
+  if (!normalizedOrgId) {
+    throw new OrgContextRequiredError(
+      'listTeamsForOrg requires orgId -- refusing to run an unscoped team lookup.'
+    );
+  }
+  let q = getDb().from('teams').select('*').eq('org_id', normalizedOrgId).order('team_name');
+  if (!includeArchived) q = q.eq('archived', false);
+  const { data, error } = await q;
+  check(error, 'listTeamsForOrg');
+  return data || [];
+}
+
 /**
  * Archive (soft-hide) or restore a team. Does not touch games, batting_lines,
  * pitching_lines, play_events, or advanced stats — all history stays intact.
@@ -1338,6 +1358,7 @@ module.exports = {
   upsertTeam,
   getTeamByUrl,
   getAllTeams,
+  listTeamsForOrg,
   setTeamArchived,
   // Games
   insertGame,

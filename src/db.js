@@ -309,6 +309,16 @@ function getAllTeams(includeArchived = false) {
   `).all();
 }
 
+// Security Slice T3C: SQLite/local-dev mode has no multi-tenant schema at
+// all (no org_id column on `teams`) -- the same intentional, documented
+// exception pipeline.js#ensureTeam already established. orgId is accepted
+// here only for interface parity with db-supabase.js's real, org-scoped
+// implementation (which fully replaces this export via Object.assign when
+// USE_SUPABASE=true; see init() above), and is otherwise ignored.
+function listTeamsForOrg(orgId, includeArchived = false) {
+  return getAllTeams(includeArchived);
+}
+
 /**
  * Archive (soft-hide) or restore a team. Does not touch games, batting_lines,
  * pitching_lines, play_events, or advanced stats — all history stays intact.
@@ -1152,6 +1162,7 @@ module.exports = {
   upsertTeam,
   getTeamByUrl,
   getAllTeams,
+  listTeamsForOrg,
   setTeamArchived,
   // Games
   insertGame,
