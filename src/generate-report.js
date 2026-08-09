@@ -31,10 +31,73 @@ const path     = require('path');
 const db       = require('./db');
 const analyzer = require('./analyzer');
 const report   = require('./report');
+const { isValidUuid, resolveReportOutputDir } = require('./report-access');
 
 const DB_PATH     = path.join(__dirname, '..', 'voodoo-scout.db');
 const REPORTS_DIR = process.env.REPORTS_DIR || path.join(__dirname, '..', 'reports');
 const OUR_TEAM_ID = process.env.OUR_TEAM_ID || '489f5656-205a-49a5-a3de-d1c8c3f226b6';
+
+// Security Slice T3B: when this process is spawned by a server.js HTTP
+// route, JOBU_USAGE_ORG_ID / JOBU_USAGE_REPORT_ID are already set (see
+// server.js#buildUsageEnv) -- pre-existing plumbing that, until now, was
+// only used to attribute AI usage events. This reuses that SAME
+// already-trusted org context (never anything derived from team
+// resolution) for two purposes:
+//   1. Write each report into a per-organization, per-report-id
+//      directory (src/report-access.js#resolveReportOutputDir), so two
+//      organizations can never collide on the same output filename
+//      (previously: <REPORTS_DIR>/scout-<team>-<date>.*, a shared flat
+//      directory with no org/report component at all).
+//   2. Record the resulting storage_path back onto the report's own
+//      `reports` row, so the authenticated download route in server.js
+//      has a reliable, database-backed report-id -> file mapping --
+//      never a filename-based lookup.
+// A bare CLI operator invocation (no HTTP job) has neither env var set:
+// it keeps writing to the flat REPORTS_DIR exactly as before, and there
+// is no `reports` row to update in that case either, so the DB update is
+// skipped entirely rather than attempted-and-failed. This does not change
+// team/organization RESOLUTION in any way -- that remains exactly as it
+// was before this slice (a separate, already-tracked follow-up).
+function normalizeUuid(value) {
+  return isValidUuid(value) ? value : null;
+}
+
+const JOB_ORG_ID    = normalizeUuid(process.env.JOBU_USAGE_ORG_ID);
+const JOB_REPORT_ID = normalizeUuid(process.env.JOBU_USAGE_REPORT_ID);
+
+const OUTPUT_DIR = resolveReportOutputDir(REPORTS_DIR, JOB_ORG_ID, JOB_REPORT_ID) || REPORTS_DIR;
+
+// Records the outcome of a report generation attempt onto the report's
+// own `reports` row (status/storage_path/generated_at on success,
+// status/error_message on failure) -- a no-op when there is no HTTP job
+// context (bare CLI) or in SQLite/local-dev mode (no `reports` table).
+// A bookkeeping failure here is logged but never allowed to crash an
+// otherwise-successful (or already-failed) report run.
+async function recordReportOutcome({ status, pdfPath, errorMessage }) {
+  if (!JOB_ORG_ID || !JOB_REPORT_ID) return;
+  if (typeof db.useSupabase !== 'function' || !db.useSupabase()) return;
+
+  const patch = { status };
+  if (status === 'ready') {
+    patch.storage_path = pdfPath
+      ? path.relative(REPORTS_DIR, pdfPath).split(path.sep).join('/')
+      : null;
+    patch.generated_at = new Date().toISOString();
+  } else if (status === 'failed') {
+    patch.error_message = String(errorMessage || 'Report generation failed').slice(0, 500);
+  }
+
+  try {
+    const { error } = await db.getDb()
+      .from('reports')
+      .update(patch)
+      .eq('id', JOB_REPORT_ID)
+      .eq('org_id', JOB_ORG_ID);
+    if (error) console.error('[report] Failed to record report outcome:', error.message);
+  } catch (err) {
+    console.error('[report] Failed to record report outcome:', err.message);
+  }
+}
 
 // Options passed through to analyzer
 const analyzerOptions = {
@@ -152,11 +215,13 @@ async function runForTeam(team) {
 
   let paths;
   try {
-    paths = await report.generateReport(analysis, REPORTS_DIR);
+    paths = await report.generateReport(analysis, OUTPUT_DIR);
   } catch (err) {
     console.error('[report] FULL ERROR:', err);
+    await recordReportOutcome({ status: 'failed', errorMessage: err.message });
     throw err;
   }
+  await recordReportOutcome({ status: 'ready', pdfPath: paths.pdf });
 
   console.log(`\n✓ Report complete for: ${team.team_name}`);
   console.log(`  Word: ${paths.docx}`);
@@ -174,11 +239,13 @@ async function runSelfScout() {
 
   let paths;
   try {
-    paths = await report.generateReport(analysis, REPORTS_DIR);
+    paths = await report.generateReport(analysis, OUTPUT_DIR);
   } catch (err) {
     console.error('[report] FULL ERROR:', err);
+    await recordReportOutcome({ status: 'failed', errorMessage: err.message });
     throw err;
   }
+  await recordReportOutcome({ status: 'ready', pdfPath: paths.pdf });
 
   console.log(`\n✓ Self-scout report complete`);
   console.log(`  Word: ${paths.docx}`);
@@ -202,11 +269,13 @@ async function runMatchup(opponentNameOrId) {
 
   let paths;
   try {
-    paths = await report.generateReport(analysis, REPORTS_DIR);
+    paths = await report.generateReport(analysis, OUTPUT_DIR);
   } catch (err) {
     console.error('[report] FULL ERROR:', err);
+    await recordReportOutcome({ status: 'failed', errorMessage: err.message });
     throw err;
   }
+  await recordReportOutcome({ status: 'ready', pdfPath: paths.pdf });
 
   console.log(`\n✓ Matchup report complete: JoBu vs ${opponent.team_name}`);
   console.log(`  Word: ${paths.docx}`);

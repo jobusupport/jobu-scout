@@ -116,6 +116,12 @@ const CLASSIFICATION = {
   "app.get('/api/teams'": 'travel',
   "app.get('/api/teams/:id/summary'": 'travel',
   "app.get('/api/reports'": 'travel',
+  // Security Slice T3B: replaces the removed unauthenticated
+  // `/reports/<filename>` static mount -- requireAuth + requireTravelAccess
+  // gated, org-scoped ownership check performed inside the handler itself
+  // (see test/report-download-and-ownership.test.js for the real-HTTP
+  // behavioral proof of that ownership check).
+  "app.get('/api/reports/:reportId/download'": 'travel',
   "app.get('/api/jobs/:id'": 'travel',
   "app.post('/api/jobs/:id/stream-credential'": 'travel',
   "app.get('/api/jobs/:id/stream'": 'travel',
@@ -172,7 +178,9 @@ test('route inventory: every server and extracted job route has an explicit clas
 test('route inventory: every route classified "travel" is gated by requireTravelAccess', () => {
   const routes = findRouteRegistrations();
   const travelRoutes = routes.filter((r) => classify(r.line) === 'travel');
-  assert.equal(travelRoutes.length, 32);
+  // Security Slice T3B added one new travel-classified route:
+  // GET /api/reports/:reportId/download.
+  assert.equal(travelRoutes.length, 33);
 
   const missingGate = travelRoutes.filter((r) => !r.line.includes('requireTravelAccess'));
   assert.deepEqual(

@@ -55,6 +55,13 @@ const {
   createStreamCredentialStore,
   registerTravelJobRoutes,
 } = require('./src/travel-job-routes');
+const {
+  isValidUuid: isValidReportUuid,
+  resolveOwnedTeamId,
+  sanitizeDownloadFilename,
+  resolveContainedReportPath,
+  isServableReportFile,
+} = require('./src/report-access');
 let SQLiteDatabase = null;
 
 // ── Stripe ───────────────────────────────────────────────────────────────────
@@ -121,7 +128,13 @@ app.set('trust proxy', true);
 app.use(express.json({
   verify: (req, res, buf) => { req.rawBody = buf; },
 }));
-app.use('/reports', express.static(REPORTS_DIR));
+// Security Slice T3B: the unauthenticated `app.use('/reports',
+// express.static(REPORTS_DIR))` mount that used to live here is removed
+// entirely -- report files are no longer served by filename at all. See
+// GET /api/reports/:reportId/download below for the authenticated,
+// organization-scoped, path-contained replacement. A request to the old
+// `/reports/<filename>` shape now falls through to Express's default
+// 404 (no route registers that path anymore), never serving content.
 app.use(express.static(path.join(ROOT, 'dashboard')));
 
 // Admin panel — a separate, hand-written static page (not run through the
@@ -305,6 +318,39 @@ async function getTeams(req = null, includeArchived = false) {
   } catch { return []; }
 }
 
+// Security Slice T3B: resolves a client-supplied ourTeamId (self-scout /
+// matchup routes) to a team id that actually belongs to the trusted
+// request organization -- reuses getTeams(req), the SAME org-scoped
+// query (.eq('org_id', orgId) at the database level) these two routes
+// already trust for their opponent-team lookup, rather than a second,
+// subtly different scoping check. Never fetches every team and filters
+// in JavaScript afterward.
+//
+// Returns:
+//   null   ourTeamId was not supplied -- callers keep their existing
+//          default "our team" behavior unchanged.
+//   id     ourTeamId was supplied and belongs to the trusted org.
+//   false  ourTeamId was supplied but is blank, malformed, unknown, or
+//          belongs to a DIFFERENT organization -- these cases are
+//          deliberately indistinguishable from each other; a caller can
+//          never learn which one occurred, matching the "team belonging
+//          to another organization behaves like an unavailable team"
+//          requirement.
+//
+// SQLite/local-dev mode (no org concept) passes the supplied id through
+// unchanged -- the same intentional, db.useSupabase()-gated exception
+// pattern already established elsewhere in this codebase. The actual
+// match/format logic lives in src/report-access.js#resolveOwnedTeamId,
+// which is independently unit-tested there; this wrapper only supplies
+// the org-scoped team list (I/O) that pure function needs.
+async function resolveOwnedOurTeamId(req, ourTeamId) {
+  if (!USE_SUPABASE) {
+    return (ourTeamId === undefined || ourTeamId === null || ourTeamId === '') ? null : ourTeamId;
+  }
+  const teams = await getTeams(req);
+  return resolveOwnedTeamId(teams, ourTeamId);
+}
+
 async function getTeamStats(teamId) {
   if (USE_SUPABASE) {
     const [{ data: games, error: gamesError }, { count: plays, error: playsError }, { data: batters, error: battersError }] = await Promise.all([
@@ -398,6 +444,9 @@ async function getTeamSummary(teamId) {
   }
 }
 
+// SQLite/local-dev only -- no organization concept, matches this
+// repo's existing db.useSupabase()-gated intentional exception pattern.
+// Never used in Supabase/production mode; see getReportsForOrg below.
 function getReports() {
   try {
     if (!fs.existsSync(REPORTS_DIR)) return [];
@@ -406,6 +455,32 @@ function getReports() {
       .map(f => { const s = fs.statSync(path.join(REPORTS_DIR, f)); return { name: f, size: s.size, mtime: s.mtimeMs }; })
       .sort((a, b) => b.mtime - a.mtime);
   } catch { return []; }
+}
+
+// Security Slice T3B: replaces the flat-filesystem listing above for
+// Supabase/production mode -- the `reports` table (not REPORTS_DIR) is
+// now the single source of truth for what a given organization may see
+// or download, scoped by org_id at the query level. A row with
+// storage_path still null (report never completed, or a legacy row from
+// before this slice) is included in the listing -- it belongs to this
+// org and there is nothing unsafe about showing its title/status -- but
+// is not downloadable (see the download route's own storage_path check).
+async function getReportsForOrg(orgId) {
+  const { data, error } = await adminClient
+    .from('reports')
+    .select('id, title, report_type, status, generated_at, created_at')
+    .eq('org_id', orgId)
+    .order('created_at', { ascending: false })
+    .limit(200);
+  if (error) throw error;
+  return (data || []).map(r => ({
+    id: r.id,
+    name: r.title,
+    reportType: r.report_type,
+    status: r.status,
+    generatedAt: r.generated_at,
+    createdAt: r.created_at,
+  }));
 }
 
 function hasPGData(teamName) {
@@ -1311,7 +1386,76 @@ app.get('/api/teams/:id/summary', requireAuth, resolveSupportSession, requireTra
   }
 });
 
-app.get('/api/reports', requireAuth, resolveSupportSession, requireTravelAccess, (req, res) => res.json(getReports()));
+app.get('/api/reports', requireAuth, resolveSupportSession, requireTravelAccess, asyncHandler(async (req, res) => {
+  if (!USE_SUPABASE) return res.json(getReports());
+  let orgId;
+  try {
+    orgId = await getRequestOrgId(req);
+  } catch (err) {
+    return sendResolverError(res, err, 'api/reports');
+  }
+  res.json(await getReportsForOrg(orgId));
+}));
+
+// GET /api/reports/:reportId/download
+//
+// Security Slice T3B: the authenticated, organization-scoped replacement
+// for the removed unauthenticated `/reports/<filename>` static mount.
+// Authorization happens entirely before any filesystem access: the
+// report row must exist AND belong to the trusted request organization
+// (queried together at the database level, never a broader fetch
+// filtered in JavaScript afterward -- mirrors the same discipline PR #30
+// established for team writes). Unknown report id, another
+// organization's report id, a report with no stored file yet, and a
+// missing file on disk all produce the identical sanitized 404 --
+// deliberately indistinguishable, so a caller can never learn which case
+// occurred or that a given report id belongs to someone else.
+app.get('/api/reports/:reportId/download', requireAuth, resolveSupportSession, requireTravelAccess, asyncHandler(async (req, res) => {
+  const { reportId } = req.params;
+  if (!isValidReportUuid(reportId)) return res.status(404).json({ error: 'Report not found' });
+
+  if (!USE_SUPABASE) return res.status(404).json({ error: 'Report not found' });
+
+  const orgId = await getRequestOrgId(req);
+  const { data: reportRow, error } = await adminClient
+    .from('reports')
+    .select('id, storage_path, title')
+    .eq('id', reportId)
+    .eq('org_id', orgId)
+    .maybeSingle();
+  if (error) throw error;
+  if (!reportRow || !reportRow.storage_path) {
+    return res.status(404).json({ error: 'Report not found' });
+  }
+
+  // Path containment (src/report-access.js#resolveContainedReportPath):
+  // canonicalizes the resolved path and verifies it is actually inside
+  // REPORTS_DIR before touching the filesystem at all. Protects against a
+  // corrupted or maliciously-written storage_path (absolute path, `../`
+  // traversal, a different drive, etc.) regardless of how it got into the
+  // row -- the check is on the resolved string, not the raw value.
+  const resolvedPath = resolveContainedReportPath(REPORTS_DIR, reportRow.storage_path);
+  if (!resolvedPath) {
+    console.error('[api/reports/download] stored path escapes REPORTS_DIR for report', reportId);
+    return res.status(404).json({ error: 'Report not found' });
+  }
+
+  // isServableReportFile uses lstat (never follows symlinks), so every
+  // symlink -- not only ones that escape REPORTS_DIR -- and every
+  // directory is rejected here, not just paths outside the root.
+  if (!isServableReportFile(resolvedPath)) {
+    return res.status(404).json({ error: 'Report not found' });
+  }
+
+  const safeName = sanitizeDownloadFilename(reportRow.title);
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+  res.sendFile(resolvedPath, (err) => {
+    if (err && !res.headersSent) {
+      res.status(404).json({ error: 'Report not found' });
+    }
+  });
+}));
 
 registerTravelJobRoutes(app, {
   jobs,
@@ -1422,16 +1566,28 @@ app.post('/api/run/report', requireAuth, resolveSupportSession, requireTravelAcc
 
 // POST /api/run/self-scout  { gameLocation?, gameDate?, gameTime?, humanObservations?, customPrompt?, ourTeamId? }
 app.post('/api/run/self-scout', requireAuth, resolveSupportSession, requireTravelAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+  // Security Slice T3B: resolved and validated BEFORE enforceReportQuota
+  // (which consumes quota and inserts a `reports` row) so an ownership
+  // rejection never spawns a job, never consumes quota, and never leaves
+  // an orphaned report record behind.
+  let ownedOurTeamId;
+  try {
+    ownedOurTeamId = await resolveOwnedOurTeamId(req, req.body.ourTeamId);
+  } catch (err) {
+    return sendResolverError(res, err, 'api/run/self-scout');
+  }
+  if (ownedOurTeamId === false) return res.status(404).json({ error: 'Team not found' });
+
   let quota;
   try {
-    quota = await enforceReportQuota(req, { reportType: 'self_scout', limitColumn: 'max_self_scout_reports_per_month', title: 'Self-Scout Report', linkedTeamId: req.body.ourTeamId });
+    quota = await enforceReportQuota(req, { reportType: 'self_scout', limitColumn: 'max_self_scout_reports_per_month', title: 'Self-Scout Report', linkedTeamId: ownedOurTeamId });
   } catch (err) {
     return sendResolverError(res, err, 'api/run/self-scout');
   }
   const id = createJob('Self-Scout Report', await getRequestOrgId(req), req.user?.id);
   appendLog(id, 'Generating self-scout report for our own team');
   const env = { ...buildReportContextEnv({ ...req.body, gameScope: 'self' }), ...buildUsageEnv(req, quota) };
-  if (req.body.ourTeamId) env.OUR_TEAM_ID = req.body.ourTeamId;
+  if (ownedOurTeamId) env.OUR_TEAM_ID = ownedOurTeamId;
   spawnJob(id, 'node', ['src/generate-report.js', '--self-scout'], ROOT, env);
   res.json({ jobId: id });
 }));
@@ -1442,6 +1598,18 @@ app.post('/api/run/matchup', requireAuth, resolveSupportSession, requireTravelAc
   const { teamId } = req.body;
   const team = (await getTeams(req)).find(t => t.id == teamId);
   if (!team) return res.status(404).json({ error: 'Opponent team not found' });
+
+  // Security Slice T3B: same ownership check and same ordering rationale
+  // as self-scout above -- resolved before enforceReportQuota so a
+  // rejection never spawns a job, consumes quota, or creates a report row.
+  let ownedOurTeamId;
+  try {
+    ownedOurTeamId = await resolveOwnedOurTeamId(req, req.body.ourTeamId);
+  } catch (err) {
+    return sendResolverError(res, err, 'api/run/matchup');
+  }
+  if (ownedOurTeamId === false) return res.status(404).json({ error: 'Team not found' });
+
   let quota;
   try {
     quota = await enforceReportQuota(req, { reportType: 'matchup', limitColumn: 'max_matchup_reports_per_month', title: `Matchup — ${team.team_name}`, linkedTeamId: team.id });
@@ -1451,7 +1619,7 @@ app.post('/api/run/matchup', requireAuth, resolveSupportSession, requireTravelAc
   const id = createJob(`Matchup — ${team.team_name}`, await getRequestOrgId(req), req.user?.id);
   appendLog(id, `Generating matchup report: our team vs ${team.team_name}`);
   const env = { ...buildReportContextEnv({ ...req.body, gameScope: 'matchup' }), ...buildUsageEnv(req, quota) };
-  if (req.body.ourTeamId) env.OUR_TEAM_ID = req.body.ourTeamId;
+  if (ownedOurTeamId) env.OUR_TEAM_ID = ownedOurTeamId;
   spawnJob(id, 'node', ['src/generate-report.js', '--matchup', team.team_name], ROOT, env);
   res.json({ jobId: id });
 }));
