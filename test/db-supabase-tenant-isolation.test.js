@@ -25,6 +25,12 @@
 // or scoping the query itself, never from a database-side policy the
 // service-role client bypasses anyway.
 //
+// Security Slice T3C additions (bottom of file): the same fake/helpers
+// also exercise listTeamsForOrg -- the tenant-scoped counterpart to
+// getAllTeams() the automated GameChanger reingestion job now uses for
+// team discovery -- proving the same fail-closed, no-cross-org-leakage
+// contract for a read path, not just the write path Slice T2 covered.
+//
 // Run with: node --test test/db-supabase-tenant-isolation.test.js
 
 const test = require('node:test');
@@ -67,7 +73,12 @@ class FakeTeamsQuery {
   }
   _exec() {
     if (this.op === 'insert') {
-      const row = { id: nextId(), ...this.payload };
+      // `archived` defaults to false at the real schema level (NOT NULL
+      // DEFAULT false) even though upsertTeam's insert payload never sets
+      // it explicitly -- mirrored here so listTeamsForOrg's default
+      // archived-exclusion filter behaves the same against this fake as
+      // it does against a real row.
+      const row = { id: nextId(), archived: false, ...this.payload };
       this.state.teams.push(row);
       return this.singleMode ? { data: row, error: null } : { data: [row], error: null };
     }
@@ -268,5 +279,101 @@ test('service-role access cannot bypass the application scope requirement: the f
     assert.equal(unscoped.data.length, 1, 'sanity check: the fake client itself enforces nothing');
 
     await assert.rejects(() => dbSupabase.upsertTeam(syntheticTeam()), /OrgContextRequiredError|orgId/);
+  });
+});
+
+// ── Security Slice T3C: listTeamsForOrg (tenant-scoped team discovery) ──────
+//
+// The automated GameChanger reingestion job (reingest-games.js) previously
+// resolved "does this scraped folder already have a team row?" via the
+// completely unscoped getAllTeams() -- searching, and therefore risking a
+// substring match against, every organization's teams. These tests prove
+// the real listTeamsForOrg implementation never returns another
+// organization's rows, fails closed without an organization, and treats
+// "this organization has zero teams" as a safe, non-broadening empty
+// result -- exercised against the same fake client as the write-path
+// tests above (still modeling no RLS of its own).
+
+test('listTeamsForOrg: throws OrgContextRequiredError when orgId is missing -- no fallback to every organization', () => {
+  return withFreshDbSupabase(async (dbSupabase) => {
+    await assert.rejects(
+      () => dbSupabase.listTeamsForOrg(),
+      (err) => { assert.equal(err.name, 'OrgContextRequiredError'); return true; }
+    );
+  });
+});
+
+test('listTeamsForOrg: throws when orgId is blank/whitespace-only', () => {
+  return withFreshDbSupabase(async (dbSupabase) => {
+    await assert.rejects(() => dbSupabase.listTeamsForOrg('   '), /OrgContextRequiredError|orgId/);
+  });
+});
+
+test('listTeamsForOrg: a mixed-tenant fixture -- org A only ever sees its own teams, never org B\'s', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    const orgATeamId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A, teamName: 'Org A Tigers' }));
+    await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_B, teamName: 'Org B Tigers' }));
+
+    const orgATeams = await dbSupabase.listTeamsForOrg(ORG_A);
+
+    assert.equal(orgATeams.length, 1, 'org A must see exactly its own one team, never org B\'s');
+    assert.equal(orgATeams[0].id, orgATeamId);
+    assert.equal(orgATeams[0].org_id, ORG_A);
+    assert.ok(
+      orgATeams.every((t) => t.org_id === ORG_A),
+      'no row belonging to a different organization may ever appear in the result'
+    );
+  });
+});
+
+test('listTeamsForOrg: service-role access cannot bypass the scope requirement -- the fake answers ANY ' +
+     'query unscoped (no RLS modeled), yet listTeamsForOrg(ORG_A) still excludes org B\'s row', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    state.teams.push({ id: nextId(), org_id: ORG_B, team_name: 'Org B Tigers', archived: false });
+    state.teams.push({ id: nextId(), org_id: ORG_A, team_name: 'Org A Tigers', archived: false });
+
+    const unscoped = await new FakeTeamsQuery(state).select()._exec();
+    assert.equal(unscoped.data.length, 2, 'sanity check: the fake client itself enforces nothing');
+
+    const orgATeams = await dbSupabase.listTeamsForOrg(ORG_A);
+    assert.equal(orgATeams.length, 1);
+    assert.equal(orgATeams[0].org_id, ORG_A);
+    assert.ok(!orgATeams.some((t) => t.org_id === ORG_B), 'org B\'s team must never appear');
+  });
+});
+
+test('listTeamsForOrg: a valid organization with zero teams returns an empty array -- a safe no-work ' +
+     'condition, never broadened into every organization\'s teams', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_B })); // some other org has teams
+
+    const orgATeams = await dbSupabase.listTeamsForOrg(ORG_A);
+
+    assert.deepEqual(orgATeams, [], 'an org with no teams of its own gets an empty result, not org B\'s teams');
+  });
+});
+
+test('listTeamsForOrg: excludes archived teams by default, same as getAllTeams', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    const activeId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A, teamName: 'Active Team' }));
+    state.teams.push({ id: nextId(), org_id: ORG_A, team_name: 'Archived Team', archived: true });
+
+    const orgATeams = await dbSupabase.listTeamsForOrg(ORG_A);
+
+    assert.equal(orgATeams.length, 1);
+    assert.equal(orgATeams[0].id, activeId);
+  });
+});
+
+test('listTeamsForOrg: returned rows carry no other organization\'s data -- safe to log in full', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_B, teamName: 'Org B Secret Team' }));
+    await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A, teamName: 'Org A Team' }));
+
+    const orgATeams = await dbSupabase.listTeamsForOrg(ORG_A);
+    const serialized = JSON.stringify(orgATeams);
+
+    assert.doesNotMatch(serialized, /Org B Secret Team/, 'org B\'s team name must never appear in org A\'s result set');
+    assert.doesNotMatch(serialized, new RegExp(ORG_B), 'org B\'s org id must never appear in org A\'s result set');
   });
 });

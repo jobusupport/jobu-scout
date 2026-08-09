@@ -24,6 +24,7 @@ const path     = require('path');
 const pipeline = require('./src/pipeline');
 const db       = require('./src/db');
 const { requireJobOrgContext } = require('./src/job-org-context');
+const { isValidUuid } = require('./src/report-access');
 
 const DB_PATH     = path.join(__dirname, 'voodoo-scout.db');
 const OUTPUT_ROOT = path.join(__dirname, 'output');
@@ -35,6 +36,19 @@ const OUTPUT_ROOT = path.join(__dirname, 'output');
 // looks up is stamped with this same, already-verified value -- never
 // inferred from the output folder name or "the only organization."
 const JOB_ORG_ID = requireJobOrgContext();
+
+// Security Slice T3C: requireJobOrgContext() only proves JOBU_JOB_ORG_ID is
+// present and non-blank -- it does not know this script's org-id contract
+// specifically requires a real UUID (the shape every trusted caller -- the
+// server's getRequestOrgId, or a trusted operator -- actually produces).
+// A malformed value must fail here, before pipeline.init()/any database
+// access, never be sent into a team query, and never silently broaden into
+// "no organization filter" (see src/db-supabase.js#listTeamsForOrg, which
+// also fails closed, defense-in-depth, if this were ever bypassed).
+if (!isValidUuid(JOB_ORG_ID)) {
+  console.error('[reingest] JOBU_JOB_ORG_ID is not a valid organization id. Refusing to run.');
+  process.exit(1);
+}
 
 pipeline.init(DB_PATH);
 
@@ -55,14 +69,18 @@ function findTeamFolders(nameFilter) {
 }
 
 // ── Ingest one team folder ────────────────────────────────────────────────────
-function ingestTeamFolder(folderName) {
+async function ingestTeamFolder(folderName) {
   const folderPath = path.join(OUTPUT_ROOT, folderName);
   console.log(`\n${'='.repeat(60)}`);
   console.log(`Ingesting: ${folderName}`);
   console.log(`Folder: ${folderPath}`);
 
-  // Get or create team in DB
-  const existingTeams = db.getAllTeams();
+  // Get or create team in DB. Security Slice T3C: this lookup is scoped to
+  // this job's own organization (JOB_ORG_ID) -- a global getAllTeams()
+  // scan previously meant a folder name that merely collided with another
+  // organization's team name could match that other organization's team
+  // row, silently attaching this job's game data to a foreign team.
+  const existingTeams = await db.listTeamsForOrg(JOB_ORG_ID);
   let team = existingTeams.find(t =>
     t.team_name.toLowerCase().includes(folderName.toLowerCase()) ||
     folderName.toLowerCase().includes(t.team_name.toLowerCase())
@@ -70,7 +88,7 @@ function ingestTeamFolder(folderName) {
 
   if (!team) {
     console.log(`[ingest] Team not found in DB — creating: ${folderName}`);
-    const teamId = db.upsertTeam({ teamName: folderName, orgId: JOB_ORG_ID });
+    const teamId = await db.upsertTeam({ teamName: folderName, orgId: JOB_ORG_ID });
     team = { id: teamId, team_name: folderName };
   }
 
@@ -142,7 +160,7 @@ function ingestTeamFolder(folderName) {
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
-function main() {
+async function main() {
   const args = process.argv.slice(2);
 
   if (args.includes('--all') || args.includes('-a')) {
@@ -150,7 +168,7 @@ function main() {
     console.log(`\nRe-ingesting all ${folders.length} team folder(s)...`);
     let total = { succeeded: 0, skipped: 0, failed: 0 };
     for (const folder of folders) {
-      const r = ingestTeamFolder(folder);
+      const r = await ingestTeamFolder(folder);
       total.succeeded += r.succeeded;
       total.skipped   += r.skipped;
       total.failed    += r.failed;
@@ -176,16 +194,23 @@ function main() {
   }
 
   for (const folder of folders) {
-    ingestTeamFolder(folder);
+    await ingestTeamFolder(folder);
   }
 
-  // Final check
-  const teams = db.getAllTeams();
+  // Final check. Security Slice T3C: scoped to this job's own organization
+  // -- this used to list EVERY team in the database regardless of
+  // organization, disclosing other organizations' team names, ids, and
+  // game counts in this job's own (customer-visible) log output.
+  const teams = await db.listTeamsForOrg(JOB_ORG_ID);
   console.log('\n── DB state after ingest ──');
   for (const t of teams) {
-    const bundle = require('./src/pipeline').getTeamBundle(t.id);
+    const bundle = await pipeline.getTeamBundle(t.id);
     console.log(`  [${t.id}] ${t.team_name} — ${bundle.meta.gamesAnalyzed} game(s)`);
   }
 }
 
-main();
+main().catch(err => {
+  console.error('\nReingest failed:');
+  console.error(err.stack || err);
+  process.exit(1);
+});

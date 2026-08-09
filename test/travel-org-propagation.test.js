@@ -154,3 +154,70 @@ test('reingest-games.js: the job org id value is never interpolated into a conso
     assert.doesNotMatch(line, /\$\{JOB_ORG_ID\}/, `console output must never include the org id value: "${line.trim()}"`);
   }
 });
+
+// ── Security Slice T3C: team discovery is scoped to JOBU_JOB_ORG_ID ─────────
+//
+// reingest-games.js previously resolved "does a team row for this scraped
+// folder already exist?" (and, in its final summary, "what teams now exist
+// after this run?") via db.getAllTeams() -- a completely unscoped query
+// across every organization. A folder name colliding with another
+// organization's team name could therefore match, and silently attach new
+// game data to, that other organization's team row; the final summary
+// separately logged every organization's team names/ids/game counts to
+// this job's own (customer-visible) output. These tests prove both call
+// sites now use the tenant-scoped src/db-supabase.js#listTeamsForOrg
+// instead, that the unscoped getAllTeams() is gone from this file
+// entirely, and that the job's own org-id contract is validated (not just
+// "present") before any team query runs.
+
+test('reingest-games.js: db.getAllTeams() is no longer called anywhere in this file', () => {
+  assert.doesNotMatch(REINGEST_SRC, /db\.getAllTeams\(/, 'the unscoped global team query must not remain');
+});
+
+test('reingest-games.js: both team-discovery call sites use the tenant-scoped db.listTeamsForOrg(JOB_ORG_ID)', () => {
+  const calls = REINGEST_SRC.match(/db\.listTeamsForOrg\(JOB_ORG_ID\)/g) || [];
+  assert.equal(calls.length, 2, 'expected exactly two scoped calls: the per-folder lookup and the final summary');
+});
+
+test('reingest-games.js: JOBU_JOB_ORG_ID is validated against a UUID contract before pipeline.init() or any team query', () => {
+  assert.match(REINGEST_SRC, /require\(['"]\.\/src\/report-access['"]\)/, 'must reuse the existing isValidUuid helper, not a new ad-hoc regex');
+  assert.match(REINGEST_SRC, /if\s*\(!isValidUuid\(JOB_ORG_ID\)\)/);
+
+  const jobOrgIdAssignIdx = REINGEST_SRC.indexOf('const JOB_ORG_ID = requireJobOrgContext()');
+  const uuidCheckIdx = REINGEST_SRC.indexOf('if (!isValidUuid(JOB_ORG_ID))');
+  const pipelineInitIdx = REINGEST_SRC.indexOf('pipeline.init(DB_PATH)');
+  const firstListTeamsIdx = REINGEST_SRC.indexOf('db.listTeamsForOrg(JOB_ORG_ID)');
+
+  assert.ok(jobOrgIdAssignIdx !== -1 && uuidCheckIdx !== -1 && pipelineInitIdx !== -1 && firstListTeamsIdx !== -1);
+  assert.ok(jobOrgIdAssignIdx < uuidCheckIdx, 'the raw env value must be resolved before its format is validated');
+  assert.ok(uuidCheckIdx < pipelineInitIdx, 'format validation must happen before pipeline/database init');
+  assert.ok(uuidCheckIdx < firstListTeamsIdx, 'format validation must happen before any team query');
+});
+
+test('reingest-games.js: a malformed JOBU_JOB_ORG_ID fails closed (exits) rather than proceeding with an unscoped or empty filter', () => {
+  const uuidCheckIdx = REINGEST_SRC.indexOf('if (!isValidUuid(JOB_ORG_ID))');
+  const nextExitIdx = REINGEST_SRC.indexOf('process.exit(1)', uuidCheckIdx);
+  assert.ok(uuidCheckIdx !== -1 && nextExitIdx !== -1 && nextExitIdx - uuidCheckIdx < 200,
+    'the malformed-org-id branch must exit(1) immediately, not fall through');
+});
+
+test('reingest-games.js: no GameChanger URL field is ever emitted in a console.log/console.error call', () => {
+  const loggingLines = REINGEST_SRC.split('\n').filter((l) => /console\.(log|error)\(/.test(l));
+  for (const line of loggingLines) {
+    assert.doesNotMatch(line, /gc_team_url|gcTeamUrl|pg_team_url|pgTeamUrl/i, `log line must never include a scraper URL field: "${line.trim()}"`);
+  }
+});
+
+test('reingest-games.js: logged team identity fields (id/name) only ever come from the org-scoped result set, ' +
+     'never from a freshly-fetched, independently-scoped query', () => {
+  // Every place this file logs a team's id/name reads from a local variable
+  // ("team" or "t") that was itself produced by db.listTeamsForOrg(JOB_ORG_ID)
+  // or db.upsertTeam({ ..., orgId: JOB_ORG_ID }) above -- proven by the two
+  // tests above. This test guards against a future regression reintroducing
+  // a second, differently-scoped lookup purely for logging purposes.
+  const loggingLines = REINGEST_SRC.split('\n').filter((l) => /console\.(log|error)\(/.test(l) && /team_name|team\.id|t\.id/.test(l));
+  assert.ok(loggingLines.length > 0, 'sanity check: this file does log team identity somewhere');
+  for (const line of loggingLines) {
+    assert.doesNotMatch(line, /getAllTeams|getTeamByUrl\(/, `team-identity log line must not read from an unscoped/independent lookup: "${line.trim()}"`);
+  }
+});
