@@ -41,7 +41,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { findMatchingTeam, formatTeamSummaryLine } = require('../src/reingest-helpers');
-const { resolveTeamMatch, formatTeamListLine, formatAmbiguousMatchLine } = require('../src/report-team-selection');
+const { resolveTeamMatch, formatTeamListLine, formatAmbiguousMatchLine, runTeamsSequentially } = require('../src/report-team-selection');
 
 const SUPABASE_JS_PATH = require.resolve('@supabase/supabase-js');
 const DB_SUPABASE_PATH = require.resolve('../src/db-supabase');
@@ -656,5 +656,57 @@ test('formatTeamListLine: zero scoped teams produces a safe, empty listing -- no
 
     assert.deepEqual(orgATeams, []);
     assert.deepEqual(captured, [], 'zero teams must produce zero list lines -- no global fallback output');
+  });
+});
+
+// ── Security Slice T3D (review correction): --all's real orchestration ──────
+// against a real mixed-tenant listTeamsForOrg result ─────────────────────────
+//
+// generate-report.js's --all branch calls db.listTeamsForOrg(JOB_ORG_ID)
+// and feeds the result into the REAL runTeamsSequentially with the real
+// runForTeam as the runner (runForTeam -> analyzer.analyzeTeam(team.id,
+// ...) -> live Claude API + report generation, which cannot safely run in
+// a test). These tests substitute a fake runner standing in for
+// runForTeam's position in that same real call chain -- proving that
+// whatever runner --all wires up (which is verified by a structural guard
+// in test/travel-org-propagation.test.js to be the real runForTeam) can
+// only ever be invoked with organization A's own teams, because the real,
+// org-scoped query is what determines the input list, not anything
+// runTeamsSequentially itself does.
+
+test('runTeamsSequentially (REAL src/report-team-selection.js) + REAL listTeamsForOrg(ORG_A): the runner ' +
+     '(standing in for runForTeam/analyzer.analyzeTeam) is invoked only for organization A\'s own teams, ' +
+     'even when organization B has teams with colliding names', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    const orgBTeamId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_B, teamName: 'Org B Tigers' }));
+    const orgATeamId1 = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A, teamName: 'Org A Tigers' }));
+    const orgATeamId2 = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A, teamName: 'Org A Bears' }));
+
+    const orgATeams = await dbSupabase.listTeamsForOrg(ORG_A);
+    assert.equal(orgATeams.length, 2);
+
+    const processedIds = [];
+    const result = await runTeamsSequentially(orgATeams, async (t) => { processedIds.push(t.id); });
+
+    assert.deepEqual(processedIds.sort(), [orgATeamId1, orgATeamId2].sort(),
+      'the runner must be called for exactly org A\'s two teams');
+    assert.ok(!processedIds.includes(orgBTeamId), 'the runner must never be called with org B\'s team id');
+    assert.deepEqual(result, { succeeded: 2, failed: 0 });
+  });
+});
+
+test('runTeamsSequentially (REAL src/report-team-selection.js) + REAL listTeamsForOrg(ORG_A): organization A ' +
+     'with zero teams never falls back to processing organization B\'s teams -- the runner is never invoked', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_B, teamName: 'Org B Only Team' }));
+
+    const orgATeams = await dbSupabase.listTeamsForOrg(ORG_A);
+    assert.deepEqual(orgATeams, []);
+
+    let callCount = 0;
+    const result = await runTeamsSequentially(orgATeams, async () => { callCount++; });
+
+    assert.equal(callCount, 0, 'the runner must never be invoked when org A has zero authorized teams');
+    assert.deepEqual(result, { succeeded: 0, failed: 0 });
   });
 });

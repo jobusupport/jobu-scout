@@ -33,7 +33,7 @@ const analyzer = require('./analyzer');
 const report   = require('./report');
 const { isValidUuid, resolveReportOutputDir } = require('./report-access');
 const { requireJobOrgContext } = require('./job-org-context');
-const { resolveTeamMatch, formatTeamListLine, formatAmbiguousMatchLine } = require('./report-team-selection');
+const { resolveTeamMatch, formatTeamListLine, formatAmbiguousMatchLine, runTeamsSequentially } = require('./report-team-selection');
 
 const DB_PATH     = path.join(__dirname, '..', 'voodoo-scout.db');
 const REPORTS_DIR = process.env.REPORTS_DIR || path.join(__dirname, '..', 'reports');
@@ -332,18 +332,11 @@ async function main() {
 
     console.log(`\nGenerating reports for ${teams.length} team(s)...`);
 
-    let succeeded = 0;
-    let failed = 0;
-
-    for (const team of teams) {
-      try {
-        await runForTeam(team);
-        succeeded++;
-      } catch (err) {
-        console.error(`\n✗ Failed for ${team.team_name}: ${err.message}`);
-        failed++;
-      }
-    }
+    const { succeeded, failed } = await runTeamsSequentially(
+      teams,
+      runForTeam,
+      (team, err) => console.error(`\n✗ Failed for ${team.team_name}: ${err.message}`)
+    );
 
     console.log(`\n${'='.repeat(60)}`);
     console.log(`Done. ${succeeded} succeeded, ${failed} failed.`);

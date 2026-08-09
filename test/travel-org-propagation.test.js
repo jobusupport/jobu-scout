@@ -302,7 +302,7 @@ test('generate-report.js: team matching and list/ambiguity formatting are delega
      '(see test/report-team-selection.test.js and test/db-supabase-tenant-isolation.test.js for the ' +
      'executable proof of their behavior)', () => {
   assert.match(GENERATE_REPORT_SRC, /require\(['"]\.\/report-team-selection['"]\)/, 'must import the extracted helpers module');
-  assert.match(GENERATE_REPORT_SRC, /resolveTeamMatch\s*,\s*formatTeamListLine\s*,\s*formatAmbiguousMatchLine/, 'must destructure all three helpers from that module');
+  assert.match(GENERATE_REPORT_SRC, /resolveTeamMatch\s*,\s*formatTeamListLine\s*,\s*formatAmbiguousMatchLine\s*,\s*runTeamsSequentially/, 'must destructure all four helpers from that module');
 
   assert.match(GENERATE_REPORT_SRC, /resolveTeamMatch\(teams,\s*nameFragment\)/, 'findTeam must call the real matcher, not an inline .find(...)/.filter(...)');
   assert.match(GENERATE_REPORT_SRC, /console\.log\(formatTeamListLine\(t,\s*games\)\)/, 'listTeams must call the real list-line formatter, not an inline template literal');
@@ -320,6 +320,20 @@ test('generate-report.js: the job org id value is never interpolated into a cons
   for (const line of loggingLines) {
     assert.doesNotMatch(line, /\$\{JOB_ORG_ID\}/, `console output must never include the org id value: "${line.trim()}"`);
   }
+});
+
+test('generate-report.js: the --all branch delegates its processing loop to the REAL, independently-tested ' +
+     'src/report-team-selection.js#runTeamsSequentially, passing the REAL runForTeam as the runner -- not an ' +
+     'inline for-loop (see test/report-team-selection.test.js and test/db-supabase-tenant-isolation.test.js ' +
+     'for the executable proof that this function only ever processes the org-scoped team list it is given)', () => {
+  assert.match(GENERATE_REPORT_SRC, /runTeamsSequentially\(\s*\n\s*teams,\s*\n\s*runForTeam,/,
+    'the --all branch must call runTeamsSequentially with the scoped `teams` list and the real runForTeam function reference');
+
+  // No inline reimplementation of the sequential-processing loop may
+  // remain -- the for/try/catch continuation logic must live only in
+  // src/report-team-selection.js#runTeamsSequentially.
+  assert.doesNotMatch(GENERATE_REPORT_SRC, /for \(const team of teams\) \{\s*\n\s*try \{\s*\n\s*await runForTeam\(team\)/,
+    'the --all loop must not be duplicated inline in generate-report.js');
 });
 
 test('server.js: every route that spawns src/generate-report.js propagates JOBU_JOB_ORG_ID into its ' +

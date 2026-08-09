@@ -77,9 +77,37 @@ function formatAmbiguousMatchLine(team) {
   return `  [${team.id}] ${team.team_name}`;
 }
 
+// Security Slice T3D (review correction): the --all branch's processing
+// loop, extracted so its continuation/error semantics are independently
+// executable-testable with a fake runner -- without needing a live
+// analyzer, report generator, or database. generate-report.js's --all
+// branch calls this SAME function with the real runForTeam as `runner`;
+// it never inlines this loop. Preserves the pre-extraction behavior
+// exactly: each team is awaited in sequence (never concurrently), one
+// team's failure is caught and reported via `onTeamError` without
+// aborting the remaining teams, and the final { succeeded, failed }
+// counts reflect exactly what ran.
+async function runTeamsSequentially(teams, runner, onTeamError) {
+  let succeeded = 0;
+  let failed = 0;
+
+  for (const team of teams) {
+    try {
+      await runner(team);
+      succeeded++;
+    } catch (err) {
+      if (onTeamError) onTeamError(team, err);
+      failed++;
+    }
+  }
+
+  return { succeeded, failed };
+}
+
 module.exports = {
   normalizeTeamQuery,
   resolveTeamMatch,
   formatTeamListLine,
   formatAmbiguousMatchLine,
+  runTeamsSequentially,
 };

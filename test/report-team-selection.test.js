@@ -20,6 +20,7 @@ const {
   resolveTeamMatch,
   formatTeamListLine,
   formatAmbiguousMatchLine,
+  runTeamsSequentially,
 } = require('../src/report-team-selection');
 
 function team(overrides = {}) {
@@ -119,4 +120,86 @@ test('formatAmbiguousMatchLine: includes only id and team_name', () => {
   assert.match(line, /Bears/);
   assert.doesNotMatch(line, /org-secret/);
   assert.doesNotMatch(line, /gc\.example/);
+});
+
+// ── runTeamsSequentially: the REAL --all orchestration loop ─────────────────
+//
+// generate-report.js's --all branch calls this exact function with the
+// real runForTeam as `runner` -- these tests exercise the real function
+// with a fake runner standing in for runForTeam (which would otherwise
+// call the live analyzer/Claude API/report generator), proving the
+// continuation/error semantics and call-isolation guarantees that were
+// previously only implied by source order, never executed.
+
+test('runTeamsSequentially: calls the runner once per team, in order, awaiting each before starting the next', async () => {
+  const calls = [];
+  const teams = [team({ id: '1' }), team({ id: '2' }), team({ id: '3' })];
+
+  const runner = async (t) => {
+    // If the loop did not await each call before starting the next, a
+    // shorter delay on a later team would let it "finish" first --
+    // proving sequencing, not just that the runner was eventually called
+    // for everyone.
+    await new Promise((resolve) => setTimeout(resolve, t.id === '1' ? 10 : 0));
+    calls.push(t.id);
+  };
+
+  const result = await runTeamsSequentially(teams, runner);
+
+  assert.deepEqual(calls, ['1', '2', '3'], 'each team must be awaited to completion before the next one starts');
+  assert.deepEqual(result, { succeeded: 3, failed: 0 });
+});
+
+test('runTeamsSequentially: zero teams -- the runner is never invoked, result is {succeeded: 0, failed: 0}', async () => {
+  let callCount = 0;
+  const result = await runTeamsSequentially([], async () => { callCount++; });
+  assert.equal(callCount, 0);
+  assert.deepEqual(result, { succeeded: 0, failed: 0 });
+});
+
+test('runTeamsSequentially: one team\'s (async, rejected-promise) failure does not abort the remaining teams -- ' +
+     'established per-team continuation semantics are preserved', async () => {
+  const processed = [];
+  const teams = [team({ id: '1' }), team({ id: '2', team_name: 'Failing Team' }), team({ id: '3' })];
+
+  const runner = async (t) => {
+    processed.push(t.id);
+    if (t.id === '2') throw new Error('boom');
+  };
+
+  const errors = [];
+  const result = await runTeamsSequentially(teams, runner, (t, err) => errors.push({ id: t.id, message: err.message }));
+
+  assert.deepEqual(processed, ['1', '2', '3'], 'team 3 must still be processed after team 2 fails');
+  assert.deepEqual(result, { succeeded: 2, failed: 1 });
+  assert.deepEqual(errors, [{ id: '2', message: 'boom' }], 'onTeamError must receive exactly the failing team and its real error');
+});
+
+test('runTeamsSequentially: a team\'s synchronous throw inside the runner is caught the same as an async rejection', async () => {
+  const teams = [team({ id: '1' })];
+  const runner = (t) => { throw new Error('sync boom'); };
+
+  const errors = [];
+  const result = await runTeamsSequentially(teams, runner, (t, err) => errors.push(err.message));
+
+  assert.deepEqual(result, { succeeded: 0, failed: 1 });
+  assert.deepEqual(errors, ['sync boom']);
+});
+
+test('runTeamsSequentially: onTeamError is optional -- a failure without a handler still updates the failed count ' +
+     'and does not throw out of runTeamsSequentially itself', async () => {
+  const teams = [team({ id: '1' }), team({ id: '2' })];
+  const runner = async (t) => { if (t.id === '1') throw new Error('boom'); };
+
+  const result = await runTeamsSequentially(teams, runner);
+  assert.deepEqual(result, { succeeded: 1, failed: 1 });
+});
+
+test('runTeamsSequentially: the runner is invoked with the exact team object from the input list -- ' +
+     'never a re-fetched, re-derived, or substituted team', async () => {
+  const teamA = team({ id: 'org-a-team' });
+  const received = [];
+  await runTeamsSequentially([teamA], async (t) => { received.push(t); });
+  assert.equal(received.length, 1);
+  assert.equal(received[0], teamA, 'must be the identical object reference, not a copy or lookup result');
 });
