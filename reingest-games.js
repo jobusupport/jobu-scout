@@ -23,9 +23,18 @@ const fs       = require('fs');
 const path     = require('path');
 const pipeline = require('./src/pipeline');
 const db       = require('./src/db');
+const { requireJobOrgContext } = require('./src/job-org-context');
 
 const DB_PATH     = path.join(__dirname, 'voodoo-scout.db');
 const OUTPUT_ROOT = path.join(__dirname, 'output');
+
+// Security Slice T2: resolved once, before any file or database access
+// begins. Fails closed (throws, exits non-zero via main()'s own error
+// handling below) if the server (or a trusted operator, for a bare CLI
+// run) did not set JOBU_JOB_ORG_ID. Every team this script creates or
+// looks up is stamped with this same, already-verified value -- never
+// inferred from the output folder name or "the only organization."
+const JOB_ORG_ID = requireJobOrgContext();
 
 pipeline.init(DB_PATH);
 
@@ -61,7 +70,7 @@ function ingestTeamFolder(folderName) {
 
   if (!team) {
     console.log(`[ingest] Team not found in DB — creating: ${folderName}`);
-    const teamId = db.upsertTeam({ teamName: folderName });
+    const teamId = db.upsertTeam({ teamName: folderName, orgId: JOB_ORG_ID });
     team = { id: teamId, team_name: folderName };
   }
 

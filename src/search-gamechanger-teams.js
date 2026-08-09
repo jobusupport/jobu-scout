@@ -7,6 +7,7 @@ const sharp = require("sharp");
 const { getTeamsFromGoogleSheet } = require("./read-teams-from-sheet");
 const pipeline = require("./pipeline");
 const db = require("./db");
+const { requireJobOrgContext } = require("./job-org-context");
 const { captureTeamHandednessByUrl } = require("./scrape-handedness");
 const { getStorageStatePath } = require("./gc-session-loader");
 
@@ -3076,7 +3077,12 @@ async function processTeam(page, team, teamNumber, totalTeams, teamUrlCache) {
   return false;
 }
 
-async function processTeamsFromSpreadsheet(page) {
+// jobOrgId: the single, already-verified organization this whole batch
+// run is trusted to act as (see requireJobOrgContext() in main()). Every
+// team read from the spreadsheet is stamped with this same value -- the
+// spreadsheet itself carries no per-row organization field, and this PR
+// deliberately does not add one (see security/travel-tenant-isolation-write-path).
+async function processTeamsFromSpreadsheet(page, jobOrgId) {
   console.log("");
   console.log("Reading teams from Google Sheet...");
 
@@ -3088,7 +3094,8 @@ async function processTeamsFromSpreadsheet(page) {
   const teamUrlCache = loadTeamUrlCache();
   console.log(`Loaded ${teamUrlCache.size} cached team URL entries from Team URLs.txt.`);
 
-  const teamsToProcess = selectTeamsToProcess(teams);
+  const teamsToProcess = selectTeamsToProcess(teams)
+    .map((team) => ({ ...team, orgId: jobOrgId }));
   console.log(`Teams selected for this run: ${teamsToProcess.length}`);
 
   for (let i = 0; i < teamsToProcess.length; i++) {
@@ -3128,6 +3135,13 @@ async function processTeamsFromSpreadsheet(page) {
 // ─── Entry Point ──────────────────────────────────────────────────────────────
 
 async function main() {
+  // Security Slice T2: resolved once, before any GameChanger acquisition
+  // or database access begins. Fails closed (throws) if the server (or a
+  // trusted operator, for a bare CLI run) did not set JOBU_JOB_ORG_ID --
+  // this process never infers an organization from GameChanger data, a
+  // spreadsheet row, or "the only organization in the system."
+  const jobOrgId = requireJobOrgContext();
+
   if (!fs.existsSync(STORAGE_STATE)) {
     throw new Error(`Missing auth file: ${STORAGE_STATE}. Run npm run login first.`);
   }
@@ -3173,12 +3187,13 @@ try {
         from:           process.env.GC_TEAM_CITY || "",
         city:           process.env.GC_TEAM_CITY || "",
         state:          process.env.GC_TEAM_STATE || "",
-        status:         "active"
+        status:         "active",
+        orgId:          jobOrgId,
       };
       const teamUrlCache = loadTeamUrlCache();
       await processTeam(page, team, 1, 1, teamUrlCache);
     } else {
-      await processTeamsFromSpreadsheet(page);
+      await processTeamsFromSpreadsheet(page, jobOrgId);
     }
   } finally {
     await browser.close();
@@ -3204,6 +3219,10 @@ if (require.main === module) {
 
 // ─── Entry Point: scrape a single team by DB record (no Google Sheet) ─────────
 async function scrapeTeamById(teamRecord) {
+  // Security Slice T2: same fail-closed contract as main() above -- resolved
+  // once, before any acquisition begins, never inferred from teamRecord.
+  const jobOrgId = requireJobOrgContext();
+
   // teamRecord should have: { id, team_name, gc_team_url, age_group }
   if (!fs.existsSync(STORAGE_STATE)) {
     throw new Error(`Missing auth file: ${STORAGE_STATE}. Run npm run login first.`);
@@ -3244,7 +3263,8 @@ console.log('[browser] Chromium launched successfully.');
     from:         teamRecord.city || "",
     city:         teamRecord.city || "",
     state:        teamRecord.state || "",
-    status:       "active"
+    status:       "active",
+    orgId:        jobOrgId,
   };
 
   const teamUrlCache = loadTeamUrlCache();

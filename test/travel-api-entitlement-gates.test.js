@@ -273,10 +273,27 @@ test('every run route binds new jobs to the authoritative request organization',
   const creationLines = serverLines.filter((line) => line.includes('createJob(') && !line.includes('function createJob'));
   assert.equal(creationLines.length, 10);
   for (const line of creationLines) {
-    assert.match(line, /await getRequestOrgId\(req\)/);
+    // Security Slice T2: some call sites now pass a local `orgId`
+    // variable (resolved exactly once earlier in the same route body via
+    // "const orgId = await getRequestOrgId(req);", and reused for the
+    // spawned child's environment too) rather than calling the resolver
+    // inline on this exact line. See test/travel-org-propagation.test.js
+    // for the full, route-block-scoped proof of that pattern; the check
+    // below (plus the resolver-assignment check further down) preserves
+    // this test's original guarantee -- every job-creation org still
+    // traces back to the trusted resolver, never to client input.
+    assert.match(line, /await getRequestOrgId\(req\)|,\s*orgId,/);
     assert.match(line, /req\.user\?\.id/);
     assert.doesNotMatch(line, /req\.(body|query|params|headers).*org/i);
   }
+
+  const variableBasedLines = creationLines.filter((line) => !/await getRequestOrgId\(req\)/.test(line));
+  assert.ok(variableBasedLines.length > 0, 'expected at least one call site using the resolve-once-into-a-variable pattern (update this test if that changes)');
+  const resolverAssignments = serverLines.filter((line) => /const orgId\s*=\s*await getRequestOrgId\(req\)/.test(line));
+  assert.ok(
+    resolverAssignments.length >= variableBasedLines.length,
+    'every variable-based createJob call must be backed by a real "const orgId = await getRequestOrgId(req)" resolution, not a coincidentally-named variable'
+  );
 });
 
 test('the browser requests a short-lived stream credential and never puts the Supabase access token in EventSource URLs', () => {

@@ -403,7 +403,12 @@ test('search-gamechanger-teams.js: a synthetic GC_AUTH_FILE_PATH override is act
   await withTempDirAsync(async (dir) => {
     const missingTarget = path.join(dir, 'synthetic-does-not-exist-gamechanger-auth.json');
     const original = process.env.GC_AUTH_FILE_PATH;
+    const originalOrgId = process.env.JOBU_JOB_ORG_ID;
     process.env.GC_AUTH_FILE_PATH = missingTarget;
+    // scrapeTeamById now requires this before its auth-file check
+    // (Security Slice T2) -- set to a synthetic value so this test still
+    // exercises the auth-file resolution behavior it's actually about.
+    process.env.JOBU_JOB_ORG_ID = '99999999-9999-4999-8999-999999999999';
     try {
       delete require.cache[require.resolve('../src/gc-session-loader')];
       delete require.cache[require.resolve('../src/search-gamechanger-teams')];
@@ -422,6 +427,7 @@ test('search-gamechanger-teams.js: a synthetic GC_AUTH_FILE_PATH override is act
       );
     } finally {
       if (original === undefined) delete process.env.GC_AUTH_FILE_PATH; else process.env.GC_AUTH_FILE_PATH = original;
+      if (originalOrgId === undefined) delete process.env.JOBU_JOB_ORG_ID; else process.env.JOBU_JOB_ORG_ID = originalOrgId;
       delete require.cache[require.resolve('../src/gc-session-loader')];
       delete require.cache[require.resolve('../src/search-gamechanger-teams')];
     }
@@ -430,7 +436,12 @@ test('search-gamechanger-teams.js: a synthetic GC_AUTH_FILE_PATH override is act
 
 test('search-gamechanger-teams.js: OUTSIDE test mode, with GC_AUTH_FILE_PATH unset, the resolved path matches the pre-existing repo-relative default (production behavior, unchanged)', async () => {
   const original = process.env.GC_AUTH_FILE_PATH;
+  const originalOrgId = process.env.JOBU_JOB_ORG_ID;
   delete process.env.GC_AUTH_FILE_PATH;
+  // scrapeTeamById now requires this before its auth-file check (Security
+  // Slice T2) -- set to a synthetic value so this test still exercises
+  // the auth-file resolution behavior it's actually about.
+  process.env.JOBU_JOB_ORG_ID = '99999999-9999-4999-8999-999999999999';
   try {
     await withNonTestMode(async () => {
       delete require.cache[require.resolve('../src/gc-session-loader')];
@@ -446,6 +457,7 @@ test('search-gamechanger-teams.js: OUTSIDE test mode, with GC_AUTH_FILE_PATH uns
     });
   } finally {
     if (original === undefined) delete process.env.GC_AUTH_FILE_PATH; else process.env.GC_AUTH_FILE_PATH = original;
+    if (originalOrgId === undefined) delete process.env.JOBU_JOB_ORG_ID; else process.env.JOBU_JOB_ORG_ID = originalOrgId;
     delete require.cache[require.resolve('../src/gc-session-loader')];
     delete require.cache[require.resolve('../src/search-gamechanger-teams')];
   }

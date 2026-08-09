@@ -28,6 +28,7 @@ const path       = require('path');
 const db         = require('./db');
 const { normalizeGameData } = require('./normalizer');
 const { processGames }      = require('./stats-engine');
+const { OrgContextRequiredError } = require('./org-context-errors');
 
 let _initialized = false;
 
@@ -79,8 +80,29 @@ function init(dbPath = './voodoo-scout.db') {
 /**
  * Ensure a team exists in the DB. Returns teamId.
  * Pass the same team object from read-teams-from-sheet.js.
+ *
+ * Security Slice T2: in Supabase mode, team.orgId (or team.org_id) is
+ * required and checked here -- before db.upsertTeam is ever called --
+ * because an unscoped team lookup previously let one organization's
+ * scrape silently reuse a different organization's team row (see
+ * security/travel-tenant-isolation-write-path). SQLite/local-dev mode has
+ * no multi-tenant schema at all and is an intentional, documented
+ * exception: db.useSupabase() is the same authoritative mode check
+ * src/db.js itself uses to choose its persistence backend, so this check
+ * can never diverge into a second, inconsistent flag.
  */
 async function ensureTeam(team) {
+  const inSupabaseMode = typeof db.useSupabase === 'function' && db.useSupabase();
+  if (inSupabaseMode) {
+    const rawOrgId = team && (team.orgId || team.org_id);
+    const orgId = typeof rawOrgId === 'string' ? rawOrgId.trim() : rawOrgId;
+    if (!orgId) {
+      throw new OrgContextRequiredError(
+        'pipeline.ensureTeam requires team.orgId (or team.org_id) when running against ' +
+        'Supabase -- refusing to look up or create a team without an organization context.'
+      );
+    }
+  }
   const teamId = await Promise.resolve(db.upsertTeam(team));
   console.log(`[pipeline] Team ID ${teamId}: ${team.teamName}`);
   return teamId;
