@@ -25,6 +25,7 @@ const pipeline = require('./src/pipeline');
 const db       = require('./src/db');
 const { requireJobOrgContext } = require('./src/job-org-context');
 const { isValidUuid } = require('./src/report-access');
+const { findMatchingTeam, formatTeamSummaryLine } = require('./src/reingest-helpers');
 
 const DB_PATH     = path.join(__dirname, 'voodoo-scout.db');
 const OUTPUT_ROOT = path.join(__dirname, 'output');
@@ -81,10 +82,7 @@ async function ingestTeamFolder(folderName) {
   // organization's team name could match that other organization's team
   // row, silently attaching this job's game data to a foreign team.
   const existingTeams = await db.listTeamsForOrg(JOB_ORG_ID);
-  let team = existingTeams.find(t =>
-    t.team_name.toLowerCase().includes(folderName.toLowerCase()) ||
-    folderName.toLowerCase().includes(t.team_name.toLowerCase())
-  );
+  let team = findMatchingTeam(existingTeams, folderName);
 
   if (!team) {
     console.log(`[ingest] Team not found in DB — creating: ${folderName}`);
@@ -205,7 +203,7 @@ async function main() {
   console.log('\n── DB state after ingest ──');
   for (const t of teams) {
     const bundle = await pipeline.getTeamBundle(t.id);
-    console.log(`  [${t.id}] ${t.team_name} — ${bundle.meta.gamesAnalyzed} game(s)`);
+    console.log(formatTeamSummaryLine(t, bundle.meta.gamesAnalyzed));
   }
 }
 

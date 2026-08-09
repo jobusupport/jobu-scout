@@ -221,3 +221,23 @@ test('reingest-games.js: logged team identity fields (id/name) only ever come fr
     assert.doesNotMatch(line, /getAllTeams|getTeamByUrl\(/, `team-identity log line must not read from an unscoped/independent lookup: "${line.trim()}"`);
   }
 });
+
+test('reingest-games.js: team matching and summary formatting are delegated to the REAL, ' +
+     'independently-tested src/reingest-helpers.js -- not an inline duplicate predicate or template ' +
+     '(see test/db-supabase-tenant-isolation.test.js for the executable proof of their behavior)', () => {
+  assert.match(REINGEST_SRC, /require\(['"]\.\/src\/reingest-helpers['"]\)/, 'must import the extracted helpers module');
+  assert.match(REINGEST_SRC, /findMatchingTeam\s*,\s*formatTeamSummaryLine/, 'must destructure both helpers from that module');
+
+  assert.match(REINGEST_SRC, /findMatchingTeam\(existingTeams,\s*folderName\)/, 'ingestTeamFolder must call the real matcher, not an inline .find(...)');
+  assert.match(REINGEST_SRC, /console\.log\(formatTeamSummaryLine\(t,\s*bundle\.meta\.gamesAnalyzed\)\)/, 'the final summary loop must call the real formatter, not an inline template literal');
+
+  // No inline reimplementation of either helper's logic may remain in this
+  // file -- the team-name substring-matching predicate and the "[id] name
+  // — N game(s)" template literal must live only in src/reingest-helpers.js.
+  // (findTeamFolders' own, unrelated folder-name filter also legitimately
+  // uses .toLowerCase().includes() -- this checks specifically for the
+  // removed team_name-matching expression, not that pattern in general.)
+  assert.doesNotMatch(REINGEST_SRC, /existingTeams\.find\(/, 'the matching predicate must not be duplicated inline via existingTeams.find(...) in reingest-games.js');
+  assert.doesNotMatch(REINGEST_SRC, /t\.team_name\.toLowerCase\(\)\.includes\(/, 'the team_name matching predicate must not be duplicated inline in reingest-games.js');
+  assert.doesNotMatch(REINGEST_SRC, /`\s*\[\$\{t\.id\}\]/, 'the summary-line template must not be duplicated inline in reingest-games.js');
+});

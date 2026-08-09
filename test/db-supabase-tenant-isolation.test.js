@@ -30,11 +30,17 @@
 // getAllTeams() the automated GameChanger reingestion job now uses for
 // team discovery -- proving the same fail-closed, no-cross-org-leakage
 // contract for a read path, not just the write path Slice T2 covered.
+// The collision-matching and log-formatting tests call the REAL
+// src/reingest-helpers.js#findMatchingTeam/formatTeamSummaryLine --
+// the same functions reingest-games.js itself calls -- rather than
+// re-typing that logic into the test, so a future change to either
+// function's actual behavior cannot silently go unproven here.
 //
 // Run with: node --test test/db-supabase-tenant-isolation.test.js
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { findMatchingTeam, formatTeamSummaryLine } = require('../src/reingest-helpers');
 
 const SUPABASE_JS_PATH = require.resolve('@supabase/supabase-js');
 const DB_SUPABASE_PATH = require.resolve('../src/db-supabase');
@@ -378,18 +384,16 @@ test('listTeamsForOrg: returned rows carry no other organization\'s data -- safe
   });
 });
 
-test('listTeamsForOrg: an IDENTICALLY-named team in org B (the exact scenario reingest-games.js\'s ' +
-     'substring-matching folder lookup is exposed to) is still never returned for org A -- the ' +
-     'row is excluded by org_id, not distinguished by name', () => {
+test('findMatchingTeam (REAL src/reingest-helpers.js, the exact function reingest-games.js calls): ' +
+     'an IDENTICALLY-named team in org B is still never selected for org A -- the row is excluded ' +
+     'by listTeamsForOrg\'s org_id scoping, not by anything findMatchingTeam itself distinguishes', () => {
   return withFreshDbSupabase(async (dbSupabase, state) => {
     // Same exact team_name in both organizations -- reingest-games.js's
-    // ingestTeamFolder() matches a scraped folder name against
-    // db.listTeamsForOrg(JOB_ORG_ID)'s result via a loose, case-insensitive
-    // substring test (t.team_name.includes(folderName) ||
-    // folderName.includes(t.team_name)). If listTeamsForOrg ever leaked a
-    // same-named row from another organization, that substring match would
-    // trivially select it. It cannot: org B's row is never even present in
-    // org A's result set.
+    // ingestTeamFolder() calls findMatchingTeam(existingTeams, folderName)
+    // against db.listTeamsForOrg(JOB_ORG_ID)'s result. If listTeamsForOrg
+    // ever leaked a same-named row from another organization, this real
+    // matching function would trivially select it (it has no org
+    // awareness of its own -- isolation is entirely the query's job).
     const orgBTeamId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_B, teamName: 'FS Bulldogs' }));
     const orgATeamId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A, teamName: 'FS Bulldogs' }));
 
@@ -399,23 +403,27 @@ test('listTeamsForOrg: an IDENTICALLY-named team in org B (the exact scenario re
     assert.equal(orgATeams[0].id, orgATeamId);
     assert.notEqual(orgATeams[0].id, orgBTeamId);
 
-    // Reproduce reingest-games.js's own matching predicate verbatim
-    // (ingestTeamFolder's `existingTeams.find(...)`) against a scraped
-    // folder name that collides with BOTH organizations' identical team
-    // name, proving the match can only ever resolve to org A's own row.
-    const folderName = 'FS Bulldogs';
-    const matched = orgATeams.find((t) =>
-      t.team_name.toLowerCase().includes(folderName.toLowerCase()) ||
-      folderName.toLowerCase().includes(t.team_name.toLowerCase())
-    );
+    // The REAL findMatchingTeam -- not a reimplementation -- against a
+    // scraped folder name that collides with BOTH organizations'
+    // identical team name, proving the match can only ever resolve to
+    // org A's own row because org B's was never in the input at all.
+    const matched = findMatchingTeam(orgATeams, 'FS Bulldogs');
     assert.ok(matched, 'the folder name must still match org A\'s own team');
     assert.equal(matched.id, orgATeamId, 'a same-named collision must resolve to org A\'s row, never org B\'s');
+
+    // Negative control: findMatchingTeam has no org filtering of its own --
+    // fed org B's row directly (proving isolation is listTeamsForOrg's
+    // property, not findMatchingTeam's), it WOULD match it. This is what
+    // makes the org-A-only result above meaningful rather than incidental.
+    const matchedAgainstOrgB = findMatchingTeam([{ id: orgBTeamId, team_name: 'FS Bulldogs' }], 'FS Bulldogs');
+    assert.equal(matchedAgainstOrgB.id, orgBTeamId, 'sanity: findMatchingTeam matches whatever list it is given');
   });
 });
 
-test('log-capture: constructing reingest-games.js\'s own "[id] name — N game(s)" summary line from a REAL ' +
-     'listTeamsForOrg(ORG_A) result never emits org B\'s org id, team id, team name, or GameChanger URL -- ' +
-     'and never emits a GameChanger URL for org A\'s own team either (this summary line does not print one)', () => {
+test('formatTeamSummaryLine (REAL src/reingest-helpers.js, the exact function reingest-games.js\'s ' +
+     'main() calls): capturing actual console.log output built from a REAL listTeamsForOrg(ORG_A) ' +
+     'result never emits org B\'s org id, team id, team name, or GameChanger URL -- and never emits ' +
+     'a GameChanger URL for org A\'s own team either (formatTeamSummaryLine cannot read that field)', () => {
   return withFreshDbSupabase(async (dbSupabase, state) => {
     await dbSupabase.upsertTeam(syntheticTeam({
       orgId: ORG_B,
@@ -430,18 +438,17 @@ test('log-capture: constructing reingest-games.js\'s own "[id] name — N game(s
 
     const orgATeams = await dbSupabase.listTeamsForOrg(ORG_A);
 
-    // Real console.log spy -- genuinely captures what would be written to
-    // stdout, using the exact template literal reingest-games.js#main()
-    // uses for its final "DB state after ingest" summary
-    // (`  [${t.id}] ${t.team_name} — ${bundle.meta.gamesAnalyzed} game(s)`),
-    // fed with the REAL org-scoped result set (not a hand-built fixture).
+    // Real console.log spy -- genuinely captures what gets written to
+    // stdout when reingest-games.js#main()'s own final-summary loop calls
+    // console.log(formatTeamSummaryLine(t, gamesAnalyzed)), fed with the
+    // REAL org-scoped result set (not a hand-built fixture).
     const captured = [];
     const originalLog = console.log;
     console.log = (...args) => { captured.push(args.join(' ')); };
     try {
       for (const t of orgATeams) {
         const gamesAnalyzed = 0; // stands in for bundle.meta.gamesAnalyzed -- irrelevant to log-safety
-        console.log(`  [${t.id}] ${t.team_name} — ${gamesAnalyzed} game(s)`);
+        console.log(formatTeamSummaryLine(t, gamesAnalyzed));
       }
     } finally {
       console.log = originalLog;
@@ -454,5 +461,28 @@ test('log-capture: constructing reingest-games.js\'s own "[id] name — N game(s
     assert.doesNotMatch(output, /org-b-secret-team-slug/, 'org B\'s GameChanger URL must never appear in captured output');
     assert.doesNotMatch(output, /org-a-team-slug/, 'no GameChanger URL is printed by this summary line, not even org A\'s own');
     assert.match(output, new RegExp(orgATeamId), 'sanity: org A\'s own team id IS expected to appear (it is this org\'s own data)');
+  });
+});
+
+test('formatTeamSummaryLine: zero scoped teams produces a safe, empty summary -- no global information, ' +
+     'no fallback output', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_B })); // some other org has teams
+
+    const orgATeams = await dbSupabase.listTeamsForOrg(ORG_A);
+
+    const captured = [];
+    const originalLog = console.log;
+    console.log = (...args) => { captured.push(args.join(' ')); };
+    try {
+      for (const t of orgATeams) {
+        console.log(formatTeamSummaryLine(t, 0));
+      }
+    } finally {
+      console.log = originalLog;
+    }
+
+    assert.deepEqual(orgATeams, [], 'an org with no teams of its own gets an empty result, not org B\'s teams');
+    assert.deepEqual(captured, [], 'zero teams must produce zero summary lines -- no global fallback output');
   });
 });
