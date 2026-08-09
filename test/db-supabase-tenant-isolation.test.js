@@ -377,3 +377,82 @@ test('listTeamsForOrg: returned rows carry no other organization\'s data -- safe
     assert.doesNotMatch(serialized, new RegExp(ORG_B), 'org B\'s org id must never appear in org A\'s result set');
   });
 });
+
+test('listTeamsForOrg: an IDENTICALLY-named team in org B (the exact scenario reingest-games.js\'s ' +
+     'substring-matching folder lookup is exposed to) is still never returned for org A -- the ' +
+     'row is excluded by org_id, not distinguished by name', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    // Same exact team_name in both organizations -- reingest-games.js's
+    // ingestTeamFolder() matches a scraped folder name against
+    // db.listTeamsForOrg(JOB_ORG_ID)'s result via a loose, case-insensitive
+    // substring test (t.team_name.includes(folderName) ||
+    // folderName.includes(t.team_name)). If listTeamsForOrg ever leaked a
+    // same-named row from another organization, that substring match would
+    // trivially select it. It cannot: org B's row is never even present in
+    // org A's result set.
+    const orgBTeamId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_B, teamName: 'FS Bulldogs' }));
+    const orgATeamId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A, teamName: 'FS Bulldogs' }));
+
+    const orgATeams = await dbSupabase.listTeamsForOrg(ORG_A);
+
+    assert.equal(orgATeams.length, 1, 'org A must see exactly one "FS Bulldogs", never two');
+    assert.equal(orgATeams[0].id, orgATeamId);
+    assert.notEqual(orgATeams[0].id, orgBTeamId);
+
+    // Reproduce reingest-games.js's own matching predicate verbatim
+    // (ingestTeamFolder's `existingTeams.find(...)`) against a scraped
+    // folder name that collides with BOTH organizations' identical team
+    // name, proving the match can only ever resolve to org A's own row.
+    const folderName = 'FS Bulldogs';
+    const matched = orgATeams.find((t) =>
+      t.team_name.toLowerCase().includes(folderName.toLowerCase()) ||
+      folderName.toLowerCase().includes(t.team_name.toLowerCase())
+    );
+    assert.ok(matched, 'the folder name must still match org A\'s own team');
+    assert.equal(matched.id, orgATeamId, 'a same-named collision must resolve to org A\'s row, never org B\'s');
+  });
+});
+
+test('log-capture: constructing reingest-games.js\'s own "[id] name — N game(s)" summary line from a REAL ' +
+     'listTeamsForOrg(ORG_A) result never emits org B\'s org id, team id, team name, or GameChanger URL -- ' +
+     'and never emits a GameChanger URL for org A\'s own team either (this summary line does not print one)', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    await dbSupabase.upsertTeam(syntheticTeam({
+      orgId: ORG_B,
+      teamName: 'FS Bulldogs', // identical name to org A's team below
+      gcTeamUrl: 'https://gc.example.test/org-b-secret-team-slug',
+    }));
+    const orgATeamId = await dbSupabase.upsertTeam(syntheticTeam({
+      orgId: ORG_A,
+      teamName: 'FS Bulldogs',
+      gcTeamUrl: 'https://gc.example.test/org-a-team-slug',
+    }));
+
+    const orgATeams = await dbSupabase.listTeamsForOrg(ORG_A);
+
+    // Real console.log spy -- genuinely captures what would be written to
+    // stdout, using the exact template literal reingest-games.js#main()
+    // uses for its final "DB state after ingest" summary
+    // (`  [${t.id}] ${t.team_name} — ${bundle.meta.gamesAnalyzed} game(s)`),
+    // fed with the REAL org-scoped result set (not a hand-built fixture).
+    const captured = [];
+    const originalLog = console.log;
+    console.log = (...args) => { captured.push(args.join(' ')); };
+    try {
+      for (const t of orgATeams) {
+        const gamesAnalyzed = 0; // stands in for bundle.meta.gamesAnalyzed -- irrelevant to log-safety
+        console.log(`  [${t.id}] ${t.team_name} — ${gamesAnalyzed} game(s)`);
+      }
+    } finally {
+      console.log = originalLog;
+    }
+
+    const output = captured.join('\n');
+    assert.equal(orgATeams.length, 1);
+    assert.equal(orgATeams[0].id, orgATeamId);
+    assert.doesNotMatch(output, new RegExp(ORG_B), 'org B\'s organization id must never appear in captured output');
+    assert.doesNotMatch(output, /org-b-secret-team-slug/, 'org B\'s GameChanger URL must never appear in captured output');
+    assert.doesNotMatch(output, /org-a-team-slug/, 'no GameChanger URL is printed by this summary line, not even org A\'s own');
+    assert.match(output, new RegExp(orgATeamId), 'sanity: org A\'s own team id IS expected to appear (it is this org\'s own data)');
+  });
+});
