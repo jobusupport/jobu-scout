@@ -834,6 +834,66 @@ test('the ambiguous name getAllTeams does not appear anywhere in src/db-supabase
   assert.doesNotMatch(source, /\bgetAllTeams\b/, 'db-supabase.js must not reference getAllTeams in any form');
 });
 
+// ── Security Slice T3I: getTeamByUrl / setTeamArchived removed ─────────────
+//
+// Both were unscoped-by-design (getTeamByUrl: `WHERE gc_team_url = ?` with
+// no org filter; setTeamArchived: `WHERE id = ?` with no org filter) and,
+// per an independent repository-wide reachability audit, had no current
+// production, API, scheduler, background-job, or operator-tool caller --
+// getTeamByUrl's only caller (src/test-normalizer.js, a standalone manual
+// diagnostic script) has been updated to reuse the id upsertTeam() already
+// returns instead of re-fetching by URL. Removed outright rather than
+// given an org-scoped replacement, since deleting genuinely dead code is
+// preferable to adding an org-scoped API with no caller to prove it
+// against. Mirrors the getAllTeams removal-verification pattern above.
+
+test('db-supabase.js does not export getTeamByUrl or setTeamArchived', () => {
+  return withFreshDbSupabase((dbSupabase) => {
+    assert.equal(dbSupabase.getTeamByUrl, undefined, 'the unscoped lookup must not remain as a live export');
+    assert.equal(dbSupabase.setTeamArchived, undefined, 'the unscoped archive toggle must not remain as a live export');
+  });
+});
+
+test('db.js (SQLite passthrough) does not export getTeamByUrl or setTeamArchived', () => {
+  delete require.cache[require.resolve('../src/db')];
+  const dbSqlite = require('../src/db');
+  assert.equal(dbSqlite.getTeamByUrl, undefined, 'the unscoped lookup must not remain as a live export');
+  assert.equal(dbSqlite.setTeamArchived, undefined, 'the unscoped archive toggle must not remain as a live export');
+  delete require.cache[require.resolve('../src/db')];
+});
+
+test('getTeamByUrl and setTeamArchived do not appear anywhere in src/db-supabase.js\'s or src/db.js\'s ' +
+     'source (a historical mention in an explanatory comment is fine; a live definition, export, or call ' +
+     'site is not)', () => {
+  const fs = require('fs');
+  const dbSupabaseSource = fs.readFileSync(DB_SUPABASE_SRC_PATH, 'utf8');
+  const dbSqliteSource = fs.readFileSync(require.resolve('../src/db'), 'utf8');
+  for (const [name, source] of [['src/db-supabase.js', dbSupabaseSource], ['src/db.js', dbSqliteSource]]) {
+    assert.doesNotMatch(source, /function getTeamByUrl|async function getTeamByUrl/, `${name} must not define getTeamByUrl`);
+    assert.doesNotMatch(source, /function setTeamArchived|async function setTeamArchived/, `${name} must not define setTeamArchived`);
+    assert.doesNotMatch(source, /^\s*getTeamByUrl,\s*$/m, `${name} must not export getTeamByUrl`);
+    assert.doesNotMatch(source, /^\s*setTeamArchived,\s*$/m, `${name} must not export setTeamArchived`);
+  }
+});
+
+test('db-supabase.js/db.js: prior team repository behavior unaffected by the removal -- upsertTeam, ' +
+     'listTeamsForOrg, and listAllTeamsForOperator remain exported and working on both adapters', () => {
+  return withFreshDbSupabase(async (dbSupabase) => {
+    const teamId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A }));
+    assert.ok(teamId);
+    const teams = await dbSupabase.listTeamsForOrg(ORG_A);
+    assert.equal(teams.length, 1);
+    assert.equal(typeof dbSupabase.listAllTeamsForOperator, 'function');
+  }).then(() => {
+    delete require.cache[require.resolve('../src/db')];
+    const dbSqlite = require('../src/db');
+    assert.equal(typeof dbSqlite.upsertTeam, 'function');
+    assert.equal(typeof dbSqlite.listTeamsForOrg, 'function');
+    assert.equal(typeof dbSqlite.listAllTeamsForOperator, 'function');
+    delete require.cache[require.resolve('../src/db')];
+  });
+});
+
 // ── Security Slice T3G: getGameUrlsForTeamInOrg / markGameUrlProcessedForOrg ─
 //
 // src/scrape-game-urls.js#getGameUrls()/markProcessed() used to open
