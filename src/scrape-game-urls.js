@@ -31,6 +31,7 @@ const pipeline     = require('./pipeline');
 const { getStorageStatePath } = require('./gc-session-loader');
 const { requireJobOrgContext } = require('./job-org-context');
 const { isValidUuid } = require('./report-access');
+const { resolveTeamOutputDir } = require('./output-paths');
 
 // Resolved through the single shared helper (src/gc-session-loader.js) every
 // other GameChanger session producer/consumer uses -- GC_AUTH_FILE_PATH is a
@@ -41,7 +42,6 @@ const { isValidUuid } = require('./report-access');
 // are unaffected. No separate fallback constant is maintained here.
 const STORAGE_STATE = getStorageStatePath();
 const DB_PATH       = path.join(__dirname, '..', 'voodoo-scout.db');
-const OUTPUT_DIR    = path.join(__dirname, '..', 'output');
 
 // ── DB helpers ────────────────────────────────────────────────────────────────
 // Security Slice T3G: previously opened voodoo-scout.db directly with a
@@ -167,9 +167,17 @@ if (require.main === module) {
     const { teamId, urls } = result;
     console.log(`Found ${urls.length} game URL(s) for: ${teamNameArg}`);
 
-    // Ensure output dir exists
-    const teamOutputDir = path.join(OUTPUT_DIR, teamNameArg.replace(/[<>:"/\\|?*]/g, ''));
-    if (!fs.existsSync(teamOutputDir)) fs.mkdirSync(teamOutputDir, { recursive: true });
+    // Security Slice T3H: validated up front, before the browser ever
+    // launches, so an invalid org/team combination fails fast rather than
+    // after a GameChanger session is already open. This staging directory
+    // is output/<JOB_ORG_ID>/<team>/, never the legacy shared
+    // output/<TeamName>/ tree -- two organizations scouting an
+    // identically-named team can no longer collide on disk. The actual
+    // file writes happen inside search-gamechanger-teams.js#extractGameData
+    // -> getTeamOutputDir(), which resolves the identical path (see
+    // setCurrentJobOrgId() below) -- this call's return value is discarded,
+    // its only purpose here is the early, fail-closed validation.
+    resolveTeamOutputDir(JOB_ORG_ID, teamNameArg.replace(/[<>:"/\\|?*]/g, ''));
 
     // Import extractGameData from the main scraper
     // It handles all HTML extraction — we just override the side assignment after
@@ -178,6 +186,16 @@ if (require.main === module) {
       const mainScraper = require('./search-gamechanger-teams');
       extractGameData   = mainScraper.extractGameData;
       if (typeof extractGameData !== 'function') throw new Error('extractGameData not exported');
+      // Security Slice T3H: search-gamechanger-teams.js's own output/ path
+      // helpers (getTeamOutputDir, etc.) read a module-level trusted org id
+      // that main()/scrapeTeamById() normally set -- this file calls
+      // extractGameData() directly, bypassing both, so it must set that
+      // state itself, with the same already-validated JOB_ORG_ID, before
+      // any game is processed. setCurrentJobOrgId() independently
+      // re-validates its input; it cannot be used to smuggle in an
+      // unvalidated value even if this file's own check above were ever
+      // removed.
+      mainScraper.setCurrentJobOrgId(JOB_ORG_ID);
     } catch (err) {
       console.error(`Cannot import extractGameData: ${err.message}`);
       console.error(`Make sure search-gamechanger-teams.js exports: module.exports = { extractGameData }`);

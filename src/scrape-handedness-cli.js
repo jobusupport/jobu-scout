@@ -14,8 +14,13 @@
  *     --myTeamGcUrl "https://web.gc.com/teams/xxxxxxxx"
  *
  * Add --forceRefresh to re-capture every player instead of only new ones.
- * Add --debugHtml to dump roster/modal HTML to output/_handedness-debug/
- * for selector verification (equivalent to setting GC_HANDEDNESS_DEBUG_HTML=true).
+ * Add --debugHtml to dump roster/modal HTML to
+ * output/<orgId>/_handedness-debug/ for selector verification (equivalent
+ * to setting GC_HANDEDNESS_DEBUG_HTML=true). Security Slice T3H: --debugHtml
+ * requires --orgId <uuid> (the organization whose output/ tree to stage
+ * the dump under) -- refuses to write into the legacy shared flat
+ * directory. --orgId is not required for the core capture-and-store
+ * behavior, which never touches output/.
  */
 
 require('dotenv').config();
@@ -50,9 +55,18 @@ async function main() {
   const opponentName = args.opponentName;
   const myTeamGcUrl = args.myTeamGcUrl;
   const forceRefresh = args.forceRefresh === 'true';
+  const orgId = args.orgId;
 
   if (!teamId || !opponentName || !myTeamGcUrl) {
-    console.error('Usage: node src/scrape-handedness-cli.js --teamId <id> --opponentName "<name>" --myTeamGcUrl "<url>" [--forceRefresh] [--debugHtml]');
+    console.error('Usage: node src/scrape-handedness-cli.js --teamId <id> --opponentName "<name>" --myTeamGcUrl "<url>" [--forceRefresh] [--debugHtml] [--orgId <uuid>]');
+    process.exit(1);
+  }
+
+  // Security Slice T3H: --debugHtml stages its dump under output/<orgId>/ --
+  // fails closed here, before any browser/database work, rather than
+  // deeper inside the debug-dump call site.
+  if (args.debugHtml === 'true' && !orgId) {
+    console.error('[handedness] --debugHtml requires --orgId <uuid> (the organization whose output/ tree to stage the dump under).');
     process.exit(1);
   }
 
@@ -90,7 +104,8 @@ async function main() {
       opponentTeamName: opponentName,
       teamId,
       db,
-      forceRefresh
+      forceRefresh,
+      orgId
     });
     console.log('[handedness] Result:', result);
   } finally {
