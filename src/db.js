@@ -311,10 +311,6 @@ function upsertTeam(team) {
   return info.lastInsertRowid;
 }
 
-function getTeamByUrl(gcTeamUrl) {
-  return getDb().prepare(`SELECT * FROM teams WHERE gc_team_url = ?`).get(gcTeamUrl);
-}
-
 // Security Slice T3E: explicitly named for what it is -- an operator-only,
 // repository-wide enumeration with no tenant filter of any kind. Never
 // call this from application-triggered code (HTTP routes, background
@@ -358,17 +354,6 @@ function markGameUrlProcessedForOrg(orgId, urlId, teamId) {
     .prepare(`UPDATE team_game_urls SET processed_at = datetime('now') WHERE id = ? AND team_id = ?`)
     .run(urlId, teamId);
   return { updated: info.changes > 0 };
-}
-
-/**
- * Archive (soft-hide) or restore a team. Does not touch games, batting_lines,
- * pitching_lines, play_events, or advanced stats — all history stays intact.
- * Used when a coach stops playing an opponent but doesn't want to lose data.
- */
-function setTeamArchived(teamId, archived) {
-  getDb().prepare(`UPDATE teams SET archived = ?, updated_at = datetime('now') WHERE id = ?`)
-    .run(archived ? 1 : 0, teamId);
-  return true;
 }
 
 // ─── Games ────────────────────────────────────────────────────────────────────
@@ -1201,10 +1186,8 @@ module.exports = {
   getRawBattingLines,
   // Teams
   upsertTeam,
-  getTeamByUrl,
   listAllTeamsForOperator,
   listTeamsForOrg,
-  setTeamArchived,
   getGameUrlsForTeamInOrg,
   markGameUrlProcessedForOrg,
   // Games

@@ -376,12 +376,6 @@ async function upsertTeam(team) {
   return data.id;
 }
 
-async function getTeamByUrl(gcTeamUrl) {
-  const { data, error } = await getDb().from('teams').select('*').eq('gc_team_url', gcTeamUrl).maybeSingle();
-  check(error, 'getTeamByUrl');
-  return data;
-}
-
 // Security Slice T3E: explicitly named for what it is -- an operator-only,
 // repository-wide enumeration across every organization, with no tenant
 // filter of any kind. Never call this from application-triggered code
@@ -495,20 +489,6 @@ async function markGameUrlProcessedForOrg(orgId, urlId, teamId) {
     .select('id');
   check(error, 'markGameUrlProcessedForOrg');
   return { updated: Array.isArray(data) && data.length > 0 };
-}
-
-/**
- * Archive (soft-hide) or restore a team. Does not touch games, batting_lines,
- * pitching_lines, play_events, or advanced stats — all history stays intact.
- * Used when a coach stops playing an opponent but doesn't want to lose data.
- */
-async function setTeamArchived(teamId, archived) {
-  const { error } = await getDb()
-    .from('teams')
-    .update({ archived: !!archived, updated_at: new Date().toISOString() })
-    .eq('id', teamId);
-  check(error, 'setTeamArchived');
-  return true;
 }
 
 // ─── Games ────────────────────────────────────────────────────────────────────
@@ -1443,10 +1423,8 @@ module.exports = {
   getGameDataForStatsEngine,
   // Teams
   upsertTeam,
-  getTeamByUrl,
   listAllTeamsForOperator,
   listTeamsForOrg,
-  setTeamArchived,
   getGameUrlsForTeamInOrg,
   markGameUrlProcessedForOrg,
   // Games

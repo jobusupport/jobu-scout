@@ -341,6 +341,11 @@ test('normalizeGameData() handles missing box score gracefully', () => {
 section('Database Layer (in-memory)');
 
 let dbModule;
+// Security Slice T3I: getTeamByUrl() (an unscoped-by-design lookup) was
+// removed from both database adapters -- this script only ever needs the
+// id upsertTeam() already returns, so every test below reuses that id
+// instead of re-fetching the team.
+let teamId;
 
 test('db.init() creates in-memory database', () => {
   dbModule = require('./db');
@@ -349,16 +354,13 @@ test('db.init() creates in-memory database', () => {
 });
 
 test('db.upsertTeam() inserts a team', () => {
-  const teamId = dbModule.upsertTeam(SAMPLE_TEAM);
+  teamId = dbModule.upsertTeam(SAMPLE_TEAM);
   assert.ok(typeof teamId === 'number', `Expected number, got ${typeof teamId}`);
   assert.ok(teamId > 0);
 });
 
 test('db.writeNormalizedGame() writes game + stats atomically', () => {
-  const team = dbModule.getTeamByUrl(SAMPLE_TEAM.gcTeamUrl);
-  assert.ok(team, 'Team should exist');
-
-  const norm = normalizeGameData(SAMPLE_RAW_GAME, team.id);
+  const norm = normalizeGameData(SAMPLE_RAW_GAME, teamId);
   const result = dbModule.writeNormalizedGame(norm);
 
   assert.ok(result.gameId > 0);
@@ -368,19 +370,17 @@ test('db.writeNormalizedGame() writes game + stats atomically', () => {
 });
 
 test('db.writeNormalizedGame() is idempotent (duplicate skipped)', () => {
-  const team = dbModule.getTeamByUrl(SAMPLE_TEAM.gcTeamUrl);
-  const norm = normalizeGameData(SAMPLE_RAW_GAME, team.id);
+  const norm = normalizeGameData(SAMPLE_RAW_GAME, teamId);
 
   // db.insertGame() detects the duplicate via gc_game_id and skips silently.
-  const gamesBefore = dbModule.getGamesByTeam(team.id).length;
+  const gamesBefore = dbModule.getGamesByTeam(teamId).length;
   dbModule.writeNormalizedGame(norm);
-  const gamesAfter = dbModule.getGamesByTeam(team.id).length;
+  const gamesAfter = dbModule.getGamesByTeam(teamId).length;
   assert.strictEqual(gamesBefore, gamesAfter, 'Duplicate write should not add a second game row');
 });
 
 test('db.getTeamBattingAggregates() returns correct totals', () => {
-  const team = dbModule.getTeamByUrl(SAMPLE_TEAM.gcTeamUrl);
-  const batting = dbModule.getTeamBattingAggregates(team.id);
+  const batting = dbModule.getTeamBattingAggregates(teamId);
 
   assert.ok(batting.length > 0, 'Should have batting aggregates');
   const jake = batting.find(b => b.player_name === 'Jake Smith');
@@ -391,8 +391,7 @@ test('db.getTeamBattingAggregates() returns correct totals', () => {
 });
 
 test('db.getTeamPitchingAggregates() calculates ERA correctly', () => {
-  const team = dbModule.getTeamByUrl(SAMPLE_TEAM.gcTeamUrl);
-  const pitching = dbModule.getTeamPitchingAggregates(team.id);
+  const pitching = dbModule.getTeamPitchingAggregates(teamId);
 
   assert.ok(pitching.length > 0);
   const marcus = pitching.find(p => p.player_name === 'Marcus Davis');
@@ -402,8 +401,7 @@ test('db.getTeamPitchingAggregates() calculates ERA correctly', () => {
 });
 
 test('db.getTeamPlayTendencies() returns event distribution', () => {
-  const team = dbModule.getTeamByUrl(SAMPLE_TEAM.gcTeamUrl);
-  const tendencies = dbModule.getTeamPlayTendencies(team.id);
+  const tendencies = dbModule.getTeamPlayTendencies(teamId);
 
   assert.ok(tendencies.length > 0);
   const single = tendencies.find(t => t.event_type === 'single');
@@ -413,8 +411,7 @@ test('db.getTeamPlayTendencies() returns event distribution', () => {
 });
 
 test('db.getTeamAnalysisBundle() returns complete bundle', () => {
-  const team = dbModule.getTeamByUrl(SAMPLE_TEAM.gcTeamUrl);
-  const bundle = dbModule.getTeamAnalysisBundle(team.id);
+  const bundle = dbModule.getTeamAnalysisBundle(teamId);
 
   assert.ok(bundle.team);
   assert.ok(Array.isArray(bundle.games));
