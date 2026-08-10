@@ -84,10 +84,23 @@ for (const { name, marker } of ROUTES) {
   });
 }
 
-test('gc-scraper and all-gc routes: the org-less src/scrape-game-urls.js branch is untouched ' +
-     '(that script does not call ensureTeam/upsertTeam, per the Slice T1 call-graph trace, so it is out of scope)', () => {
+// Security Slice T3G: src/scrape-game-urls.js used to open voodoo-scout.db
+// directly with no organization scoping at all (team_game_urls has no
+// org_id column, and the script never checked JOBU_JOB_ORG_ID) -- the
+// "org-less, out of scope" framing this test previously had was accurate
+// for T1's ensureTeam/upsertTeam call-graph trace specifically, but the
+// script itself is a tenant-facing job like any other and is now scoped
+// the same way every sibling spawn call in these routes already is.
+test('gc-scraper, full-pipeline, and all-gc routes: the src/scrape-game-urls.js branch receives JOBU_JOB_ORG_ID, ' +
+     'same as every other spawned step in these routes', () => {
   const gcScraperBlock = extractRouteBlock(SERVER_SRC, "app.post('/api/run/gc-scraper'");
-  assert.match(gcScraperBlock, /spawnJob\(id, 'node', \['src\/scrape-game-urls\.js'/);
+  assert.match(gcScraperBlock, /spawnJob\(id, 'node', \['src\/scrape-game-urls\.js', `"\$\{cleanTeamName\(team\.team_name\)\}"`\], ROOT, \{ JOBU_JOB_ORG_ID: orgId \}\)/);
+
+  const fullPipelineBlock = extractRouteBlock(SERVER_SRC, "app.post('/api/run/full-pipeline'");
+  assert.match(fullPipelineBlock, /runStep\('node', \['src\/scrape-game-urls\.js', `"\$\{cleanTeamName\(team\.team_name\)\}"`\], ROOT, \{ JOBU_JOB_ORG_ID: orgId \}\)/);
+
+  const allGcBlock = extractRouteBlock(SERVER_SRC, "app.post('/api/run/all-gc'");
+  assert.match(allGcBlock, /runStep\('node', \['src\/scrape-game-urls\.js', `"\$\{cleanTeamName\(team\.team_name\)\}"`\], ROOT, \{ JOBU_JOB_ORG_ID: orgId \}\)/);
 });
 
 test('full-pipeline route: step 3 (reingest-games.js) also receives JOBU_JOB_ORG_ID', () => {

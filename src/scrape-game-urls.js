@@ -7,6 +7,14 @@
  *
  * Usage: node src/scrape-game-urls.js <teamName>
  *
+ * Required env var:
+ *   JOBU_JOB_ORG_ID  <uuid>  ← the trusted organization this run acts as.
+ *                                Set by server.js when this script is
+ *                                spawned from an authenticated route; a
+ *                                trusted operator must set it explicitly
+ *                                for a bare CLI run. Refuses to run
+ *                                without it (Security Slice T3G).
+ *
  * Reads game URLs from DB table: team_game_urls
  * Each row: gc_game_url, label, box_side ('away'|'home')
  *   'away' = left side of box score
@@ -18,9 +26,11 @@ require('dotenv').config();
 const { chromium } = require('@playwright/test');
 const path         = require('path');
 const fs           = require('fs');
-const Database     = require('better-sqlite3');
+const db           = require('./db');
 const pipeline     = require('./pipeline');
 const { getStorageStatePath } = require('./gc-session-loader');
+const { requireJobOrgContext } = require('./job-org-context');
+const { isValidUuid } = require('./report-access');
 
 // Resolved through the single shared helper (src/gc-session-loader.js) every
 // other GameChanger session producer/consumer uses -- GC_AUTH_FILE_PATH is a
@@ -34,40 +44,47 @@ const DB_PATH       = path.join(__dirname, '..', 'voodoo-scout.db');
 const OUTPUT_DIR    = path.join(__dirname, '..', 'output');
 
 // ── DB helpers ────────────────────────────────────────────────────────────────
-function getGameUrls(teamName) {
-  const db = new Database(DB_PATH);
+// Security Slice T3G: previously opened voodoo-scout.db directly with a
+// raw, unscoped `WHERE team_id = ?` query -- team_game_urls has no org_id
+// column, so that query (and the equally unscoped UPDATE in markProcessed
+// below) could read or update ANY organization's rows, and never even
+// went through src/db.js's T3F database-mode gate. Now routed through the
+// shared repository (src/db.js -> src/db-supabase.js in Supabase mode),
+// the same db.listTeamsForOrg(orgId) tenant-scoped team lookup
+// src/reingest-helpers.js and src/report-team-selection.js already use
+// (fuzzy name matching happens here, in JS, same as before -- but against
+// an already org-scoped team list, never a global one), and the new
+// db.getGameUrlsForTeamInOrg/markGameUrlProcessedForOrg methods, which
+// re-verify team ownership against orgId at query time before touching
+// team_game_urls (see src/db-supabase.js for the exact query shape).
+function normalizeTeamNameForMatch(value) {
+  return String(value || '').trim().toLowerCase();
+}
 
-  // Try exact match first, then starts-with match to handle minor name differences
-  let team = db.prepare(
-    `SELECT id FROM teams WHERE LOWER(TRIM(team_name)) = LOWER(TRIM(?))`
-  ).get(teamName);
+async function getGameUrls(orgId, teamName) {
+  const teams = await Promise.resolve(db.listTeamsForOrg(orgId));
+
+  const needle = normalizeTeamNameForMatch(teamName);
+  let team = teams.find((t) => normalizeTeamNameForMatch(t.team_name) === needle);
 
   if (!team) {
-    // Try stripping record suffix from DB names
+    // Try stripping record suffix from DB names (e.g. "(12-3 in 2026)")
     const cleanArg = teamName.replace(/\(\d[\d-]*\s+in\s+\d{4}\)/gi, '').trim();
-    team = db.prepare(
-      `SELECT id FROM teams WHERE LOWER(TRIM(team_name)) = LOWER(TRIM(?))`
-    ).get(cleanArg);
+    const cleanNeedle = normalizeTeamNameForMatch(cleanArg);
+    team = teams.find((t) => normalizeTeamNameForMatch(t.team_name) === cleanNeedle);
   }
 
   if (!team) {
-    db.close();
     console.log(`No team found in DB matching: "${teamName}"`);
     return null;
   }
 
-  const urls = db.prepare(
-    `SELECT * FROM team_game_urls WHERE team_id = ? ORDER BY created_at`
-  ).all(team.id);
-
-  db.close();
+  const urls = await Promise.resolve(db.getGameUrlsForTeamInOrg(orgId, team.id));
   return { teamId: team.id, urls };
 }
 
-function markProcessed(urlId) {
-  const db = new Database(DB_PATH);
-  db.prepare(`UPDATE team_game_urls SET processed_at = datetime('now') WHERE id = ?`).run(urlId);
-  db.close();
+async function markProcessed(orgId, urlId, teamId) {
+  await Promise.resolve(db.markGameUrlProcessedForOrg(orgId, urlId, teamId));
 }
 
 // ── Re-tag game data rows with the user-specified side ────────────────────────
@@ -121,8 +138,27 @@ if (require.main === module) {
     process.exit(1);
   }
 
+  // Security Slice T3G: resolved and validated before ANY database access
+  // (including pipeline.init() below) -- the same fail-closed contract
+  // src/reingest-games.js and src/generate-report.js already established.
+  // This job is spawned by server.js's authenticated /api/run/gc-scraper,
+  // /api/run/full-pipeline, and /api/run/all-gc routes on behalf of a
+  // real, already-verified organization; JOBU_JOB_ORG_ID carries that
+  // trusted value. There is no fallback to "the only organization" or any
+  // other inference.
+  const JOB_ORG_ID = requireJobOrgContext();
+  if (!isValidUuid(JOB_ORG_ID)) {
+    console.error('[scrape-game-urls] JOBU_JOB_ORG_ID is not a valid organization id. Refusing to run.');
+    process.exit(1);
+  }
+
   (async () => {
-    const result = getGameUrls(teamNameArg);
+    // Initialize pipeline/DB first -- getGameUrls() below needs db.js
+    // initialized (this is also where T3F's resolveDatabaseMode() gate
+    // runs, before any team or team_game_urls query).
+    pipeline.init(DB_PATH);
+
+    const result = await getGameUrls(JOB_ORG_ID, teamNameArg);
     if (!result || !result.urls || !result.urls.length) {
       console.log(`No game URLs found for team: ${teamNameArg}`);
       process.exit(0);
@@ -130,9 +166,6 @@ if (require.main === module) {
 
     const { teamId, urls } = result;
     console.log(`Found ${urls.length} game URL(s) for: ${teamNameArg}`);
-
-    // Initialize pipeline/DB
-    pipeline.init(DB_PATH);
 
     // Ensure output dir exists
     const teamOutputDir = path.join(OUTPUT_DIR, teamNameArg.replace(/[<>:"/\\|?*]/g, ''));
@@ -202,7 +235,7 @@ if (require.main === module) {
         // Process through normalizer → DB
         pipeline.processExtractResult(captureResult, teamId);
 
-        markProcessed(row.id);
+        await markProcessed(JOB_ORG_ID, row.id, teamId);
         console.log(`  ✓ Processed successfully`);
         successCount++;
 

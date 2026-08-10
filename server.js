@@ -1486,7 +1486,9 @@ app.post('/api/run/gc-scraper', requireAuth, resolveSupportSession, requireTrave
   appendLog(id, `Starting opponent's-games analysis for: ${team.team_name}`);
   if (!team.gc_team_url && await hasGameUrls(team.id)) {
     appendLog(id, `No team URL — analyzing via individual game URLs`);
-    spawnJob(id, 'node', ['src/scrape-game-urls.js', `"${cleanTeamName(team.team_name)}"`], ROOT);
+    // Security Slice T3G: propagated the same way every other spawned
+    // scraper/report step in this file already receives it.
+    spawnJob(id, 'node', ['src/scrape-game-urls.js', `"${cleanTeamName(team.team_name)}"`], ROOT, { JOBU_JOB_ORG_ID: orgId });
   } else {
     const env = { JOBU_JOB_ORG_ID: orgId };
     if (team.gc_team_url) env.GC_TEAM_URL = team.gc_team_url;
@@ -1661,7 +1663,9 @@ app.post('/api/run/full-pipeline', requireAuth, resolveSupportSession, requireTr
     try {
       appendLog(id, "── Step 1/4: Analyze Opponent's Games ──");
       if (noGC) {
-        await runStep('node', ['src/scrape-game-urls.js', `"${cleanTeamName(team.team_name)}"`], ROOT);
+        // Security Slice T3G: propagated the same way every other step in
+        // this pipeline already receives it (see step 3/4, step 4/4 below).
+        await runStep('node', ['src/scrape-game-urls.js', `"${cleanTeamName(team.team_name)}"`], ROOT, { JOBU_JOB_ORG_ID: orgId });
       } else {
         const gcEnv = { JOBU_JOB_ORG_ID: orgId };
         if (team.gc_team_url) gcEnv.GC_TEAM_URL = team.gc_team_url;
@@ -1706,7 +1710,9 @@ app.post('/api/run/all-gc', requireAuth, resolveSupportSession, requireTravelAcc
       appendLog(id, `\n── [${done+failed+1}/${teams.length}] ${team.team_name} ──`);
       try {
         if (!team.gc_team_url && team._hasGameUrls) {
-          await runStep('node', ['src/scrape-game-urls.js', `"${cleanTeamName(team.team_name)}"`], ROOT);
+          // Security Slice T3G: propagated the same way the sibling branch
+          // below already receives it.
+          await runStep('node', ['src/scrape-game-urls.js', `"${cleanTeamName(team.team_name)}"`], ROOT, { JOBU_JOB_ORG_ID: orgId });
         } else {
           const env = { JOBU_JOB_ORG_ID: orgId };
           if (team.gc_team_url) env.GC_TEAM_URL = team.gc_team_url;
