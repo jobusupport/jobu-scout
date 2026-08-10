@@ -16,20 +16,20 @@
 
 const fs   = require('fs');
 const path = require('path');
+const { resolveDatabaseMode } = require('./db-mode');
 
 let _db = null;  // module-level singleton
 
+// Re-derives the exact same decision init() already made and enforced
+// (resolveDatabaseMode() is a pure function of the environment, so calling
+// it again after a successful init() returns the identical result without
+// re-throwing) -- the single authoritative mode check src/pipeline.js's
+// ensureTeam() and src/generate-report.js already relied on before this
+// slice, so neither needed to change. Kept on the exports object (not
+// overwritten by init()'s Object.assign(module.exports, sbDb) in Supabase
+// mode, since db-supabase.js does not define its own useSupabase key).
 function useSupabase() {
-  const explicitUseSupabase =
-    String(process.env.USE_SUPABASE || '').trim().toLowerCase() === 'true';
-
-  const hasSupabaseRuntimeConfig = Boolean(
-    process.env.SUPABASE_URL &&
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-  );
-
-  return explicitUseSupabase ||
-    (process.env.NODE_ENV === 'production' && hasSupabaseRuntimeConfig);
+  return resolveDatabaseMode() === 'supabase';
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
@@ -40,9 +40,26 @@ function useSupabase() {
  */
 function init(dbPath = './voodoo-scout.db') {
   // ── Supabase switch ──────────────────────────────────────────────────────
-  // When USE_SUPABASE=true, transparently delegate everything to db-supabase.js.
-  // All callers (pipeline.js, reingest-games.js, etc.) stay completely unchanged.
-  if (useSupabase()) {
+  // Security Slice T3F: resolveDatabaseMode() is the single authoritative
+  // decision of which repository this process may use -- see src/db-mode.js.
+  // It throws (uncaught, exits non-zero) rather than falling back to SQLite
+  // when running in production without valid, explicit Supabase
+  // configuration. Every entrypoint in this codebase reaches this exact
+  // call before touching a team, game, or stat row (directly via db.init(),
+  // or via pipeline.init() -> db.init()), so this is the one place the
+  // decision is made, not something each entrypoint computes independently.
+  //
+  // Normalizing process.env.USE_SUPABASE to the resolved, canonical
+  // 'true'/'false' string (as server.js already did before this slice)
+  // keeps every downstream raw `process.env.USE_SUPABASE === 'true'` read
+  // (src/pipeline.js's runSync helper, src/validate-team-stats.js, etc. --
+  // all of which only run after init() has already been called) consistent
+  // with the same decision, and propagates unchanged to any child process
+  // spawned afterward via `env: { ...process.env, ... }`.
+  const mode = resolveDatabaseMode();
+  process.env.USE_SUPABASE = mode === 'supabase' ? 'true' : 'false';
+
+  if (mode === 'supabase') {
     console.log('[db] USE_SUPABASE = true');
     console.log('[db] Loading Supabase DB layer');
     const sbDb = require('./db-supabase');
