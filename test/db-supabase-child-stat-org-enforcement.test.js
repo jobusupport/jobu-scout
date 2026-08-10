@@ -207,10 +207,29 @@ const TEAM_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const TEAM_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const TEAM_UNKNOWN = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
 
+const GAME_A = 'game-owned-by-org-a';
+const GAME_B = 'game-owned-by-org-b';
+const GAME_UNKNOWN = 'game-does-not-exist';
+const GAME_NO_ORG = 'game-with-unresolved-org';
+
 function seedTeams(state) {
   state.teams.push(
     { id: TEAM_A, org_id: ORG_A },
     { id: TEAM_B, org_id: ORG_B },
+  );
+}
+
+// Seeds real-looking games rows: GAME_A owned by ORG_A, GAME_B owned by
+// ORG_B (used to prove a team from one organization cannot be combined
+// with a real game from another), plus GAME_NO_ORG (exists, but its own
+// org_id is unresolved/null -- the schema's org_id is nullable pre-T3K-
+// migration, so this is a state the application boundary itself must
+// still refuse rather than assume).
+function seedGames(state) {
+  state.games.push(
+    { id: GAME_A, org_id: ORG_A },
+    { id: GAME_B, org_id: ORG_B },
+    { id: GAME_NO_ORG, org_id: null },
   );
 }
 
@@ -233,89 +252,135 @@ test('insertBattingLines/insertPitchingLines/insertPlayEvents: an empty array is
 
 // ── insertBattingLines ───────────────────────────────────────────────────────
 
-test('insertBattingLines: every inserted row carries the parent team\'s org_id', () => {
+test('insertBattingLines: every inserted row carries the actual game\'s authoritative org_id', () => {
   return withFreshDbSupabase(async (db, state) => {
     seedTeams(state);
-    await db.insertBattingLines([battingLine()], 'game-1');
+    seedGames(state);
+    await db.insertBattingLines([battingLine()], GAME_A);
     assert.equal(state.batting_lines.length, 1);
     assert.equal(state.batting_lines[0].org_id, ORG_A);
+    assert.equal(state.batting_lines[0].game_id, GAME_A);
   });
 });
 
 test('insertBattingLines: cannot silently omit org_id -- every row has a non-null org_id', () => {
   return withFreshDbSupabase(async (db, state) => {
     seedTeams(state);
-    await db.insertBattingLines([battingLine(), battingLine({ playerName: 'Second Player' })], 'game-1');
+    seedGames(state);
+    await db.insertBattingLines([battingLine(), battingLine({ playerName: 'Second Player' })], GAME_A);
     assert.equal(state.batting_lines.length, 2);
     for (const row of state.batting_lines) assert.ok(row.org_id, 'every batting_lines row must carry org_id');
   });
 });
 
-test('insertBattingLines: missing parent team fails closed -- no row is written', async () => {
+test('insertBattingLines: a nonexistent game fails closed -- no row is written', async () => {
   await withFreshDbSupabase(async (db, state) => {
+    seedTeams(state);
     await assert.rejects(
-      () => db.insertBattingLines([battingLine({ teamId: TEAM_UNKNOWN })], 'game-1'),
-      /not found/i,
+      () => db.insertBattingLines([battingLine({ teamId: TEAM_A })], GAME_UNKNOWN),
+      /game.*not found/i,
     );
     assert.equal(state.batting_lines.length, 0);
   });
 });
 
-test('insertBattingLines: a caller-supplied org_id on a LATER row that conflicts with the authoritative team org is REJECTED -- the whole batch fails closed, never silently coalesced to a single org', async () => {
+test('insertBattingLines: a game that exists but has no resolvable org_id fails closed -- no row is written', async () => {
   await withFreshDbSupabase(async (db, state) => {
     seedTeams(state);
+    seedGames(state);
+    await assert.rejects(
+      () => db.insertBattingLines([battingLine({ teamId: TEAM_A })], GAME_NO_ORG),
+      /does not have org_id/i,
+    );
+    assert.equal(state.batting_lines.length, 0);
+  });
+});
+
+test('insertBattingLines: missing parent team fails closed -- no row is written (game itself is valid)', async () => {
+  await withFreshDbSupabase(async (db, state) => {
+    seedGames(state);
+    await assert.rejects(
+      () => db.insertBattingLines([battingLine({ teamId: TEAM_UNKNOWN })], GAME_A),
+      /team.*not found/i,
+    );
+    assert.equal(state.batting_lines.length, 0);
+  });
+});
+
+test('insertBattingLines: THE GAME/TEAM MISMATCH REGRESSION -- a team belonging to Organization A combined with a REAL game belonging to Organization B is rejected before any row is written', async () => {
+  await withFreshDbSupabase(async (db, state) => {
+    seedTeams(state);
+    seedGames(state);
+    // TEAM_A (org A) + GAME_B (a real, existing game -- but owned by org B).
+    // Both individually resolve fine (their own foreign keys are satisfied);
+    // the batch must still be refused because they don't belong together.
+    await assert.rejects(
+      () => db.insertBattingLines([battingLine({ teamId: TEAM_A })], GAME_B),
+      /disagrees with a team|mismatched game\/team/i,
+    );
+    assert.equal(state.batting_lines.length, 0, 'a team/game organization mismatch must never produce a written row');
+  });
+});
+
+test('insertBattingLines: a caller-supplied org_id on a LATER row that conflicts with the authoritative game org is REJECTED -- the whole batch fails closed, never silently coalesced to a single org', async () => {
+  await withFreshDbSupabase(async (db, state) => {
+    seedTeams(state);
+    seedGames(state);
     const lines = [
       battingLine({ teamId: TEAM_A }),
       battingLine({ teamId: TEAM_A, playerName: 'Second Player', orgId: ORG_B }),
     ];
     await assert.rejects(
-      () => db.insertBattingLines(lines, 'game-1'),
-      /conflicts with its team's authoritative organization/i,
+      () => db.insertBattingLines(lines, GAME_A),
+      /conflicts with the game's authoritative organization/i,
     );
     assert.equal(state.batting_lines.length, 0, 'no row may be written when any row\'s hint conflicts with the authoritative org');
   });
 });
 
-test('insertBattingLines: THE MIXED-ORGANIZATION REGRESSION -- a batch containing a row tied to org A\'s team and another tied to org B\'s team is rejected BEFORE any row is written, and cannot result in both rows landing under org A', async () => {
+test('insertBattingLines: THE MIXED-ORGANIZATION-TEAMS REGRESSION -- a batch containing a row tied to org A\'s team and another tied to org B\'s team is rejected BEFORE any row is written, and cannot result in both rows landing under either org', async () => {
   await withFreshDbSupabase(async (db, state) => {
     seedTeams(state);
+    seedGames(state);
     const lines = [
       battingLine({ teamId: TEAM_A, playerName: 'Org A Player' }),
       battingLine({ teamId: TEAM_B, playerName: 'Org B Player' }),
     ];
     await assert.rejects(
-      () => db.insertBattingLines(lines, 'game-1'),
-      /different organizations/i,
+      () => db.insertBattingLines(lines, GAME_A),
+      /disagrees with a team|mismatched game\/team/i,
     );
     assert.equal(state.batting_lines.length, 0, 'a mixed-organization batch must not partially or fully write under either organization');
   });
 });
 
-test('insertBattingLines: a batch spanning two DIFFERENT teams that both belong to the SAME organization is accepted and every row gets that organization\'s org_id', () => {
+test('insertBattingLines: a batch spanning two DIFFERENT teams that both belong to the SAME organization as the game is accepted and every row gets that organization\'s org_id', () => {
   return withFreshDbSupabase(async (db, state) => {
     seedTeams(state);
+    seedGames(state);
     const TEAM_A2 = 'aaaaaaaa-aaaa-4aaa-8aaa-a2a2a2a2a2a2';
     state.teams.push({ id: TEAM_A2, org_id: ORG_A });
     const lines = [
       battingLine({ teamId: TEAM_A, playerName: 'Player On Team A' }),
       battingLine({ teamId: TEAM_A2, playerName: 'Player On Team A2' }),
     ];
-    await db.insertBattingLines(lines, 'game-1');
+    await db.insertBattingLines(lines, GAME_A);
     assert.equal(state.batting_lines.length, 2);
-    for (const row of state.batting_lines) assert.equal(row.org_id, ORG_A, 'two different teams under the same org must both resolve to that org, not be rejected as mixed-tenant');
+    for (const row of state.batting_lines) assert.equal(row.org_id, ORG_A, 'two different teams under the same org as the game must both resolve to that org, not be rejected as mismatched');
   });
 });
 
-test('insertBattingLines: any single row with an unresolvable team fails the whole batch closed, even when other rows resolve fine', async () => {
+test('insertBattingLines: any single row with an unresolvable team fails the whole batch closed, even when the game and other rows resolve fine', async () => {
   await withFreshDbSupabase(async (db, state) => {
     seedTeams(state);
+    seedGames(state);
     const lines = [
       battingLine({ teamId: TEAM_A, playerName: 'Resolvable Player' }),
       battingLine({ teamId: TEAM_UNKNOWN, playerName: 'Unresolvable Player' }),
     ];
     await assert.rejects(
-      () => db.insertBattingLines(lines, 'game-1'),
-      /not found/i,
+      () => db.insertBattingLines(lines, GAME_A),
+      /team.*not found/i,
     );
     assert.equal(state.batting_lines.length, 0);
   });
@@ -323,20 +388,45 @@ test('insertBattingLines: any single row with an unresolvable team fails the who
 
 // ── insertPitchingLines ──────────────────────────────────────────────────────
 
-test('insertPitchingLines: every inserted row carries the parent team\'s org_id', () => {
+test('insertPitchingLines: every inserted row carries the actual game\'s authoritative org_id', () => {
   return withFreshDbSupabase(async (db, state) => {
     seedTeams(state);
-    await db.insertPitchingLines([{ teamId: TEAM_B, playerName: 'Pitcher One', isOurTeam: false }], 'game-2');
+    seedGames(state);
+    await db.insertPitchingLines([{ teamId: TEAM_B, playerName: 'Pitcher One', isOurTeam: false }], GAME_B);
     assert.equal(state.pitching_lines.length, 1);
     assert.equal(state.pitching_lines[0].org_id, ORG_B);
   });
 });
 
-test('insertPitchingLines: missing parent team fails closed -- no row is written', async () => {
+test('insertPitchingLines: missing parent team fails closed -- no row is written (game itself is valid)', async () => {
   await withFreshDbSupabase(async (db, state) => {
+    seedGames(state);
     await assert.rejects(
-      () => db.insertPitchingLines([{ teamId: TEAM_UNKNOWN, playerName: 'Ghost' }], 'game-2'),
-      /not found/i,
+      () => db.insertPitchingLines([{ teamId: TEAM_UNKNOWN, playerName: 'Ghost' }], GAME_A),
+      /team.*not found/i,
+    );
+    assert.equal(state.pitching_lines.length, 0);
+  });
+});
+
+test('insertPitchingLines: a nonexistent game fails closed -- no row is written', async () => {
+  await withFreshDbSupabase(async (db, state) => {
+    seedTeams(state);
+    await assert.rejects(
+      () => db.insertPitchingLines([{ teamId: TEAM_A, playerName: 'Ghost Pitcher' }], GAME_UNKNOWN),
+      /game.*not found/i,
+    );
+    assert.equal(state.pitching_lines.length, 0);
+  });
+});
+
+test('insertPitchingLines: THE GAME/TEAM MISMATCH REGRESSION -- a team belonging to Organization A combined with a REAL game belonging to Organization B is rejected before any row is written', async () => {
+  await withFreshDbSupabase(async (db, state) => {
+    seedTeams(state);
+    seedGames(state);
+    await assert.rejects(
+      () => db.insertPitchingLines([{ teamId: TEAM_A, playerName: 'Cross-Tenant Pitcher' }], GAME_B),
+      /disagrees with a team|mismatched game\/team/i,
     );
     assert.equal(state.pitching_lines.length, 0);
   });
@@ -345,12 +435,13 @@ test('insertPitchingLines: missing parent team fails closed -- no row is written
 test('insertPitchingLines: a mixed-organization batch (one row per org A/org B team) is rejected before any row is written', async () => {
   await withFreshDbSupabase(async (db, state) => {
     seedTeams(state);
+    seedGames(state);
     await assert.rejects(
       () => db.insertPitchingLines([
         { teamId: TEAM_A, playerName: 'Org A Pitcher' },
         { teamId: TEAM_B, playerName: 'Org B Pitcher' },
-      ], 'game-1'),
-      /different organizations/i,
+      ], GAME_A),
+      /disagrees with a team|mismatched game\/team/i,
     );
     assert.equal(state.pitching_lines.length, 0);
   });
@@ -358,20 +449,45 @@ test('insertPitchingLines: a mixed-organization batch (one row per org A/org B t
 
 // ── insertPlayEvents ──────────────────────────────────────────────────────────
 
-test('insertPlayEvents: every inserted row carries the parent team\'s org_id', () => {
+test('insertPlayEvents: every inserted row carries the actual game\'s authoritative org_id', () => {
   return withFreshDbSupabase(async (db, state) => {
     seedTeams(state);
-    await db.insertPlayEvents([{ teamId: TEAM_A, sequenceNum: 1, description: 'Groundout' }], 'game-1');
+    seedGames(state);
+    await db.insertPlayEvents([{ teamId: TEAM_A, sequenceNum: 1, description: 'Groundout' }], GAME_A);
     assert.equal(state.play_events.length, 1);
     assert.equal(state.play_events[0].org_id, ORG_A);
   });
 });
 
-test('insertPlayEvents: missing parent team fails closed -- no row is written', async () => {
+test('insertPlayEvents: missing parent team fails closed -- no row is written (game itself is valid)', async () => {
   await withFreshDbSupabase(async (db, state) => {
+    seedGames(state);
     await assert.rejects(
-      () => db.insertPlayEvents([{ teamId: TEAM_UNKNOWN, sequenceNum: 1 }], 'game-1'),
-      /not found/i,
+      () => db.insertPlayEvents([{ teamId: TEAM_UNKNOWN, sequenceNum: 1 }], GAME_A),
+      /team.*not found/i,
+    );
+    assert.equal(state.play_events.length, 0);
+  });
+});
+
+test('insertPlayEvents: a nonexistent game fails closed -- no row is written', async () => {
+  await withFreshDbSupabase(async (db, state) => {
+    seedTeams(state);
+    await assert.rejects(
+      () => db.insertPlayEvents([{ teamId: TEAM_A, sequenceNum: 1 }], GAME_UNKNOWN),
+      /game.*not found/i,
+    );
+    assert.equal(state.play_events.length, 0);
+  });
+});
+
+test('insertPlayEvents: THE GAME/TEAM MISMATCH REGRESSION -- a team belonging to Organization A combined with a REAL game belonging to Organization B is rejected before any row is written', async () => {
+  await withFreshDbSupabase(async (db, state) => {
+    seedTeams(state);
+    seedGames(state);
+    await assert.rejects(
+      () => db.insertPlayEvents([{ teamId: TEAM_A, sequenceNum: 1 }], GAME_B),
+      /disagrees with a team|mismatched game\/team/i,
     );
     assert.equal(state.play_events.length, 0);
   });
@@ -380,12 +496,13 @@ test('insertPlayEvents: missing parent team fails closed -- no row is written', 
 test('insertPlayEvents: a mixed-organization batch (one row per org A/org B team) is rejected before any row is written', async () => {
   await withFreshDbSupabase(async (db, state) => {
     seedTeams(state);
+    seedGames(state);
     await assert.rejects(
       () => db.insertPlayEvents([
         { teamId: TEAM_A, sequenceNum: 1 },
         { teamId: TEAM_B, sequenceNum: 2 },
-      ], 'game-1'),
-      /different organizations/i,
+      ], GAME_A),
+      /disagrees with a team|mismatched game\/team/i,
     );
     assert.equal(state.play_events.length, 0);
   });
@@ -558,8 +675,9 @@ test('writeNormalizedGame: reingesting org A\'s game never touches org B\'s chil
 test('insertBattingLines: THE T3K REGRESSION -- still attaches org_id even when the org_id capability probe would report the column missing', () => {
   return withFreshDbSupabase(async (db, state) => {
     seedTeams(state);
+    seedGames(state);
     state._simulateMissingOrgIdColumn = new Set(['batting_lines']);
-    await db.insertBattingLines([battingLine()], 'game-1');
+    await db.insertBattingLines([battingLine()], GAME_A);
     assert.equal(state.batting_lines.length, 1);
     assert.equal(state.batting_lines[0].org_id, ORG_A, 'org_id must be attached even though the (now-irrelevant) capability probe would say the column is missing');
   });
@@ -568,8 +686,9 @@ test('insertBattingLines: THE T3K REGRESSION -- still attaches org_id even when 
 test('insertPitchingLines: THE T3K REGRESSION -- still attaches org_id even when the org_id capability probe would report the column missing', () => {
   return withFreshDbSupabase(async (db, state) => {
     seedTeams(state);
+    seedGames(state);
     state._simulateMissingOrgIdColumn = new Set(['pitching_lines']);
-    await db.insertPitchingLines([{ teamId: TEAM_A, playerName: 'Pitcher' }], 'game-1');
+    await db.insertPitchingLines([{ teamId: TEAM_A, playerName: 'Pitcher' }], GAME_A);
     assert.equal(state.pitching_lines.length, 1);
     assert.equal(state.pitching_lines[0].org_id, ORG_A);
   });
@@ -578,8 +697,9 @@ test('insertPitchingLines: THE T3K REGRESSION -- still attaches org_id even when
 test('insertPlayEvents: THE T3K REGRESSION -- still attaches org_id even when the org_id capability probe would report the column missing', () => {
   return withFreshDbSupabase(async (db, state) => {
     seedTeams(state);
+    seedGames(state);
     state._simulateMissingOrgIdColumn = new Set(['play_events']);
-    await db.insertPlayEvents([{ teamId: TEAM_A, sequenceNum: 1 }], 'game-1');
+    await db.insertPlayEvents([{ teamId: TEAM_A, sequenceNum: 1 }], GAME_A);
     assert.equal(state.play_events.length, 1);
     assert.equal(state.play_events[0].org_id, ORG_A);
   });

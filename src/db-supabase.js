@@ -126,25 +126,43 @@ async function getOrgIdForTeam(teamId) {
 
 // Security Slice T3K: resolves and validates the ONE authoritative org_id
 // for an entire bulk child-stat write (insertBattingLines/
-// insertPitchingLines/insertPlayEvents), instead of trusting rows[0]'s
-// team as evidence for every other row in the batch. Every row in these
-// three functions carries its own team_id (batting/pitching lines and
-// play events can, in principle, be filed under different teams within
-// the same game write), so this resolves every DISTINCT team_id
-// represented in the batch in one bounded query, confirms they all
-// belong to the SAME organization, and rejects the whole batch -- before
-// any row is written -- if:
-//   - any row's team can't be resolved at all (fails closed, same
-//     contract as getOrgIdForTeam)
-//   - two rows resolve to teams in different organizations (a
-//     mixed-tenant batch)
+// insertPitchingLines/insertPlayEvents) against BOTH of its actual
+// parents -- the game these rows are being written under (gameId, the
+// function's own shared argument -- NEVER row.gameId, which is only ever
+// the inert '__pending__' placeholder normalizeGameData stamps onto a
+// row before the real game has even been inserted) and every row's own
+// team (row.teamId). games.org_id is authoritative here, matching the
+// migration's own backfill source for these three tables (game_id ->
+// games.org_id) -- team ownership is validated to AGREE with it, not
+// used as an independent, separate source of truth.
+//
+// Rejects the whole batch, before any row is written, if:
+//   - gameId doesn't resolve to a real games row, or that row has no
+//     org_id (fails closed, same contract as getOrgIdForTeam)
+//   - any row's team can't be resolved at all
+//   - any resolved team's organization disagrees with the game's
+//     organization -- this is the cross-tenant case a malformed or
+//     future caller could otherwise produce: a real team from
+//     Organization A combined with a real game from Organization B,
+//     each individually valid per its own foreign key, but never
+//     belonging together
 //   - any row carries its own orgId/org_id hint that disagrees with the
-//     authoritative, freshly-resolved value (a caller-supplied override
-//     is never trusted over real team ownership)
-// A single-team batch (every real caller today) resolves in exactly one
-// extra query beyond what getOrgIdForTeam already needed, not one query
-// per row.
-async function resolveHomogeneousBatchOrgId(rows, functionLabel) {
+//     game's authoritative organization (a caller-supplied override is
+//     never trusted over real ownership)
+// Exactly two bounded queries per batch call, regardless of batch size:
+// one for the game, one .in() lookup for every distinct team_id -- never
+// one query per row.
+async function resolveHomogeneousBatchOrgId(rows, gameId, functionLabel) {
+  const { data: game, error: gameError } = await getDb()
+    .from('games')
+    .select('id, org_id')
+    .eq('id', gameId)
+    .maybeSingle();
+  check(gameError, `${functionLabel} game org_id validation`);
+  if (!game) throw new Error(`Game ${gameId} not found while resolving org_id for ${functionLabel}`);
+  if (!game.org_id) throw new Error(`Game ${gameId} does not have org_id`);
+  const orgId = game.org_id;
+
   const distinctTeamIds = [...new Set(
     rows.map(r => r && r.teamId).filter(v => v !== undefined && v !== null && v !== '')
   )];
@@ -153,24 +171,21 @@ async function resolveHomogeneousBatchOrgId(rows, functionLabel) {
     throw new Error(`${functionLabel} requires every row to carry a teamId to resolve org_id`);
   }
 
-  const { data: teams, error } = await getDb()
+  const { data: teams, error: teamsError } = await getDb()
     .from('teams')
     .select('id, org_id')
     .in('id', distinctTeamIds);
-  check(error, `${functionLabel} batch team org_id validation`);
+  check(teamsError, `${functionLabel} batch team org_id validation`);
 
   const teamOrgById = new Map((teams || []).map(t => [t.id, t.org_id]));
 
-  let orgId = null;
   for (const teamId of distinctTeamIds) {
     const teamOrgId = teamOrgById.get(teamId);
     if (!teamOrgId) throw new Error(`Team ${teamId} not found while resolving org_id for ${functionLabel}`);
-    if (orgId === null) {
-      orgId = teamOrgId;
-    } else if (teamOrgId !== orgId) {
+    if (teamOrgId !== orgId) {
       throw new Error(
-        `${functionLabel}: batch contains rows tied to teams from different organizations -- ` +
-        'refusing to write a mixed-tenant batch'
+        `${functionLabel}: game ${gameId}'s organization disagrees with a team referenced in this batch -- ` +
+        'refusing to write a mismatched game/team batch'
       );
     }
   }
@@ -179,7 +194,7 @@ async function resolveHomogeneousBatchOrgId(rows, functionLabel) {
     const suppliedOrgId = normalizeNullable(row && (row.orgId || row.org_id));
     if (suppliedOrgId && suppliedOrgId !== orgId) {
       throw new Error(
-        `${functionLabel}: a row's supplied orgId conflicts with its team's authoritative organization -- ` +
+        `${functionLabel}: a row's supplied orgId conflicts with the game's authoritative organization -- ` +
         'refusing to write a mixed-tenant batch'
       );
     }
@@ -831,19 +846,17 @@ async function getGameById(gameId) {
 async function insertBattingLines(lines, gameId) {
   if (!lines.length) return;
 
-  // Security Slice T3K: org_id is authoritative-parent-derived (an
-  // already-resolved value propagated by writeNormalizedGame, or freshly
-  // resolved here from every row's own team via
-  // resolveHomogeneousBatchOrgId, which validates the WHOLE batch -- not
-  // just lines[0] -- and throws rather than guessing if any team/org
-  // can't be resolved or if the batch spans more than one organization)
-  // and is now ALWAYS attached to every row -- batting_lines.org_id is
-  // NOT NULL at the database level (see the T3K migration), so a
+  // Security Slice T3K: org_id is the actual game's authoritative
+  // organization (resolveHomogeneousBatchOrgId resolves gameId through
+  // games.org_id -- the same authoritative source the T3K migration
+  // itself backfills from -- and validates every row's team agrees with
+  // it) and is now ALWAYS attached to every row -- batting_lines.org_id
+  // is NOT NULL at the database level (see the T3K migration), so a
   // conditional, schema-probing include here would only ever silently
   // reintroduce a tenantless write the database will now reject anyway.
   // There is no longer a supported schema state where this table lacks
   // org_id.
-  const orgId = await resolveHomogeneousBatchOrgId(lines, 'insertBattingLines');
+  const orgId = await resolveHomogeneousBatchOrgId(lines, gameId, 'insertBattingLines');
 
   const rows = lines.map(row => ({
     game_id:       gameId,
@@ -884,11 +897,11 @@ async function insertBattingLines(lines, gameId) {
 async function insertPitchingLines(lines, gameId) {
   if (!lines.length) return;
 
-  // Security Slice T3K: see insertBattingLines's comment -- org_id is
-  // resolved and validated across the WHOLE batch (never just lines[0])
-  // and always attached; pitching_lines no longer has a supported schema
-  // state without a NOT NULL org_id.
-  const orgId = await resolveHomogeneousBatchOrgId(lines, 'insertPitchingLines');
+  // Security Slice T3K: see insertBattingLines's comment -- org_id is the
+  // actual game's authoritative organization, validated against every
+  // row's team, and always attached; pitching_lines no longer has a
+  // supported schema state without a NOT NULL org_id.
+  const orgId = await resolveHomogeneousBatchOrgId(lines, gameId, 'insertPitchingLines');
 
   const rows = lines.map(row => ({
     game_id:       gameId,
@@ -924,11 +937,11 @@ async function insertPitchingLines(lines, gameId) {
 async function insertPlayEvents(events, gameId) {
   if (!events.length) return;
 
-  // Security Slice T3K: see insertBattingLines's comment -- org_id is
-  // resolved and validated across the WHOLE batch (never just events[0])
-  // and always attached; play_events no longer has a supported schema
-  // state without a NOT NULL org_id.
-  const orgId = await resolveHomogeneousBatchOrgId(events, 'insertPlayEvents');
+  // Security Slice T3K: see insertBattingLines's comment -- org_id is the
+  // actual game's authoritative organization, validated against every
+  // row's team, and always attached; play_events no longer has a
+  // supported schema state without a NOT NULL org_id.
+  const orgId = await resolveHomogeneousBatchOrgId(events, gameId, 'insertPlayEvents');
 
   const rows = events.map(row => ({
     game_id:        gameId,
