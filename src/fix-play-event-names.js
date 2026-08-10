@@ -29,7 +29,7 @@ function nameKey(value) {
 }
 
 async function findTeam(nameOrId) {
-  const teams = await Promise.resolve(db.getAllTeams());
+  const teams = await Promise.resolve(db.listAllTeamsForOperator());
   const wanted = normalize(nameOrId);
   const byId = teams.find(t => normalize(t.id) === wanted);
   if (byId) return byId;

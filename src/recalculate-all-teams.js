@@ -25,7 +25,7 @@ async function main() {
 
   const nameFilter = process.argv.slice(2).join(' ').trim().toLowerCase() || null;
 
-  const teams = await Promise.resolve(db.getAllTeams());
+  const teams = await Promise.resolve(db.listAllTeamsForOperator());
   if (!Array.isArray(teams) || !teams.length) {
     console.log('No teams found.');
     return;

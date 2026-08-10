@@ -24,7 +24,7 @@ function normalize(value) {
 }
 
 async function findTeam(nameOrId) {
-  const teams = await Promise.resolve(db.getAllTeams());
+  const teams = await Promise.resolve(db.listAllTeamsForOperator());
   const q = normalize(nameOrId);
 
   const byId = teams.find(t => normalize(t.id) === q);

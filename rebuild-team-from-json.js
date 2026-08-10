@@ -44,7 +44,7 @@ function normalizeName(value) {
 }
 
 function findTeam(nameFilter) {
-  const teams = db.getAllTeams();
+  const teams = db.listAllTeamsForOperator();
   const needle = normalizeName(nameFilter);
   const exact = teams.find(t => normalizeName(t.team_name) === needle);
   if (exact) return exact;

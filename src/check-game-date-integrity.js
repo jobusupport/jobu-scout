@@ -25,7 +25,7 @@ const db = require('./db');
 async function main() {
   db.init(process.env.SQLITE_DB_PATH || require('path').join(__dirname, '..', 'voodoo-scout.db'));
 
-  const teams = await Promise.resolve(db.getAllTeams());
+  const teams = await Promise.resolve(db.listAllTeamsForOperator());
   if (!Array.isArray(teams) || !teams.length) {
     console.log('No teams found.');
     return;

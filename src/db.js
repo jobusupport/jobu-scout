@@ -298,7 +298,13 @@ function getTeamByUrl(gcTeamUrl) {
   return getDb().prepare(`SELECT * FROM teams WHERE gc_team_url = ?`).get(gcTeamUrl);
 }
 
-function getAllTeams(includeArchived = false) {
+// Security Slice T3E: explicitly named for what it is -- an operator-only,
+// repository-wide enumeration with no tenant filter of any kind. Never
+// call this from application-triggered code (HTTP routes, background
+// jobs, pipelines, report generation); use listTeamsForOrg(orgId) there.
+// See test/team-enumeration-api-boundary.test.js for the enforced,
+// independently-verified reachability boundary.
+function listAllTeamsForOperator(includeArchived = false) {
   if (includeArchived) {
     return getDb().prepare(`SELECT * FROM teams ORDER BY team_name`).all();
   }
@@ -316,7 +322,7 @@ function getAllTeams(includeArchived = false) {
 // implementation (which fully replaces this export via Object.assign when
 // USE_SUPABASE=true; see init() above), and is otherwise ignored.
 function listTeamsForOrg(orgId, includeArchived = false) {
-  return getAllTeams(includeArchived);
+  return listAllTeamsForOperator(includeArchived);
 }
 
 /**
@@ -1161,7 +1167,7 @@ module.exports = {
   // Teams
   upsertTeam,
   getTeamByUrl,
-  getAllTeams,
+  listAllTeamsForOperator,
   listTeamsForOrg,
   setTeamArchived,
   // Games
