@@ -87,6 +87,44 @@ function isServableReportFile(resolvedPath) {
   }
 }
 
+// Security Slice T3J: resolveContainedReportPath above is deliberately
+// pure, string-only logic (see its own header) -- it can approve a path
+// that LOOKS contained (`path.resolve()`/`startsWith()` on the string)
+// even when an intermediate directory component is actually a symlink
+// pointing outside reportsDir. isServableReportFile's lstat only refuses
+// the FINAL path component being a symlink; the OS still transparently
+// follows a symlinked intermediate directory while locating that final
+// component, so neither existing check catches, e.g., reportsDir/escape/
+// report.pdf where "escape" is a symlink to somewhere outside reportsDir.
+//
+// This re-resolves both the root and the candidate through the real
+// filesystem with fs.realpathSync() -- which follows every symlink in
+// the full chain, intermediate or final -- and re-checks containment on
+// those canonical, symlink-resolved locations. Call this only once the
+// candidate is already known to exist as a real file (i.e. after
+// isServableReportFile has returned true for it); realpathSync throws
+// for a path that doesn't exist, so an already-vanished file (a TOCTOU
+// race) or a missing reportsDir simply fails closed here exactly like
+// any other "not found" case, never as a distinct filesystem error.
+//
+// Returns the canonical absolute path when it is genuinely contained
+// within the canonical reportsDir, or null otherwise.
+function resolveCanonicalReportPath(reportsDir, resolvedPath) {
+  let canonicalRoot;
+  let canonicalCandidate;
+  try {
+    canonicalRoot = fs.realpathSync(reportsDir);
+    canonicalCandidate = fs.realpathSync(resolvedPath);
+  } catch {
+    return null;
+  }
+  const rootWithSep = canonicalRoot + path.sep;
+  if (canonicalCandidate !== canonicalRoot && !canonicalCandidate.startsWith(rootWithSep)) {
+    return null;
+  }
+  return canonicalCandidate;
+}
+
 // Builds the collision-resistant, per-organization output directory a
 // newly generated report is written into: <reportsDir>/<orgId>/<reportId>.
 // Both components come only from already-trusted, server-controlled
@@ -112,5 +150,6 @@ module.exports = {
   sanitizeDownloadFilename,
   resolveContainedReportPath,
   isServableReportFile,
+  resolveCanonicalReportPath,
   resolveReportOutputDir,
 };

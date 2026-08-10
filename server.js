@@ -58,6 +58,7 @@ const {
   sanitizeDownloadFilename,
   resolveContainedReportPath,
   isServableReportFile,
+  resolveCanonicalReportPath,
 } = require('./src/report-access');
 let SQLiteDatabase = null;
 
@@ -1447,10 +1448,24 @@ app.get('/api/reports/:reportId/download', requireAuth, resolveSupportSession, r
     return res.status(404).json({ error: 'Report not found' });
   }
 
+  // Security Slice T3J: the two checks above are both still ultimately
+  // lexical/final-component-only (see src/report-access.js#
+  // resolveCanonicalReportPath's own header) and can be bypassed by an
+  // INTERMEDIATE directory component that is actually a symlink pointing
+  // outside REPORTS_DIR, even though resolvedPath's string looked
+  // contained and its final component is a real file. This re-resolves
+  // the real, symlink-followed filesystem location with realpathSync and
+  // re-checks containment there before the file is ever served.
+  const canonicalPath = resolveCanonicalReportPath(REPORTS_DIR, resolvedPath);
+  if (!canonicalPath) {
+    console.error('[api/reports/download] canonical path escapes REPORTS_DIR for report', reportId);
+    return res.status(404).json({ error: 'Report not found' });
+  }
+
   const safeName = sanitizeDownloadFilename(reportRow.title);
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
-  res.sendFile(resolvedPath, (err) => {
+  res.sendFile(canonicalPath, (err) => {
     if (err && !res.headersSent) {
       res.status(404).json({ error: 'Report not found' });
     }

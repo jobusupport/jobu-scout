@@ -21,6 +21,7 @@ const {
   sanitizeDownloadFilename,
   resolveContainedReportPath,
   isServableReportFile,
+  resolveCanonicalReportPath,
   resolveReportOutputDir,
 } = require('../src/report-access');
 
@@ -212,6 +213,166 @@ test('isServableReportFile: a symlink is rejected even when it points at a real 
     fs.unlinkSync(linkPath);
   }
 });
+
+// ── resolveCanonicalReportPath (T3J: canonical/symlink-aware containment) ───
+// Security Slice T3J. resolveContainedReportPath and isServableReportFile
+// above are both pure/final-component-only checks (see their own headers)
+// and can be individually satisfied by a path that traverses an
+// INTERMEDIATE symlinked directory. These tests use real temporary
+// directories, files, and (where the runtime allows it) real symlinks/
+// junctions on disk, never source-text assertions.
+
+const CANON_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'jobu-canon-reports-test-'));
+
+// Creates a directory symlink at linkPath pointing at target, falling
+// back to a directory junction (no elevated privileges required) on a
+// platform where an unprivileged process cannot create a real symlink.
+// Returns true if a link was created, false only if the runtime
+// genuinely cannot create either.
+function tryMakeDirLink(target, linkPath) {
+  try {
+    fs.symlinkSync(target, linkPath, 'dir');
+    return true;
+  } catch {
+    try {
+      fs.symlinkSync(target, linkPath, 'junction');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+const DIR_LINK_PROBE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'jobu-canon-link-probe-'));
+const DIR_LINK_PROBE_TARGET = path.join(DIR_LINK_PROBE_ROOT, 'target');
+fs.mkdirSync(DIR_LINK_PROBE_TARGET);
+const CAN_CREATE_DIR_LINK = tryMakeDirLink(DIR_LINK_PROBE_TARGET, path.join(DIR_LINK_PROBE_ROOT, 'link'));
+
+test('resolveCanonicalReportPath: a normal report file inside the root is accepted', () => {
+  const filePath = path.join(CANON_ROOT, 'normal-report.pdf');
+  fs.writeFileSync(filePath, 'synthetic pdf bytes');
+  const canonical = resolveCanonicalReportPath(CANON_ROOT, filePath);
+  assert.ok(canonical);
+  assert.equal(canonical, fs.realpathSync(filePath));
+});
+
+test('resolveCanonicalReportPath: a missing file is rejected safely, never throws (fails closed like a TOCTOU race)', () => {
+  assert.equal(resolveCanonicalReportPath(CANON_ROOT, path.join(CANON_ROOT, 'does-not-exist.pdf')), null);
+});
+
+test('resolveCanonicalReportPath: a missing reports root is rejected safely, never throws', () => {
+  const missingRoot = path.join(CANON_ROOT, 'no-such-root');
+  assert.equal(resolveCanonicalReportPath(missingRoot, path.join(missingRoot, 'report.pdf')), null);
+});
+
+test('resolveCanonicalReportPath: ordinary ../ traversal outside the root remains rejected', () => {
+  const escaped = path.resolve(CANON_ROOT, '..', 'outside-escaped.pdf');
+  fs.writeFileSync(escaped, 'outside bytes');
+  try {
+    assert.equal(resolveCanonicalReportPath(CANON_ROOT, escaped), null);
+  } finally {
+    fs.rmSync(escaped, { force: true });
+  }
+});
+
+test('resolveCanonicalReportPath: an absolute path outside the root remains rejected', () => {
+  const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'jobu-canon-outside-test-'));
+  const outsideFile = path.join(outsideDir, 'outside.pdf');
+  fs.writeFileSync(outsideFile, 'outside bytes');
+  try {
+    assert.equal(resolveCanonicalReportPath(CANON_ROOT, outsideFile), null);
+  } finally {
+    fs.rmSync(outsideDir, { recursive: true, force: true });
+  }
+});
+
+test('resolveCanonicalReportPath: a sibling directory that merely shares a prefix with the root is rejected', () => {
+  const prefixSibling = path.resolve(CANON_ROOT) + '-evil';
+  fs.mkdirSync(prefixSibling, { recursive: true });
+  const siblingFile = path.join(prefixSibling, 'file.pdf');
+  fs.writeFileSync(siblingFile, 'evil bytes');
+  try {
+    assert.equal(resolveCanonicalReportPath(CANON_ROOT, siblingFile), null);
+  } finally {
+    fs.rmSync(prefixSibling, { recursive: true, force: true });
+  }
+});
+
+test(
+  'resolveCanonicalReportPath: THE T3J REGRESSION -- an intermediate directory symlink inside the reports root, pointing outside the root, is rejected even though resolveContainedReportPath\'s lexical check approves the identical path string',
+  { skip: CAN_CREATE_DIR_LINK ? false : 'runtime cannot create a directory symlink or junction on this platform/environment' },
+  () => {
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'jobu-canon-escape-target-'));
+    const intermediateLink = path.join(CANON_ROOT, 'escape-link');
+    const linked = tryMakeDirLink(outsideDir, intermediateLink);
+    assert.ok(linked, 'expected a directory symlink/junction to be created for this test');
+
+    try {
+      fs.writeFileSync(path.join(outsideDir, 'report.pdf'), 'exfiltrated bytes');
+      const candidate = path.join(CANON_ROOT, 'escape-link', 'report.pdf');
+
+      // Prove the lexical check alone would have wrongly approved this --
+      // this is exactly the T3B-only bypass T3J closes.
+      const lexicallyApproved = resolveContainedReportPath(CANON_ROOT, path.join('escape-link', 'report.pdf'));
+      assert.ok(lexicallyApproved, 'lexical check should still approve the string (that is the bug this test proves)');
+      assert.ok(fs.lstatSync(candidate).isFile(), 'the escaped file is reachable and is a real file, not a symlink itself');
+
+      // The canonical check must reject it.
+      assert.equal(resolveCanonicalReportPath(CANON_ROOT, candidate), null);
+    } finally {
+      fs.rmSync(intermediateLink, { recursive: true, force: true });
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  }
+);
+
+test(
+  'resolveCanonicalReportPath: an intermediate directory symlink whose canonical target remains INSIDE the reports root is still accepted (containment, not a blanket symlink ban)',
+  { skip: CAN_CREATE_DIR_LINK ? false : 'runtime cannot create a directory symlink or junction on this platform/environment' },
+  () => {
+    const realSubdir = path.join(CANON_ROOT, 'real-subdir');
+    fs.mkdirSync(realSubdir, { recursive: true });
+    const insideLink = path.join(CANON_ROOT, 'inside-link');
+    const linked = tryMakeDirLink(realSubdir, insideLink);
+    assert.ok(linked, 'expected a directory symlink/junction to be created for this test');
+
+    try {
+      const filePath = path.join(realSubdir, 'ok-report.pdf');
+      fs.writeFileSync(filePath, 'fine bytes');
+      const candidate = path.join(CANON_ROOT, 'inside-link', 'ok-report.pdf');
+      const canonical = resolveCanonicalReportPath(CANON_ROOT, candidate);
+      assert.ok(canonical);
+      assert.equal(canonical, fs.realpathSync(filePath));
+    } finally {
+      fs.rmSync(insideLink, { recursive: true, force: true });
+      fs.rmSync(realSubdir, { recursive: true, force: true });
+    }
+  }
+);
+
+test(
+  'resolveCanonicalReportPath: a final-component report-file symlink pointing outside the root is independently rejected too (defense in depth alongside isServableReportFile\'s lstat check)',
+  { skip: process.platform === 'win32' ? 'symlink creation requires elevated privileges on this platform' : false },
+  () => {
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'jobu-canon-file-escape-'));
+    const outsideFile = path.join(outsideDir, 'secret.pdf');
+    fs.writeFileSync(outsideFile, 'secret bytes');
+    const linkPath = path.join(CANON_ROOT, 'file-escape-link.pdf');
+    try {
+      fs.symlinkSync(outsideFile, linkPath, 'file');
+    } catch {
+      // Environment doesn't allow file symlink creation -- skip gracefully.
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+      return;
+    }
+    try {
+      assert.equal(resolveCanonicalReportPath(CANON_ROOT, linkPath), null);
+    } finally {
+      fs.unlinkSync(linkPath);
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  }
+);
 
 // ── resolveReportOutputDir (collision-resistant per-org storage) ────────────
 
