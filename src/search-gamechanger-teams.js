@@ -10,6 +10,8 @@ const db = require("./db");
 const { requireJobOrgContext } = require("./job-org-context");
 const { captureTeamHandednessByUrl } = require("./scrape-handedness");
 const { getStorageStatePath } = require("./gc-session-loader");
+const { resolveOrgOutputRoot, resolveTeamOutputDir, resolveOrgSubdir } = require("./output-paths");
+const { isValidUuid } = require("./report-access");
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -20,9 +22,58 @@ const { getStorageStatePath } = require("./gc-session-loader");
 // always resolved to, so existing deployments are unaffected.
 const STORAGE_STATE = getStorageStatePath();
 const TEST_TEAM_CONTAINS = process.env.GC_TEST_TEAM_CONTAINS || "";
-const OUTPUT_DIR = path.join(__dirname, "..", "output");
-const FAILED_MATCHES_DIR = path.join(OUTPUT_DIR, "_failed-team-matches");
-const FAILED_GAME_CAPTURES_DIR = path.join(OUTPUT_DIR, "_failed-game-captures");
+
+// Security Slice T3H: every output/ path in this file is now derived from
+// this job's own organization root (output/<orgId>/...), never the shared,
+// legacy flat output/ tree. This cannot be a module-level constant the way
+// it was before -- the trusted orgId is only known once requireJobOrgContext()
+// has run inside main()/scrapeTeamById(), both of which set this exactly
+// once, immediately after that call succeeds, before any output/ path is
+// touched. Every output-path helper below reads it (never re-derives org
+// context from the environment itself, and never accepts one from a team
+// object, spreadsheet row, or any other untrusted source) and throws if it
+// is still unset, so a code path that somehow ran before org context was
+// established fails closed instead of silently touching a shared directory.
+let CURRENT_JOB_ORG_ID = null;
+
+function requireCurrentJobOrgId() {
+  if (!CURRENT_JOB_ORG_ID) {
+    throw new Error(
+      'Internal error: an output/ path was requested before organization context was established. ' +
+      'This must never happen -- requireJobOrgContext() is required to run first in main()/scrapeTeamById(), ' +
+      'or setCurrentJobOrgId() must be called first by an external caller (see scrape-game-urls.js).'
+    );
+  }
+  return CURRENT_JOB_ORG_ID;
+}
+
+// Security Slice T3H: scrape-game-urls.js requires this file as a library
+// and calls extractGameData()/getTeamOutputDir() directly -- it never runs
+// through main()/scrapeTeamById() above, so CURRENT_JOB_ORG_ID would
+// otherwise still be unset and every output/ path lookup would throw. This
+// is the only supported way an external caller may set it; it still
+// requires an already-validated org id (isValidUuid), the same contract
+// requireJobOrgContext() enforces, so a caller cannot smuggle in an
+// unvalidated value through this seam.
+function setCurrentJobOrgId(orgId) {
+  if (!isValidUuid(orgId)) {
+    throw new Error('setCurrentJobOrgId requires a valid organization id.');
+  }
+  CURRENT_JOB_ORG_ID = orgId;
+}
+
+function failedMatchesDir() {
+  return resolveOrgSubdir(requireCurrentJobOrgId(), "_failed-team-matches");
+}
+
+function failedGameCapturesDir() {
+  return resolveOrgSubdir(requireCurrentJobOrgId(), "_failed-game-captures");
+}
+
+function teamUrlsFilePath() {
+  return path.join(resolveOrgOutputRoot(requireCurrentJobOrgId()), "Team URLs.txt");
+}
+
 const GC_GAME_MAX_ATTEMPTS = Math.max(1, Number(process.env.GC_GAME_MAX_ATTEMPTS || 3));
 const GC_GAME_EXTRACTION_TIMEOUT_MS = Math.max(30000, Number(process.env.GC_GAME_EXTRACTION_TIMEOUT_MS || 180000));
 const GC_GAME_DB_WRITE_TIMEOUT_MS = Math.max(30000, Number(process.env.GC_GAME_DB_WRITE_TIMEOUT_MS || 90000));
@@ -40,7 +91,6 @@ const GC_SKIP_PLAYS = process.env.GC_SKIP_PLAYS === 'true';
 const GC_SKIP_HANDEDNESS = process.env.GC_SKIP_HANDEDNESS === 'true';
 const GC_HANDEDNESS_FORCE_REFRESH = process.env.GC_HANDEDNESS_FORCE_REFRESH === 'true';
 
-const TEAM_URLS_FILE = path.join(OUTPUT_DIR, "Team URLs.txt");
 const DB_PATH = path.join(__dirname, "..", "voodoo-scout.db");
 
 const TARGET_SEASON_YEAR = process.env.GC_TARGET_YEAR || "2026";
@@ -86,9 +136,10 @@ function getTeamCacheKeys(team) {
 
 function loadTeamUrlCache() {
   const cache = new Map();
-  if (!fs.existsSync(TEAM_URLS_FILE)) return cache;
+  const teamUrlsFile = teamUrlsFilePath();
+  if (!fs.existsSync(teamUrlsFile)) return cache;
 
-  const text = fs.readFileSync(TEAM_URLS_FILE, "utf8");
+  const text = fs.readFileSync(teamUrlsFile, "utf8");
   const lines = text.split(/\r?\n/);
 
   for (const line of lines) {
@@ -116,7 +167,7 @@ function loadTeamUrlCache() {
 }
 
 function saveTeamUrlCache(cache) {
-  ensureDirectory(OUTPUT_DIR);
+  const teamUrlsFile = teamUrlsFilePath(); // resolveOrgOutputRoot() inside already ensures the org root exists
   const rows = Array.from(cache.entries())
     .filter(([teamName, teamUrl]) => teamName && teamUrl)
     .sort((a, b) => a[0].localeCompare(b[0]));
@@ -126,8 +177,8 @@ function saveTeamUrlCache(cache) {
     lines.push(`${teamName}\t${teamUrl}`);
   }
 
-  fs.writeFileSync(TEAM_URLS_FILE, lines.join("\n"), "utf8");
-  console.log(`Updated Team URLs file: ${TEAM_URLS_FILE}`);
+  fs.writeFileSync(teamUrlsFile, lines.join("\n"), "utf8");
+  console.log(`Updated Team URLs file: ${teamUrlsFile}`);
 }
 
 function getKnownTeamUrl(team, teamUrlCache) {
@@ -221,6 +272,11 @@ async function captureHandednessForTeam(page, team, teamId, resolvedTeamUrl) {
       db,
       forceRefresh: GC_HANDEDNESS_FORCE_REFRESH,
       teamName: team.teamName,
+      // Security Slice T3H: this job's own trusted org id, so any debug
+      // dump scrape-handedness.js writes (GC_HANDEDNESS_DEBUG_HTML=true
+      // only) is staged under the same org-scoped output/ root as
+      // everything else in this file, never the shared flat tree.
+      orgId: requireCurrentJobOrgId(),
     });
     console.log(`[handedness] "${team.teamName}": captured ${result.captured}, skipped ${result.skipped}, failed ${result.failed}.`);
   } catch (error) {
@@ -268,15 +324,13 @@ function getSeasonRegexText() {
 
 function getTeamOutputDir(team) {
   const folderName = sanitizeFileName(team.teamName || team.rawTeamName || "team");
-  const dir = path.join(OUTPUT_DIR, folderName);
-  ensureDirectory(dir);
-  return dir;
+  return resolveTeamOutputDir(requireCurrentJobOrgId(), folderName);
 }
 
 function getFailedMatchReportPath(team) {
-  ensureDirectory(FAILED_MATCHES_DIR);
+  const dir = failedMatchesDir();
   const baseName = sanitizeFileNameCompact(team.teamName || team.rawTeamName || "unknown-team");
-  return path.join(FAILED_MATCHES_DIR, `${baseName}.txt`);
+  return path.join(dir, `${baseName}.txt`);
 }
 
 function simplifyTeamNameForSearch(teamName) {
@@ -2581,12 +2635,12 @@ function getErrorMessage(error) {
 
 async function writeFailedGameCaptureReport(page, team, gameIndex, phase, error, extra = {}) {
   try {
-    ensureDirectory(FAILED_GAME_CAPTURES_DIR);
+    const failedCapturesDir = failedGameCapturesDir();
     const teamName = sanitizeFileNameCompact(team.teamName || team.rawTeamName || 'unknown-team');
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const base = `${teamName}-game-${gameIndex + 1}-${phase}-${stamp}`;
-    const txtPath = path.join(FAILED_GAME_CAPTURES_DIR, `${base}.txt`);
-    const pngPath = path.join(FAILED_GAME_CAPTURES_DIR, `${base}.png`);
+    const txtPath = path.join(failedCapturesDir, `${base}.txt`);
+    const pngPath = path.join(failedCapturesDir, `${base}.png`);
 
     const lines = [];
     lines.push('GameChanger Game Capture Failure');
@@ -3141,14 +3195,18 @@ async function main() {
   // this process never infers an organization from GameChanger data, a
   // spreadsheet row, or "the only organization in the system."
   const jobOrgId = requireJobOrgContext();
+  // Security Slice T3H: set immediately after org context is resolved and
+  // before any output/ path is touched -- every output-path helper in this
+  // file reads this rather than re-deriving org context itself.
+  CURRENT_JOB_ORG_ID = jobOrgId;
 
   if (!fs.existsSync(STORAGE_STATE)) {
     throw new Error(`Missing auth file: ${STORAGE_STATE}. Run npm run login first.`);
   }
 
-  ensureDirectory(OUTPUT_DIR);
-  ensureDirectory(FAILED_MATCHES_DIR);
-  ensureDirectory(FAILED_GAME_CAPTURES_DIR);
+  resolveOrgOutputRoot(jobOrgId);
+  failedMatchesDir();
+  failedGameCapturesDir();
 
   // ── NEW: initialize pipeline / database ──
   pipeline.init(DB_PATH);
@@ -3222,15 +3280,18 @@ async function scrapeTeamById(teamRecord) {
   // Security Slice T2: same fail-closed contract as main() above -- resolved
   // once, before any acquisition begins, never inferred from teamRecord.
   const jobOrgId = requireJobOrgContext();
+  // Security Slice T3H: same as main() above -- set before any output/ path
+  // is touched.
+  CURRENT_JOB_ORG_ID = jobOrgId;
 
   // teamRecord should have: { id, team_name, gc_team_url, age_group }
   if (!fs.existsSync(STORAGE_STATE)) {
     throw new Error(`Missing auth file: ${STORAGE_STATE}. Run npm run login first.`);
   }
 
-  ensureDirectory(OUTPUT_DIR);
-  ensureDirectory(FAILED_MATCHES_DIR);
-  ensureDirectory(FAILED_GAME_CAPTURES_DIR);
+  resolveOrgOutputRoot(jobOrgId);
+  failedMatchesDir();
+  failedGameCapturesDir();
 
   pipeline.init(DB_PATH);
 
@@ -3299,5 +3360,6 @@ if (require.main !== module) {
     normalizeTeamUrl,
     getVisibleCompletedGameCount,
     getVisibleCompletedGameEntries,
+    setCurrentJobOrgId,
   };
 }

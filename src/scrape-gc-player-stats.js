@@ -57,13 +57,27 @@ function safeName(name) {
   return String(name || 'unknown').replace(/[^a-z0-9]/gi, '-').toLowerCase();
 }
 
-async function maybeDumpDebugHtml(page, filename) {
+// Security Slice T3H: this used to write into a shared, flat
+// output/_handedness-debug/ directory -- the same gap fixed in
+// scrape-handedness.js, which this module's only caller
+// (captureRosterHandedness) already resolves a trusted orgId for. Routed
+// through the same resolveOrgSubdir()/'_handedness-debug' pair
+// scrape-handedness.js itself uses, so both files' debug dumps land in one
+// place per organization. Requires orgId (no fallback) -- if it is ever
+// missing, the debug dump is skipped (a warning is logged) rather than
+// falling back to the legacy shared directory; this is best-effort
+// diagnostic output, not a path production correctness depends on.
+async function maybeDumpDebugHtml(page, filename, orgId) {
   if (!DEBUG_ON()) return;
+  if (!orgId) {
+    console.warn(`[gc-stats] Skipping debug HTML dump ${filename}: no organization context was provided.`);
+    return;
+  }
   try {
     const fs = require('fs');
     const path = require('path');
-    const dir = path.join(__dirname, '..', 'output', '_handedness-debug');
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const { resolveOrgSubdir } = require('./output-paths');
+    const dir = resolveOrgSubdir(orgId, '_handedness-debug');
     fs.writeFileSync(path.join(dir, filename), await page.content(), 'utf8');
     console.log(`[gc-stats] Wrote debug HTML: ${filename}`);
   } catch (error) {
@@ -223,7 +237,7 @@ async function extractBattingSprayChart(page) {
  * @param {object} opts.db   db.js/db-supabase.js module (already init()'d).
  * @returns {Promise<{statsCaptured: number, statsFailed: number, sprayCaptured: boolean, statsTabFound: boolean, sprayTabFound: boolean}>}
  */
-async function captureGcStatsAndSprayForPlayer(page, { teamId, jerseyNumber, fullName, matchKey, db }) {
+async function captureGcStatsAndSprayForPlayer(page, { teamId, jerseyNumber, fullName, matchKey, db, orgId }) {
   const result = {
     statsCaptured: 0,
     statsFailed: 0,
@@ -294,7 +308,7 @@ async function captureGcStatsAndSprayForPlayer(page, { teamId, jerseyNumber, ful
           }
         } catch (error) {
           console.error(`[gc-stats] Failed to capture ${label} / ${category}: ${error.message}`);
-          await maybeDumpDebugHtml(page, `STATSFAIL-${safeName(fullName)}-${jerseyNumber || 'nojersey'}-${category}.html`);
+          await maybeDumpDebugHtml(page, `STATSFAIL-${safeName(fullName)}-${jerseyNumber || 'nojersey'}-${category}.html`, orgId);
           result.statsFailed++;
         }
       }
@@ -333,7 +347,7 @@ async function captureGcStatsAndSprayForPlayer(page, { teamId, jerseyNumber, ful
       }
     } catch (error) {
       console.error(`[gc-stats] Failed to capture spray chart for ${label}: ${error.message}`);
-      await maybeDumpDebugHtml(page, `SPRAYFAIL-${safeName(fullName)}-${jerseyNumber || 'nojersey'}.html`);
+      await maybeDumpDebugHtml(page, `SPRAYFAIL-${safeName(fullName)}-${jerseyNumber || 'nojersey'}.html`, orgId);
     }
   }
 

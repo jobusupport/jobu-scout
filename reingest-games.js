@@ -26,9 +26,9 @@ const db       = require('./src/db');
 const { requireJobOrgContext } = require('./src/job-org-context');
 const { isValidUuid } = require('./src/report-access');
 const { findMatchingTeam, formatTeamSummaryLine } = require('./src/reingest-helpers');
+const { resolveOrgOutputRoot } = require('./src/output-paths');
 
-const DB_PATH     = path.join(__dirname, 'voodoo-scout.db');
-const OUTPUT_ROOT = path.join(__dirname, 'output');
+const DB_PATH = path.join(__dirname, 'voodoo-scout.db');
 
 // Security Slice T2: resolved once, before any file or database access
 // begins. Fails closed (throws, exits non-zero via main()'s own error
@@ -51,9 +51,27 @@ if (!isValidUuid(JOB_ORG_ID)) {
   process.exit(1);
 }
 
+// Security Slice T3H: resolved once, immediately after JOB_ORG_ID is
+// validated, before pipeline.init() or any filesystem access. Throws
+// (uncaught, nonzero exit) rather than falling back to the legacy shared
+// output/<TeamName>/ tree if JOB_ORG_ID were somehow still invalid here --
+// resolveOrgOutputRoot() re-validates independently of the isValidUuid
+// check above, defense-in-depth, the same layered-validation convention
+// src/db-supabase.js#listTeamsForOrg already uses. This is the ONLY root
+// findTeamFolders()/ingestTeamFolder() below ever read or write --
+// this job can never see, enumerate, or ingest another organization's
+// staged files, and never falls back to the global output/ root.
+const OUTPUT_ROOT = resolveOrgOutputRoot(JOB_ORG_ID);
+
 pipeline.init(DB_PATH);
 
 // ── Find team folder by name ──────────────────────────────────────────────────
+// Security Slice T3H: OUTPUT_ROOT is already this job's own organization
+// root (output/<JOB_ORG_ID>/) -- enumerating it can never see another
+// organization's team folders, even an identically-named one, and there is
+// no fallback to the legacy flat output/ root if this directory happens
+// not to exist yet (an organization with no staged scrapes yet correctly
+// sees zero folders, not every organization's folders).
 function findTeamFolders(nameFilter) {
   if (!fs.existsSync(OUTPUT_ROOT)) {
     console.error(`Output folder not found: ${OUTPUT_ROOT}`);

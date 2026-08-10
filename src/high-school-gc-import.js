@@ -46,6 +46,7 @@
 
 const policy = require('./gc-collection-policy');
 const { matchPlayerCandidates } = require('./high-school-importer-contract');
+const { isValidUuid } = require('./report-access');
 
 // Default sleep -- injectable so tests never actually wait.
 function defaultSleep(ms) {
@@ -459,6 +460,27 @@ if (require.main === module) {
     const adminClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
     const repository = createHighSchoolImportRepository(adminClient);
     const importService = createHighSchoolImportService({ repository });
+
+    // Security Slice T3H: collectGame() below calls straight into
+    // search-gamechanger-teams.js#extractGameData(), the same shared
+    // DOM-extraction function Travel's own scraper uses -- including its
+    // internal getTeamOutputDir() call, which now requires that module's
+    // own trusted org-id state to be set first (see setCurrentJobOrgId()
+    // in that file). ctx.orgId already comes from
+    // src/high-school-import-routes.js's req._orgId (the same
+    // server-resolved, authenticated-route value every other High School
+    // import operation trusts) -- never from this process's own argv or
+    // any value a caller of this spawned process could otherwise control.
+    // Re-validated here, independently, before any browser/session work,
+    // so a malformed value fails closed instead of surfacing as the
+    // generic "organization context was established" internal error deep
+    // inside extractGameData().
+    if (!isValidUuid(ctx.orgId)) {
+      console.error('[hs-gc-import] HS_IMPORT_ORG_ID is not a valid organization id. Refusing to run.');
+      await markRunFailedSafely('Invalid organization context.');
+      return;
+    }
+    scraper.setCurrentJobOrgId(ctx.orgId);
 
     // A fatal error at ANY point below -- before or after the browser ever
     // launches -- must still leave this run in a terminal (not stuck

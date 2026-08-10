@@ -28,15 +28,40 @@
 const fs = require('fs');
 const path = require('path');
 const { captureGcStatsAndSprayForPlayer } = require('./scrape-gc-player-stats');
+// output-paths.js is a pure functions module (no module-level filesystem or
+// org-context side effects), so importing it here does not reintroduce the
+// module-level side effect this file otherwise deliberately avoids by
+// duplicating (rather than importing) search-gamechanger-teams.js's helpers.
+const { resolveOrgSubdir } = require('./output-paths');
 
-const OUTPUT_DIR = path.join(__dirname, '..', 'output');
-const DEBUG_DIR = path.join(OUTPUT_DIR, '_handedness-debug');
 function isDebugHtmlEnabled() {
   return process.env.GC_HANDEDNESS_DEBUG_HTML === 'true';
 }
 
 function ensureDirectory(dirPath) {
   if (!fs.existsSync(dirPath)) fs.mkdirSync(dirPath, { recursive: true });
+}
+
+// Security Slice T3H: the debug-HTML/JSON dump (GC_HANDEDNESS_DEBUG_HTML=
+// true only) used to write into a shared, flat output/_handedness-debug/
+// directory. Set once by captureTeamHandednessByUrl/captureTeamHandedness
+// (this file's only two exported entry points) immediately after they
+// receive an already-trusted orgId from their caller -- never re-derived
+// from the environment here, and never accepted from anything
+// scrape-related (a team name, a GameChanger page, etc.). Every debug-dump
+// call site deep in the roster-scraping call graph reads this instead of
+// needing orgId threaded through every intermediate function signature.
+let CURRENT_JOB_ORG_ID = null;
+
+function debugDir() {
+  if (!CURRENT_JOB_ORG_ID) {
+    throw new Error(
+      'Internal error: a handedness debug dump was requested before organization context was ' +
+      'established. This must never happen -- captureTeamHandednessByUrl/captureTeamHandedness ' +
+      'must be called with a valid orgId first.'
+    );
+  }
+  return resolveOrgSubdir(CURRENT_JOB_ORG_ID, '_handedness-debug');
 }
 
 // ─── Small local copies of shared helpers ──────────────────────────────────
@@ -512,9 +537,9 @@ async function openRosterTab(page) {
 async function maybeDumpDebugHtml(page, filename, { force = false } = {}) {
   if (!isDebugHtmlEnabled() && !force) return;
   try {
-    ensureDirectory(DEBUG_DIR);
+    const dir = debugDir();
     const html = await page.content();
-    fs.writeFileSync(path.join(DEBUG_DIR, filename), html, 'utf8');
+    fs.writeFileSync(path.join(dir, filename), html, 'utf8');
     console.log(`[handedness] Wrote debug HTML: ${filename}`);
   } catch (error) {
     console.warn(`[handedness] Failed to write debug HTML ${filename}: ${error.message}`);
@@ -524,8 +549,8 @@ async function maybeDumpDebugHtml(page, filename, { force = false } = {}) {
 async function maybeDumpDebugJson(page, filename, data, { force = false } = {}) {
   if (!isDebugHtmlEnabled() && !force) return;
   try {
-    ensureDirectory(DEBUG_DIR);
-    fs.writeFileSync(path.join(DEBUG_DIR, filename), JSON.stringify(data, null, 2), 'utf8');
+    const dir = debugDir();
+    fs.writeFileSync(path.join(dir, filename), JSON.stringify(data, null, 2), 'utf8');
     console.log(`[handedness] Wrote debug JSON: ${filename}`);
   } catch (error) {
     console.warn(`[handedness] Failed to write debug JSON ${filename}: ${error.message}`);
@@ -1205,6 +1230,13 @@ async function captureRosterHandedness(page, { teamName, teamId, db, forceRefres
             fullName,
             matchKey: buildMatchKey(fullName),
             db,
+            // Security Slice T3H: same org-scoped debug-dump directory as
+            // this file's own maybeDumpDebugHtml/maybeDumpDebugJson --
+            // CURRENT_JOB_ORG_ID is already set by this point (both
+            // captureTeamHandednessByUrl and captureTeamHandedness set it
+            // before calling captureRosterHandedness, which is the only
+            // caller of this function).
+            orgId: CURRENT_JOB_ORG_ID,
           });
 
           if (!gcStatsChecked) {
@@ -1266,10 +1298,17 @@ async function captureRosterHandedness(page, { teamName, teamId, db, forceRefres
  * @param {string} [opts.teamName]       Display name only, for logging.
  * @returns {Promise<{captured: number, skipped: number, failed: number}>}
  */
-async function captureTeamHandednessByUrl({ page, teamGcUrl, teamId, db, forceRefresh = false, teamName = '' }) {
+async function captureTeamHandednessByUrl({ page, teamGcUrl, teamId, db, forceRefresh = false, teamName = '', orgId }) {
   if (!teamGcUrl) throw new Error('captureTeamHandednessByUrl: teamGcUrl is required.');
   if (!teamId) throw new Error('captureTeamHandednessByUrl: teamId is required.');
   if (!db) throw new Error('captureTeamHandednessByUrl: db module is required.');
+  // Security Slice T3H: this is the production entry point (called from
+  // search-gamechanger-teams.js, which always resolves a trusted orgId
+  // before calling here) -- required, not optional, so any debug dump
+  // this run triggers is staged under the correct organization's output/
+  // root, never the shared flat tree.
+  if (!orgId) throw new Error('captureTeamHandednessByUrl: orgId is required.');
+  CURRENT_JOB_ORG_ID = orgId;
 
   const label = teamName || teamGcUrl;
   const result = { captured: 0, skipped: 0, failed: 0 };
@@ -1302,11 +1341,19 @@ async function captureTeamHandednessByUrl({ page, teamGcUrl, teamId, db, forceRe
  * @param {boolean} [opts.forceRefresh]    Re-capture every player, ignoring existing rows.
  * @returns {Promise<{captured: number, skipped: number, failed: number}>}
  */
-async function captureTeamHandedness({ page, myTeamGcUrl, opponentTeamName, teamId, db, forceRefresh = false }) {
+async function captureTeamHandedness({ page, myTeamGcUrl, opponentTeamName, teamId, db, forceRefresh = false, orgId }) {
   if (!myTeamGcUrl) throw new Error('captureTeamHandedness: myTeamGcUrl is required.');
   if (!opponentTeamName) throw new Error('captureTeamHandedness: opponentTeamName is required.');
   if (!teamId) throw new Error('captureTeamHandedness: teamId is required.');
   if (!db) throw new Error('captureTeamHandedness: db module is required.');
+  // Security Slice T3H: this is the legacy, operator-only CLI path
+  // (src/scrape-handedness-cli.js, not spawned by server.js). orgId is
+  // optional here -- the script's core capture-and-store-in-DB behavior
+  // does not touch output/ at all -- but if the operator also requested
+  // the debug-HTML dump (--debugHtml/GC_HANDEDNESS_DEBUG_HTML=true), that
+  // dump now requires orgId too and fails closed without it, rather than
+  // silently writing into the old shared flat directory.
+  if (orgId) CURRENT_JOB_ORG_ID = orgId;
 
   const result = { captured: 0, skipped: 0, failed: 0 };
 
