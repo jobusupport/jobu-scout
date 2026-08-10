@@ -72,6 +72,23 @@ function assertNoSecretsLeaked(output) {
   assert.doesNotMatch(output, new RegExp(FAKE_ANON_KEY), 'the Supabase anon key must never appear in process output');
 }
 
+// Independent-review correction: a bare nonzero-exit/never-listened proof
+// does not distinguish "the T3F database-mode gate correctly fired" from
+// "server.js crashed before listening for some unrelated reason" -- a
+// future regression that broke the gate AND happened to break something
+// else at startup could still pass those assertions alone. Every case
+// below additionally asserts the actual thrown error type
+// (DatabaseModeConfigError -- see src/db-mode.js) plus a message fragment
+// specific to which branch of resolveDatabaseMode() produced it, matched
+// against combined stdout+stderr text, never a stack-trace file:line
+// (Node's default uncaught-exception output always prints
+// "<ErrorName>: <message>" regardless of where in the call stack it was
+// thrown, so this is stable across refactors that only move line numbers).
+function assertDatabaseModeConfigError(output, messageFragment) {
+  assert.match(output, /DatabaseModeConfigError/, 'the failure must be a DatabaseModeConfigError, not an unrelated startup crash');
+  assert.match(output, messageFragment, 'the error message must match the specific database-mode failure category expected for this case');
+}
+
 test('server.js (real child process): production with USE_SUPABASE missing fails closed before listening', async () => {
   const env = { NODE_ENV: 'production', DASHBOARD_PORT: '48601', GC_AUTH_JSON: '' };
   delete env.USE_SUPABASE;
@@ -85,6 +102,7 @@ test('server.js (real child process): production with USE_SUPABASE blank fails c
     NODE_ENV: 'production', USE_SUPABASE: '   ', DASHBOARD_PORT: '48602', GC_AUTH_JSON: '',
   });
   assertServerNeverListened(result);
+  assertDatabaseModeConfigError(result.stdout + result.stderr, /requires USE_SUPABASE=true to be set explicitly/);
 }, { timeout: 20000 });
 
 test('server.js (real child process): production with USE_SUPABASE=false fails closed before listening (never falls back to SQLite)', async () => {
@@ -92,6 +110,7 @@ test('server.js (real child process): production with USE_SUPABASE=false fails c
     NODE_ENV: 'production', USE_SUPABASE: 'false', DASHBOARD_PORT: '48603', GC_AUTH_JSON: '',
   });
   assertServerNeverListened(result);
+  assertDatabaseModeConfigError(result.stdout + result.stderr, /requires USE_SUPABASE=true to be set explicitly/);
 }, { timeout: 20000 });
 
 test('server.js (real child process): production with a malformed USE_SUPABASE value fails closed before listening', async () => {
@@ -99,6 +118,7 @@ test('server.js (real child process): production with a malformed USE_SUPABASE v
     NODE_ENV: 'production', USE_SUPABASE: 'ture', DASHBOARD_PORT: '48604', GC_AUTH_JSON: '',
   });
   assertServerNeverListened(result);
+  assertDatabaseModeConfigError(result.stdout + result.stderr, /USE_SUPABASE has an unrecognized value/);
 }, { timeout: 20000 });
 
 test('server.js (real child process): production with USE_SUPABASE=true but missing SUPABASE_URL fails closed before listening', async () => {
@@ -110,6 +130,7 @@ test('server.js (real child process): production with USE_SUPABASE=true but miss
   const result = await runChild(SERVER_PATH, [], env);
   assertServerNeverListened(result);
   assertNoSecretsLeaked(result.stdout + result.stderr);
+  assertDatabaseModeConfigError(result.stdout + result.stderr, /required Supabase configuration is missing or blank.*SUPABASE_URL/);
 }, { timeout: 20000 });
 
 test('server.js (real child process): the error output for a production failure never contains the configured Supabase credentials', async () => {
@@ -121,6 +142,7 @@ test('server.js (real child process): the error output for a production failure 
   const result = await runChild(SERVER_PATH, [], env);
   assertServerNeverListened(result);
   assertNoSecretsLeaked(result.stdout + result.stderr);
+  assertDatabaseModeConfigError(result.stdout + result.stderr, /required Supabase configuration is missing or blank.*SUPABASE_SERVICE_ROLE_KEY/);
 }, { timeout: 20000 });
 
 // ── generate-report.js: a production report/job subprocess fails before ───
@@ -151,6 +173,7 @@ test('generate-report.js (real child process): production with USE_SUPABASE=fals
   };
   const result = await runChild(GENERATE_REPORT_PATH, ['--list'], env);
   assertFailedClosedBeforeDatabaseActivity(result);
+  assertDatabaseModeConfigError(result.stdout + result.stderr, /requires USE_SUPABASE=true to be set explicitly/);
 }, { timeout: 20000 });
 
 test('generate-report.js (real child process): JOBU_JOB_ORG_ID validation still runs first -- a missing org id fails via the org-context contract even in production, not the database-mode contract', async () => {
