@@ -138,6 +138,32 @@ test('CHARACTERIZATION -- empty games array returns empty finalized stat maps wi
   assert.deepEqual(stats.unattributedErrors, { ourSide: 0, opponentSide: 0 });
 });
 
+test('CHARACTERIZATION -- IDENTITY HAZARD: a display name present on BOTH the own and opponent roster in one game causes every play mentioning that name to be attributed to "own", even though the play could equally belong to the opponent -- processGames has no side-aware play attribution, only a bare ourBatterNames.has(name) membership check', () => {
+  const stats = processGames([
+    game({
+      homeBatting: [{ Player: 'J Smith', isOurTeam: true, TeamSide: 'home' }],
+      awayBatting: [{ Player: 'J Smith', isOurTeam: false, TeamSide: 'away' }],
+      plays: [{ text: 'Single. J Smith singles to left field, D Placeholder pitching.' }],
+    }),
+  ]);
+  assert.deepEqual(Object.keys(stats.players), ['J Smith']); // always "own", regardless of which real player it was
+  assert.deepEqual(Object.keys(stats.opponentBatters), []);
+});
+
+test('CHARACTERIZATION -- IDENTITY HAZARD: two different players sharing one display name on the SAME roster are silently merged into a single accumulator entry (their plate appearances are combined as if one person)', () => {
+  const stats = processGames([
+    game({
+      homeBatting: [{ Player: 'Jordan Smith', isOurTeam: true, TeamSide: 'home' }],
+      plays: [
+        { text: 'Single. Jordan Smith singles to left field, D Placeholder pitching.' },
+        { text: 'Strikeout. Jordan Smith strikes out swinging, C Fixture pitching.' },
+      ],
+    }),
+  ]);
+  assert.deepEqual(Object.keys(stats.players), ['Jordan Smith']);
+  assert.equal(stats.players['Jordan Smith'].PA, 2); // both plate appearances merged into one entry, regardless of whether they were the same real person
+});
+
 test('CHARACTERIZATION -- a play with unparseable/garbage text is silently skipped, not thrown', () => {
   const stats = processGames([
     game({

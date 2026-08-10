@@ -115,31 +115,76 @@ test('normalizeBaseballGame -- throws when ownSide is missing or not exactly "ho
   assert.throws(() => normalizeBaseballGame(raw, 'team-1', 'Home'), /ownSide is required/); // case-sensitive, never guessed
 });
 
-// ── Purity: no input mutation, deterministic output ─────────────────────────
+// ── Purity: no input mutation, full-output determinism ──────────────────────
+//
+// Each test below deep-clones the canonical fixture into two SEPARATE,
+// unrelated object graphs (cloneA/cloneB -- no shared references at all,
+// unlike calling the same function twice on the same object, which cannot
+// rule out the function reading mutable shared state), calls the public
+// operation once per clone, deep-equal-compares the COMPLETE returned
+// value (never a subset, and no field is stripped or ignored inside the
+// assertion), and separately confirms neither clone was mutated by its
+// call. Passing this is a stronger claim than "the suite passed twice" --
+// it is a direct claim about the returned values themselves.
 
-test('reconstructBaseballGame -- does not mutate its input game object', () => {
-  const game = ownHomeGame();
-  const snapshot = JSON.parse(JSON.stringify(game));
-  reconstructBaseballGame(game);
-  assert.deepEqual(game, snapshot);
+test('reconstructBaseballGame -- deterministic: two independently-cloned copies of the same input produce a fully deep-equal result, with neither input mutated', () => {
+  const canonical = ownHomeGame();
+  const cloneA = JSON.parse(JSON.stringify(canonical));
+  const cloneB = JSON.parse(JSON.stringify(canonical));
+  const resultA = reconstructBaseballGame(cloneA);
+  const resultB = reconstructBaseballGame(cloneB);
+  assert.deepEqual(resultA, resultB);
+  assert.deepEqual(cloneA, canonical);
+  assert.deepEqual(cloneB, canonical);
 });
 
-test('reconstructBaseballGame -- deterministic: identical input produces identical output across repeated calls', () => {
-  const game = ownHomeGame();
-  const r1 = reconstructBaseballGame(game);
-  const r2 = reconstructBaseballGame(game);
-  assert.deepEqual(r1, r2);
+test('reconstructBaseballTeamGames -- deterministic: two independently-cloned copies of the same games array produce a fully deep-equal { summary, gameResults }, with neither input mutated', () => {
+  const canonical = [ownHomeGame(), {
+    meta: { gameId: 'synthetic-g2' },
+    boxScore: { batting: [battingRow('A Sample', 'away', true, { AB: 2, H: 2 })], pitching: [] },
+    plays: [],
+  }];
+  const cloneA = JSON.parse(JSON.stringify(canonical));
+  const cloneB = JSON.parse(JSON.stringify(canonical));
+  const resultA = reconstructBaseballTeamGames('team-x', cloneA);
+  const resultB = reconstructBaseballTeamGames('team-x', cloneB);
+  assert.deepEqual(resultA, resultB);
+  assert.deepEqual(cloneA, canonical);
+  assert.deepEqual(cloneB, canonical);
 });
 
-test('computeBaseballStats -- does not mutate its input games array', () => {
-  const games = [{
+test('computeBaseballStats -- deterministic: two independently-cloned copies of the same games array produce a fully deep-equal result, with neither input mutated', () => {
+  const canonical = [{
     meta: { gameId: 'g1' },
     boxScore: { batting: [battingRow('A Sample', 'home', true, {})] },
     plays: [{ text: 'Single. A Sample singles to left field, D Placeholder pitching.' }],
   }];
-  const snapshot = JSON.parse(JSON.stringify(games));
-  computeBaseballStats(games);
-  assert.deepEqual(games, snapshot);
+  const cloneA = JSON.parse(JSON.stringify(canonical));
+  const cloneB = JSON.parse(JSON.stringify(canonical));
+  const resultA = computeBaseballStats(cloneA);
+  const resultB = computeBaseballStats(cloneB);
+  assert.deepEqual(resultA, resultB);
+  assert.deepEqual(cloneA, canonical);
+  assert.deepEqual(cloneB, canonical);
+});
+
+test('normalizeBaseballGame -- deterministic: two independently-cloned copies of the same rawJson produce a fully deep-equal result (including the game object with capturedAt removed), with neither input mutated', () => {
+  const canonical = {
+    meta: { gameDate: '2026-03-01', opponentName: 'Maple Grove Foxes' }, // no capturedAt supplied -- would be wall-clock-live if surfaced
+    boxScore: {
+      awayBatting: [{ Player: 'B Example', AB: 3, H: 1 }],
+      homeBatting: [{ Player: 'A Sample', AB: 3, H: 2 }],
+    },
+    plays: [],
+  };
+  const cloneA = JSON.parse(JSON.stringify(canonical));
+  const cloneB = JSON.parse(JSON.stringify(canonical));
+  const resultA = normalizeBaseballGame(cloneA, 'team-own', 'home');
+  const resultB = normalizeBaseballGame(cloneB, 'team-own', 'home');
+  assert.deepEqual(resultA, resultB);
+  assert.equal('capturedAt' in resultA.game, false); // proves the nondeterministic field isn't merely equal by luck -- it's absent
+  assert.deepEqual(cloneA, canonical);
+  assert.deepEqual(cloneB, canonical);
 });
 
 // ── Game integrity: reconstructBaseballTeamGames aggregates correctly ──────
@@ -207,9 +252,9 @@ test('reconstructBaseballGame -- an identical player name on both own and oppone
   assert.equal(result.opponent.reconstructedBatting.doubles, 1);
 });
 
-// ── normalizeBaseballGame: explicit ownSide, own field alongside legacy isOurTeam ──
+// ── normalizeBaseballGame: explicit ownSide; own is the sole public ownership field ──
 
-test('normalizeBaseballGame -- ownSide is explicit and independent of rawJson.meta.ourSide; adds an own boolean alongside isOurTeam', () => {
+test('normalizeBaseballGame -- ownSide is explicit and independent of rawJson.meta.ourSide; own replaces legacy isOurTeam entirely (isOurTeam is not exposed)', () => {
   const raw = {
     meta: { gameDate: '2026-03-01', opponentName: 'Maple Grove Foxes' }, // no ourSide at all
     boxScore: {
@@ -219,9 +264,11 @@ test('normalizeBaseballGame -- ownSide is explicit and independent of rawJson.me
     plays: [],
   };
   const result = normalizeBaseballGame(raw, 'team-own', 'home');
-  const bySide = Object.fromEntries(result.battingLines.map((b) => [b.playerName, { isOurTeam: b.isOurTeam, own: b.own }]));
-  assert.deepEqual(bySide['A Sample'], { isOurTeam: 1, own: true });
-  assert.deepEqual(bySide['B Example'], { isOurTeam: 0, own: false });
+  const bySide = Object.fromEntries(result.battingLines.map((b) => [b.playerName, b.own]));
+  assert.deepEqual(bySide, { 'A Sample': true, 'B Example': false });
+  for (const row of result.battingLines) {
+    assert.equal('isOurTeam' in row, false);
+  }
 });
 
 test('normalizeBaseballGame -- every row still carries the placeholder gameId \'__pending__\'', () => {

@@ -17,6 +17,32 @@
  * logic; it only translates at the boundary between an explicit, safe
  * public contract and each legacy function's own input/output shape.
  *
+ * ── Architecture: this is a boundary-translation wrapper, not an extracted
+ *    computational core — stated plainly, not left to be inferred ────────
+ * Every function in this file is one of exactly three things: (1) a rename
+ * of a field or bucket name (e.g. legacy `scouted` -> `own`), (2) an
+ * inversion of one boolean at one tested point (`own` -> `is_our_team`),
+ * or (3) an added VALIDATION/GUARD (explicit-own enforcement,
+ * contradictory-side-metadata rejection, duplicate-identity rejection,
+ * capturedAt isolation) that runs before or after an unmodified call into
+ * a legacy function. Zero event-type classification, zero play-by-play
+ * text parsing, zero box-score totaling, zero rate-stat formulas (BA/OBP/
+ * SLG/OPS/K%/etc.), and zero roster alias-matching logic live in this
+ * file — all of that remains, unchanged and unduplicated, exclusively in
+ * normalizer.js / game-reconstructor.js / stats-engine.js, which stay the
+ * sole authoritative implementation of every baseball calculation this
+ * module exposes. Because this module never reimplements a formula, there
+ * is no second copy of any calculation to drift out of sync with the
+ * legacy one — a change to a legacy formula changes this module's output
+ * identically and automatically, with no parallel code to keep in sync.
+ * Leaving the three legacy files unmodified is the appropriate choice
+ * here specifically because the defect this slice fixes (ambiguous
+ * ownership semantics at the CALLER boundary) was never a calculation
+ * defect — every characterized formula was already correct — so the
+ * narrowest fix that fully addresses it is a boundary translation, not a
+ * rewrite of validated statistical code that Travel production
+ * (pipeline.js, src/validate-team-stats.js) also depends on unchanged.
+ *
  * ── Why this module exists ──────────────────────────────────────────────
  * game-reconstructor.js's internal bucketing is driven by
  * `isScoutedRow(row)`, which is true when `row.is_our_team === false` — the
@@ -65,11 +91,22 @@
  * test/baseball-engine-dependency-boundary.test.js, which greps this file's
  * own source and its require graph to prove it). Inputs are never mutated
  * (each row is shallow-copied before its `own` field is translated). Given
- * the same input, output is byte-for-byte identical across repeated calls,
- * with one narrow, explicitly documented exception inherited unchanged from
- * normalizer.js: `normalizeBaseballGame`'s returned `game.capturedAt` field
- * is a live wall-clock timestamp (an audit field, not a statistic) — see
- * that legacy file's own normalizeGameMeta().
+ * the same input, EVERY value returned by every function in this module's
+ * public contract is deeply, unconditionally identical across repeated
+ * calls — proven by an explicit full-object deep-equality test per public
+ * operation in test/baseball-engine.test.js (not merely "the suite passed
+ * twice").
+ *
+ * normalizer.js's own normalizeGameMeta() stamps a `capturedAt` field with
+ * `meta.capturedAt || new Date().toISOString()` — a live wall-clock read
+ * whenever the caller doesn't supply one, which would otherwise be the one
+ * non-deterministic value in this module's output. `normalizeBaseballGame`
+ * deliberately strips that field from its returned `game` object before
+ * returning (see the comment at that call site) rather than exposing it —
+ * it is DB-audit metadata, not a value this pure engine computes, so it is
+ * isolated outside the engine's contract entirely instead of being
+ * "documented as an exception" to a determinism guarantee that must
+ * otherwise hold without exception.
  *
  * ── Errors ───────────────────────────────────────────────────────────────
  * Thrown errors are plain `Error` instances with a short, non-sensitive
@@ -113,9 +150,38 @@ function toReconstructionRow(row, rowKind, index) {
   return { ...rest, is_our_team: !own };
 }
 
+// Contradictory-metadata guard: game-reconstructor.js's own scoutedSide/
+// opponentSide resolution (buildRosterContext) treats each bucket's venue
+// side independently -- if a caller supplies rows where the SAME TeamSide
+// (venue) carries both own:true and own:false rows, the underlying legacy
+// function does not detect this; it silently resolves ownSide and
+// opponentSide to the SAME venue value, which is logically incoherent (two
+// teams cannot both play at the venue in one game) but was not previously
+// rejected. This is exactly the kind of caller error the explicit
+// own/opponent contract exists to catch rather than paper over, so it is
+// checked and rejected here, at the one place both reconstructBaseballGame
+// and reconstructBaseballTeamGames funnel through.
+function assertNoContradictorySideMetadata(capturedGame, rowKind, rows) {
+  const ownByVenue = new Map(); // normalized TeamSide -> own boolean seen there
+  rows.forEach((row, index) => {
+    const venue = String(row?.TeamSide ?? row?.teamSide ?? '').trim().toLowerCase();
+    if (!venue || typeof row?.own !== 'boolean') return; // unresolvable venue can't be checked; requireExplicitOwnBoolean already covers missing `own`
+    const existing = ownByVenue.get(venue);
+    if (existing === undefined) {
+      ownByVenue.set(venue, row.own);
+      return;
+    }
+    if (existing !== row.own) {
+      throw new Error(`baseball-engine: contradictory side metadata in ${rowKind}[${index}] -- this game already has a row with TeamSide "${venue}" and own:${existing}, but this row has TeamSide "${venue}" and own:${row.own}. A single venue side cannot be both own and opponent within one game.`);
+    }
+  });
+}
+
 function toReconstructionInput(capturedGame) {
   const batting = capturedGame?.boxScore?.batting || [];
   const pitching = capturedGame?.boxScore?.pitching || [];
+  assertNoContradictorySideMetadata(capturedGame, 'boxScore.batting', batting);
+  assertNoContradictorySideMetadata(capturedGame, 'boxScore.pitching', pitching);
   return {
     ...capturedGame,
     boxScore: {
@@ -219,28 +285,153 @@ function toStatsEngineGame(capturedGame) {
   };
 }
 
+// ── Durable-identity guard ──────────────────────────────────────────────
+//
+// stats-engine.js's processGames() keys every player's accumulated
+// statistics by RESOLVED DISPLAY NAME STRING (`players[pa.batter]`, etc.)
+// -- there is no durable-ID concept anywhere in that file, and this is
+// inherited unchanged, not fixed, since play-by-play text itself carries
+// no ID, only a name (see test/legacy-stats-engine-characterization.test.js
+// for the underlying legacy behavior this rests on). Empirically: two
+// DIFFERENT real players who happen to share one display name on one
+// side, in one game or across games, are silently merged into a single
+// accumulator entry by the wrapped legacy engine -- their plate
+// appearances, hits, etc. are combined as if they were one person.
+//
+// This guard cannot fix that merge (the play-by-play text this engine
+// receives has no way to say which of two identically-named players a
+// given play belongs to -- that information does not exist in the source
+// data at all). What it CAN safely do, and does, is refuse to silently
+// accept input where the hazard is provable: if a caller supplies an
+// optional `playerId` per row and two DIFFERENT non-null playerIds share
+// one display name on the same side (own/opponent, batting/pitching),
+// that is definitive proof of two different real people -- this function
+// throws rather than let stats-engine.js merge them. If no playerId is
+// supplied at all, the collision is undetectable from this data alone and
+// the caller inherits the legacy limitation, documented here rather than
+// silently assumed safe (see computeBaseballStats' own JSDoc "Durable
+// identity" section below).
+//
+// When no collision is found and a name's rows all agree on one
+// playerId, that ID is attached to the corresponding output entry as
+// `.playerId` -- a non-breaking courtesy so callers who did supply IDs
+// can key their own downstream storage by ID even though stats-engine.js's
+// internal accumulator could not.
+function collectSideRows(box, kind) {
+  const capKind = kind.charAt(0).toUpperCase() + kind.slice(1);
+  return [...(box?.[kind] || []), ...(box?.[`away${capKind}`] || []), ...(box?.[`home${capKind}`] || [])];
+}
+
+function checkDurableIdentityAndBuildIdMap(capturedGames) {
+  // bucketKey -> displayName -> { playerId: string|null, firstSeen: 'games[i].boxScore.<kind>[j]' }
+  const buckets = { 'true|batting': new Map(), 'false|batting': new Map(), 'true|pitching': new Map(), 'false|pitching': new Map() };
+
+  capturedGames.forEach((game, gameIndex) => {
+    const box = game?.boxScore || {};
+    for (const kind of ['batting', 'pitching']) {
+      // CROSS-SIDE collision check, within this one game only: unlike
+      // game-reconstructor.js (which disambiguates same-named players on
+      // opposing rosters via inning-derived offense/defense side --
+      // proven in test/baseball-engine-game-integrity-matrix.test.js), the
+      // wrapped stats-engine.js has NO side-aware play attribution at all.
+      // Its own/opponent bucketing for a given play is a bare
+      // `ourBatterNames.has(pa.batter)` name-set-membership check -- if the
+      // same display name is a member of BOTH the own and opponent roster
+      // sets for this game, every play mentioning that name is silently
+      // attributed to "own", even when it was actually the opponent's
+      // player (empirically confirmed directly against the unmodified
+      // legacy engine in
+      // test/legacy-stats-engine-characterization.test.js). This cannot be
+      // fixed by an ID -- the underlying play-by-play text carries no ID,
+      // and by the time processGames() has already resolved and
+      // accumulated a play, the misattribution has already happened. The
+      // only safe boundary action is to detect the collision up front and
+      // refuse it.
+      const ownNames = new Set();
+      const opponentNames = new Set();
+      collectSideRows(box, kind).forEach((row) => {
+        if (!row || typeof row !== 'object' || typeof row.own !== 'boolean') return;
+        const name = String(row.Player || row.Name || '').trim();
+        if (!name) return;
+        (row.own ? ownNames : opponentNames).add(name);
+      });
+      for (const name of ownNames) {
+        if (opponentNames.has(name)) {
+          throw new Error(`baseball-engine: computeBaseballStats games[${gameIndex}].boxScore.${kind} has one display name present on BOTH the own and opponent roster for this game. stats-engine.js's play-to-side attribution is a bare name-set membership check with no side-awareness (unlike game-reconstructor.js) and would silently attribute every one of that name's plays to "own", even ones that belonged to the opponent. This module rejects the input rather than risk that misattribution. Ensure display names do not collide across own and opponent rosters within one game.`);
+        }
+      }
+
+      collectSideRows(box, kind).forEach((row, rowIndex) => {
+        if (!row || typeof row !== 'object' || typeof row.own !== 'boolean') return;
+        const name = String(row.Player || row.Name || '').trim();
+        if (!name) return;
+        const playerId = row.playerId != null ? String(row.playerId) : null;
+        const bucket = buckets[`${row.own}|${kind}`];
+        const location = `games[${gameIndex}].boxScore.${kind}[${rowIndex}]`;
+        const existing = bucket.get(name);
+        if (!existing) {
+          bucket.set(name, { playerId, firstSeen: location });
+          return;
+        }
+        if (existing.playerId && playerId && existing.playerId !== playerId) {
+          throw new Error(`baseball-engine: computeBaseballStats found two rows with different playerId values sharing one display name on the same side (own:${row.own}, ${kind}) -- ${existing.firstSeen} and ${location}. stats-engine.js's accumulator keys players by display name and would silently merge their statistics into one entry; this module rejects the input instead, since the supplied playerIds prove they are two different real people.`);
+        }
+        // If exactly one of the two rows carries a playerId, adopt it (a
+        // caller may only tag identity on some rows); if neither carries
+        // one, the collision remains undetectable and is not rejected.
+        if (!existing.playerId && playerId) existing.playerId = playerId;
+      });
+    }
+  });
+
+  return buckets;
+}
+
 /**
  * Computes advanced per-player/per-pitcher statistics from play-by-play
  * text across many games. Pure pass-through to stats-engine.js's
  * processGames() after an explicit own/opponent boundary translation.
  *
+ * ── Durable identity ──────────────────────────────────────────────────
+ * stats-engine.js's own accumulator keys players by resolved display name,
+ * not by ID (see the "Durable-identity guard" comment above this
+ * function). This wrapper adds one safety property on top, no more: if an
+ * optional `playerId` is supplied per boxScore row and two rows on the
+ * same side share a display name with two DIFFERENT playerId values, this
+ * function throws rather than let the legacy accumulator silently merge
+ * their statistics. When no collision is detected, a name's resolved
+ * `playerId` (if every contributing row agreed on one) is attached to its
+ * output entry as `.playerId`. If no playerId is ever supplied, this
+ * function cannot detect or prevent a same-name collision -- that residual
+ * limitation is inherited from the wrapped legacy engine and documented,
+ * not hidden.
+ *
  * @param {object[]} capturedGames - Each game's boxScore rows (whichever of
  *   the combined `batting`/`pitching` or split `awayBatting`/`homeBatting`/
  *   `awayPitching`/`homePitching` shapes is present) must carry an explicit
- *   `own` boolean per row.
+ *   `own` boolean per row, and may optionally carry a `playerId`.
  * @returns {{ ownBatters: object, opponentBatters: object, ownPitchers: object, opponentPitchers: object, unattributedErrors: { ownSide: number, opponentSide: number } }}
  */
 function computeBaseballStats(capturedGames = []) {
   if (!Array.isArray(capturedGames)) {
     throw new Error('baseball-engine: capturedGames must be an array');
   }
+  const idBuckets = checkDurableIdentityAndBuildIdMap(capturedGames);
   const translatedGames = capturedGames.map(toStatsEngineGame);
   const legacyResult = processGames(translatedGames);
+  const attachIds = (statMap, bucketKey) => {
+    const bucket = idBuckets[bucketKey];
+    for (const [name, stats] of Object.entries(statMap)) {
+      const known = bucket.get(name);
+      if (known?.playerId) stats.playerId = known.playerId;
+    }
+    return statMap;
+  };
   return {
-    ownBatters: legacyResult.players,
-    opponentBatters: legacyResult.opponentBatters,
-    ownPitchers: legacyResult.ourPitchers,
-    opponentPitchers: legacyResult.pitchers,
+    ownBatters: attachIds(legacyResult.players, 'true|batting'),
+    opponentBatters: attachIds(legacyResult.opponentBatters, 'false|batting'),
+    ownPitchers: attachIds(legacyResult.ourPitchers, 'true|pitching'),
+    opponentPitchers: attachIds(legacyResult.pitchers, 'false|pitching'),
     unattributedErrors: {
       ownSide: legacyResult.unattributedErrors.ourSide,
       opponentSide: legacyResult.unattributedErrors.opponentSide,
@@ -256,9 +447,12 @@ function computeBaseballStats(capturedGames = []) {
  * requiring `ownSide` as an explicit argument (never read from
  * `rawJson.meta.ourSide` implicitly) so the caller's own/opponent intent is
  * always visible at this module's boundary, and adds an explicit `own`
- * boolean alongside each returned row (normalizer.js's own `isOurTeam`
- * 1/0/null field is left in place, unchanged, for callers that already
- * depend on it).
+ * boolean on each returned row, replacing normalizer.js's own `isOurTeam`
+ * 1/0/null field entirely -- `own` is this module's sole public ownership
+ * field across all four operations; normalizer.js's legacy field name is
+ * never exposed, for the same reason reconstructBaseballGame/
+ * computeBaseballStats never expose `is_our_team`/`isOurTeam` either (see
+ * test/baseball-engine-explicit-side-contract.test.js).
  *
  * normalizer.js's own isOurTeam semantics were empirically confirmed
  * (test/legacy-normalizer-own-opponent-characterization.test.js) to already
@@ -285,9 +479,26 @@ function normalizeBaseballGame(rawJson, teamId, ownSide, options = {}) {
     meta: { ...(rawJson.meta || {}), ourSide: ownSide },
   };
   const result = normalizeGameData(rawJsonWithExplicitSide, teamId, { invertTeamSide: options.invertOwnership === true });
-  const addOwn = (row) => ({ ...row, own: row.isOurTeam === 1 ? true : row.isOurTeam === 0 ? false : null });
+  // Replaces normalizer.js's legacy isOurTeam field with this module's own
+  // `own` boolean -- own is the ONLY public ownership field this module
+  // ever returns, on any of its four operations.
+  const addOwn = (row) => {
+    const { isOurTeam, ...rest } = row;
+    return { ...rest, own: isOurTeam === 1 ? true : isOurTeam === 0 ? false : null };
+  };
+  // capturedAt is deliberately dropped: normalizer.js's normalizeGameMeta()
+  // stamps it with `meta.capturedAt || new Date().toISOString()` -- a live
+  // wall-clock read whenever the caller doesn't supply one. That would make
+  // this function's own return value non-deterministic across two calls
+  // with identical input (see the "capturedAt is dropped, not surfaced"
+  // determinism test in test/baseball-engine.test.js). It is DB-audit
+  // metadata, not a computed value this engine is responsible for, so it is
+  // isolated out here rather than exposed on the pure engine's return
+  // value. A caller that still wants it can read `result.game.capturedAt`
+  // by calling normalizer.js's normalizeGameData() directly.
+  const { capturedAt: _capturedAt, ...gameWithoutCapturedAt } = result.game;
   return {
-    game: result.game,
+    game: gameWithoutCapturedAt,
     battingLines: result.battingLines.map(addOwn),
     pitchingLines: result.pitchingLines.map(addOwn),
     playEvents: result.playEvents,
