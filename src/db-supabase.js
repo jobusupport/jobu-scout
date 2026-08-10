@@ -124,6 +124,85 @@ async function getOrgIdForTeam(teamId) {
   return data.org_id;
 }
 
+// Security Slice T3K: resolves and validates the ONE authoritative org_id
+// for an entire bulk child-stat write (insertBattingLines/
+// insertPitchingLines/insertPlayEvents) against BOTH of its actual
+// parents -- the game these rows are being written under (gameId, the
+// function's own shared argument -- NEVER row.gameId, which is only ever
+// the inert '__pending__' placeholder normalizeGameData stamps onto a
+// row before the real game has even been inserted) and every row's own
+// team (row.teamId). games.org_id is authoritative here, matching the
+// migration's own backfill source for these three tables (game_id ->
+// games.org_id) -- team ownership is validated to AGREE with it, not
+// used as an independent, separate source of truth.
+//
+// Rejects the whole batch, before any row is written, if:
+//   - gameId doesn't resolve to a real games row, or that row has no
+//     org_id (fails closed, same contract as getOrgIdForTeam)
+//   - any row's team can't be resolved at all
+//   - any resolved team's organization disagrees with the game's
+//     organization -- this is the cross-tenant case a malformed or
+//     future caller could otherwise produce: a real team from
+//     Organization A combined with a real game from Organization B,
+//     each individually valid per its own foreign key, but never
+//     belonging together
+//   - any row carries its own orgId/org_id hint that disagrees with the
+//     game's authoritative organization (a caller-supplied override is
+//     never trusted over real ownership)
+// Exactly two bounded queries per batch call, regardless of batch size:
+// one for the game, one .in() lookup for every distinct team_id -- never
+// one query per row.
+async function resolveHomogeneousBatchOrgId(rows, gameId, functionLabel) {
+  const { data: game, error: gameError } = await getDb()
+    .from('games')
+    .select('id, org_id')
+    .eq('id', gameId)
+    .maybeSingle();
+  check(gameError, `${functionLabel} game org_id validation`);
+  if (!game) throw new Error(`Game ${gameId} not found while resolving org_id for ${functionLabel}`);
+  if (!game.org_id) throw new Error(`Game ${gameId} does not have org_id`);
+  const orgId = game.org_id;
+
+  const distinctTeamIds = [...new Set(
+    rows.map(r => r && r.teamId).filter(v => v !== undefined && v !== null && v !== '')
+  )];
+
+  if (!distinctTeamIds.length) {
+    throw new Error(`${functionLabel} requires every row to carry a teamId to resolve org_id`);
+  }
+
+  const { data: teams, error: teamsError } = await getDb()
+    .from('teams')
+    .select('id, org_id')
+    .in('id', distinctTeamIds);
+  check(teamsError, `${functionLabel} batch team org_id validation`);
+
+  const teamOrgById = new Map((teams || []).map(t => [t.id, t.org_id]));
+
+  for (const teamId of distinctTeamIds) {
+    const teamOrgId = teamOrgById.get(teamId);
+    if (!teamOrgId) throw new Error(`Team ${teamId} not found while resolving org_id for ${functionLabel}`);
+    if (teamOrgId !== orgId) {
+      throw new Error(
+        `${functionLabel}: game ${gameId}'s organization disagrees with a team referenced in this batch -- ` +
+        'refusing to write a mismatched game/team batch'
+      );
+    }
+  }
+
+  for (const row of rows) {
+    const suppliedOrgId = normalizeNullable(row && (row.orgId || row.org_id));
+    if (suppliedOrgId && suppliedOrgId !== orgId) {
+      throw new Error(
+        `${functionLabel}: a row's supplied orgId conflicts with the game's authoritative organization -- ` +
+        'refusing to write a mixed-tenant batch'
+      );
+    }
+  }
+
+  return orgId;
+}
+
 // Security Slice T2: there is deliberately no "only one organization"
 // inference here (a prior getSingleOrgIdFallback did this and is why the
 // Travel tenant-isolation defect existed -- see security/
@@ -767,40 +846,46 @@ async function getGameById(gameId) {
 async function insertBattingLines(lines, gameId) {
   if (!lines.length) return;
 
-  const orgId = normalizeNullable(lines[0].orgId || lines[0].org_id) || await getOrgIdForTeam(lines[0].teamId);
-  const includeOrgId = await tableHasOrgId('batting_lines');
+  // Security Slice T3K: org_id is the actual game's authoritative
+  // organization (resolveHomogeneousBatchOrgId resolves gameId through
+  // games.org_id -- the same authoritative source the T3K migration
+  // itself backfills from -- and validates every row's team agrees with
+  // it) and is now ALWAYS attached to every row -- batting_lines.org_id
+  // is NOT NULL at the database level (see the T3K migration), so a
+  // conditional, schema-probing include here would only ever silently
+  // reintroduce a tenantless write the database will now reject anyway.
+  // There is no longer a supported schema state where this table lacks
+  // org_id.
+  const orgId = await resolveHomogeneousBatchOrgId(lines, gameId, 'insertBattingLines');
 
-  const rows = lines.map(row => {
-    const payload = {
-      game_id:       gameId,
-      team_id:       row.teamId,
-      player_name:   row.playerName,
-      batting_order: numericOrNull(row.battingOrder),
-      is_our_team:   row.isOurTeam     ? true : false,
-      team_side:     row.teamSide      || null,
-      team_name_raw: row.teamNameRaw   || null,
-      position:      row.position      || null,
-      ab:            numericOrZero(row.ab),
-      r:             numericOrZero(row.r),
-      h:             numericOrZero(row.h),
-      rbi:           numericOrZero(row.rbi),
-      bb:            numericOrZero(row.bb),
-      so:            numericOrZero(row.so),
-      avg:           numericOrNull(row.avg),
-      obp:           numericOrNull(row.obp),
-      slg:           numericOrNull(row.slg),
-      doubles:       numericOrZero(row.doubles),
-      triples:       numericOrZero(row.triples),
-      hr:            numericOrZero(row.hr),
-      sb:            numericOrZero(row.sb),
-      hbp:           numericOrZero(row.hbp),
-      sac:           numericOrZero(row.sac),
-      lob:           numericOrZero(row.lob),
-      raw_json:      serializeRawJsonForTextColumn(row.rawJson),
-    };
-    if (includeOrgId) payload.org_id = orgId;
-    return payload;
-  });
+  const rows = lines.map(row => ({
+    game_id:       gameId,
+    org_id:        orgId,
+    team_id:       row.teamId,
+    player_name:   row.playerName,
+    batting_order: numericOrNull(row.battingOrder),
+    is_our_team:   row.isOurTeam     ? true : false,
+    team_side:     row.teamSide      || null,
+    team_name_raw: row.teamNameRaw   || null,
+    position:      row.position      || null,
+    ab:            numericOrZero(row.ab),
+    r:             numericOrZero(row.r),
+    h:             numericOrZero(row.h),
+    rbi:           numericOrZero(row.rbi),
+    bb:            numericOrZero(row.bb),
+    so:            numericOrZero(row.so),
+    avg:           numericOrNull(row.avg),
+    obp:           numericOrNull(row.obp),
+    slg:           numericOrNull(row.slg),
+    doubles:       numericOrZero(row.doubles),
+    triples:       numericOrZero(row.triples),
+    hr:            numericOrZero(row.hr),
+    sb:            numericOrZero(row.sb),
+    hbp:           numericOrZero(row.hbp),
+    sac:           numericOrZero(row.sac),
+    lob:           numericOrZero(row.lob),
+    raw_json:      serializeRawJsonForTextColumn(row.rawJson),
+  }));
 
   const { error } = await getDb().from('batting_lines').insert(rows);
   check(error, 'insertBattingLines');
@@ -812,35 +897,35 @@ async function insertBattingLines(lines, gameId) {
 async function insertPitchingLines(lines, gameId) {
   if (!lines.length) return;
 
-  const orgId = normalizeNullable(lines[0].orgId || lines[0].org_id) || await getOrgIdForTeam(lines[0].teamId);
-  const includeOrgId = await tableHasOrgId('pitching_lines');
+  // Security Slice T3K: see insertBattingLines's comment -- org_id is the
+  // actual game's authoritative organization, validated against every
+  // row's team, and always attached; pitching_lines no longer has a
+  // supported schema state without a NOT NULL org_id.
+  const orgId = await resolveHomogeneousBatchOrgId(lines, gameId, 'insertPitchingLines');
 
-  const rows = lines.map(row => {
-    const payload = {
-      game_id:       gameId,
-      team_id:       row.teamId,
-      player_name:   row.playerName,
-      is_our_team:   row.isOurTeam     ? true : false,
-      team_side:     row.teamSide      || null,
-      team_name_raw: row.teamNameRaw   || null,
-      ip:            row.ip            || null,
-      ip_decimal:    numericOrNull(row.ipDecimal),
-      bf:            numericOrZero(row.bf),
-      pc:            numericOrZero(row.pc),
-      strikes:       numericOrZero(row.strikes),
-      h_allowed:     numericOrZero(row.hAllowed),
-      r_allowed:     numericOrZero(row.rAllowed),
-      er:            numericOrZero(row.er),
-      bb:            numericOrZero(row.bb),
-      so:            numericOrZero(row.so),
-      hr_allowed:    numericOrZero(row.hrAllowed),
-      era:           numericOrNull(row.era),
-      whip:          numericOrNull(row.whip),
-      raw_json:      serializeRawJsonForTextColumn(row.rawJson),
-    };
-    if (includeOrgId) payload.org_id = orgId;
-    return payload;
-  });
+  const rows = lines.map(row => ({
+    game_id:       gameId,
+    org_id:        orgId,
+    team_id:       row.teamId,
+    player_name:   row.playerName,
+    is_our_team:   row.isOurTeam     ? true : false,
+    team_side:     row.teamSide      || null,
+    team_name_raw: row.teamNameRaw   || null,
+    ip:            row.ip            || null,
+    ip_decimal:    numericOrNull(row.ipDecimal),
+    bf:            numericOrZero(row.bf),
+    pc:            numericOrZero(row.pc),
+    strikes:       numericOrZero(row.strikes),
+    h_allowed:     numericOrZero(row.hAllowed),
+    r_allowed:     numericOrZero(row.rAllowed),
+    er:            numericOrZero(row.er),
+    bb:            numericOrZero(row.bb),
+    so:            numericOrZero(row.so),
+    hr_allowed:    numericOrZero(row.hrAllowed),
+    era:           numericOrNull(row.era),
+    whip:          numericOrNull(row.whip),
+    raw_json:      serializeRawJsonForTextColumn(row.rawJson),
+  }));
 
   const { error } = await getDb().from('pitching_lines').insert(rows);
   check(error, 'insertPitchingLines');
@@ -852,29 +937,29 @@ async function insertPitchingLines(lines, gameId) {
 async function insertPlayEvents(events, gameId) {
   if (!events.length) return;
 
-  const orgId = normalizeNullable(events[0].orgId || events[0].org_id) || await getOrgIdForTeam(events[0].teamId);
-  const includeOrgId = await tableHasOrgId('play_events');
+  // Security Slice T3K: see insertBattingLines's comment -- org_id is the
+  // actual game's authoritative organization, validated against every
+  // row's team, and always attached; play_events no longer has a
+  // supported schema state without a NOT NULL org_id.
+  const orgId = await resolveHomogeneousBatchOrgId(events, gameId, 'insertPlayEvents');
 
-  const rows = events.map(row => {
-    const payload = {
-      game_id:        gameId,
-      team_id:        row.teamId,
-      sequence_num:   numericOrNull(row.sequenceNum),
-      inning:         row.inning        || null,
-      inning_num:     numericOrNull(row.inningNum),
-      inning_half:    row.inningHalf    || null,
-      event_type:     row.eventType     || null,
-      batter_name:    row.batterName    || null,
-      pitcher_name:   row.pitcherName   || null,
-      description:    row.description   || null,
-      runners_on:     row.runnersOn     || null,
-      outs_before:    numericOrNull(row.outsBefore),
-      result_rbi:     numericOrZero(row.resultRbi),
-      is_scoring_play: row.isScoringPlay ? true : false,
-    };
-    if (includeOrgId) payload.org_id = orgId;
-    return payload;
-  });
+  const rows = events.map(row => ({
+    game_id:        gameId,
+    org_id:         orgId,
+    team_id:        row.teamId,
+    sequence_num:   numericOrNull(row.sequenceNum),
+    inning:         row.inning        || null,
+    inning_num:     numericOrNull(row.inningNum),
+    inning_half:    row.inningHalf    || null,
+    event_type:     row.eventType     || null,
+    batter_name:    row.batterName    || null,
+    pitcher_name:   row.pitcherName   || null,
+    description:    row.description   || null,
+    runners_on:     row.runnersOn     || null,
+    outs_before:    numericOrNull(row.outsBefore),
+    result_rbi:     numericOrZero(row.resultRbi),
+    is_scoring_play: row.isScoringPlay ? true : false,
+  }));
 
   const { error } = await getDb().from('play_events').insert(rows);
   check(error, 'insertPlayEvents');
@@ -1193,9 +1278,17 @@ async function getTeamAnalysisBundle(teamId) {
 async function upsertPlayerAdvancedStats(teamId, playerName, isOurTeam, stats) {
   const s  = stats;
   const sd = s.swingDecisions ? JSON.stringify(s.swingDecisions) : null;
+  // Security Slice T3K: org_id is always resolved fresh from the
+  // authoritative parent team (getOrgIdForTeam throws rather than
+  // guessing if teamId/its org can't be resolved) and always attached --
+  // player_advanced_stats no longer has a supported schema state without
+  // a NOT NULL org_id. team_id already fully disambiguates tenant in the
+  // onConflict target below (a team row belongs to exactly one
+  // organization), so org_id does not need to be added to it.
   const orgId = await getOrgIdForTeam(teamId);
   const payload = {
     team_id:     teamId,
+    org_id:      orgId,
     player_name: playerName,
     is_our_team: isOurTeam ? true : false,
     games:         s.games        ?? 0,
@@ -1217,7 +1310,6 @@ async function upsertPlayerAdvancedStats(teamId, playerName, isOurTeam, stats) {
 	bunts: s.BUNT ?? 0,
 	errors: s.E ?? 0,
   };
-  if (await tableHasOrgId('player_advanced_stats')) payload.org_id = orgId;
 
   const { error } = await getDb().from('player_advanced_stats').upsert(payload, { onConflict: 'team_id,player_name,is_our_team' });
 
@@ -1226,9 +1318,15 @@ async function upsertPlayerAdvancedStats(teamId, playerName, isOurTeam, stats) {
 
 async function upsertPitcherAdvancedStats(teamId, playerName, isOurTeam, stats) {
   const s = stats;
+  // Security Slice T3K: see upsertPlayerAdvancedStats's comment -- org_id
+  // is always resolved fresh from the authoritative parent team and
+  // always attached; pitcher_advanced_stats no longer has a supported
+  // schema state without a NOT NULL org_id, and team_id already fully
+  // disambiguates tenant in the onConflict target below.
   const orgId = await getOrgIdForTeam(teamId);
   const payload = {
     team_id:      teamId,
+    org_id:       orgId,
     player_name:  playerName,
     is_our_team:  isOurTeam ? true : false,
     games:        s.games        ?? 0,
@@ -1244,7 +1342,6 @@ async function upsertPitcherAdvancedStats(teamId, playerName, isOurTeam, stats) 
     wp: s.WP ?? 0, bk: s.BK ?? 0, pik: s.PIK ?? 0,
 	errors: s.E ?? 0,
   };
-  if (await tableHasOrgId('pitcher_advanced_stats')) payload.org_id = orgId;
 
   const { error } = await getDb().from('pitcher_advanced_stats').upsert(payload, { onConflict: 'team_id,player_name,is_our_team' });
 
