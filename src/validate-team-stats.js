@@ -34,7 +34,7 @@ function fmt(obj) {
 }
 
 async function findTeam(nameFragment) {
-  const teams = await Promise.resolve(db.getAllTeams());
+  const teams = await Promise.resolve(db.listAllTeamsForOperator());
   const lower = normalize(nameFragment);
 
   const byId = teams.find(t => normalize(t.id) === lower);
@@ -202,7 +202,7 @@ async function main() {
   const cleanArgs = args.filter(a => !['--dry-run', '--all', '-a'].includes(a));
 
   if (all) {
-    const teams = await Promise.resolve(db.getAllTeams());
+    const teams = await Promise.resolve(db.listAllTeamsForOperator());
     for (const team of teams) {
       try {
         await validateTeam(team, { dryRun });

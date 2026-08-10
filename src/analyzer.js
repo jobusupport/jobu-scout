@@ -1064,23 +1064,6 @@ async function analyzeTeam(teamId, options = {}) {
   return analysis;
 }
 
-async function analyzeAllTeams(options = {}) {
-  const teams   = db.getAllTeams();
-  const results = [];
-  for (const team of teams) {
-    try {
-      const b = pipeline.getTeamBundle(team.id);
-      if (b.meta.gamesAnalyzed === 0) { console.log(`[analyzer] Skipping ${team.team_name} — no games.`); continue; }
-      const analysis = await analyzeTeam(team.id, options);
-      results.push({ teamId: team.id, teamName: team.team_name, analysis });
-    } catch (err) {
-      console.error(`[analyzer] Failed for ${team.team_name}: ${err.message}`);
-      results.push({ teamId: team.id, teamName: team.team_name, error: err.message });
-    }
-  }
-  return results;
-}
-
 // ─── Self-Scout Report ──────────────────────────────────────────────────────
 // A self-scout report turns OUR OWN GameChanger data into coaching decisions:
 // what do we do, what will opponents notice, what should we fix/exploit before
@@ -1565,7 +1548,7 @@ async function analyzeMatchup(ourTeamId, opponentTeamId, options = {}) {
 }
 
 module.exports = {
-  analyzeTeam, analyzeAllTeams, callClaude, buildAnalysisPrompt, parseClaudeJson, extractJsonCandidate, computePitchSmartEligibility,
+  analyzeTeam, callClaude, buildAnalysisPrompt, parseClaudeJson, extractJsonCandidate, computePitchSmartEligibility,
   analyzeSelfScout, buildSelfScoutPrompt,
   analyzeMatchup, buildMatchupPrompt,
   buildCoachContextBlock,

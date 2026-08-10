@@ -382,20 +382,28 @@ async function getTeamByUrl(gcTeamUrl) {
   return data;
 }
 
-async function getAllTeams(includeArchived = false) {
+// Security Slice T3E: explicitly named for what it is -- an operator-only,
+// repository-wide enumeration across every organization, with no tenant
+// filter of any kind. Never call this from application-triggered code
+// (HTTP routes, background jobs, pipelines, report generation); use
+// listTeamsForOrg(orgId) there. See
+// test/team-enumeration-api-boundary.test.js for the enforced,
+// independently-verified reachability boundary.
+async function listAllTeamsForOperator(includeArchived = false) {
   let q = getDb().from('teams').select('*').order('team_name');
   if (!includeArchived) q = q.eq('archived', false);
   const { data, error } = await q;
-  check(error, 'getAllTeams');
+  check(error, 'listAllTeamsForOperator');
   return data || [];
 }
 
-// Security Slice T3C: the tenant-scoped counterpart to getAllTeams(), for
-// callers (the automated GameChanger reingestion job) that must discover
-// only one organization's own teams -- never every organization's, the
-// way applyOrgScope already refuses to run an unscoped write-path lookup.
-// Fails closed (throws OrgContextRequiredError) rather than silently
-// falling back to every organization's teams when orgId is missing/blank.
+// Security Slice T3C: the tenant-scoped counterpart to
+// listAllTeamsForOperator(), for callers (the automated GameChanger
+// reingestion job) that must discover only one organization's own teams
+// -- never every organization's, the way applyOrgScope already refuses to
+// run an unscoped write-path lookup. Fails closed (throws
+// OrgContextRequiredError) rather than silently falling back to every
+// organization's teams when orgId is missing/blank.
 async function listTeamsForOrg(orgId, includeArchived = false) {
   const normalizedOrgId = typeof orgId === 'string' ? orgId.trim() : orgId;
   if (!normalizedOrgId) {
@@ -1357,7 +1365,7 @@ module.exports = {
   // Teams
   upsertTeam,
   getTeamByUrl,
-  getAllTeams,
+  listAllTeamsForOperator,
   listTeamsForOrg,
   setTeamArchived,
   // Games

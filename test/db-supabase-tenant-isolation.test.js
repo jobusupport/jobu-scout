@@ -710,3 +710,87 @@ test('runTeamsSequentially (REAL src/report-team-selection.js) + REAL listTeamsF
     assert.deepEqual(result, { succeeded: 0, failed: 0 });
   });
 });
+
+// ── Security Slice T3E: getAllTeams() replaced by listAllTeamsForOperator ───
+//
+// getAllTeams() was an ambiguous name -- nothing in it communicated
+// whether "all" meant one organization's teams or every organization's.
+// It is renamed to listAllTeamsForOperator() (an explicit, intentionally
+// dangerous repository-wide enumeration with no tenant filter) and the
+// ambiguous name is removed from the module entirely, with no
+// compatibility alias. These tests exercise the REAL renamed function
+// against the same fake Supabase client used throughout this file,
+// proving it (a) still performs genuine repository-wide enumeration
+// (never accidentally organization-scoped) and (b) is no longer reachable
+// under its old, ambiguous name.
+
+test('listAllTeamsForOperator: performs genuine repository-wide enumeration -- returns teams from BOTH ' +
+     'organizations in a single call, never scoped to just one', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    const orgATeamId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A, teamName: 'Org A Tigers' }));
+    const orgBTeamId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_B, teamName: 'Org B Bears' }));
+
+    const allTeams = await dbSupabase.listAllTeamsForOperator();
+
+    assert.equal(allTeams.length, 2, 'the operator-wide call must see both organizations\' teams');
+    const ids = allTeams.map((t) => t.id);
+    assert.ok(ids.includes(orgATeamId) && ids.includes(orgBTeamId),
+      'both organizations\' teams must be present -- this is the intentionally dangerous, repository-wide query');
+  });
+});
+
+test('listAllTeamsForOperator: does not accidentally apply any organization\'s filter -- takes no orgId ' +
+     'argument and its result is identical regardless of which organizations exist', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A }));
+    await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_B }));
+
+    // Sanity: the fake client's FakeTeamsQuery only filters on explicit
+    // .eq()/.ilike() calls -- listAllTeamsForOperator's own query (see
+    // src/db-supabase.js) applies neither .eq('org_id', ...) nor any
+    // other tenant predicate, which this length assertion (2, not 1 or 0)
+    // is what actually proves, not merely the function's arity.
+    const allTeams = await dbSupabase.listAllTeamsForOperator();
+    assert.equal(allTeams.length, 2, 'both organizations\' teams must be returned -- no orgId filter is ever applied');
+  });
+});
+
+test('listAllTeamsForOperator: excludes archived teams by default, same as before the rename; ' +
+     'includeArchived=true still returns every team including archived ones', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    const activeId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A, teamName: 'Active' }));
+    state.teams.push({ id: nextId(), org_id: ORG_B, team_name: 'Archived', archived: true });
+
+    const activeOnly = await dbSupabase.listAllTeamsForOperator();
+    assert.equal(activeOnly.length, 1);
+    assert.equal(activeOnly[0].id, activeId);
+
+    const withArchived = await dbSupabase.listAllTeamsForOperator(true);
+    assert.equal(withArchived.length, 2);
+  });
+});
+
+test('db-supabase.js no longer exports getAllTeams under any name -- listAllTeamsForOperator is the ' +
+     'only repository-wide enumerator, and the ambiguous name is completely gone', () => {
+  return withFreshDbSupabase(async (dbSupabase) => {
+    assert.equal(dbSupabase.getAllTeams, undefined, 'the ambiguous name must not remain as a live export');
+    assert.equal(typeof dbSupabase.listAllTeamsForOperator, 'function', 'the explicit replacement must be exported');
+    assert.equal(typeof dbSupabase.listTeamsForOrg, 'function', 'the tenant-scoped API must be unaffected');
+  });
+});
+
+test('db.js (SQLite passthrough) no longer exports getAllTeams under any name', () => {
+  delete require.cache[require.resolve('../src/db')];
+  const dbSqlite = require('../src/db');
+  assert.equal(dbSqlite.getAllTeams, undefined, 'the ambiguous name must not remain as a live export');
+  assert.equal(typeof dbSqlite.listAllTeamsForOperator, 'function', 'the explicit replacement must be exported');
+  delete require.cache[require.resolve('../src/db')];
+});
+
+test('the ambiguous name getAllTeams does not appear anywhere in src/db-supabase.js\'s source ' +
+     '(a historical mention in an explanatory comment about a past defect is fine; a live definition, ' +
+     'export, or call site is not)', () => {
+  const fs = require('fs');
+  const source = fs.readFileSync(DB_SUPABASE_SRC_PATH, 'utf8');
+  assert.doesNotMatch(source, /\bgetAllTeams\b/, 'db-supabase.js must not reference getAllTeams in any form');
+});
