@@ -342,6 +342,24 @@ function listTeamsForOrg(orgId, includeArchived = false) {
   return listAllTeamsForOperator(includeArchived);
 }
 
+// Security Slice T3G: SQLite/local-dev passthrough for the same reason as
+// listTeamsForOrg above -- no multi-tenant schema exists locally (no
+// org_id on `teams`, and team_game_urls has no org_id column even in
+// Supabase). orgId is accepted for interface parity with
+// db-supabase.js's real, org-verified implementation (which fully
+// replaces these exports via Object.assign when USE_SUPABASE=true) and is
+// otherwise ignored here.
+function getGameUrlsForTeamInOrg(orgId, teamId) {
+  return getDb().prepare(`SELECT * FROM team_game_urls WHERE team_id = ? ORDER BY created_at`).all(teamId);
+}
+
+function markGameUrlProcessedForOrg(orgId, urlId, teamId) {
+  const info = getDb()
+    .prepare(`UPDATE team_game_urls SET processed_at = datetime('now') WHERE id = ? AND team_id = ?`)
+    .run(urlId, teamId);
+  return { updated: info.changes > 0 };
+}
+
 /**
  * Archive (soft-hide) or restore a team. Does not touch games, batting_lines,
  * pitching_lines, play_events, or advanced stats — all history stays intact.
@@ -1187,6 +1205,8 @@ module.exports = {
   listAllTeamsForOperator,
   listTeamsForOrg,
   setTeamArchived,
+  getGameUrlsForTeamInOrg,
+  markGameUrlProcessedForOrg,
   // Games
   insertGame,
   getGamesByTeam,

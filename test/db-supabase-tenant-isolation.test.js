@@ -69,6 +69,11 @@ class FakeTeamsQuery {
   insert(row) { this.op = 'insert'; this.payload = row; return this; }
   update(patch) { this.op = 'update'; this.payload = patch; return this; }
   single() { this.singleMode = true; return this; }
+  // Real Supabase collapses to a single object or null (never an array,
+  // never an error for zero rows) -- distinct from .single(), which errors
+  // on zero rows. T3G's ownership-check queries rely on exactly this
+  // "null means not found, not an error" collapsing behavior.
+  maybeSingle() { this.maybeSingleMode = true; return this; }
   _matches(row) {
     return this.filters.every((f) => {
       if (f.type === 'ilike') return String(row[f.col] || '').toLowerCase() === f.val;
@@ -96,15 +101,49 @@ class FakeTeamsQuery {
     }
     let rows = this.state.teams.filter((r) => this._matches(r));
     if (typeof this._limit === 'number') rows = rows.slice(0, this._limit);
+    if (this.maybeSingleMode) return { data: rows[0] || null, error: null };
+    if (this.singleMode) return { data: rows[0] || null, error: null };
     return { data: rows, error: null };
+  }
+}
+
+// Security Slice T3G: models team_game_urls alongside teams -- just enough
+// query surface (.eq/.order/.select/.update) for
+// getGameUrlsForTeamInOrg/markGameUrlProcessedForOrg to exercise against,
+// same no-RLS-modeled philosophy as FakeTeamsQuery above (isolation must
+// come from db-supabase.js's own org_id/team_id scoping, never a
+// database-side policy a service-role connection would bypass anyway).
+class FakeGameUrlsQuery {
+  constructor(state) {
+    this.state = state;
+    this.filters = [];
+    this.op = 'select';
+    this.payload = null;
+  }
+  select() { return this; }
+  eq(col, val) { this.filters.push({ col, val }); return this; }
+  order() { return this; }
+  update(patch) { this.op = 'update'; this.payload = patch; return this; }
+  _matches(row) { return this.filters.every((f) => row[f.col] === f.val); }
+  then(resolve, reject) {
+    return Promise.resolve(this._exec()).then(resolve, reject);
+  }
+  _exec() {
+    const matches = this.state.gameUrls.filter((r) => this._matches(r));
+    if (this.op === 'update') {
+      for (const row of matches) Object.assign(row, this.payload);
+      return { data: matches, error: null };
+    }
+    return { data: matches, error: null };
   }
 }
 
 function createFakeTeamsClient(state) {
   return {
     from(table) {
-      if (table !== 'teams') throw new Error(`fake client: unexpected table "${table}" (this test only models "teams")`);
-      return new FakeTeamsQuery(state);
+      if (table === 'teams') return new FakeTeamsQuery(state);
+      if (table === 'team_game_urls') return new FakeGameUrlsQuery(state);
+      throw new Error(`fake client: unexpected table "${table}" (this test only models "teams" and "team_game_urls")`);
     },
   };
 }
@@ -114,7 +153,7 @@ function createFakeTeamsClient(state) {
 // module plus the shared in-memory `state` so a test can seed rows
 // directly and inspect them afterward.
 function withFreshDbSupabase(fn) {
-  const state = { teams: [] };
+  const state = { teams: [], gameUrls: [] };
   const fakeClient = createFakeTeamsClient(state);
 
   const originalSupabaseJsEntry = require.cache[SUPABASE_JS_PATH];
@@ -793,4 +832,127 @@ test('the ambiguous name getAllTeams does not appear anywhere in src/db-supabase
   const fs = require('fs');
   const source = fs.readFileSync(DB_SUPABASE_SRC_PATH, 'utf8');
   assert.doesNotMatch(source, /\bgetAllTeams\b/, 'db-supabase.js must not reference getAllTeams in any form');
+});
+
+// ── Security Slice T3G: getGameUrlsForTeamInOrg / markGameUrlProcessedForOrg ─
+//
+// src/scrape-game-urls.js#getGameUrls()/markProcessed() used to open
+// voodoo-scout.db directly with no organization scoping at all --
+// team_game_urls has no org_id column, so an unscoped `WHERE team_id = ?`
+// query could read or update any organization's rows. These tests exercise
+// the REAL src/db-supabase.js#getGameUrlsForTeamInOrg/
+// markGameUrlProcessedForOrg against the same fake client used throughout
+// this file, proving the same two-step "verify team ownership via teams.org_id,
+// then operate scoped by team_id" pattern server.js's own
+// assertTeamInRequestOrg + getTeamGameUrls/PUT/DELETE routes already
+// established for this exact table (see server.js) is now available as a
+// shared repository method, not a route-only convention.
+
+function syntheticGameUrl(overrides = {}) {
+  return {
+    id: nextId(),
+    team_id: null,
+    gc_game_url: 'https://web.gc.com/game/synthetic',
+    label: '',
+    box_side: 'away',
+    processed_at: null,
+    created_at: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
+test('getGameUrlsForTeamInOrg: returns only the requested team\'s rows when that team belongs to the given org', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    const teamId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A, teamName: 'No-GC Tigers' }));
+    state.gameUrls.push(syntheticGameUrl({ team_id: teamId, label: 'Game 1' }));
+    state.gameUrls.push(syntheticGameUrl({ team_id: teamId, label: 'Game 2' }));
+
+    const urls = await dbSupabase.getGameUrlsForTeamInOrg(ORG_A, teamId);
+    assert.equal(urls.length, 2, 'both of this team\'s rows must be returned');
+  });
+});
+
+test('getGameUrlsForTeamInOrg: a foreign organization\'s id for a real team in a DIFFERENT org returns an empty result, not that team\'s rows', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    const teamId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A, teamName: 'Org A Team' }));
+    state.gameUrls.push(syntheticGameUrl({ team_id: teamId, label: 'Org A Game' }));
+
+    const urls = await dbSupabase.getGameUrlsForTeamInOrg(ORG_B, teamId);
+    assert.deepEqual(urls, [], 'a team belonging to a different organization must never leak its game-url rows');
+  });
+});
+
+test('getGameUrlsForTeamInOrg: a nonexistent teamId returns an empty result, not an error, and never falls back to a global scan', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    state.gameUrls.push(syntheticGameUrl({ team_id: 'some-other-team-id', label: 'Unrelated' }));
+    const urls = await dbSupabase.getGameUrlsForTeamInOrg(ORG_A, 'nonexistent-team-id');
+    assert.deepEqual(urls, []);
+  });
+});
+
+test('getGameUrlsForTeamInOrg: fails closed (OrgContextRequiredError) for missing/blank orgId, never treated as "return everything"', async () => {
+  await withFreshDbSupabase(async (dbSupabase, state) => {
+    const teamId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A }));
+    state.gameUrls.push(syntheticGameUrl({ team_id: teamId }));
+    await assert.rejects(() => dbSupabase.getGameUrlsForTeamInOrg(undefined, teamId), /orgId/i);
+    await assert.rejects(() => dbSupabase.getGameUrlsForTeamInOrg('   ', teamId), /orgId/i);
+  });
+});
+
+test('markGameUrlProcessedForOrg: updates processed_at on a row belonging to the authenticated organization\'s team', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    const teamId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A }));
+    const row = syntheticGameUrl({ team_id: teamId });
+    state.gameUrls.push(row);
+
+    const result = await dbSupabase.markGameUrlProcessedForOrg(ORG_A, row.id, teamId);
+    assert.equal(result.updated, true);
+    assert.ok(state.gameUrls.find((r) => r.id === row.id).processed_at, 'processed_at must actually be set on the real row');
+  });
+});
+
+test('markGameUrlProcessedForOrg: a foreign organization\'s id cannot update another organization\'s row', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    const teamId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A }));
+    const row = syntheticGameUrl({ team_id: teamId });
+    state.gameUrls.push(row);
+
+    const result = await dbSupabase.markGameUrlProcessedForOrg(ORG_B, row.id, teamId);
+    assert.equal(result.updated, false, 'a foreign organization must never be able to mark another organization\'s row processed');
+    assert.equal(state.gameUrls.find((r) => r.id === row.id).processed_at, null, 'the row must remain untouched');
+  });
+});
+
+test('markGameUrlProcessedForOrg: fails closed (OrgContextRequiredError) for missing/blank orgId', async () => {
+  await withFreshDbSupabase(async (dbSupabase, state) => {
+    const teamId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A }));
+    const row = syntheticGameUrl({ team_id: teamId });
+    state.gameUrls.push(row);
+    await assert.rejects(() => dbSupabase.markGameUrlProcessedForOrg(undefined, row.id, teamId), /orgId/i);
+    assert.equal(state.gameUrls.find((r) => r.id === row.id).processed_at, null);
+  });
+});
+
+test('markGameUrlProcessedForOrg: the underlying Supabase mutation is constrained by BOTH the row id and team_id at query time ' +
+     '(not merely by an application-level check performed earlier and then trusted)', () => {
+  return withFreshDbSupabase(async (dbSupabase, state) => {
+    const teamId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A }));
+    const otherTeamId = await dbSupabase.upsertTeam(syntheticTeam({ orgId: ORG_A, teamName: 'Other Team Same Org' }));
+    const row = syntheticGameUrl({ team_id: teamId });
+    state.gameUrls.push(row);
+
+    // Same org, but the WRONG team_id for this row -- the query itself must
+    // still refuse to touch it, proving team_id is a real query constraint,
+    // not decoration.
+    const result = await dbSupabase.markGameUrlProcessedForOrg(ORG_A, row.id, otherTeamId);
+    assert.equal(result.updated, false);
+    assert.equal(state.gameUrls.find((r) => r.id === row.id).processed_at, null);
+  });
+});
+
+test('db-supabase.js exports getGameUrlsForTeamInOrg and markGameUrlProcessedForOrg', () => {
+  return withFreshDbSupabase(async (dbSupabase) => {
+    assert.equal(typeof dbSupabase.getGameUrlsForTeamInOrg, 'function');
+    assert.equal(typeof dbSupabase.markGameUrlProcessedForOrg, 'function');
+  });
 });

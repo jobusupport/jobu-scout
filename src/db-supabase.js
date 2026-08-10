@@ -418,6 +418,85 @@ async function listTeamsForOrg(orgId, includeArchived = false) {
   return data || [];
 }
 
+// Security Slice T3G: team_game_urls (the manually-entered box-score URLs
+// for a No-GC-page team; see src/scrape-game-urls.js) has no org_id column
+// of its own -- the same schema shape as everything else keyed only by
+// team_id. Tenant isolation for it has always meant verifying the team_id
+// belongs to the caller's organization first, the exact two-step pattern
+// server.js#assertTeamInRequestOrg + getTeamGameUrls/its PUT/DELETE routes
+// already established for this table. These are that same pattern,
+// promoted to the shared repository layer so src/scrape-game-urls.js (a
+// tenant-facing job, not an HTTP route) can use it instead of opening
+// SQLite directly with no scoping at all.
+//
+// Fails closed (throws OrgContextRequiredError) for missing/blank orgId,
+// same convention as listTeamsForOrg. A teamId that does not belong to
+// orgId -- because it belongs to a different organization, or does not
+// exist at all -- resolves to an empty result (read) or a no-op (write),
+// never an error and never another organization's rows; this also means a
+// foreign orgId cannot distinguish "row exists in another org" from "row
+// does not exist" (see markGameUrlProcessedForOrg below).
+async function getGameUrlsForTeamInOrg(orgId, teamId) {
+  const normalizedOrgId = typeof orgId === 'string' ? orgId.trim() : orgId;
+  if (!normalizedOrgId) {
+    throw new OrgContextRequiredError(
+      'getGameUrlsForTeamInOrg requires orgId -- refusing to run an unscoped team-game-url lookup.'
+    );
+  }
+  const { data: team, error: teamError } = await getDb()
+    .from('teams')
+    .select('id')
+    .eq('id', teamId)
+    .eq('org_id', normalizedOrgId)
+    .maybeSingle();
+  check(teamError, 'getGameUrlsForTeamInOrg (team ownership check)');
+  if (!team) return [];
+
+  const { data, error } = await getDb()
+    .from('team_game_urls')
+    .select('*')
+    .eq('team_id', teamId)
+    .order('created_at');
+  check(error, 'getGameUrlsForTeamInOrg');
+  return data || [];
+}
+
+// The mutation is constrained by BOTH id and team_id at query time (not
+// merely by trusting that the caller already verified team_id belongs to
+// orgId earlier) -- matching server.js's existing PUT/DELETE
+// /api/teams/:id/game-urls/:urlId routes, which apply the identical
+// .eq('id', urlId).eq('team_id', teamId) pair. Team ownership is
+// re-verified here regardless, so this function is safe to call even if a
+// caller's own team_id happened to be wrong or stale.
+async function markGameUrlProcessedForOrg(orgId, urlId, teamId) {
+  const normalizedOrgId = typeof orgId === 'string' ? orgId.trim() : orgId;
+  if (!normalizedOrgId) {
+    throw new OrgContextRequiredError(
+      'markGameUrlProcessedForOrg requires orgId -- refusing to run an unscoped update.'
+    );
+  }
+  const { data: team, error: teamError } = await getDb()
+    .from('teams')
+    .select('id')
+    .eq('id', teamId)
+    .eq('org_id', normalizedOrgId)
+    .maybeSingle();
+  check(teamError, 'markGameUrlProcessedForOrg (team ownership check)');
+  if (!team) return { updated: false };
+
+  // .select() after .update() so the actually-affected row(s) come back --
+  // without it, Supabase reports no error even when the id/team_id pair
+  // matched nothing, which would make "updated" a lie.
+  const { data, error } = await getDb()
+    .from('team_game_urls')
+    .update({ processed_at: new Date().toISOString() })
+    .eq('id', urlId)
+    .eq('team_id', teamId)
+    .select('id');
+  check(error, 'markGameUrlProcessedForOrg');
+  return { updated: Array.isArray(data) && data.length > 0 };
+}
+
 /**
  * Archive (soft-hide) or restore a team. Does not touch games, batting_lines,
  * pitching_lines, play_events, or advanced stats — all history stays intact.
@@ -1368,6 +1447,8 @@ module.exports = {
   listAllTeamsForOperator,
   listTeamsForOrg,
   setTeamArchived,
+  getGameUrlsForTeamInOrg,
+  markGameUrlProcessedForOrg,
   // Games
   insertGame,
   getGamesByTeam,
