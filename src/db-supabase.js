@@ -124,6 +124,70 @@ async function getOrgIdForTeam(teamId) {
   return data.org_id;
 }
 
+// Security Slice T3K: resolves and validates the ONE authoritative org_id
+// for an entire bulk child-stat write (insertBattingLines/
+// insertPitchingLines/insertPlayEvents), instead of trusting rows[0]'s
+// team as evidence for every other row in the batch. Every row in these
+// three functions carries its own team_id (batting/pitching lines and
+// play events can, in principle, be filed under different teams within
+// the same game write), so this resolves every DISTINCT team_id
+// represented in the batch in one bounded query, confirms they all
+// belong to the SAME organization, and rejects the whole batch -- before
+// any row is written -- if:
+//   - any row's team can't be resolved at all (fails closed, same
+//     contract as getOrgIdForTeam)
+//   - two rows resolve to teams in different organizations (a
+//     mixed-tenant batch)
+//   - any row carries its own orgId/org_id hint that disagrees with the
+//     authoritative, freshly-resolved value (a caller-supplied override
+//     is never trusted over real team ownership)
+// A single-team batch (every real caller today) resolves in exactly one
+// extra query beyond what getOrgIdForTeam already needed, not one query
+// per row.
+async function resolveHomogeneousBatchOrgId(rows, functionLabel) {
+  const distinctTeamIds = [...new Set(
+    rows.map(r => r && r.teamId).filter(v => v !== undefined && v !== null && v !== '')
+  )];
+
+  if (!distinctTeamIds.length) {
+    throw new Error(`${functionLabel} requires every row to carry a teamId to resolve org_id`);
+  }
+
+  const { data: teams, error } = await getDb()
+    .from('teams')
+    .select('id, org_id')
+    .in('id', distinctTeamIds);
+  check(error, `${functionLabel} batch team org_id validation`);
+
+  const teamOrgById = new Map((teams || []).map(t => [t.id, t.org_id]));
+
+  let orgId = null;
+  for (const teamId of distinctTeamIds) {
+    const teamOrgId = teamOrgById.get(teamId);
+    if (!teamOrgId) throw new Error(`Team ${teamId} not found while resolving org_id for ${functionLabel}`);
+    if (orgId === null) {
+      orgId = teamOrgId;
+    } else if (teamOrgId !== orgId) {
+      throw new Error(
+        `${functionLabel}: batch contains rows tied to teams from different organizations -- ` +
+        'refusing to write a mixed-tenant batch'
+      );
+    }
+  }
+
+  for (const row of rows) {
+    const suppliedOrgId = normalizeNullable(row && (row.orgId || row.org_id));
+    if (suppliedOrgId && suppliedOrgId !== orgId) {
+      throw new Error(
+        `${functionLabel}: a row's supplied orgId conflicts with its team's authoritative organization -- ` +
+        'refusing to write a mixed-tenant batch'
+      );
+    }
+  }
+
+  return orgId;
+}
+
 // Security Slice T2: there is deliberately no "only one organization"
 // inference here (a prior getSingleOrgIdFallback did this and is why the
 // Travel tenant-isolation defect existed -- see security/
@@ -769,14 +833,17 @@ async function insertBattingLines(lines, gameId) {
 
   // Security Slice T3K: org_id is authoritative-parent-derived (an
   // already-resolved value propagated by writeNormalizedGame, or freshly
-  // resolved here from the row's own team via getOrgIdForTeam, which
-  // throws rather than guessing if the team/org can't be resolved) and is
-  // now ALWAYS attached to every row -- batting_lines.org_id is NOT NULL
-  // at the database level (see the T3K migration), so a conditional,
-  // schema-probing include here would only ever silently reintroduce a
-  // tenantless write the database will now reject anyway. There is no
-  // longer a supported schema state where this table lacks org_id.
-  const orgId = normalizeNullable(lines[0].orgId || lines[0].org_id) || await getOrgIdForTeam(lines[0].teamId);
+  // resolved here from every row's own team via
+  // resolveHomogeneousBatchOrgId, which validates the WHOLE batch -- not
+  // just lines[0] -- and throws rather than guessing if any team/org
+  // can't be resolved or if the batch spans more than one organization)
+  // and is now ALWAYS attached to every row -- batting_lines.org_id is
+  // NOT NULL at the database level (see the T3K migration), so a
+  // conditional, schema-probing include here would only ever silently
+  // reintroduce a tenantless write the database will now reject anyway.
+  // There is no longer a supported schema state where this table lacks
+  // org_id.
+  const orgId = await resolveHomogeneousBatchOrgId(lines, 'insertBattingLines');
 
   const rows = lines.map(row => ({
     game_id:       gameId,
@@ -818,9 +885,10 @@ async function insertPitchingLines(lines, gameId) {
   if (!lines.length) return;
 
   // Security Slice T3K: see insertBattingLines's comment -- org_id is
-  // always authoritative-parent-derived and always attached; pitching_lines
-  // no longer has a supported schema state without a NOT NULL org_id.
-  const orgId = normalizeNullable(lines[0].orgId || lines[0].org_id) || await getOrgIdForTeam(lines[0].teamId);
+  // resolved and validated across the WHOLE batch (never just lines[0])
+  // and always attached; pitching_lines no longer has a supported schema
+  // state without a NOT NULL org_id.
+  const orgId = await resolveHomogeneousBatchOrgId(lines, 'insertPitchingLines');
 
   const rows = lines.map(row => ({
     game_id:       gameId,
@@ -857,9 +925,10 @@ async function insertPlayEvents(events, gameId) {
   if (!events.length) return;
 
   // Security Slice T3K: see insertBattingLines's comment -- org_id is
-  // always authoritative-parent-derived and always attached; play_events
-  // no longer has a supported schema state without a NOT NULL org_id.
-  const orgId = normalizeNullable(events[0].orgId || events[0].org_id) || await getOrgIdForTeam(events[0].teamId);
+  // resolved and validated across the WHOLE batch (never just events[0])
+  // and always attached; play_events no longer has a supported schema
+  // state without a NOT NULL org_id.
+  const orgId = await resolveHomogeneousBatchOrgId(events, 'insertPlayEvents');
 
   const rows = events.map(row => ({
     game_id:        gameId,

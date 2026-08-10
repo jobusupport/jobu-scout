@@ -218,6 +218,19 @@ function battingLine(overrides = {}) {
   return { teamId: TEAM_A, playerName: 'Synthetic Player', isOurTeam: true, ab: 3, h: 1, ...overrides };
 }
 
+// ── Empty-batch behavior (unchanged by the bulk-homogeneity validation) ─────
+
+test('insertBattingLines/insertPitchingLines/insertPlayEvents: an empty array is a no-op, never queries teams or writes anything', () => {
+  return withFreshDbSupabase(async (db, state) => {
+    await db.insertBattingLines([], 'game-1');
+    await db.insertPitchingLines([], 'game-1');
+    await db.insertPlayEvents([], 'game-1');
+    assert.equal(state.batting_lines.length, 0);
+    assert.equal(state.pitching_lines.length, 0);
+    assert.equal(state.play_events.length, 0);
+  });
+});
+
 // ── insertBattingLines ───────────────────────────────────────────────────────
 
 test('insertBattingLines: every inserted row carries the parent team\'s org_id', () => {
@@ -248,16 +261,63 @@ test('insertBattingLines: missing parent team fails closed -- no row is written'
   });
 });
 
-test('insertBattingLines: a caller-supplied org_id on a LATER row cannot override the batch\'s single authoritative org_id (mixed-tenant input is not honored per-row)', () => {
-  return withFreshDbSupabase(async (db, state) => {
+test('insertBattingLines: a caller-supplied org_id on a LATER row that conflicts with the authoritative team org is REJECTED -- the whole batch fails closed, never silently coalesced to a single org', async () => {
+  await withFreshDbSupabase(async (db, state) => {
     seedTeams(state);
     const lines = [
       battingLine({ teamId: TEAM_A }),
       battingLine({ teamId: TEAM_A, playerName: 'Second Player', orgId: ORG_B }),
     ];
+    await assert.rejects(
+      () => db.insertBattingLines(lines, 'game-1'),
+      /conflicts with its team's authoritative organization/i,
+    );
+    assert.equal(state.batting_lines.length, 0, 'no row may be written when any row\'s hint conflicts with the authoritative org');
+  });
+});
+
+test('insertBattingLines: THE MIXED-ORGANIZATION REGRESSION -- a batch containing a row tied to org A\'s team and another tied to org B\'s team is rejected BEFORE any row is written, and cannot result in both rows landing under org A', async () => {
+  await withFreshDbSupabase(async (db, state) => {
+    seedTeams(state);
+    const lines = [
+      battingLine({ teamId: TEAM_A, playerName: 'Org A Player' }),
+      battingLine({ teamId: TEAM_B, playerName: 'Org B Player' }),
+    ];
+    await assert.rejects(
+      () => db.insertBattingLines(lines, 'game-1'),
+      /different organizations/i,
+    );
+    assert.equal(state.batting_lines.length, 0, 'a mixed-organization batch must not partially or fully write under either organization');
+  });
+});
+
+test('insertBattingLines: a batch spanning two DIFFERENT teams that both belong to the SAME organization is accepted and every row gets that organization\'s org_id', () => {
+  return withFreshDbSupabase(async (db, state) => {
+    seedTeams(state);
+    const TEAM_A2 = 'aaaaaaaa-aaaa-4aaa-8aaa-a2a2a2a2a2a2';
+    state.teams.push({ id: TEAM_A2, org_id: ORG_A });
+    const lines = [
+      battingLine({ teamId: TEAM_A, playerName: 'Player On Team A' }),
+      battingLine({ teamId: TEAM_A2, playerName: 'Player On Team A2' }),
+    ];
     await db.insertBattingLines(lines, 'game-1');
     assert.equal(state.batting_lines.length, 2);
-    for (const row of state.batting_lines) assert.equal(row.org_id, ORG_A, 'org_id must always be the batch\'s authoritative value, never a per-row hint');
+    for (const row of state.batting_lines) assert.equal(row.org_id, ORG_A, 'two different teams under the same org must both resolve to that org, not be rejected as mixed-tenant');
+  });
+});
+
+test('insertBattingLines: any single row with an unresolvable team fails the whole batch closed, even when other rows resolve fine', async () => {
+  await withFreshDbSupabase(async (db, state) => {
+    seedTeams(state);
+    const lines = [
+      battingLine({ teamId: TEAM_A, playerName: 'Resolvable Player' }),
+      battingLine({ teamId: TEAM_UNKNOWN, playerName: 'Unresolvable Player' }),
+    ];
+    await assert.rejects(
+      () => db.insertBattingLines(lines, 'game-1'),
+      /not found/i,
+    );
+    assert.equal(state.batting_lines.length, 0);
   });
 });
 
@@ -277,6 +337,20 @@ test('insertPitchingLines: missing parent team fails closed -- no row is written
     await assert.rejects(
       () => db.insertPitchingLines([{ teamId: TEAM_UNKNOWN, playerName: 'Ghost' }], 'game-2'),
       /not found/i,
+    );
+    assert.equal(state.pitching_lines.length, 0);
+  });
+});
+
+test('insertPitchingLines: a mixed-organization batch (one row per org A/org B team) is rejected before any row is written', async () => {
+  await withFreshDbSupabase(async (db, state) => {
+    seedTeams(state);
+    await assert.rejects(
+      () => db.insertPitchingLines([
+        { teamId: TEAM_A, playerName: 'Org A Pitcher' },
+        { teamId: TEAM_B, playerName: 'Org B Pitcher' },
+      ], 'game-1'),
+      /different organizations/i,
     );
     assert.equal(state.pitching_lines.length, 0);
   });
@@ -303,7 +377,39 @@ test('insertPlayEvents: missing parent team fails closed -- no row is written', 
   });
 });
 
-// ── upsertPlayerAdvancedStats ─────────────────────────────────────────────────
+test('insertPlayEvents: a mixed-organization batch (one row per org A/org B team) is rejected before any row is written', async () => {
+  await withFreshDbSupabase(async (db, state) => {
+    seedTeams(state);
+    await assert.rejects(
+      () => db.insertPlayEvents([
+        { teamId: TEAM_A, sequenceNum: 1 },
+        { teamId: TEAM_B, sequenceNum: 2 },
+      ], 'game-1'),
+      /different organizations/i,
+    );
+    assert.equal(state.play_events.length, 0);
+  });
+});
+
+// ── upsertPlayerAdvancedStats / upsertPitcherAdvancedStats ──────────────────
+// Unlike insertBattingLines/insertPitchingLines/insertPlayEvents, these two
+// functions take a single teamId scalar argument (never an array of rows
+// tied to potentially different teams) and never accept a caller-supplied
+// orgId at all -- there is no batch, and therefore no mixed-tenant-batch
+// shape possible at this boundary by construction. org_id is always
+// resolved fresh via getOrgIdForTeam(teamId), which already fails closed on
+// an unresolvable team. The tests below (missing-parent-fails-closed,
+// org_id-carried, cross-org-no-collision) already fully cover this
+// boundary's tenant-safety; no additional bulk-validation code was added
+// here because there is nothing for it to validate.
+
+test('upsertPlayerAdvancedStats/upsertPitcherAdvancedStats: signatures confirm there is no batch to validate -- teamId is a single scalar, not an array, and neither function accepts a caller-supplied orgId', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'db-supabase.js'), 'utf8');
+  assert.match(source, /async function upsertPlayerAdvancedStats\(teamId, playerName, isOurTeam, stats\)/);
+  assert.match(source, /async function upsertPitcherAdvancedStats\(teamId, playerName, isOurTeam, stats\)/);
+});
 
 test('upsertPlayerAdvancedStats: the upserted row carries the parent team\'s org_id', () => {
   return withFreshDbSupabase(async (db, state) => {
