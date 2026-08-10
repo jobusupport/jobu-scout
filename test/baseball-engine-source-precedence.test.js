@@ -82,10 +82,10 @@ test('computeBaseballStats -- box-score numeric totals (AB/H/etc.) are NEVER rea
     boxScore: {
       // Deliberately impossible box totals that a real GameChanger page
       // could never produce (99 AB / 99 H in one game).
-      batting: [{ Player: 'A Sample', own: true, TeamSide: 'home', AB: 99, H: 99 }],
+      batting: [{ Player: 'A Sample', playerId: 'a-1', own: true, TeamSide: 'home', AB: 99, H: 99 }],
     },
     plays: [{ text: 'Single. A Sample singles to left field, D Placeholder pitching.' }],
   }]);
-  assert.equal(stats.ownBatters['A Sample'].AB, 1); // from the ONE play, not 99
-  assert.equal(stats.ownBatters['A Sample'].H, 1);
+  assert.equal(stats.ownBatters['a-1'].AB, 1); // from the ONE play, not 99
+  assert.equal(stats.ownBatters['a-1'].H, 1);
 });

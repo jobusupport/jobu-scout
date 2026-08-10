@@ -119,9 +119,9 @@
  * pipeline.js or any other existing caller — this module is additive only.
  */
 
-const { reconstructGame, reconstructTeamGames } = require('../game-reconstructor');
-const { normalizeGameData } = require('../normalizer');
-const { processGames } = require('../stats-engine');
+const { reconstructGame, reconstructTeamGames } = require('./reconstruct-core');
+const { normalizeGameData } = require('./normalize-core');
+const { processGames } = require('./stats-core');
 
 // ─── Shared ownership-translation helpers ──────────────────────────────────
 
@@ -226,6 +226,59 @@ function reconstructBaseballGame(capturedGame) {
   return toEngineGameResult(legacyResult);
 }
 
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function canonicalGameIdentity(game) {
+  const meta = game?.meta || {};
+  const durableId = meta.sourceGameId ?? meta.gameId ?? game?.sourceGameId ?? game?.gameId;
+  if (durableId != null && !['', 'unknown', '__pending__'].includes(String(durableId))) {
+    return { key: `source:${String(durableId)}`, resolved: true, method: 'sourceGameId' };
+  }
+  const date = meta.gameDate ?? meta.date ?? game?.gameDate ?? game?.date ?? null;
+  const home = meta.homeTeamId ?? meta.homeTeam ?? meta.homeTeamName ?? null;
+  const away = meta.awayTeamId ?? meta.awayTeam ?? meta.awayTeamName ?? null;
+  const discriminator = meta.scheduledStart ?? meta.startTime ?? meta.gameNumber ?? meta.doubleheaderGame ?? null;
+  if (date && home && away && discriminator != null) {
+    return { key: `fallback:${date}|${home}|${away}|${discriminator}`, resolved: true, method: 'scheduleComposite' };
+  }
+  return {
+    key: `ambiguous:${stableStringify({ date, home, away })}:${stableStringify(game)}`,
+    resolved: false,
+    method: 'ambiguousFingerprint',
+    reason: 'no durable source ID or sufficiently discriminating schedule composite',
+  };
+}
+
+function snapshotScore(game) {
+  const box = game?.boxScore || {};
+  const rows = ['batting', 'pitching', 'awayBatting', 'homeBatting', 'awayPitching', 'homePitching']
+    .reduce((sum, key) => sum + (Array.isArray(box[key]) ? box[key].length : 0), 0);
+  const plays = Array.isArray(game?.plays) ? game.plays.length : Array.isArray(game?.plays?.events) ? game.plays.events.length : 0;
+  const complete = game?.meta?.status === 'final' || game?.meta?.complete === true ? 1000000 : 0;
+  return complete + rows * 1000 + plays;
+}
+
+function reconcileGameCollection(games) {
+  const buckets = new Map();
+  for (const game of games) {
+    const identity = canonicalGameIdentity(game);
+    const candidate = { game, identity, score: snapshotScore(game), serial: stableStringify(game) };
+    const current = buckets.get(identity.key);
+    if (!current || candidate.score > current.score || (candidate.score === current.score && candidate.serial < current.serial)) {
+      buckets.set(identity.key, candidate);
+    }
+  }
+  return [...buckets.values()]
+    .sort((a, b) => a.identity.key.localeCompare(b.identity.key))
+    .map(({ game, identity }) => ({ game, identity }));
+}
+
 /**
  * Reconstructs and aggregates own/opponent totals across many games for one
  * team. Pure pass-through to game-reconstructor.js's reconstructTeamGames()
@@ -244,11 +297,12 @@ function reconstructBaseballTeamGames(teamId, capturedGames = []) {
   if (!Array.isArray(capturedGames)) {
     throw new Error('baseball-engine: capturedGames must be an array');
   }
-  const translatedGames = capturedGames.map((game) => toReconstructionInput(game));
+  const reconciled = reconcileGameCollection(capturedGames);
+  const translatedGames = reconciled.map(({ game }) => toReconstructionInput(game));
   const { summary, gameResults } = reconstructTeamGames(teamId, translatedGames);
   return {
     summary,
-    gameResults: gameResults.map(toEngineGameResult),
+    gameResults: gameResults.map((result, index) => ({ ...toEngineGameResult(result), identity: reconciled[index].identity })),
   };
 }
 
@@ -416,22 +470,16 @@ function computeBaseballStats(capturedGames = []) {
   if (!Array.isArray(capturedGames)) {
     throw new Error('baseball-engine: capturedGames must be an array');
   }
-  const idBuckets = checkDurableIdentityAndBuildIdMap(capturedGames);
-  const translatedGames = capturedGames.map(toStatsEngineGame);
+  const reconciled = reconcileGameCollection(capturedGames);
+  const translatedGames = reconciled.map(({ game }) => toStatsEngineGame(game));
   const legacyResult = processGames(translatedGames);
-  const attachIds = (statMap, bucketKey) => {
-    const bucket = idBuckets[bucketKey];
-    for (const [name, stats] of Object.entries(statMap)) {
-      const known = bucket.get(name);
-      if (known?.playerId) stats.playerId = known.playerId;
-    }
-    return statMap;
-  };
   return {
-    ownBatters: attachIds(legacyResult.players, 'true|batting'),
-    opponentBatters: attachIds(legacyResult.opponentBatters, 'false|batting'),
-    ownPitchers: attachIds(legacyResult.ourPitchers, 'true|pitching'),
-    opponentPitchers: attachIds(legacyResult.pitchers, 'false|pitching'),
+    ownBatters: legacyResult.players,
+    opponentBatters: legacyResult.opponentBatters,
+    ownPitchers: legacyResult.ourPitchers,
+    opponentPitchers: legacyResult.pitchers,
+    unresolvedBatters: legacyResult.unresolvedBatters,
+    unresolvedPitchers: legacyResult.unresolvedPitchers,
     unattributedErrors: {
       ownSide: legacyResult.unattributedErrors.ourSide,
       opponentSide: legacyResult.unattributedErrors.opponentSide,
@@ -512,5 +560,5 @@ module.exports = {
   normalizeBaseballGame,
   // Exposed for the dependency-boundary/unit tests only -- not part of the
   // stable public contract other modules should depend on.
-  _internals: { toReconstructionInput, toStatsEngineGame, requireExplicitOwnBoolean },
+  _internals: { toReconstructionInput, toStatsEngineGame, requireExplicitOwnBoolean, canonicalGameIdentity, reconcileGameCollection, stableStringify },
 };

@@ -215,8 +215,8 @@ test('computeBaseballStats -- buckets batters/pitchers into ownBatters/opponentB
     meta: { gameId: 'g1' },
     boxScore: {
       batting: [
-        battingRow('A Sample', 'home', true, {}),
-        battingRow('B Example', 'away', false, {}),
+        battingRow('A Sample', 'home', true, { playerId: 'a-1' }),
+        battingRow('B Example', 'away', false, { playerId: 'b-1' }),
       ],
     },
     plays: [
@@ -224,10 +224,10 @@ test('computeBaseballStats -- buckets batters/pitchers into ownBatters/opponentB
       { text: 'Strikeout. B Example strikes out swinging, C Fixture pitching.' },
     ],
   }]);
-  assert.deepEqual(Object.keys(stats.ownBatters), ['A Sample']);
-  assert.deepEqual(Object.keys(stats.opponentBatters), ['B Example']);
-  assert.equal(stats.ownBatters['A Sample'].H, 1);
-  assert.equal(stats.opponentBatters['B Example'].SO, 1);
+  assert.deepEqual(Object.keys(stats.ownBatters), ['a-1']);
+  assert.deepEqual(Object.keys(stats.opponentBatters), ['b-1']);
+  assert.equal(stats.ownBatters['a-1'].H, 1);
+  assert.equal(stats.opponentBatters['b-1'].SO, 1);
 });
 
 // ── Player identity: name collisions across rosters still disambiguate ─────

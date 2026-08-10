@@ -83,15 +83,17 @@ test('reconstructBaseballTeamGames propagates the same contradictory-metadata re
   );
 });
 
-test('computeBaseballStats rejects contradictory metadata: one display name present on both own and opponent rosters in one game', () => {
-  assert.throws(
-    () => computeBaseballStats([{
-      meta: {},
-      boxScore: { batting: [{ Player: 'X', TeamSide: 'home', own: true }, { Player: 'X', TeamSide: 'away', own: false }] },
-      plays: [],
-    }]),
-    /present on BOTH the own and opponent roster/,
-  );
+test('computeBaseballStats resolves one display name on both rosters from inning side', () => {
+  const result = computeBaseballStats([{
+    meta: { gameId: 'cross-side', ourSide: 'home' },
+    boxScore: { batting: [{ Player: 'J Smith', playerId: 'own-x', TeamSide: 'home', own: true }, { Player: 'J Smith', playerId: 'opp-x', TeamSide: 'away', own: false }] },
+    plays: [
+      { inning: 'Bottom 1', batterId: 'own-x', text: 'Single. J Smith singles to left field, D Pitcher pitching.' },
+      { inning: 'Top 2', batterId: 'opp-x', text: 'Walk. J Smith walks, D Pitcher pitching.' },
+    ],
+  }]);
+  assert.equal(result.ownBatters['own-x'].H, 1);
+  assert.equal(result.opponentBatters['opp-x'].BB, 1);
 });
 
 // ── Home/away remains a separate dimension from own/opponent ───────────────

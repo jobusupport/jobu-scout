@@ -151,12 +151,12 @@ test('SCENARIO 10 (relevant op: reconstructBaseballGame) -- a play-by-play/box-s
 });
 
 // ── 11: duplicate ingestion of ONE source game (collection-level op) ───────
-test('SCENARIO 11 (relevant op: reconstructBaseballTeamGames) -- HONEST FINDING: submitting the SAME source game object twice produces TWO logical copies (double-counted totals). This module performs no game-level deduplication; that responsibility belongs to a caller-owned layer (e.g. a persistence-side unique constraint on the source game reference).', () => {
+test('SCENARIO 11 -- submitting the same source game twice produces one logical game', () => {
   const oneGame = fullGame({ gameId: 'g-real-1', ownSide: 'home' });
   const { summary, gameResults } = reconstructBaseballTeamGames('team-x', [oneGame, oneGame]);
-  assert.equal(summary.games, 2); // NOT deduplicated to 1
-  assert.equal(summary.officialBatting.h, 4); // A Sample's 2 hits counted twice = 4
-  assert.deepEqual(gameResults.map((r) => r.gameId), ['g-real-1', 'g-real-1']); // same gameId appears twice, undetected
+  assert.equal(summary.games, 1);
+  assert.equal(summary.officialBatting.h, 2);
+  assert.deepEqual(gameResults.map((r) => r.gameId), ['g-real-1']);
 });
 
 // ── 12: two legitimate distinct games, same two teams, same date ───────────

@@ -64,10 +64,10 @@ function collectLocalRequireGraph(entryFile) {
   return [...visited];
 }
 
-test('dependency boundary -- baseball-engine.js only requires the three legacy pure modules (no other local files)', () => {
+test('dependency boundary -- baseball-engine.js only requires the three authoritative pure core modules', () => {
   const source = fs.readFileSync(ENGINE_ENTRY, 'utf8');
   const localRequires = [...source.matchAll(/require\(\s*['"](\.[^'"]+)['"]\s*\)/g)].map((m) => m[1]);
-  assert.deepEqual(localRequires.sort(), ['../game-reconstructor', '../normalizer', '../stats-engine'].sort());
+  assert.deepEqual(localRequires.sort(), ['./normalize-core', './reconstruct-core', './stats-core'].sort());
 });
 
 test('dependency boundary -- the engine\'s full local require graph never requires a DB/network/filesystem/child-process/env/UI-framework module', () => {
@@ -99,7 +99,7 @@ test('dependency boundary -- no file under src/engine/ requires anything outside
     const localRequires = [...source.matchAll(/require\(\s*['"](\.[^'"]+)['"]\s*\)/g)].map((m) => m[1]);
     for (const req of localRequires) {
       assert.ok(
-        /^\.\.\/(game-reconstructor|normalizer|stats-engine)$/.test(req),
+        /^\.\/(normalize-core|reconstruct-core|stats-core)$/.test(req),
         `${f} requires unexpected local module "${req}"`,
       );
     }
