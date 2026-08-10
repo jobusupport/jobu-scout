@@ -29,6 +29,7 @@ const {
   sanitizeDownloadFilename,
   resolveContainedReportPath,
   isServableReportFile,
+  resolveCanonicalReportPath,
 } = require('../src/report-access');
 
 const USERS = {
@@ -117,10 +118,17 @@ async function startFixture({ reportsRoot, reportsRows, teamsRows }) {
     if (!resolvedPath) return res.status(404).json({ error: 'Report not found' });
     if (!isServableReportFile(resolvedPath)) return res.status(404).json({ error: 'Report not found' });
 
+    // Security Slice T3J: canonical (symlink-resolved) containment,
+    // in addition to the lexical/final-component-only checks above --
+    // see server.js's own route and src/report-access.js#
+    // resolveCanonicalReportPath for the full rationale.
+    const canonicalPath = resolveCanonicalReportPath(reportsRoot, resolvedPath);
+    if (!canonicalPath) return res.status(404).json({ error: 'Report not found' });
+
     const safeName = sanitizeDownloadFilename(reportRow.title);
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
-    res.sendFile(resolvedPath, (err) => {
+    res.sendFile(canonicalPath, (err) => {
       if (err && !res.headersSent) res.status(404).json({ error: 'Report not found' });
     });
   });
@@ -325,6 +333,101 @@ test('report download: a directory mistakenly stored as storage_path is rejected
     await fx.close();
   }
 });
+
+// Creates a directory symlink at linkPath pointing at target. On a
+// platform/environment where an unprivileged process cannot create a
+// real symlink (e.g. Windows without Developer Mode or elevation), falls
+// back to a functionally equivalent directory junction, which Windows
+// allows unprivileged processes to create and which the filesystem
+// resolves through identically for path-traversal purposes. Returns
+// true if a link was created, false only if the runtime genuinely
+// cannot create either.
+function tryMakeDirLink(target, linkPath) {
+  try {
+    fs.symlinkSync(target, linkPath, 'dir');
+    return true;
+  } catch {
+    try {
+      fs.symlinkSync(target, linkPath, 'junction');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+const DIR_LINK_PROBE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'jobu-dl-link-probe-'));
+const DIR_LINK_PROBE_TARGET = path.join(DIR_LINK_PROBE_ROOT, 'target');
+fs.mkdirSync(DIR_LINK_PROBE_TARGET);
+const CAN_CREATE_DIR_LINK = tryMakeDirLink(DIR_LINK_PROBE_TARGET, path.join(DIR_LINK_PROBE_ROOT, 'link'));
+
+test(
+  'report download: THE T3J REGRESSION -- an intermediate directory symlink inside REPORTS_DIR pointing outside it is rejected over real HTTP, even though the lexical containment check alone would approve the same storage_path string',
+  { skip: CAN_CREATE_DIR_LINK ? false : 'runtime cannot create a directory symlink or junction on this platform/environment' },
+  async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jobu-dl-symlink-test-'));
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'jobu-dl-symlink-outside-'));
+    const reportId = 'deadbeef-0000-4000-8000-00000000000b';
+
+    // <root>/escape-link -> <outsideDir>, entirely outside root.
+    const linked = tryMakeDirLink(outsideDir, path.join(root, 'escape-link'));
+    assert.ok(linked, 'expected a directory symlink/junction to be created for this test');
+    fs.writeFileSync(path.join(outsideDir, 'report.pdf'), 'exfiltrated secret bytes');
+
+    const storagePath = 'escape-link/report.pdf'; // lexically inside root, but escapes via the symlink.
+
+    // Prove this is the real bypass shape: the lexical check alone
+    // would have approved it, and the target is a real, readable file.
+    assert.ok(resolveContainedReportPath(root, storagePath), 'lexical check should still approve the string -- that is the bug T3J closes');
+    assert.ok(fs.lstatSync(path.join(root, storagePath)).isFile());
+
+    const fx = await startFixture({
+      reportsRoot: root,
+      reportsRows: [{ id: reportId, org_id: ORG_A, storage_path: storagePath, title: 'Escaped Report' }],
+      teamsRows: [],
+    });
+    try {
+      const res = await fx.request(`/api/reports/${reportId}/download`, { headers: authHeaders('a') });
+      assert.equal(res.status, 404);
+      assert.notEqual(res.headers.get('content-type'), 'application/pdf');
+    } finally {
+      await fx.close();
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  }
+);
+
+test(
+  'report download: an intermediate directory symlink whose canonical target remains inside REPORTS_DIR is still served normally (containment, not a blanket symlink ban)',
+  { skip: CAN_CREATE_DIR_LINK ? false : 'runtime cannot create a directory symlink or junction on this platform/environment' },
+  async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jobu-dl-symlink-ok-test-'));
+    const reportId = 'deadbeef-0000-4000-8000-00000000000c';
+    const realDir = path.join(root, ORG_A, reportId);
+    fs.mkdirSync(realDir, { recursive: true });
+    fs.writeFileSync(path.join(realDir, 'report.pdf'), 'legit pdf bytes');
+
+    // <root>/link-in -> <root>/<ORG_A>/<reportId>, still inside root.
+    const linked = tryMakeDirLink(realDir, path.join(root, 'link-in'));
+    assert.ok(linked, 'expected a directory symlink/junction to be created for this test');
+    const storagePath = 'link-in/report.pdf';
+
+    const fx = await startFixture({
+      reportsRoot: root,
+      reportsRows: [{ id: reportId, org_id: ORG_A, storage_path: storagePath, title: 'Linked Report' }],
+      teamsRows: [],
+    });
+    try {
+      const res = await fx.request(`/api/reports/${reportId}/download`, { headers: authHeaders('a') });
+      assert.equal(res.status, 200);
+      assert.equal(await res.text(), 'legit pdf bytes');
+    } finally {
+      await fx.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+);
 
 // ── ourTeamId ownership + lifecycle ordering ─────────────────────────────────
 
