@@ -15,6 +15,7 @@ const {
   computeBaseballStats,
   normalizeBaseballGame,
 } = require('../src/engine/baseball-engine');
+const normalizeCore = require('../src/engine/normalize-core');
 
 function battingRow(player, side, own, stats = {}) {
   return { Player: player, TeamSide: side, own, ...stats };
@@ -185,6 +186,52 @@ test('normalizeBaseballGame -- deterministic: two independently-cloned copies of
   assert.equal('capturedAt' in resultA.game, false); // proves the nondeterministic field isn't merely equal by luck -- it's absent
   assert.deepEqual(cloneA, canonical);
   assert.deepEqual(cloneB, canonical);
+});
+
+test('normalizeBaseballGame -- yearless dates never depend on the live clock', () => {
+  const raw = {
+    meta: { gameDateTime: 'Sat Apr 12, 2:00 PM' },
+    boxScore: {},
+    plays: [],
+  };
+  const originalDate = global.Date;
+  const runWithClock = (iso) => {
+    global.Date = class extends originalDate {
+      constructor(...args) { super(...(args.length ? args : [iso])); }
+      static now() { return new originalDate(iso).getTime(); }
+    };
+    return normalizeBaseballGame(structuredClone(raw), 'synthetic-team', 'home');
+  };
+  try {
+    const early = runWithClock('2025-01-01T00:00:00.000Z');
+    const late = runWithClock('2037-12-31T23:59:59.000Z');
+    assert.deepEqual(early, late);
+    assert.equal(early.game.gameDate, null);
+    assert.equal('capturedAt' in early.game, false);
+  } finally {
+    global.Date = originalDate;
+  }
+});
+
+test('normalizeBaseballGame -- explicit referenceYear resolves yearless dates without mutating input', () => {
+  const raw = { meta: { gameDateTime: 'Sat Apr 12, 2:00 PM' }, boxScore: {}, plays: [] };
+  const before = structuredClone(raw);
+  const result = normalizeBaseballGame(raw, 'synthetic-team', 'home', { referenceYear: 2026 });
+  assert.equal(result.game.gameDate, '2026-04-12');
+  assert.equal(result.game.gameTime, '14:00');
+  assert.equal('capturedAt' in result.game, false);
+  assert.deepEqual(raw, before);
+});
+
+test('normalize-core -- missing reference time remains unresolved and no capture timestamp is generated', () => {
+  const raw = { meta: { gameDateTime: 'Sat Apr 12, 2:00 PM', ourSide: 'home' }, boxScore: {}, plays: [] };
+  const before = structuredClone(raw);
+  const first = normalizeCore.normalizeGameData(structuredClone(raw), 'synthetic-team');
+  const second = normalizeCore.normalizeGameData(structuredClone(raw), 'synthetic-team');
+  assert.deepEqual(first, second);
+  assert.equal(first.game.gameDate, null);
+  assert.equal(first.game.capturedAt, null);
+  assert.deepEqual(raw, before);
 });
 
 // ── Game integrity: reconstructBaseballTeamGames aggregates correctly ──────

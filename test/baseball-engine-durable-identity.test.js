@@ -72,3 +72,121 @@ test('one durable ID with conflicting names resolves deterministically', () => {
   assert.deepEqual(computeBaseballStats([a, b]), computeBaseballStats([b, a]));
   assert.equal(computeBaseballStats([a, b]).ownBatters.p6.name, 'Alpha');
 });
+
+test('batting and fielding contributions merge into one durable batter record', () => {
+  const stats = computeBaseballStats([game('field-1', [
+    { Player: 'Bailey Example', own: true, TeamSide: 'home', playerId: 'bailey-id' },
+    { Player: 'Rival Hitter', own: false, TeamSide: 'away', playerId: 'rival-id' },
+  ], [
+    { inning: 'Bottom 1', batterId: 'bailey-id', text: 'Single. Bailey Example singles to left field, Dana Pitcher pitching.' },
+    { inning: 'Top 2', batterId: 'rival-id', fielderId: 'bailey-id', text: 'Error. Rival Hitter reaches on an error by shortstop Bailey Example, Dana Pitcher pitching.' },
+  ])]);
+
+  assert.deepEqual(Object.keys(stats.ownBatters), ['bailey-id']);
+  assert.equal(stats.ownBatters['bailey-id'].playerId, 'bailey-id');
+  assert.equal(stats.ownBatters['bailey-id'].H, 1);
+  assert.equal(stats.ownBatters['bailey-id'].E, 1);
+  assert.equal(stats.ownBatters['bailey-id'].games, 1);
+});
+
+test('same-named opposing fielders remain separate by side and explicit ID', () => {
+  const batting = [
+    { Player: 'Bailey Example', own: true, TeamSide: 'home', playerId: 'own-bailey' },
+    { Player: 'Bailey Example', own: false, TeamSide: 'away', playerId: 'opp-bailey' },
+    { Player: 'Own Hitter', own: true, TeamSide: 'home', playerId: 'own-hitter' },
+    { Player: 'Away Hitter', own: false, TeamSide: 'away', playerId: 'away-hitter' },
+  ];
+  const plays = [
+    { inning: 'Top 1', batterId: 'away-hitter', fielderId: 'own-bailey', text: 'Error. Away Hitter reaches on an error by shortstop Bailey Example, Dana Pitcher pitching.' },
+    { inning: 'Bottom 1', batterId: 'own-hitter', fielderId: 'opp-bailey', text: 'Error. Own Hitter reaches on an error by shortstop Bailey Example, Dana Pitcher pitching.' },
+  ];
+  const stats = computeBaseballStats([game('field-2', batting, plays)]);
+
+  assert.equal(stats.ownBatters['own-bailey'].E, 1);
+  assert.equal(stats.opponentBatters['opp-bailey'].E, 1);
+  assert.equal(stats.ownBatters['opp-bailey'], undefined);
+  assert.equal(stats.opponentBatters['own-bailey'], undefined);
+});
+
+test('explicit fielder ID remains authoritative across a display-name variation', () => {
+  const stats = computeBaseballStats([game('field-id', [
+    { Player: 'Bailey Example', own: true, TeamSide: 'home', playerId: 'bailey-id' },
+    { Player: 'Away Hitter', own: false, TeamSide: 'away', playerId: 'away-id' },
+  ], [
+    { inning: 'Top 1', batterId: 'away-id', fielderId: 'bailey-id', text: 'Error. Away Hitter reaches on an error by shortstop Bailey Changed, Dana Pitcher pitching.' },
+  ])]);
+
+  assert.equal(stats.ownBatters['bailey-id'].E, 1);
+  assert.equal(stats.ownBatters['bailey-id'].playerId, 'bailey-id');
+  assert.equal(stats.unresolvedBatters['bailey-id'], undefined);
+});
+
+test('same-named opposing fielders use inning-derived defense side without arbitrary own bias', () => {
+  const batting = [
+    { Player: 'Bailey Example', own: true, TeamSide: 'home', playerId: 'own-bailey' },
+    { Player: 'Bailey Example', own: false, TeamSide: 'away', playerId: 'opp-bailey' },
+    { Player: 'Own Hitter', own: true, TeamSide: 'home', playerId: 'own-hitter' },
+    { Player: 'Away Hitter', own: false, TeamSide: 'away', playerId: 'away-hitter' },
+  ];
+  const plays = [
+    { inning: 'Top 1', batterId: 'away-hitter', text: 'Error. Away Hitter reaches on an error by shortstop Bailey Example, Dana Pitcher pitching.' },
+    { inning: 'Bottom 1', batterId: 'own-hitter', text: 'Error. Own Hitter reaches on an error by shortstop Bailey Example, Dana Pitcher pitching.' },
+  ];
+  const forward = computeBaseballStats([game('field-3', batting, plays)]);
+
+  assert.equal(forward.ownBatters['own-bailey'].E, 1);
+  assert.equal(forward.opponentBatters['opp-bailey'].E, 1);
+});
+
+test('ambiguous fielder name without side or ID is explicitly unresolved', () => {
+  const stats = computeBaseballStats([game('field-4', [
+    { Player: 'Bailey Example', own: true, TeamSide: 'home', playerId: 'own-bailey' },
+    { Player: 'Bailey Example', own: false, TeamSide: 'away', playerId: 'opp-bailey' },
+  ], [
+    { text: 'Error. Unknown Hitter reaches on an error by shortstop Bailey Example, Dana Pitcher pitching.' },
+  ])]);
+
+  assert.equal(stats.ownBatters['own-bailey'], undefined);
+  assert.equal(stats.opponentBatters['opp-bailey'], undefined);
+  const unresolved = Object.values(stats.unresolvedBatters);
+  assert.equal(unresolved.length, 1);
+  assert.equal(unresolved[0].E, 1);
+  assert.equal(unresolved[0].identity.resolved, false);
+  assert.equal(unresolved[0].identity.side, null);
+});
+
+test('fielder without an ID remains unresolved but retains known side context', () => {
+  const stats = computeBaseballStats([game('field-5', [
+    { Player: 'Bailey Example', own: true, TeamSide: 'home' },
+    { Player: 'Away Hitter', own: false, TeamSide: 'away', playerId: 'away-hitter' },
+  ], [
+    { inning: 'Top 1', batterId: 'away-hitter', text: 'Error. Away Hitter reaches on an error by shortstop Bailey Example, Dana Pitcher pitching.' },
+  ])]);
+
+  const unresolved = Object.values(stats.unresolvedBatters);
+  assert.equal(unresolved.length, 1);
+  assert.equal(unresolved[0].E, 1);
+  assert.equal(unresolved[0].identity.side, 'own');
+  assert.match(unresolved[0].identity.context, /:own:fielder$/);
+});
+
+test('durable fielding totals are deterministic under alternate game ordering', () => {
+  const first = game('field-order-a', [
+    { Player: 'Bailey Example', own: true, TeamSide: 'home', playerId: 'bailey-id' },
+    { Player: 'Away Hitter', own: false, TeamSide: 'away', playerId: 'away-a' },
+  ], [
+    { inning: 'Top 1', batterId: 'away-a', fielderId: 'bailey-id', text: 'Error. Away Hitter reaches on an error by shortstop Bailey Example, Dana Pitcher pitching.' },
+  ]);
+  const second = game('field-order-b', [
+    { Player: 'Bailey Example', own: true, TeamSide: 'home', playerId: 'bailey-id' },
+    { Player: 'Other Hitter', own: false, TeamSide: 'away', playerId: 'away-b' },
+  ], [
+    { inning: 'Top 2', batterId: 'away-b', fielderId: 'bailey-id', text: 'Error. Other Hitter reaches on an error by shortstop Bailey Example, Dana Pitcher pitching.' },
+  ]);
+
+  const forward = computeBaseballStats([first, second]);
+  const reverse = computeBaseballStats([second, first]);
+  assert.deepEqual(forward, reverse);
+  assert.equal(forward.ownBatters['bailey-id'].E, 2);
+  assert.equal(forward.ownBatters['bailey-id'].games, 2);
+});

@@ -1,68 +1,21 @@
 'use strict';
 
 /**
- * stats-core.js — authoritative statistical-computation engine (High School Slice 2B).
+ * Authoritative statistical-computation core for High School Slice 2B.
  *
- * Calculates ALL stats visible in the Bob Jones sample report
- * directly from play-by-play text. No additional scraping needed.
+ * Parsing, event classification, and baseball formulas live only here.
+ * src/stats-engine.js is the narrow Travel compatibility adapter and invokes
+ * legacyIdentity mode; the public baseball engine invokes the safer default.
  *
- * This is the AUTHORITATIVE implementation of every statistical formula it
- * contains — src/stats-engine.js is now a thin compatibility re-export of
- * this module, not an independent copy (see that file's own header).
+ * The default contract accumulates by durable player ID whenever available,
+ * uses inning/venue context to separate same-named opposing players, routes
+ * unresolved identities into explicit game-scoped buckets, and applies that
+ * same identity path to batting, pitching, baserunning, and fielding errors.
+ * A reconciled engine game identity, when supplied in metadata, controls game
+ * counts and unresolved context without mutating source games.
  *
- * ── What changed from the relocated src/stats-engine.js, and why ──────────
- * Every parsing/regex/rate-stat FORMULA below is unchanged, verbatim, from
- * the legacy file (proven by test/legacy-stats-engine-characterization.test.js
- * passing unchanged against this file via src/stats-engine.js's re-export).
- * Exactly two things were added, both scoped narrowly to the
- * own/opponent/durable-identity accumulation decision, never to any parsing
- * or math:
- *
- * 1. DURABLE-ID ACCUMULATOR KEYS: when a boxScore row carries an optional
- *    `playerId`, that player's statistics are now accumulated under a key
- *    of `playerId`, not display name — so two different real people who
- *    happen to share a display name never collide (see accumulatorKeyFor()
- *    below). When NO row anywhere supplies playerId (true for every
- *    existing Travel caller, which never has), the id-lookup maps are
- *    empty and accumulatorKeyFor() always falls back to the exact legacy
- *    plain-name key — behavior for Travel is BYTE-FOR-BYTE unchanged. The
- *    accumulator object's shape is also unchanged for Travel: `.playerId`
- *    is only ever added to the object when a real id was supplied (see
- *    emptyPlayerStats/emptyPitcherStats below).
- *
- * 2. CROSS-SIDE DISAMBIGUATION + EXPLICIT UNRESOLVED IDENTITY: the legacy
- *    file's own/opponent decision was a bare name-set-membership check
- *    with no side-awareness at all -- when one display name appeared on
- *    BOTH the own and opponent roster for a game, EVERY play mentioning it
- *    was silently credited to "own" (characterized directly against the
- *    unmodified legacy file in
- *    test/legacy-stats-engine-characterization.test.js's "IDENTITY HAZARD"
- *    test). This file now additionally checks the play's own inning label
- *    (top/bottom) against which venue the own team occupies
- *    (`game.meta.ourSide`) — the exact mechanism game-reconstructor.js
- *    already uses successfully for the same disambiguation, see
- *    resolveOffenseSideFromInning() below. When the inning label resolves
- *    the ambiguity, the play is credited to the CORRECT side. When it does
- *    not (no inning label, or `game.meta.ourSide` not supplied), the play
- *    is routed to a NEW `unresolvedBatters`/`unresolvedPitchers` bucket,
- *    explicitly marked `identity: { resolved: false, ... }`, rather than
- *    silently defaulting to "own" as the legacy file did. This is an
- *    INTENTIONAL, documented behavioral difference from the legacy file,
- *    authorized because it only ever activates in the rare cross-side
- *    name-collision case (Travel's real rosters essentially never collide
- *    across teams) and because silently mis-crediting a real opponent play
- *    to the scouted team's own stats was a genuine, previously undetected
- *    hazard, not a behavior worth preserving.
- *
- * Purity: no database, network, filesystem, environment-variable, or UI
- * dependency. Does not mutate its inputs. Fully deterministic (games are
- * processed in array order; unresolved-bucket keys are deterministic
- * per-game+name, never randomly generated).
- *
- * Usage:
- *   Import processGames from this module.
- *   const stats = processGames(gameJsonArray);
- *   // → { players, opponentBatters, ourPitchers, pitchers, unresolvedBatters, unresolvedPitchers, unattributedErrors }
+ * This module has no database, network, filesystem, environment, UI, or
+ * wall-clock dependency and does not mutate inputs.
  */
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -649,8 +602,8 @@ function playProvidedName(play, camelName, snakeName, altName) {
 // ─── Durable identity + side-disambiguation helpers (new in this file) ────
 
 // Builds a name -> playerId Map from one side's box rows for one row kind.
-// Empty (and therefore a permanent no-op for accumulatorKeyFor) whenever no
-// row supplies a playerId -- which is every existing Travel call site.
+// The public engine uses it for durable-first identity. Travel compatibility
+// mode deliberately preserves the former display-name accumulator contract.
 function idMapFor(rows, wantOwn) {
   const map = new Map();
   for (const row of rows || []) {
@@ -663,9 +616,9 @@ function idMapFor(rows, wantOwn) {
   return map;
 }
 
-// Durable ID takes precedence over the display name as the accumulator key
-// whenever one is known for this name; otherwise falls back to the exact
-// legacy plain-name key.
+// Durable ID takes precedence over the display name as the accumulator key.
+// Without one, the public mode creates an explicit context-scoped unresolved
+// key; only Travel compatibility mode keeps the former plain-name key.
 function identityFor(name, providedId, idByName, context, legacyIdentity) {
   if (providedId != null) return { key: String(providedId), playerId: String(providedId), resolved: true };
   const ids = idByName?.get(name);
@@ -725,7 +678,7 @@ function processGames(games, options = {}) {
   let unattributedErrorsOpponentSide = 0;
 
   for (const game of games) {
-    const gameId   = game.meta?.gameId || 'unknown';
+    const gameId   = game.meta?.engineGameIdentity?.key || game.meta?.sourceGameId || game.meta?.gameId || 'unknown';
     const ourSide  = game.meta?.ourSide || null;
     const plays    = game.plays || [];
     const batting  = boxRowsForSide(game, 'batting');
@@ -807,7 +760,7 @@ function processGames(games, options = {}) {
         const fielderName = fielderInfo.name;
         let attributed = false;
 
-        if (fielderName) {
+        if (legacyIdentity && fielderName) {
           if (ourBatterNames.has(fielderName)) {
             if (!players[fielderName]) players[fielderName] = emptyPlayerStats(fielderName);
             players[fielderName].E++;
@@ -825,6 +778,73 @@ function processGames(games, options = {}) {
             pitchers[fielderName].E++;
             attributed = true;
           }
+        } else if (fielderName) {
+          const suppliedFielderId = playProvidedName(play, 'fielderId', 'fielder_id', 'FielderId');
+          const mapContainsId = (idMap) => suppliedFielderId != null
+            && [...idMap.values()].some((ids) => ids.has(String(suppliedFielderId)));
+          const inOwn = ourBatterNames.has(fielderName) || ourPitcherNames.has(fielderName);
+          const inOpponent = oppBatterNames.has(fielderName) || oppPitcherNames.has(fielderName);
+          const idInOwnBatting = mapContainsId(ownBatterIdByName);
+          const idInOwnPitching = mapContainsId(ownPitcherIdByName);
+          const idInOpponentBatting = mapContainsId(oppBatterIdByName);
+          const idInOpponentPitching = mapContainsId(oppPitcherIdByName);
+          const idInOwn = idInOwnBatting || idInOwnPitching;
+          const idInOpponent = idInOpponentBatting || idInOpponentPitching;
+          const offenseSide = resolveOffenseSideFromInning(play, ourSide);
+          const defenseSide = offenseSide ? (offenseSide === 'own' ? 'opponent' : 'own') : null;
+          let fielderSide = null;
+          if (idInOwn !== idInOpponent) fielderSide = idInOwn ? 'own' : 'opponent';
+          else if (inOwn && inOpponent) fielderSide = defenseSide;
+          else if (inOwn) fielderSide = 'own';
+          else if (inOpponent) fielderSide = 'opponent';
+
+          const onBattingRoster = fielderSide === 'own'
+            ? ourBatterNames.has(fielderName)
+            : fielderSide === 'opponent' ? oppBatterNames.has(fielderName) : false;
+          const onPitchingRoster = fielderSide === 'own'
+            ? ourPitcherNames.has(fielderName)
+            : fielderSide === 'opponent' ? oppPitcherNames.has(fielderName) : false;
+          const idOnBattingRoster = fielderSide === 'own' ? idInOwnBatting : fielderSide === 'opponent' ? idInOpponentBatting : false;
+          const idOnPitchingRoster = fielderSide === 'own' ? idInOwnPitching : fielderSide === 'opponent' ? idInOpponentPitching : false;
+          const role = idOnBattingRoster || onBattingRoster ? 'batter'
+            : idOnPitchingRoster || onPitchingRoster ? 'pitcher' : 'batter';
+          const idMap = fielderSide === 'own'
+            ? (role === 'batter' ? ownBatterIdByName : ownPitcherIdByName)
+            : fielderSide === 'opponent'
+              ? (role === 'batter' ? oppBatterIdByName : oppPitcherIdByName)
+              : null;
+          const identity = identityFor(
+            fielderName,
+            suppliedFielderId,
+            idMap,
+            `${gameId}:${fielderSide || 'unresolved'}:fielder`,
+            false,
+          );
+          const resolvedMap = role === 'pitcher'
+            ? (fielderSide === 'own' ? ourPitchers : pitchers)
+            : (fielderSide === 'own' ? players : opponentBatters);
+          const statMap = !fielderSide || identity.resolved === false
+            ? (role === 'pitcher' ? unresolvedPitchers : unresolvedBatters)
+            : resolvedMap;
+          if (!statMap[identity.key]) {
+            statMap[identity.key] = role === 'pitcher'
+              ? emptyPitcherStats(fielderName, identity.playerId)
+              : emptyPlayerStats(fielderName, identity.playerId);
+            if (!fielderSide || identity.resolved === false) {
+              statMap[identity.key].identity = {
+                resolved: false,
+                playerIdentityResolved: identity.resolved,
+                playerId: identity.playerId,
+                displayName: fielderName,
+                reason: !fielderSide ? 'fielder side could not be resolved' : identity.reason,
+                context: `${gameId}:${fielderSide || 'unresolved'}:fielder`,
+                side: fielderSide,
+              };
+            }
+          }
+          statMap[identity.key].E++;
+          statMap[identity.key].games.add(gameId);
+          attributed = true;
         }
 
         if (!attributed) {

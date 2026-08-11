@@ -1,39 +1,16 @@
 'use strict';
 
 /**
- * normalize-core.js — authoritative normalization engine (High School Slice 2B).
+ * Authoritative normalization core for High School Slice 2B.
  *
- * Converts raw game JSON extracted by the Playwright scraper into
- * clean, typed objects. This is the AUTHORITATIVE implementation of every
- * normalization formula it contains — src/normalizer.js is now a thin
- * compatibility re-export of this module, not an independent copy (see
- * that file's own header). No formula in this file differs from the
- * legacy src/normalizer.js this was relocated from; the relocation itself
- * is proven behavior-preserving by running the pre-existing
- * characterization suites (test/normalizer-game-date.test.js,
- * test/normalizer-abbreviated-months.test.js,
- * test/legacy-normalizer-own-opponent-characterization.test.js) unchanged
- * against this file via src/normalizer.js's re-export.
+ * All normalization parsing and formulas live here. src/normalizer.js is a
+ * narrow Travel compatibility adapter that supplies legacy clock values at
+ * its boundary; this core never reads the live clock itself.
  *
- * Usage:
- *   Import normalizeGameData from this module.
- *   const normalized = normalizeGameData(rawJson, team);
- *   // → { game, battingLines, pitchingLines, playEvents }
- *
- * Options:
- *   invertTeamSide: true  → flip isOurTeam for all batting/pitching rows.
- *                           Use this when ingesting an OPPONENT team's GC page
- *                           so that their players land in is_our_team=0 (the
- *                           side the report queries look at for scouting data).
- *
- * Purity: no database, network, filesystem, environment-variable, or UI
- * dependency. Does not mutate its inputs. One documented, inherited,
- * narrow exception to full determinism: normalizeGameMeta()'s returned
- * `capturedAt` field defaults to a live wall-clock read
- * (`meta.capturedAt || new Date().toISOString()`) when the caller supplies
- * no `capturedAt` -- this is DB-audit metadata, not a computed statistic.
- * src/engine/baseball-engine.js's normalizeBaseballGame() isolates this
- * field out of its own public contract entirely (see that file).
+ * Yearless date text resolves only with options.referenceYear. capturedAt is
+ * copied only from explicit metadata/options. The module has no database,
+ * network, filesystem, environment, UI, or wall-clock dependency and does
+ * not mutate inputs.
  */
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -155,7 +132,7 @@ function ipToDecimal(ip) {
  * Preferred input is YYYY-MM-DD. Also accepts ISO timestamps and common
  * MM/DD/YYYY / Month Day, Year strings.
  */
-function normalizeDateCandidate(value) {
+function normalizeDateCandidate(value, options = {}) {
   if (value === undefined || value === null) return null;
   const raw = String(value).trim();
   if (!raw) return null;
@@ -181,22 +158,28 @@ function normalizeDateCandidate(value) {
   if (monthName) {
     const month = MONTHS[monthName[1].toLowerCase().replace('.', '')];
     const day = String(monthName[2]).padStart(2, '0');
-    const year = monthName[3] || new Date().getFullYear();
+    const year = monthName[3] || (Number.isInteger(options.referenceYear) ? String(options.referenceYear) : null);
+    if (!year) return null;
     if (month) return `${year}-${month}-${day}`;
   }
 
-  const parsed = new Date(raw);
-  if (!Number.isNaN(parsed.getTime())) return parsed.toISOString().slice(0, 10);
+  // Date parsing is only deterministic when the input itself carries a
+  // four-digit year. Yearless values require options.referenceYear above.
+  if (/\b(?:19|20)\d{2}\b/.test(raw)) {
+    const parsed = new Date(raw);
+    if (!Number.isNaN(parsed.getTime())) return parsed.toISOString().slice(0, 10);
+  }
 
   return null;
 }
 
 /**
  * Parse a raw date/time string from GC into ISO date + time parts.
- * Input: "Sat April 12, 2:00 PM - 4:30 PM CT"
+ * Input: "Sat April 12, 2026, 2:00 PM - 4:30 PM CT", or a yearless
+ * value plus options.referenceYear.
  * Output: { date: "2026-04-12", time: "14:00", raw: "..." }
  */
-function parseDateTimeRaw(raw) {
+function parseDateTimeRaw(raw, options = {}) {
   if (!raw) return { date: null, time: null, raw: null };
 
   // Both full names and their standard abbreviation (with an optional
@@ -222,8 +205,8 @@ function parseDateTimeRaw(raw) {
   if (monthMatch) {
     const month = MONTHS[monthMatch[1].toLowerCase().replace('.', '')];
     const day = String(monthMatch[2]).padStart(2, '0');
-    const year = yearMatch ? yearMatch[1] : new Date().getFullYear();
-    date = `${year}-${month}-${day}`;
+    const year = yearMatch ? yearMatch[1] : (Number.isInteger(options.referenceYear) ? String(options.referenceYear) : null);
+    if (year) date = `${year}-${month}-${day}`;
   }
 
   let time = null;
@@ -474,7 +457,7 @@ function normalizePlayEvent(raw, gameId, teamId, sequenceNum) {
 /**
  * Normalize the game-level meta from extractGameHeader() output.
  */
-function normalizeGameMeta(meta, teamId) {
+function normalizeGameMeta(meta, teamId, options = {}) {
   const rawDateTime = meta.gameDateTime || meta.gameDatetimeRaw || meta.game_datetime_raw || meta.dateTime || '';
   const explicitGameDate = normalizeDateCandidate(
     meta.gameDate ||
@@ -483,9 +466,10 @@ function normalizeGameMeta(meta, teamId) {
     meta.schedule_game_date ||
     meta.scheduleDate ||
     meta.schedule_date ||
-    meta.date
+    meta.date,
+    options,
   );
-  const dateTime = parseDateTimeRaw(rawDateTime);
+  const dateTime = parseDateTimeRaw(rawDateTime, options);
 
   // Extract opponent name from teamCandidates
   // GC header typically has both team names; the opponent is the one that
@@ -579,7 +563,7 @@ function normalizeGameMeta(meta, teamId) {
     seasonType:      null,
     jsonFile:        meta.jsonFile || null,
     screenshotFile:  meta.screenshotFile || null,
-    capturedAt:      meta.capturedAt || new Date().toISOString(),
+    capturedAt:      meta.capturedAt || options.capturedAt || null,
   };
 }
 
@@ -611,7 +595,7 @@ function normalizeGameData(rawJson, teamId, options = {}) {
   const { meta = {}, boxScore = {}, plays = [] } = rawJson;
 
   // 1. Game record
-  const game = normalizeGameMeta(meta, teamId);
+  const game = normalizeGameMeta(meta, teamId, options);
 
   // Placeholder game_id — will be replaced with DB-assigned ID after insert
   const gameId = '__pending__';
@@ -783,10 +767,6 @@ function normalizeGameData(rawJson, teamId, options = {}) {
   const playEvents = rawPlays
     .map((play, i) => normalizePlayEvent(play, gameId, teamId, i + 1))
     .filter(Boolean);
-
-  if (invertTeamSide) {
-    console.log('[normalizer] invertTeamSide=true — scouted team players stored as is_our_team=0');
-  }
 
   return {
     game,

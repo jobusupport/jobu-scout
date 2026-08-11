@@ -17,6 +17,7 @@ const path = require('path');
 
 const ENGINE_DIR = path.join(__dirname, '..', 'src', 'engine');
 const ENGINE_ENTRY = path.join(ENGINE_DIR, 'baseball-engine.js');
+const SRC_DIR = path.join(__dirname, '..', 'src');
 
 // Forbidden Node built-ins / patterns for a pure computational module.
 const FORBIDDEN_REQUIRE_PATTERNS = [
@@ -127,4 +128,60 @@ test('dependency boundary -- running the engine\'s functions on purely synthetic
     plays: [],
   });
   assert.equal(result.own.boxBatting.h, 1);
+});
+
+test('dependency boundary -- authoritative core never imports legacy adapters or reads the live clock', () => {
+  for (const fileName of ['normalize-core.js', 'reconstruct-core.js', 'stats-core.js']) {
+    const source = fs.readFileSync(path.join(ENGINE_DIR, fileName), 'utf8');
+    assert.doesNotMatch(source, /require\([^)]*(?:normalizer|game-reconstructor|stats-engine)/);
+    assert.doesNotMatch(source, /new\s+Date\s*\(\s*\)/);
+    assert.doesNotMatch(source, /\bDate\.now\s*\(/);
+  }
+});
+
+test('dependency boundary -- legacy Travel modules are narrow adapters over one authoritative core each', () => {
+  const expected = {
+    'normalizer.js': './engine/normalize-core',
+    'game-reconstructor.js': './engine/reconstruct-core',
+    'stats-engine.js': './engine/stats-core',
+  };
+  for (const [fileName, coreRequire] of Object.entries(expected)) {
+    const source = fs.readFileSync(path.join(SRC_DIR, fileName), 'utf8');
+    const requires = [...source.matchAll(/require\(\s*['"]([^'"]+)['"]\s*\)/g)].map((match) => match[1]);
+    assert.deepEqual(requires, [coreRequire]);
+    assert.ok(source.split(/\r?\n/).length < 40, `${fileName} is no longer a narrow adapter`);
+  }
+});
+
+test('dependency boundary -- reconstruction adapter and core expose the same authoritative functions', () => {
+  const adapter = require('../src/game-reconstructor');
+  const core = require('../src/engine/reconstruct-core');
+  assert.deepEqual(adapter, core);
+});
+
+test('dependency boundary -- stats adapter preserves complete legacy-mode core output', () => {
+  const adapter = require('../src/stats-engine');
+  const core = require('../src/engine/stats-core');
+  const games = [{
+    meta: { gameId: 'synthetic-parity' },
+    boxScore: { batting: [{ Player: 'Parity Player', isOurTeam: true }], pitching: [] },
+    plays: [{ text: 'Single. Parity Player singles to left field, Dana Pitcher pitching.' }],
+  }];
+  assert.deepEqual(adapter.processGames(games), core.processGames(games, { legacyIdentity: true }));
+  assert.deepEqual(adapter.processGameFile(games[0]), core.processGames(games, { legacyIdentity: true }));
+});
+
+test('dependency boundary -- normalizer adapter preserves complete core output when compatibility inputs are explicit', () => {
+  const adapter = require('../src/normalizer');
+  const core = require('../src/engine/normalize-core');
+  const raw = {
+    meta: { gameDateTime: 'Sat Apr 12, 2:00 PM', ourSide: 'home' },
+    boxScore: { homeBatting: [{ Player: 'Parity Player', AB: 1, H: 1 }] },
+    plays: [],
+  };
+  const options = { referenceYear: 2026, capturedAt: '2026-04-12T20:00:00.000Z' };
+  assert.deepEqual(
+    adapter.normalizeGameData(raw, 'synthetic-team', options),
+    core.normalizeGameData(raw, 'synthetic-team', options),
+  );
 });
