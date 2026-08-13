@@ -625,9 +625,9 @@ test('ambiguous-component exclusion does not mutate any input record', () => {
 //    foundational partitions or disconnected components ──────────────────
 
 test('two unrelated ambiguous components (different dates) report only their own candidates', () => {
-  const early1 = scheduleGame('10:00 AM', { meta: { gameDate: '2026-04-01', homeTeam: 'Home A', awayTeam: 'Away A' } });
-  const g1a = scheduleGame('10:00 AM', { meta: { gameDate: '2026-04-01', homeTeam: 'Home A', awayTeam: 'Away A', gameNumber: 1 } });
-  const g2a = scheduleGame('10:00 AM', { meta: { gameDate: '2026-04-01', homeTeam: 'Home A', awayTeam: 'Away A', gameNumber: 2 } });
+  const early1 = scheduleGame('10:00 AM', { meta: { gameDate: '2026-04-01', homeTeam: 'Synthetic Home', awayTeam: 'Synthetic Away' } });
+  const g1a = scheduleGame('10:00 AM', { meta: { gameDate: '2026-04-01', homeTeam: 'Synthetic Home', awayTeam: 'Synthetic Away', gameNumber: 1 } });
+  const g2a = scheduleGame('10:00 AM', { meta: { gameDate: '2026-04-01', homeTeam: 'Synthetic Home', awayTeam: 'Synthetic Away', gameNumber: 2 } });
   const early2 = scheduleGame('11:00 AM', { meta: { gameDate: '2026-05-01', homeTeam: 'Home B', awayTeam: 'Away B' } });
   const g1b = scheduleGame('11:00 AM', { meta: { gameDate: '2026-05-01', homeTeam: 'Home B', awayTeam: 'Away B', gameNumber: 1 } });
   const g2b = scheduleGame('11:00 AM', { meta: { gameDate: '2026-05-01', homeTeam: 'Home B', awayTeam: 'Away B', gameNumber: 2 } });
@@ -698,10 +698,10 @@ test('candidate fingerprints are deterministically ordered regardless of input o
 });
 
 test('global key disambiguation remains collision-safe across two unrelated ambiguous components sharing a duplicated fingerprint', () => {
-  const early1 = scheduleGame('10:00 AM', { meta: { homeTeam: 'Home A', awayTeam: 'Away A' } });
+  const early1 = scheduleGame('10:00 AM', { meta: { homeTeam: 'Synthetic Home', awayTeam: 'Synthetic Away' } });
   const early1Dup = structuredClone(early1);
-  const g1a = scheduleGame('10:00 AM', { meta: { homeTeam: 'Home A', awayTeam: 'Away A', gameNumber: 1 } });
-  const g2a = scheduleGame('10:00 AM', { meta: { homeTeam: 'Home A', awayTeam: 'Away A', gameNumber: 2 } });
+  const g1a = scheduleGame('10:00 AM', { meta: { homeTeam: 'Synthetic Home', awayTeam: 'Synthetic Away', gameNumber: 1 } });
+  const g2a = scheduleGame('10:00 AM', { meta: { homeTeam: 'Synthetic Home', awayTeam: 'Synthetic Away', gameNumber: 2 } });
   const early2 = scheduleGame('10:00 AM', { meta: { homeTeam: 'Home B', awayTeam: 'Away B' } });
   const early2Dup = structuredClone(early2);
   const g1b = scheduleGame('10:00 AM', { meta: { homeTeam: 'Home B', awayTeam: 'Away B', gameNumber: 1 } });
@@ -713,9 +713,9 @@ test('global key disambiguation remains collision-safe across two unrelated ambi
 });
 
 test('each ambiguous record references the correct component identifier', () => {
-  const early = scheduleGame('10:00 AM', { meta: { homeTeam: 'Home A', awayTeam: 'Away A' } });
-  const g1a = scheduleGame('10:00 AM', { meta: { homeTeam: 'Home A', awayTeam: 'Away A', gameNumber: 1 } });
-  const g2a = scheduleGame('10:00 AM', { meta: { homeTeam: 'Home A', awayTeam: 'Away A', gameNumber: 2 } });
+  const early = scheduleGame('10:00 AM', { meta: { homeTeam: 'Synthetic Home', awayTeam: 'Synthetic Away' } });
+  const g1a = scheduleGame('10:00 AM', { meta: { homeTeam: 'Synthetic Home', awayTeam: 'Synthetic Away', gameNumber: 1 } });
+  const g2a = scheduleGame('10:00 AM', { meta: { homeTeam: 'Synthetic Home', awayTeam: 'Synthetic Away', gameNumber: 2 } });
   const unrelated = scheduleGame('11:00 AM', { meta: { homeTeam: 'Home B', awayTeam: 'Away B' } });
   const g1b = scheduleGame('11:00 AM', { meta: { homeTeam: 'Home B', awayTeam: 'Away B', gameNumber: 1 } });
   const g2b = scheduleGame('11:00 AM', { meta: { homeTeam: 'Home B', awayTeam: 'Away B', gameNumber: 2 } });
@@ -730,11 +730,318 @@ test('each ambiguous record references the correct component identifier', () => 
 });
 
 test('ambiguity-metadata scoping does not mutate any input record', () => {
-  const early1 = scheduleGame('10:00 AM', { meta: { homeTeam: 'Home A', awayTeam: 'Away A' } });
-  const g1a = scheduleGame('10:00 AM', { meta: { homeTeam: 'Home A', awayTeam: 'Away A', gameNumber: 1 } });
-  const g2a = scheduleGame('10:00 AM', { meta: { homeTeam: 'Home A', awayTeam: 'Away A', gameNumber: 2 } });
+  const early1 = scheduleGame('10:00 AM', { meta: { homeTeam: 'Synthetic Home', awayTeam: 'Synthetic Away' } });
+  const g1a = scheduleGame('10:00 AM', { meta: { homeTeam: 'Synthetic Home', awayTeam: 'Synthetic Away', gameNumber: 1 } });
+  const g2a = scheduleGame('10:00 AM', { meta: { homeTeam: 'Synthetic Home', awayTeam: 'Synthetic Away', gameNumber: 2 } });
   const early2 = scheduleGame('11:00 AM', { meta: { homeTeam: 'Home B', awayTeam: 'Away B' } });
   const before = [early1, g1a, g2a, early2].map((g) => structuredClone(g));
   reconstructBaseballTeamGames('team', [early1, g1a, g2a, early2]);
   assert.deepEqual([early1, g1a, g2a, early2], before);
+});
+
+// ── Correction: a malformed ambiguous record must not abort the whole
+//    reconstructBaseballTeamGames() call and discard already-computed
+//    authoritative results for proven games ─────────────────────────────
+//
+// Prior defect (fixed by this correction): reconstructBaseballTeamGames
+// diagnostically reconstructs every ambiguous record for display
+// (excludedFromOfficialTotals: true) via an unguarded
+// reconstructBaseballGame(game) call. Because domain validation
+// (requireExplicitOwnBoolean / assertNoContradictorySideMetadata) throws on
+// malformed box-score data, and nothing validates box-score shape before a
+// record enters reconcileGameCollection, a single malformed record that
+// also happens to be schedule-ambiguous threw an exception that propagated
+// out of the WHOLE function -- discarding the summary/gameResults for every
+// proven, valid game in the same collection. Every test below fails against
+// SHA 7abaaba for exactly this reason.
+//
+// Fixed with a narrow per-record error boundary (reconstructAmbiguousDiagnostic
+// in baseball-engine.js): only the diagnostic reconstruction of one already-
+// excluded ambiguous record is wrapped; authoritative reconstruction is never
+// wrapped and still throws exactly as before for a malformed AUTHORITATIVE
+// game. A failed ambiguous diagnostic is preserved (never dropped, never
+// silently reported as successful, never given fabricated stats) with a
+// stable `diagnosticReconstruction: { status: 'error', code, message }`
+// shape that structurally cannot be confused with a real game result.
+
+function malformedNoOwn(startTime, extraMeta = {}) {
+  return {
+    meta: { complete: false, gameDate: '2026-04-01', homeTeam: 'Synthetic Home', awayTeam: 'Synthetic Away', startTime, ...extraMeta },
+    boxScore: { batting: [{ Player: 'Bad Row', TeamSide: 'home', AB: 1, H: 1 }], pitching: [] }, // no `own`
+    plays: [],
+  };
+}
+function malformedContradictorySide(startTime, extraMeta = {}) {
+  return {
+    meta: { complete: false, gameDate: '2026-04-01', homeTeam: 'Synthetic Home', awayTeam: 'Synthetic Away', startTime, ...extraMeta },
+    boxScore: {
+      batting: [
+        { Player: 'A', own: true, TeamSide: 'home', AB: 1, H: 1 },
+        { Player: 'B', own: false, TeamSide: 'home', AB: 1, H: 0 },
+      ],
+      pitching: [],
+    },
+    plays: [],
+  };
+}
+function malformedBoxScoreStructure(startTime, extraMeta = {}) {
+  return {
+    meta: { complete: false, gameDate: '2026-04-01', homeTeam: 'Synthetic Home', awayTeam: 'Synthetic Away', startTime, ...extraMeta },
+    boxScore: { batting: ['not-a-row-object'], pitching: [] },
+    plays: [],
+  };
+}
+function provenDurableGame(id, hits = 1) {
+  return {
+    meta: { gameId: id, complete: false },
+    boxScore: { batting: [{ Player: 'Proven Batter', own: true, TeamSide: 'home', playerId: 'proven-id', AB: hits, H: hits }], pitching: [{ Player: 'Proven Pitcher', own: true, TeamSide: 'home', playerId: 'proven-pitcher-id', BF: 1 }] },
+    plays: [{ batterId: 'proven-id', inning: 'Bottom 1', text: 'Single. Proven Batter singles to left field, Opp Pitcher pitching.' }],
+  };
+}
+function ambiguousTriple(malformedFactory) {
+  const early = malformedFactory('10:00 AM');
+  const gameOne = scheduleGame('10:00 AM', { meta: { gameNumber: 1 } });
+  const gameTwo = scheduleGame('10:00 AM', { meta: { gameNumber: 2 } });
+  return [early, gameOne, gameTwo];
+}
+
+test('a valid authoritative game plus one malformed ambiguous record returns successfully', () => {
+  const proven = provenDurableGame('source-good');
+  const [early, gameOne, gameTwo] = ambiguousTriple(malformedNoOwn);
+  assert.doesNotThrow(() => reconstructBaseballTeamGames('team', [proven, early, gameOne, gameTwo]));
+});
+
+test('the valid authoritative game remains in summary.games', () => {
+  const proven = provenDurableGame('source-good');
+  const [early, gameOne, gameTwo] = ambiguousTriple(malformedNoOwn);
+  const result = reconstructBaseballTeamGames('team', [proven, early, gameOne, gameTwo]);
+  assert.equal(result.summary.games, 1);
+});
+
+test('the authoritative game batting totals remain correct', () => {
+  const proven = provenDurableGame('source-good', 3);
+  const [early, gameOne, gameTwo] = ambiguousTriple(malformedNoOwn);
+  const result = reconstructBaseballTeamGames('team', [proven, early, gameOne, gameTwo]);
+  assert.equal(result.summary.officialBatting.h, 3);
+});
+
+test('the authoritative game pitching totals remain correct', () => {
+  const proven = provenDurableGame('source-good', 1);
+  const [early, gameOne, gameTwo] = ambiguousTriple(malformedNoOwn);
+  const result = reconstructBaseballTeamGames('team', [proven, early, gameOne, gameTwo]);
+  assert.equal(result.summary.officialPitching.bf, 1);
+});
+
+test('the authoritative game fielding-relevant reconstruction totals remain correct', () => {
+  const proven = provenDurableGame('source-good', 1);
+  const [early, gameOne, gameTwo] = ambiguousTriple(malformedNoOwn);
+  const result = reconstructBaseballTeamGames('team', [proven, early, gameOne, gameTwo]);
+  const provenResult = result.gameResults.find((r) => r.identity.method === 'sourceGameId');
+  assert.equal(provenResult.own.boxBatting.h, 1);
+  assert.equal(provenResult.excludedFromOfficialTotals, false);
+});
+
+test('the authoritative game player game count remains correct via computeBaseballStats', () => {
+  const proven = provenDurableGame('source-good', 1);
+  const [early, gameOne, gameTwo] = ambiguousTriple(malformedNoOwn);
+  const stats = computeBaseballStats([proven, early, gameOne, gameTwo]);
+  assert.equal(stats.ownBatters['proven-id'].games, 1);
+});
+
+test('the malformed ambiguous record remains represented exactly once, marked excluded', () => {
+  const proven = provenDurableGame('source-good');
+  const [early, gameOne, gameTwo] = ambiguousTriple(malformedNoOwn);
+  const result = reconstructBaseballTeamGames('team', [proven, early, gameOne, gameTwo]);
+  const failed = result.gameResults.filter((r) => r.diagnosticReconstruction?.status === 'error');
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0].excludedFromOfficialTotals, true);
+});
+
+test('the failed diagnostic carries a stable error status and code', () => {
+  const [early, gameOne, gameTwo] = ambiguousTriple(malformedNoOwn);
+  const result = reconstructBaseballTeamGames('team', [early, gameOne, gameTwo]);
+  const failed = result.gameResults.find((r) => r.diagnosticReconstruction?.status === 'error');
+  assert.equal(failed.diagnosticReconstruction.status, 'error');
+  assert.equal(failed.diagnosticReconstruction.code, 'AMBIGUOUS_RECONSTRUCTION_FAILED');
+  assert.equal(typeof failed.diagnosticReconstruction.message, 'string');
+});
+
+test('the failed diagnostic message contains no stack trace or filesystem path', () => {
+  const [early, gameOne, gameTwo] = ambiguousTriple(malformedNoOwn);
+  const result = reconstructBaseballTeamGames('team', [early, gameOne, gameTwo]);
+  const failed = result.gameResults.find((r) => r.diagnosticReconstruction?.status === 'error');
+  const { message } = failed.diagnosticReconstruction;
+  assert.ok(!/\.js:\d+:\d+/.test(message), 'must not contain a file:line:col stack frame');
+  assert.ok(!/at\s+\w+.*\(/.test(message), 'must not contain a stack-frame-shaped substring');
+  assert.ok(!/[A-Za-z]:\\|\/(home|Users)\//.test(message), 'must not contain an absolute filesystem path');
+  assert.ok(!('stack' in failed.diagnosticReconstruction));
+});
+
+test('a missing `own` boolean produces an isolated diagnostic failure', () => {
+  const [early, gameOne, gameTwo] = ambiguousTriple(malformedNoOwn);
+  const result = reconstructBaseballTeamGames('team', [early, gameOne, gameTwo]);
+  const failed = result.gameResults.find((r) => r.diagnosticReconstruction?.status === 'error');
+  assert.match(failed.diagnosticReconstruction.message, /own.*boolean/i);
+  assert.equal(result.summary.games, 0);
+});
+
+test('contradictory side metadata produces an isolated diagnostic failure', () => {
+  const [early, gameOne, gameTwo] = ambiguousTriple(malformedContradictorySide);
+  const result = reconstructBaseballTeamGames('team', [early, gameOne, gameTwo]);
+  const failed = result.gameResults.find((r) => r.diagnosticReconstruction?.status === 'error');
+  assert.ok(failed, 'a contradictory-side-metadata ambiguous record must produce a failed diagnostic, not throw');
+  assert.match(failed.diagnosticReconstruction.message, /contradictory side metadata/i);
+});
+
+test('an invalid ambiguous box-score structure produces an isolated diagnostic failure', () => {
+  const [early, gameOne, gameTwo] = ambiguousTriple(malformedBoxScoreStructure);
+  assert.doesNotThrow(() => reconstructBaseballTeamGames('team', [early, gameOne, gameTwo]));
+  const result = reconstructBaseballTeamGames('team', [early, gameOne, gameTwo]);
+  const failed = result.gameResults.find((r) => r.diagnosticReconstruction?.status === 'error');
+  assert.ok(failed, 'an invalid box-score row shape must produce a failed diagnostic, not throw');
+});
+
+test('one malformed and one valid ambiguous diagnostic in the same component are handled independently', () => {
+  const early = malformedNoOwn('10:00 AM');
+  const gameOne = scheduleGame('10:00 AM', { meta: { gameNumber: 1 } });
+  const gameTwo = scheduleGame('10:00 AM', { meta: { gameNumber: 2 } });
+  const result = reconstructBaseballTeamGames('team', [early, gameOne, gameTwo]);
+  const byStatus = { ok: 0, error: 0 };
+  for (const r of result.gameResults) byStatus[r.diagnosticReconstruction.status] += 1;
+  assert.deepEqual(byStatus, { ok: 2, error: 1 });
+});
+
+test('multiple malformed ambiguous records each receive their own independent failure record', () => {
+  const badA = malformedNoOwn('10:00 AM', { field: 'Field A' });
+  const badB = malformedContradictorySide('10:00 AM', { field: 'Field B' });
+  const anchor = scheduleGame('10:00 AM');
+  // Both bad records and the anchor share `start`, forming one ambiguous
+  // component only if they also conflict with something -- give each a
+  // DIFFERENT gameNumber sibling so the whole group is a non-clique.
+  const gameOne = scheduleGame('10:00 AM', { meta: { gameNumber: 1 } });
+  const gameTwo = scheduleGame('10:00 AM', { meta: { gameNumber: 2 } });
+  const result = reconstructBaseballTeamGames('team', [badA, badB, anchor, gameOne, gameTwo]);
+  const failed = result.gameResults.filter((r) => r.diagnosticReconstruction?.status === 'error');
+  assert.equal(failed.length, 2, 'both malformed records must each surface their own failure');
+  assert.equal(result.summary.failedAmbiguousDiagnostics, 2);
+  assert.equal(new Set(failed.map((r) => r.identity.key)).size, 2, 'each failure must have its own distinct key');
+});
+
+test('a malformed ambiguous record cannot alter authoritative totals', () => {
+  const proven = provenDurableGame('source-good', 2);
+  const [early, gameOne, gameTwo] = ambiguousTriple(malformedNoOwn);
+  const withMalformed = reconstructBaseballTeamGames('team', [proven, early, gameOne, gameTwo]);
+  const withoutAmbiguous = reconstructBaseballTeamGames('team', [proven]);
+  assert.equal(withMalformed.summary.games, withoutAmbiguous.summary.games);
+  assert.equal(withMalformed.summary.officialBatting.h, withoutAmbiguous.summary.officialBatting.h);
+});
+
+test('reversing input order produces semantically identical output for a mix including a malformed ambiguous record', () => {
+  const proven = provenDurableGame('source-good');
+  const [early, gameOne, gameTwo] = ambiguousTriple(malformedNoOwn);
+  const forward = reconstructBaseballTeamGames('team', [proven, early, gameOne, gameTwo]);
+  const reverse = reconstructBaseballTeamGames('team', [gameTwo, gameOne, early, proven]);
+  assert.deepEqual(forward, reverse);
+});
+
+test('inputs remain deeply unmodified after a malformed ambiguous record is diagnosed', () => {
+  const proven = provenDurableGame('source-good');
+  const [early, gameOne, gameTwo] = ambiguousTriple(malformedNoOwn);
+  const before = [proven, early, gameOne, gameTwo].map((g) => structuredClone(g));
+  reconstructBaseballTeamGames('team', [proven, early, gameOne, gameTwo]);
+  assert.deepEqual([proven, early, gameOne, gameTwo], before);
+});
+
+test('an authoritative (non-ambiguous) malformed game still throws -- the ambiguous error boundary must not swallow it', () => {
+  const badAuthoritative = { meta: { gameId: 'source-bad' }, boxScore: { batting: [{ Player: 'Bad', TeamSide: 'home', AB: 1, H: 1 }], pitching: [] }, plays: [] }; // no `own`, but durable -> authoritative
+  assert.throws(
+    () => reconstructBaseballTeamGames('team', [badAuthoritative]),
+    /missing the required explicit "own" boolean/,
+  );
+});
+
+test('computeBaseballStats remains unaffected by the error boundary and never reconstructs ambiguous records', () => {
+  const [early, gameOne, gameTwo] = ambiguousTriple(malformedNoOwn);
+  assert.doesNotThrow(() => computeBaseballStats([early, gameOne, gameTwo]));
+  const stats = computeBaseballStats([early, gameOne, gameTwo]);
+  assert.deepEqual(stats.ownBatters, {});
+  assert.equal(stats.ambiguousInputRecords, 3);
+  assert.equal(stats.officialTotalsComplete, false);
+});
+
+test('an all-ambiguous collection with one malformed diagnostic reports truthful exclusion and failure counts', () => {
+  const [early, gameOne, gameTwo] = ambiguousTriple(malformedNoOwn);
+  const result = reconstructBaseballTeamGames('team', [early, gameOne, gameTwo]);
+  assert.equal(result.summary.games, 0);
+  assert.equal(result.summary.ambiguousInputRecords, 3);
+  assert.equal(result.summary.failedAmbiguousDiagnostics, 1);
+  assert.equal(result.summary.officialTotalsComplete, false);
+  assert.equal(result.gameResults.length, 3);
+});
+
+test('empty input retains the documented complete/zero behavior', () => {
+  const result = reconstructBaseballTeamGames('team', []);
+  assert.equal(result.summary.games, 0);
+  assert.equal(result.summary.ambiguousInputRecords, 0);
+  assert.equal(result.summary.failedAmbiguousDiagnostics, 0);
+  assert.equal(result.summary.officialTotalsComplete, true);
+  assert.equal(result.gameResults.length, 0);
+
+  const stats = computeBaseballStats([]);
+  assert.equal(stats.ambiguousInputRecords, 0);
+  assert.equal(stats.officialTotalsComplete, true);
+});
+
+test('officialTotalsComplete is true only when no input was excluded from official totals, across empty/authoritative-only/ambiguous-only/mixed collections', () => {
+  const proven = provenDurableGame('source-complete');
+  const [early, gameOne, gameTwo] = ambiguousTriple(() => scheduleGame('10:00 AM'));
+
+  assert.equal(reconstructBaseballTeamGames('team', []).summary.officialTotalsComplete, true, 'empty');
+  assert.equal(reconstructBaseballTeamGames('team', [proven]).summary.officialTotalsComplete, true, 'authoritative-only');
+  assert.equal(reconstructBaseballTeamGames('team', [early, gameOne, gameTwo]).summary.officialTotalsComplete, false, 'ambiguous-only');
+  assert.equal(reconstructBaseballTeamGames('team', [proven, early, gameOne, gameTwo]).summary.officialTotalsComplete, false, 'mixed');
+
+  assert.equal(computeBaseballStats([]).officialTotalsComplete, true, 'empty (stats)');
+  assert.equal(computeBaseballStats([proven]).officialTotalsComplete, true, 'authoritative-only (stats)');
+  assert.equal(computeBaseballStats([early, gameOne, gameTwo]).officialTotalsComplete, false, 'ambiguous-only (stats)');
+  assert.equal(computeBaseballStats([proven, early, gameOne, gameTwo]).officialTotalsComplete, false, 'mixed (stats)');
+});
+
+test('a successful ambiguous diagnostic reconstruction does not make official totals complete', () => {
+  // All 3 members of this ambiguous component are well-formed (diagnostic
+  // reconstruction succeeds for every one of them) -- officialTotalsComplete
+  // must still be false, because "diagnostic success" and "authoritative
+  // completeness" are different questions.
+  const early = scheduleGame('10:00 AM');
+  const gameOne = scheduleGame('10:00 AM', { meta: { gameNumber: 1 } });
+  const gameTwo = scheduleGame('10:00 AM', { meta: { gameNumber: 2 } });
+  const result = reconstructBaseballTeamGames('team', [early, gameOne, gameTwo]);
+  assert.equal(result.summary.failedAmbiguousDiagnostics, 0, 'sanity check: nothing actually failed');
+  assert.ok(result.gameResults.every((r) => r.diagnosticReconstruction.status === 'ok'));
+  assert.equal(result.summary.officialTotalsComplete, false);
+});
+
+test('an unresolved (non-ambiguous) record follows the existing authoritative contract, unaffected by this correction', () => {
+  const unresolved = { meta: { complete: false }, boxScore: { batting: [{ Player: 'Solo', own: true, TeamSide: 'home', AB: 1, H: 1 }], pitching: [] }, plays: [] };
+  const result = reconstructBaseballTeamGames('team', [unresolved, structuredClone(unresolved)]);
+  assert.equal(result.summary.games, 2, 'unresolved records remain authoritative, unlike ambiguous ones');
+  assert.equal(result.summary.ambiguousInputRecords, 0);
+  assert.equal(result.summary.officialTotalsComplete, true);
+});
+
+test('a non-Error thrown value is normalized to a safe, deterministic string', () => {
+  assert.equal(_internals.normalizeThrownValue(new Error('plain error')), 'plain error');
+  assert.equal(_internals.normalizeThrownValue('a plain string throw'), 'a plain string throw');
+  assert.equal(
+    _internals.normalizeThrownValue({ weird: 'object' }),
+    'non-Error value thrown during ambiguous diagnostic reconstruction',
+  );
+  assert.equal(
+    _internals.normalizeThrownValue(42),
+    'non-Error value thrown during ambiguous diagnostic reconstruction',
+  );
+  assert.equal(
+    _internals.normalizeThrownValue(undefined),
+    'non-Error value thrown during ambiguous diagnostic reconstruction',
+  );
 });

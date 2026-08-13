@@ -626,6 +626,55 @@ function reconcileGameCollection(games) {
   return reconciled.sort((a, b) => codePointCompare(a.identity.key, b.identity.key));
 }
 
+// Normalizes a thrown value from ambiguous-diagnostic reconstruction into a
+// safe, deterministic string for a public result: an Error's `.message`
+// only -- never `.stack`, which can embed filesystem paths and is not part
+// of this module's public error contract -- the thrown value itself when
+// it is already a plain string, or a fixed fallback for anything else. This
+// codebase's domain validation only ever throws plain Error objects with a
+// static-shaped, content-derived (never timestamped/random) message, so the
+// non-Error/non-string branch is defensive rather than expected to fire.
+function normalizeThrownValue(err) {
+  if (err instanceof Error && typeof err.message === 'string') return err.message;
+  if (typeof err === 'string') return err;
+  return 'non-Error value thrown during ambiguous diagnostic reconstruction';
+}
+
+// Reconstructs ONE ambiguous record's own/opponent totals for diagnostic
+// display, with its own narrow error boundary. This wraps ONLY
+// reconstructBaseballGame(game) for a single record already classified
+// ambiguous and excluded from official totals -- never the authoritative
+// reconstructTeamGames() call in reconstructBaseballTeamGames below, and
+// never any part of reconcileGameCollection/clusterFallbackIdentities. A
+// malformed ambiguous record (missing `own`, contradictory side metadata,
+// or any other domain-validation failure reconstructBaseballGame can throw)
+// must not abort the whole reconstructBaseballTeamGames() call and discard
+// already-computed authoritative results for proven games -- but it also
+// must never be silently dropped, silently reported as successful, given
+// fabricated zero stats, or shaped so a caller could mistake it for a valid
+// game result: the two branches below return deliberately different shapes
+// (only the success branch carries own/opponent/ownSide/etc. stat fields).
+function reconstructAmbiguousDiagnostic(game, identity) {
+  try {
+    return {
+      ...reconstructBaseballGame(game),
+      identity,
+      excludedFromOfficialTotals: true,
+      diagnosticReconstruction: { status: 'ok' },
+    };
+  } catch (err) {
+    return {
+      identity,
+      excludedFromOfficialTotals: true,
+      diagnosticReconstruction: {
+        status: 'error',
+        code: 'AMBIGUOUS_RECONSTRUCTION_FAILED',
+        message: normalizeThrownValue(err),
+      },
+    };
+  }
+}
+
 /**
  * Reconstructs and aggregates own/opponent totals across many games for one
  * team through the authoritative reconstruction core after collection
@@ -638,12 +687,18 @@ function reconcileGameCollection(games) {
  * how many distinct physical games an ambiguous component represents, so it
  * never counts toward "official" totals, whether or not it happens to
  * repeat a byte-identical snapshot. They are NOT discarded, though -- each
- * still gets its own per-game reconstruction (own/opponent totals for that
- * specific snapshot in isolation) and appears in `gameResults` tagged
- * `excludedFromOfficialTotals: true`, so a caller who wants to inspect the
- * raw evidence still can. `summary.ambiguousInputRecords` /
- * `summary.ambiguousComponents` / `summary.excludedFromOfficialTotals` tell
- * a caller when official totals are incomplete because of this.
+ * still gets its own per-game diagnostic reconstruction, ISOLATED so a
+ * malformed ambiguous record can never abort this whole call and take
+ * already-computed authoritative results down with it (see
+ * reconstructAmbiguousDiagnostic above); every ambiguous record appears
+ * exactly once in `gameResults`, tagged `excludedFromOfficialTotals: true`
+ * and `diagnosticReconstruction.status` of either 'ok' or 'error'.
+ * Authoritative reconstruction is NOT wrapped this way -- a malformed
+ * authoritative game still throws exactly as before this correction.
+ * `summary.ambiguousInputRecords` / `summary.ambiguousComponents` /
+ * `summary.excludedFromOfficialTotals` / `summary.failedAmbiguousDiagnostics`
+ * / `summary.officialTotalsComplete` tell a caller when official totals are
+ * incomplete and why, without needing to interpret per-record diagnostics.
  *
  * @param {string} teamId
  * @param {object[]} capturedGames
@@ -661,6 +716,11 @@ function reconstructBaseballTeamGames(teamId, capturedGames = []) {
   const authoritative = reconciled.filter(({ identity }) => identity.authoritative !== false);
   const ambiguous = reconciled.filter(({ identity }) => identity.authoritative === false);
 
+  // Authoritative reconstruction is intentionally NOT wrapped in a try/catch
+  // here: a malformed authoritative game must continue to throw exactly as
+  // it always has. Only the ambiguous/diagnostic path below gets an error
+  // boundary, and only around the one call that produces diagnostic-only
+  // output for records already excluded from official totals.
   const translatedGames = authoritative.map(({ game }) => toReconstructionInput(game));
   const { summary, gameResults } = reconstructTeamGames(teamId, translatedGames);
 
@@ -669,12 +729,9 @@ function reconstructBaseballTeamGames(teamId, capturedGames = []) {
     identity: authoritative[index].identity,
     excludedFromOfficialTotals: false,
   }));
-  const ambiguousResults = ambiguous.map(({ game, identity }) => ({
-    ...reconstructBaseballGame(game),
-    identity,
-    excludedFromOfficialTotals: true,
-  }));
+  const ambiguousResults = ambiguous.map(({ game, identity }) => reconstructAmbiguousDiagnostic(game, identity));
   const ambiguousComponents = new Set(ambiguous.map(({ identity }) => identity.reconciliation.componentId)).size;
+  const failedAmbiguousDiagnostics = ambiguousResults.filter((result) => result.diagnosticReconstruction.status === 'error').length;
 
   return {
     summary: {
@@ -682,6 +739,8 @@ function reconstructBaseballTeamGames(teamId, capturedGames = []) {
       ambiguousInputRecords: ambiguous.length,
       ambiguousComponents,
       excludedFromOfficialTotals: ambiguous.length,
+      failedAmbiguousDiagnostics,
+      officialTotalsComplete: ambiguous.length === 0,
     },
     gameResults: [...authoritativeResults, ...ambiguousResults].sort((a, b) => codePointCompare(a.identity.key, b.identity.key)),
   };
@@ -735,8 +794,13 @@ function toStatsEngineGame(capturedGame) {
  * They are NOT discarded from the response, though -- `gameIdentities`
  * still lists every input record exactly once (including ambiguous ones),
  * so a caller can see the full reconciliation evidence. `ambiguousInputRecords`
- * / `excludedFromOfficialTotals` report how many records were withheld from
- * accumulation for this reason.
+ * / `excludedFromOfficialTotals` / `officialTotalsComplete` report how many
+ * records were withheld from accumulation for this reason, using the same
+ * field names and semantics as reconstructBaseballTeamGames's `summary`.
+ * computeBaseballStats never reconstructs ambiguous records the way
+ * reconstructBaseballTeamGames does for diagnostic display, so it has no
+ * equivalent of that function's per-record diagnostic-reconstruction error
+ * boundary to expose here.
  *
  * @param {object[]} capturedGames - Games whose box-score rows carry an
  *   explicit own boolean and may carry a durable playerId.
@@ -766,6 +830,7 @@ function computeBaseballStats(capturedGames = []) {
     gameIdentities: reconciled.map(({ identity }) => identity),
     ambiguousInputRecords,
     excludedFromOfficialTotals: ambiguousInputRecords,
+    officialTotalsComplete: ambiguousInputRecords === 0,
     unattributedErrors: {
       ownSide: legacyResult.unattributedErrors.ourSide,
       opponentSide: legacyResult.unattributedErrors.opponentSide,
@@ -846,6 +911,6 @@ module.exports = {
   _internals: {
     toReconstructionInput, toStatsEngineGame, requireExplicitOwnBoolean, canonicalGameIdentity,
     reconcileGameCollection, stableStringify, clusterFallbackIdentities, relateDiscriminators, unionDiscriminators,
-    finalizeAmbiguousComponent,
+    finalizeAmbiguousComponent, normalizeThrownValue,
   },
 };
