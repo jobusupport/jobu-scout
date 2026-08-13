@@ -441,6 +441,11 @@ function materialSnapshotConflicts(candidates) {
 // instead of whichever single member's own provisional key happened to be
 // picked as `selected` -- so the same physical game converges on one key as
 // its evidence accumulates across replays, rather than forking per snapshot.
+// `authoritative: true` unconditionally -- every status this function can
+// produce (single/deduplicated/reconciled/conflict) already represents
+// EXACTLY ONE physical game's worth of evidence (candidates were proven to
+// be the same game before this was ever called), so it is always safe to
+// count toward summary.games / officialBatting / player totals.
 function finalizeResolvedGroup(candidates, keyOverride) {
   candidates.sort((a, b) => b.score - a.score || codePointCompare(a.serial, b.serial));
   const selected = candidates[0];
@@ -454,6 +459,7 @@ function finalizeResolvedGroup(candidates, keyOverride) {
     identity: {
       ...selected.identity,
       ...(keyOverride ? { key: keyOverride } : {}),
+      authoritative: true,
       reconciliation: {
         status,
         candidateCount: candidates.length,
@@ -466,12 +472,17 @@ function finalizeResolvedGroup(candidates, keyOverride) {
 }
 
 // Shared ordinal-disambiguation for candidates that could NOT be uniquely
-// resolved (either no evidence at all, or evidence proving nothing because
-// multiple mutually-incompatible candidates fit equally well). Content-based
-// (sorted by serialized fingerprint, never by original array position), so
-// output is deterministic under input reversal; an ordinal is only appended
-// when two candidates in the SAME scope are byte-identical, so identical
-// records are never accidentally fingerprint-deduplicated.
+// resolved to a single proven game AND ARE STILL COUNTED as one game each
+// (today: only the plain 'unresolved' bucket -- no schedule evidence at all,
+// so every retained record legitimately stands for its own indistinguishable
+// game; see "identical unresolved records remain two logical games"). This
+// is content-based (sorted by serialized fingerprint, never by original
+// array position), so output is deterministic under input reversal; an
+// ordinal is only appended when two candidates in the SAME scope are
+// byte-identical, so identical records are never accidentally
+// fingerprint-deduplicated. Ambiguous fallback candidates do NOT go through
+// this -- see finalizeAmbiguousComponent below, which shares the same
+// ordinal-disambiguation shape but is NEVER counted as a proven game.
 function scopeUnmatchedCandidates(candidates, keyPrefix, reconciliationFor) {
   const sorted = [...candidates].sort((a, b) => codePointCompare(a.serial, b.serial));
   const ordinalByFingerprint = new Map();
@@ -484,7 +495,76 @@ function scopeUnmatchedCandidates(candidates, keyPrefix, reconciliationFor) {
         ...candidate.identity,
         key: `${keyPrefix}:${stableStringify([candidate.serial, ordinal])}`,
         scopeOrdinal: ordinal,
+        authoritative: true,
         reconciliation: reconciliationFor(candidate),
+      },
+    };
+  });
+}
+
+// Builds output records for ONE ambiguous fallback component (a non-clique
+// connected component from clusterFallbackIdentities: every member is
+// individually compatible with at least one sibling, but the component as a
+// whole is not a full clique, so no subset can be safely merged and the
+// engine cannot prove how many distinct physical games it represents -- see
+// clusterFallbackIdentities's own header for why a non-clique component is
+// never merged).
+//
+// Every member is preserved EXACTLY ONCE, keyed by its own provisional
+// identity plus a component-scoped ordinal (only incremented when two
+// members are byte-identical) -- this disambiguates the OUTPUT KEY only; it
+// is never proof that two members are the same logical game, and identical
+// members are NEVER fingerprint-merged here. `componentId` is a stable,
+// content-derived identifier for this specific component (never a global
+// counter, never array position), so metadata for one ambiguous component
+// can never be confused with a different, unrelated component's -- this is
+// the fix for the metadata cross-contamination defect: reconcileGameCollection
+// used to flatten every ambiguous component in the whole collection into one
+// array before computing candidateCount/candidateFingerprints, so unrelated
+// components (different dates, different teams, or simply a different
+// disconnected component within the same foundational partition) leaked each
+// other's sibling counts. Metadata here is computed from THIS component's
+// `members` only.
+//
+// Unit contract (documented once, applies to every ambiguous component):
+// `candidateCount` counts RECORDS in this component, including duplicates.
+// `candidateFingerprints` lists this component's UNIQUE fingerprints,
+// sorted. A duplicate inside a component is therefore visible as
+// `candidateCount > candidateFingerprints.length` -- multiplicity is exposed
+// via that difference, never silently absorbed by either field alone.
+//
+// `authoritative: false` on every member: see reconstructBaseballTeamGames
+// and computeBaseballStats, which exclude these from summary.games,
+// officialBatting/officialPitching, and player accumulation. This is NOT a
+// fingerprint-based deduplication (a byte-identical repeat inside this
+// component still produces its own separate output record above, with its
+// own ordinal) -- it is a statement that NONE of this component's evidence
+// is safe to count as a proven game, whether or not it happens to repeat.
+function finalizeAmbiguousComponent(members) {
+  const componentId = `component:${stableStringify(members.map((member) => member.serial).sort(codePointCompare))}`;
+  const candidateFingerprints = [...new Set(members.map((member) => member.serial))].sort(codePointCompare);
+  const sorted = [...members].sort((a, b) => codePointCompare(a.serial, b.serial));
+  const ordinalByFingerprint = new Map();
+  return sorted.map((candidate) => {
+    const ordinal = (ordinalByFingerprint.get(candidate.serial) || 0) + 1;
+    ordinalByFingerprint.set(candidate.serial, ordinal);
+    return {
+      game: candidate.game,
+      identity: {
+        ...candidate.identity,
+        key: `ambiguous:${stableStringify([componentId, candidate.serial, ordinal])}`,
+        scopeOrdinal: ordinal,
+        authoritative: false,
+        reconciliation: {
+          status: 'ambiguous',
+          componentId,
+          candidateCount: members.length,
+          conflictFields: [],
+          candidateFingerprints,
+          selectedFingerprint: candidate.serial,
+          automaticDeduplication: false,
+          reason: 'multiple schedule candidates are each individually compatible but conflict with one another; cannot uniquely reconcile',
+        },
       },
     };
   });
@@ -517,11 +597,12 @@ function reconcileGameCollection(games) {
 
   // Fallback identity is conservative candidate matching, not an exact key
   // lookup: cluster first (see clusterFallbackIdentities), THEN decide
-  // status from the cluster's own members.
-  const ambiguousCandidates = [];
+  // status from EACH cluster's own members -- never pooled across clusters
+  // (that pooling was the metadata cross-contamination defect; see
+  // finalizeAmbiguousComponent's header).
   for (const cluster of clusterFallbackIdentities(fallbackEntries)) {
     if (cluster.ambiguous) {
-      ambiguousCandidates.push(...cluster.members);
+      reconciled.push(...finalizeAmbiguousComponent(cluster.members));
       continue;
     }
     const keyOverride = cluster.members.length > 1
@@ -531,23 +612,6 @@ function reconcileGameCollection(games) {
       })}`
       : undefined;
     reconciled.push(finalizeResolvedGroup(cluster.members, keyOverride));
-  }
-
-  // Ambiguous fallback candidates keep their OWN provisional per-record
-  // identity (never another candidate's), tagged with which sibling
-  // fingerprints made the match unprovable -- proof, not a coin flip,
-  // decides which record a caller sees data attached to.
-  if (ambiguousCandidates.length) {
-    const siblingFingerprints = [...new Set(ambiguousCandidates.map((candidate) => candidate.serial))].sort(codePointCompare);
-    reconciled.push(...scopeUnmatchedCandidates(ambiguousCandidates, 'ambiguous', (candidate) => ({
-      status: 'ambiguous',
-      candidateCount: ambiguousCandidates.length,
-      conflictFields: [],
-      candidateFingerprints: siblingFingerprints,
-      selectedFingerprint: candidate.serial,
-      automaticDeduplication: false,
-      reason: 'multiple schedule candidates are each individually compatible but conflict with one another; cannot uniquely reconcile',
-    })));
   }
 
   reconciled.push(...scopeUnmatchedCandidates(unresolved, 'unresolved', (candidate) => ({
@@ -567,25 +631,59 @@ function reconcileGameCollection(games) {
  * team through the authoritative reconstruction core after collection
  * reconciliation and explicit own/opponent boundary translation.
  *
+ * Ambiguous fallback records (identity.authoritative === false -- see
+ * reconcileGameCollection/finalizeAmbiguousComponent) are EXCLUDED from
+ * `summary` (summary.games, officialBatting, officialPitching, and every
+ * other aggregate reconstructTeamGames computes): the engine cannot prove
+ * how many distinct physical games an ambiguous component represents, so it
+ * never counts toward "official" totals, whether or not it happens to
+ * repeat a byte-identical snapshot. They are NOT discarded, though -- each
+ * still gets its own per-game reconstruction (own/opponent totals for that
+ * specific snapshot in isolation) and appears in `gameResults` tagged
+ * `excludedFromOfficialTotals: true`, so a caller who wants to inspect the
+ * raw evidence still can. `summary.ambiguousInputRecords` /
+ * `summary.ambiguousComponents` / `summary.excludedFromOfficialTotals` tell
+ * a caller when official totals are incomplete because of this.
+ *
  * @param {string} teamId
  * @param {object[]} capturedGames
  * @returns {{ summary: object, gameResults: object[] }} `gameResults` uses
  *   this module's own/opponent vocabulary (see toEngineGameResult above).
- *   `summary` is passed through from reconstructTeamGames() unchanged
- *   (its own/opponent framing was already unambiguous: it reports on
- *   whichever games were handed to it, aggregated from each game's already-
- *   translated `scouted` bucket).
+ *   `summary`'s own/opponent-aggregate fields are passed through from
+ *   reconstructTeamGames() unchanged, computed only over the authoritative
+ *   subset, plus the ambiguity-disclosure fields documented above.
  */
 function reconstructBaseballTeamGames(teamId, capturedGames = []) {
   if (!Array.isArray(capturedGames)) {
     throw new Error('baseball-engine: capturedGames must be an array');
   }
   const reconciled = reconcileGameCollection(capturedGames);
-  const translatedGames = reconciled.map(({ game }) => toReconstructionInput(game));
+  const authoritative = reconciled.filter(({ identity }) => identity.authoritative !== false);
+  const ambiguous = reconciled.filter(({ identity }) => identity.authoritative === false);
+
+  const translatedGames = authoritative.map(({ game }) => toReconstructionInput(game));
   const { summary, gameResults } = reconstructTeamGames(teamId, translatedGames);
+
+  const authoritativeResults = gameResults.map((result, index) => ({
+    ...toEngineGameResult(result),
+    identity: authoritative[index].identity,
+    excludedFromOfficialTotals: false,
+  }));
+  const ambiguousResults = ambiguous.map(({ game, identity }) => ({
+    ...reconstructBaseballGame(game),
+    identity,
+    excludedFromOfficialTotals: true,
+  }));
+  const ambiguousComponents = new Set(ambiguous.map(({ identity }) => identity.reconciliation.componentId)).size;
+
   return {
-    summary,
-    gameResults: gameResults.map((result, index) => ({ ...toEngineGameResult(result), identity: reconciled[index].identity })),
+    summary: {
+      ...summary,
+      ambiguousInputRecords: ambiguous.length,
+      ambiguousComponents,
+      excludedFromOfficialTotals: ambiguous.length,
+    },
+    gameResults: [...authoritativeResults, ...ambiguousResults].sort((a, b) => codePointCompare(a.identity.key, b.identity.key)),
   };
 }
 
@@ -628,21 +726,36 @@ function toStatsEngineGame(capturedGame) {
  * Durable player IDs control accumulation whenever available; unresolved
  * identities remain separate and carry explicit context.
  *
+ * Ambiguous fallback records (identity.authoritative === false -- see
+ * reconcileGameCollection/finalizeAmbiguousComponent) are EXCLUDED from
+ * player accumulation: the engine cannot prove how many distinct physical
+ * games an ambiguous component represents, so none of its batting/pitching/
+ * fielding/game-count contributions are safe to attribute to a player,
+ * whether or not the component happens to contain a byte-identical repeat.
+ * They are NOT discarded from the response, though -- `gameIdentities`
+ * still lists every input record exactly once (including ambiguous ones),
+ * so a caller can see the full reconciliation evidence. `ambiguousInputRecords`
+ * / `excludedFromOfficialTotals` report how many records were withheld from
+ * accumulation for this reason.
+ *
  * @param {object[]} capturedGames - Games whose box-score rows carry an
  *   explicit own boolean and may carry a durable playerId.
  * @returns {object} Own/opponent batter and pitcher maps, unresolved maps,
- *   game reconciliation provenance, and unattributed error counts.
+ *   game reconciliation provenance (all input records), ambiguity-exclusion
+ *   counts, and unattributed error counts.
  */
 function computeBaseballStats(capturedGames = []) {
   if (!Array.isArray(capturedGames)) {
     throw new Error('baseball-engine: capturedGames must be an array');
   }
   const reconciled = reconcileGameCollection(capturedGames);
-  const translatedGames = reconciled.map(({ game, identity }) => toStatsEngineGame({
+  const authoritative = reconciled.filter(({ identity }) => identity.authoritative !== false);
+  const translatedGames = authoritative.map(({ game, identity }) => toStatsEngineGame({
     ...game,
     meta: { ...(game?.meta || {}), engineGameIdentity: identity },
   }));
   const legacyResult = processGames(translatedGames);
+  const ambiguousInputRecords = reconciled.length - authoritative.length;
   return {
     ownBatters: legacyResult.players,
     opponentBatters: legacyResult.opponentBatters,
@@ -651,6 +764,8 @@ function computeBaseballStats(capturedGames = []) {
     unresolvedBatters: legacyResult.unresolvedBatters,
     unresolvedPitchers: legacyResult.unresolvedPitchers,
     gameIdentities: reconciled.map(({ identity }) => identity),
+    ambiguousInputRecords,
+    excludedFromOfficialTotals: ambiguousInputRecords,
     unattributedErrors: {
       ownSide: legacyResult.unattributedErrors.ourSide,
       opponentSide: legacyResult.unattributedErrors.opponentSide,
@@ -731,5 +846,6 @@ module.exports = {
   _internals: {
     toReconstructionInput, toStatsEngineGame, requireExplicitOwnBoolean, canonicalGameIdentity,
     reconcileGameCollection, stableStringify, clusterFallbackIdentities, relateDiscriminators, unionDiscriminators,
+    finalizeAmbiguousComponent,
   },
 };
