@@ -25,7 +25,7 @@
  */
 
 const { reconstructGame, reconstructTeamGames } = require('./reconstruct-core');
-const { normalizeGameData } = require('./normalize-core');
+const { normalizeGameData, normalizeDateCandidate } = require('./normalize-core');
 const { processGames } = require('./stats-core');
 
 // ─── Shared ownership-translation helpers ──────────────────────────────────
@@ -66,27 +66,37 @@ function toReconstructionRow(row, rowKind, index) {
 // own/opponent contract exists to catch rather than paper over, so it is
 // checked and rejected here, at the one place both reconstructBaseballGame
 // and reconstructBaseballTeamGames funnel through.
-function assertNoContradictorySideMetadata(capturedGame, rowKind, rows) {
-  const ownByVenue = new Map(); // normalized TeamSide -> own boolean seen there
-  rows.forEach((row, index) => {
-    const venue = String(row?.TeamSide ?? row?.teamSide ?? '').trim().toLowerCase();
-    if (!venue || typeof row?.own !== 'boolean') return; // unresolvable venue can't be checked; requireExplicitOwnBoolean already covers missing `own`
+function assertNoContradictorySideMetadata(capturedGame) {
+  const ownByVenue = new Map();
+  const venueByOwnership = new Map();
+  const box = capturedGame?.boxScore || {};
+  const rowFamilies = [
+    'batting', 'pitching', 'fielding',
+    'awayBatting', 'homeBatting', 'awayPitching', 'homePitching',
+    'awayFielding', 'homeFielding',
+  ];
+  for (const rowKind of rowFamilies) for (const [index, row] of (box[rowKind] || []).entries()) {
+    const venue = String(row?.TeamSide ?? row?.teamSide ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!venue || typeof row?.own !== 'boolean') continue;
     const existing = ownByVenue.get(venue);
     if (existing === undefined) {
       ownByVenue.set(venue, row.own);
-      return;
+    } else if (existing !== row.own) {
+      throw new Error(`baseball-engine: contradictory side metadata in boxScore.${rowKind}[${index}] -- TeamSide "${venue}" is already associated with own:${existing}, but this row has own:${row.own}.`);
     }
-    if (existing !== row.own) {
-      throw new Error(`baseball-engine: contradictory side metadata in ${rowKind}[${index}] -- this game already has a row with TeamSide "${venue}" and own:${existing}, but this row has TeamSide "${venue}" and own:${row.own}. A single venue side cannot be both own and opponent within one game.`);
+    const ownershipKey = row.own ? 'own' : 'opponent';
+    const existingVenue = venueByOwnership.get(ownershipKey);
+    if (existingVenue === undefined) venueByOwnership.set(ownershipKey, venue);
+    else if (existingVenue !== venue) {
+      throw new Error(`baseball-engine: contradictory side metadata in boxScore.${rowKind}[${index}] -- ${ownershipKey} is already associated with TeamSide "${existingVenue}", but this row uses "${venue}".`);
     }
-  });
+  }
 }
 
 function toReconstructionInput(capturedGame) {
   const batting = capturedGame?.boxScore?.batting || [];
   const pitching = capturedGame?.boxScore?.pitching || [];
-  assertNoContradictorySideMetadata(capturedGame, 'boxScore.batting', batting);
-  assertNoContradictorySideMetadata(capturedGame, 'boxScore.pitching', pitching);
+  assertNoContradictorySideMetadata(capturedGame);
   return {
     ...capturedGame,
     boxScore: {
@@ -130,10 +140,17 @@ function reconstructBaseballGame(capturedGame) {
   return toEngineGameResult(legacyResult);
 }
 
+function codePointCompare(left, right) {
+  const a = String(left);
+  const b = String(right);
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 function stableStringify(value) {
+  if (value === undefined) return '{"$type":"undefined"}';
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
   if (value && typeof value === 'object') {
-    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
+    return `{${Object.keys(value).sort(codePointCompare).map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
   }
   return JSON.stringify(value);
 }
@@ -141,7 +158,7 @@ function stableStringify(value) {
 function meaningfulIdentityPart(value) {
   if (value === null || value === undefined) return null;
   const normalized = String(value).replace(/\s+/g, ' ').trim();
-  if (!normalized || ['unknown', '__pending__', 'tbd', 'n/a'].includes(normalized.toLowerCase())) return null;
+  if (!normalized || ['unknown', '__pending__', 'tba', 'tbd', 'n/a', 'none', '-', 'null'].includes(normalized.toLowerCase())) return null;
   return normalized;
 }
 
@@ -153,18 +170,65 @@ function firstMeaningfulIdentityPart(...values) {
   return null;
 }
 
+function canonicalTextIdentityPart(value) {
+  return meaningfulIdentityPart(value)?.toLowerCase() ?? null;
+}
+
+function canonicalScheduleTime(value) {
+  const raw = meaningfulIdentityPart(value);
+  if (!raw) return null;
+  const twelveHour = raw.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([ap])\.?m\.?$/i);
+  if (twelveHour) {
+    let hour = Number(twelveHour[1]);
+    const minute = Number(twelveHour[2]);
+    const second = twelveHour[3] == null ? null : Number(twelveHour[3]);
+    if (hour < 1 || hour > 12 || minute > 59 || (second != null && second > 59)) return null;
+    if (twelveHour[4].toLowerCase() === 'p' && hour !== 12) hour += 12;
+    if (twelveHour[4].toLowerCase() === 'a' && hour === 12) hour = 0;
+    return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}${second ? `:${String(second).padStart(2, '0')}` : ''}`;
+  }
+  const twentyFourHour = raw.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (twentyFourHour) {
+    const hour = Number(twentyFourHour[1]);
+    const minute = Number(twentyFourHour[2]);
+    const second = twentyFourHour[3] == null ? null : Number(twentyFourHour[3]);
+    if (hour > 23 || minute > 59 || (second != null && second > 59)) return null;
+    return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}${second ? `:${String(second).padStart(2, '0')}` : ''}`;
+  }
+  return raw.toLowerCase();
+}
+
+function scheduleDiscriminators(meta) {
+  const discriminators = {};
+  const start = firstMeaningfulIdentityPart(meta.scheduledStart, meta.startTime);
+  const components = {
+    start: canonicalScheduleTime(start),
+    gameNumber: canonicalTextIdentityPart(meta.gameNumber),
+    doubleheaderGame: canonicalTextIdentityPart(meta.doubleheaderGame),
+    scheduleOrdinal: canonicalTextIdentityPart(firstMeaningfulIdentityPart(meta.scheduleOrdinal, meta.ordinal)),
+    field: canonicalTextIdentityPart(firstMeaningfulIdentityPart(meta.field, meta.fieldName)),
+    venue: canonicalTextIdentityPart(firstMeaningfulIdentityPart(meta.venue, meta.venueName, meta.location)),
+    event: canonicalTextIdentityPart(firstMeaningfulIdentityPart(meta.event, meta.eventName)),
+  };
+  for (const [name, value] of Object.entries(components)) if (value) discriminators[name] = value;
+  return discriminators;
+}
+
 function canonicalGameIdentity(game) {
   const meta = game?.meta || {};
   const durableId = firstMeaningfulIdentityPart(meta.sourceGameId, meta.gameId, game?.sourceGameId, game?.gameId);
   if (durableId) {
     return { key: `source:${stableStringify([durableId])}`, resolved: true, method: 'sourceGameId', durable: true };
   }
-  const date = firstMeaningfulIdentityPart(meta.gameDate, meta.date, game?.gameDate, game?.date);
-  const home = firstMeaningfulIdentityPart(meta.homeTeamId, meta.homeTeam, meta.homeTeamName)?.toLowerCase();
-  const away = firstMeaningfulIdentityPart(meta.awayTeamId, meta.awayTeam, meta.awayTeamName)?.toLowerCase();
-  const discriminator = firstMeaningfulIdentityPart(meta.scheduledStart, meta.startTime, meta.gameNumber, meta.doubleheaderGame)?.toLowerCase();
-  if (date && home && away && discriminator) {
-    return { key: `fallback:${stableStringify([date, home, away, discriminator])}`, resolved: true, method: 'scheduleComposite', durable: false };
+  const dateRaw = firstMeaningfulIdentityPart(meta.gameDate, meta.date, game?.gameDate, game?.date);
+  const date = dateRaw ? normalizeDateCandidate(dateRaw) : null;
+  const home = canonicalTextIdentityPart(firstMeaningfulIdentityPart(meta.homeTeamId, meta.homeTeam, meta.homeTeamName));
+  const away = canonicalTextIdentityPart(firstMeaningfulIdentityPart(meta.awayTeamId, meta.awayTeam, meta.awayTeamName));
+  const discriminators = scheduleDiscriminators(meta);
+  const hasScheduleSlot = ['start', 'gameNumber', 'doubleheaderGame', 'scheduleOrdinal']
+    .some((name) => Object.prototype.hasOwnProperty.call(discriminators, name));
+  if (date && home && away && hasScheduleSlot) {
+    return { key: `fallback:${stableStringify({ date, home, away, discriminators })}`, resolved: true, method: 'scheduleComposite', durable: false };
   }
   return {
     key: null,
@@ -181,7 +245,7 @@ function snapshotScore(game) {
   const rows = ['batting', 'pitching', 'awayBatting', 'homeBatting', 'awayPitching', 'homePitching']
     .reduce((sum, key) => sum + (Array.isArray(box[key]) ? box[key].length : 0), 0);
   const plays = Array.isArray(game?.plays) ? game.plays.length : Array.isArray(game?.plays?.events) ? game.plays.events.length : 0;
-  const complete = game?.meta?.status === 'final' || game?.meta?.complete === true ? 1000000 : 0;
+  const complete = isFinalSnapshot(game) ? 1000000 : 0;
   return complete + rows * 1000 + plays;
 }
 
@@ -230,7 +294,7 @@ function materialSnapshotConflicts(candidates) {
       .filter((value) => typeof value === 'boolean'));
     if (values.size > 1) conflicts.add(`ownership.${side}`);
   }
-  return [...conflicts].sort();
+  return [...conflicts].sort(codePointCompare);
 }
 
 function reconcileGameCollection(games) {
@@ -249,7 +313,7 @@ function reconcileGameCollection(games) {
 
   const reconciled = [];
   for (const [key, candidates] of resolvedBuckets) {
-    candidates.sort((a, b) => b.score - a.score || a.serial.localeCompare(b.serial));
+    candidates.sort((a, b) => b.score - a.score || codePointCompare(a.serial, b.serial));
     const selected = candidates[0];
     const uniqueFingerprints = [...new Set(candidates.map((candidate) => candidate.serial))];
     const conflictFields = materialSnapshotConflicts(candidates);
@@ -264,14 +328,14 @@ function reconcileGameCollection(games) {
           status,
           candidateCount: candidates.length,
           conflictFields,
-          candidateFingerprints: uniqueFingerprints.sort(),
+          candidateFingerprints: uniqueFingerprints.sort(codePointCompare),
           selectedFingerprint: selected.serial,
         },
       },
     });
   }
 
-  unresolved.sort((a, b) => a.serial.localeCompare(b.serial));
+  unresolved.sort((a, b) => codePointCompare(a.serial, b.serial));
   const ordinalByFingerprint = new Map();
   for (const candidate of unresolved) {
     const ordinal = (ordinalByFingerprint.get(candidate.serial) || 0) + 1;
@@ -295,7 +359,7 @@ function reconcileGameCollection(games) {
     });
   }
 
-  return reconciled.sort((a, b) => a.identity.key.localeCompare(b.identity.key));
+  return reconciled.sort((a, b) => codePointCompare(a.identity.key, b.identity.key));
 }
 
 /**
@@ -343,6 +407,7 @@ function toStatsEngineRow(row, rowKind, index) {
 
 function toStatsEngineGame(capturedGame) {
   const box = capturedGame?.boxScore || {};
+  assertNoContradictorySideMetadata(capturedGame);
   const mapSide = (rows, rowKind) => (Array.isArray(rows) ? rows.map((row, i) => toStatsEngineRow(row, rowKind, i)) : rows);
   return {
     ...capturedGame,

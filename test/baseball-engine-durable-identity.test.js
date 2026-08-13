@@ -4,8 +4,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { computeBaseballStats } = require('../src/engine/baseball-engine');
 
-function game(id, batting, plays, ourSide = 'home') {
-  return { meta: { gameId: id, ourSide }, boxScore: { batting, pitching: [] }, plays };
+function game(id, batting, plays, ourSide = 'home', pitching = []) {
+  return { meta: { gameId: id, ourSide }, boxScore: { batting, pitching }, plays };
 }
 
 test('same-named players with different durable IDs remain separate and correct', () => {
@@ -189,4 +189,153 @@ test('durable fielding totals are deterministic under alternate game ordering', 
   assert.deepEqual(forward, reverse);
   assert.equal(forward.ownBatters['bailey-id'].E, 2);
   assert.equal(forward.ownBatters['bailey-id'].games, 2);
+});
+
+test('explicit batter ID resolves the correct opposing side without inning context', () => {
+  const stats = computeBaseballStats([game('id-side-batter', [
+    { Player: 'Jordan Smith', own: true, TeamSide: 'home', playerId: 'own-jordan' },
+    { Player: 'Jordan Smith', own: false, TeamSide: 'away', playerId: 'opp-jordan' },
+  ], [
+    { batterId: 'opp-jordan', text: 'Single. Jordan Smith singles to left field, Dana Pitcher pitching.' },
+  ])]);
+  assert.equal(stats.opponentBatters['opp-jordan'].H, 1);
+  assert.deepEqual(stats.unresolvedBatters, {});
+});
+
+test('explicit pitcher ID resolves the correct opposing side without inning context', () => {
+  const stats = computeBaseballStats([game('id-side-pitcher', [
+    { Player: 'Alex Batter', own: true, TeamSide: 'home', playerId: 'alex-batter' },
+  ], [
+    { batterId: 'alex-batter', pitcherId: 'opp-pitcher', text: 'Single. Alex Batter singles to left field, Jordan Smith pitching.' },
+  ], 'home', [
+    { Player: 'Jordan Smith', own: true, TeamSide: 'home', playerId: 'own-pitcher' },
+    { Player: 'Jordan Smith', own: false, TeamSide: 'away', playerId: 'opp-pitcher' },
+  ])]);
+  assert.equal(stats.opponentPitchers['opp-pitcher'].H, 1);
+  assert.deepEqual(stats.unresolvedPitchers, {});
+});
+
+test('durable batter and pitcher IDs survive play-text name variations', () => {
+  const stats = computeBaseballStats([game('id-name-variation', [
+    { Player: 'Canonical Batter', own: true, TeamSide: 'home', playerId: 'batter-id' },
+  ], [
+    { batterId: 'batter-id', pitcherId: 'pitcher-id', text: 'Single. Changed Batter singles to left field, Changed Pitcher pitching.' },
+  ], 'home', [
+    { Player: 'Canonical Pitcher', own: false, TeamSide: 'away', playerId: 'pitcher-id' },
+  ])]);
+  assert.equal(stats.ownBatters['batter-id'].name, 'Canonical Batter');
+  assert.equal(stats.ownBatters['batter-id'].H, 1);
+  assert.equal(stats.opponentPitchers['pitcher-id'].name, 'Canonical Pitcher');
+  assert.equal(stats.opponentPitchers['pitcher-id'].H, 1);
+});
+
+test('supplied ID conflicts and unknown IDs remain explicit with the ID retained', () => {
+  const conflict = computeBaseballStats([game('id-conflict', [
+    { Player: 'Jordan Smith', own: true, TeamSide: 'home', playerId: 'own-jordan' },
+    { Player: 'Jordan Smith', own: false, TeamSide: 'away', playerId: 'opp-jordan' },
+  ], [
+    { inning: 'Bottom 1', batterId: 'opp-jordan', text: 'Single. Jordan Smith singles to left field, Dana Pitcher pitching.' },
+  ])]);
+  const conflictRecord = Object.values(conflict.unresolvedBatters)[0];
+  assert.equal(conflictRecord.identity.playerId, 'opp-jordan');
+  assert.match(conflictRecord.identity.reason, /conflict/i);
+
+  const unknown = computeBaseballStats([game('id-unknown', [
+    { Player: 'Alex Batter', own: true, TeamSide: 'home', playerId: 'known-id' },
+  ], [
+    { batterId: 'unknown-id', text: 'Single. Alex Batter singles to left field, Dana Pitcher pitching.' },
+  ])]);
+  const unknownRecord = Object.values(unknown.unresolvedBatters)[0];
+  assert.equal(unknownRecord.identity.playerId, 'unknown-id');
+  assert.match(unknownRecord.identity.reason, /not found/i);
+});
+
+test('an ID present on both sides is never guessed', () => {
+  const stats = computeBaseballStats([game('id-ambiguous', [
+    { Player: 'Own Name', own: true, TeamSide: 'home', playerId: 'shared-id' },
+    { Player: 'Opponent Name', own: false, TeamSide: 'away', playerId: 'shared-id' },
+  ], [
+    { batterId: 'shared-id', batterName: 'Own Name', text: 'Single. Own Name singles to left field, Dana Pitcher pitching.' },
+  ])]);
+  const unresolved = Object.values(stats.unresolvedBatters);
+  assert.equal(unresolved.length, 1);
+  assert.equal(unresolved[0].identity.playerId, 'shared-id');
+  assert.match(unresolved[0].identity.reason, /multiple sides/i);
+});
+
+test('pitcher ID conflicts and unknown pitcher IDs remain explicit', () => {
+  const pitching = [
+    { Player: 'Own Pitcher', own: true, TeamSide: 'home', playerId: 'own-pitcher' },
+    { Player: 'Opponent Pitcher', own: false, TeamSide: 'away', playerId: 'opp-pitcher' },
+  ];
+  const conflict = computeBaseballStats([game('pitcher-conflict', [
+    { Player: 'Own Batter', own: true, TeamSide: 'home', playerId: 'own-batter' },
+  ], [
+    { inning: 'Bottom 1', batterId: 'own-batter', pitcherId: 'own-pitcher', text: 'Single. Own Batter singles to left field, Own Pitcher pitching.' },
+  ], 'home', pitching)]);
+  const conflictRecord = Object.values(conflict.unresolvedPitchers)[0];
+  assert.equal(conflictRecord.identity.playerId, 'own-pitcher');
+  assert.match(conflictRecord.identity.reason, /conflict/i);
+
+  const unknown = computeBaseballStats([game('pitcher-unknown', [
+    { Player: 'Own Batter', own: true, TeamSide: 'home', playerId: 'own-batter' },
+  ], [
+    { batterId: 'own-batter', pitcherId: 'missing-pitcher', text: 'Single. Own Batter singles to left field, Unknown Pitcher pitching.' },
+  ], 'home', pitching)]);
+  const unknownRecord = Object.values(unknown.unresolvedPitchers)[0];
+  assert.equal(unknownRecord.identity.playerId, 'missing-pitcher');
+  assert.match(unknownRecord.identity.reason, /not found/i);
+});
+
+test('position-only fielding honors a known durable ID without double counting', () => {
+  const stats = computeBaseballStats([game('position-fielding', [
+    { Player: 'Bailey Example', own: true, TeamSide: 'home', playerId: 'bailey-id' },
+    { Player: 'Away Hitter', own: false, TeamSide: 'away', playerId: 'away-id' },
+  ], [
+    { inning: 'Top 1', batterId: 'away-id', fielderId: 'bailey-id', text: 'Error. Away Hitter reaches on an error by shortstop, Dana Pitcher pitching.' },
+  ])]);
+  assert.equal(stats.ownBatters['bailey-id'].E, 1);
+  assert.deepEqual(stats.unattributedErrors, { ownSide: 0, opponentSide: 0 });
+});
+
+test('position-only unknown fielder ID remains explicit and game-scoped', () => {
+  const make = (id) => game(id, [
+    { Player: 'Away Hitter', own: false, TeamSide: 'away', playerId: `away-${id}` },
+  ], [
+    { inning: 'Top 1', batterId: `away-${id}`, fielderId: 'unknown-fielder', text: 'Error. Away Hitter reaches on an error by shortstop, Dana Pitcher pitching.' },
+  ]);
+  const stats = computeBaseballStats([make('field-a'), make('field-b')]);
+  const unresolved = Object.values(stats.unresolvedBatters).filter((row) => row.E === 1);
+  assert.equal(unresolved.length, 2);
+  assert.ok(unresolved.every((row) => row.identity.playerId === 'unknown-fielder'));
+  assert.ok(unresolved.every((row) => row.identity.position === 'SS'));
+  assert.deepEqual(stats.unattributedErrors, { ownSide: 0, opponentSide: 0 });
+  assert.deepEqual(stats, computeBaseballStats([make('field-b'), make('field-a')]));
+});
+
+test('position-only fielder ID conflicting with defense side is explicit, not reassigned', () => {
+  const stats = computeBaseballStats([game('position-conflict', [
+    { Player: 'Own Fielder', own: true, TeamSide: 'home', playerId: 'own-fielder' },
+    { Player: 'Own Hitter', own: true, TeamSide: 'home', playerId: 'own-hitter' },
+  ], [
+    { inning: 'Bottom 1', batterId: 'own-hitter', fielderId: 'own-fielder', text: 'Error. Own Hitter reaches on an error by shortstop, Dana Pitcher pitching.' },
+  ])]);
+  assert.equal(stats.ownBatters['own-fielder'], undefined);
+  const unresolved = Object.values(stats.unresolvedBatters).find((row) => row.E === 1);
+  assert.equal(unresolved.identity.playerId, 'own-fielder');
+  assert.equal(unresolved.identity.matchedSide, 'own');
+  assert.match(unresolved.identity.reason, /conflict/i);
+});
+
+test('special-string durable IDs remain distinct and cannot corrupt accumulator objects', () => {
+  const ids = ['__proto__', 'constructor', 'prototype', 'id:with|delimiters'];
+  const names = ['Alpha Example', 'Bravo Example', 'Charlie Example', 'Delta Example'];
+  const batting = ids.map((playerId, index) => ({ Player: names[index], own: true, TeamSide: 'home', playerId }));
+  const plays = ids.map((batterId, index) => ({ batterId, text: `Single. ${names[index]} singles to left field, Dana Pitcher pitching.` }));
+  const stats = computeBaseballStats([game('special-ids', batting, plays)]);
+  assert.deepEqual(Object.keys(stats.ownBatters).sort(), [...ids].sort());
+  for (const id of ids) {
+    assert.equal(stats.ownBatters[id].playerId, id);
+    assert.equal(stats.ownBatters[id].H, 1);
+  }
 });

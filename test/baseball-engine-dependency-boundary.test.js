@@ -136,7 +136,9 @@ test('dependency boundary -- authoritative core never imports legacy adapters or
     assert.doesNotMatch(source, /require\([^)]*(?:normalizer|game-reconstructor|stats-engine)/);
     assert.doesNotMatch(source, /new\s+Date\s*\(\s*\)/);
     assert.doesNotMatch(source, /\bDate\.now\s*\(/);
+    assert.doesNotMatch(source, /\.localeCompare\s*\(/);
   }
+  assert.doesNotMatch(fs.readFileSync(ENGINE_ENTRY, 'utf8'), /\.localeCompare\s*\(/);
 });
 
 test('dependency boundary -- legacy Travel modules are narrow adapters over one authoritative core each', () => {

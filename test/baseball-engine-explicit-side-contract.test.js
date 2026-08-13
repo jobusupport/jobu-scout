@@ -83,6 +83,57 @@ test('reconstructBaseballTeamGames propagates the same contradictory-metadata re
   );
 });
 
+test('ownership validation rejects contradictions across batting and pitching row families', () => {
+  const game = {
+    meta: { gameId: 'cross-kind-ownership' },
+    boxScore: {
+      batting: [{ Player: 'A Batter', TeamSide: 'home', own: true }],
+      pitching: [{ Player: 'A Pitcher', TeamSide: 'home', own: false }],
+    },
+    plays: [],
+  };
+  assert.throws(() => reconstructBaseballGame(game), /contradictory side metadata/);
+  assert.throws(() => reconstructBaseballTeamGames('team', [game]), /contradictory side metadata/);
+  assert.throws(() => computeBaseballStats([game]), /contradictory side metadata/);
+});
+
+test('compatible ownership evidence across row families remains valid under row reordering', () => {
+  const game = {
+    meta: { gameId: 'compatible-kinds' },
+    boxScore: {
+      batting: [
+        { Player: 'Own Batter', TeamSide: 'home', own: true },
+        { Player: 'Opponent Batter', TeamSide: 'away', own: false },
+      ],
+      pitching: [
+        { Player: 'Own Pitcher', TeamSide: 'home', own: true },
+        { Player: 'Opponent Pitcher', TeamSide: 'away', own: false },
+      ],
+    },
+    plays: [],
+  };
+  const reversed = structuredClone(game);
+  reversed.boxScore.batting.reverse();
+  reversed.boxScore.pitching.reverse();
+  const first = reconstructBaseballGame(game);
+  const second = reconstructBaseballGame(reversed);
+  assert.equal(first.ownSide, 'home');
+  assert.equal(first.opponentSide, 'away');
+  assert.deepEqual(first, second);
+});
+
+test('ownership validation includes supported fielding rows when they carry ownership', () => {
+  assert.throws(() => reconstructBaseballGame({
+    meta: { gameId: 'fielding-ownership' },
+    boxScore: {
+      batting: [{ Player: 'Own Batter', TeamSide: 'home', own: true }],
+      pitching: [],
+      fielding: [{ Player: 'Contradictory Fielder', TeamSide: 'home', own: false }],
+    },
+    plays: [],
+  }), /contradictory side metadata/);
+});
+
 test('computeBaseballStats resolves one display name on both rosters from inning side', () => {
   const result = computeBaseballStats([{
     meta: { gameId: 'cross-side', ourSide: 'home' },

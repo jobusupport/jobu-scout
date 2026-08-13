@@ -9,6 +9,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { execFileSync } = require('node:child_process');
 const {
   reconstructBaseballGame,
   reconstructBaseballTeamGames,
@@ -232,6 +233,41 @@ test('normalize-core -- missing reference time remains unresolved and no capture
   assert.equal(first.game.gameDate, null);
   assert.equal(first.game.capturedAt, null);
   assert.deepEqual(raw, before);
+});
+
+test('normalize-core -- supported explicit-year dates are invariant across host timezones', () => {
+  const script = "const n=require('./src/engine/normalize-core'); console.log(JSON.stringify(['2026/04/12 23:30:00','04/12/2026 23:30:00','April 12, 2026, 11:30 PM','2026-04-12T23:30:00-05:00'].map(value=>n.normalizeDateCandidate(value))))";
+  const results = ['UTC', 'America/Chicago', 'Pacific/Kiritimati'].map((TZ) => JSON.parse(execFileSync(
+    process.execPath,
+    ['-e', script],
+    { cwd: process.cwd(), env: { ...process.env, TZ }, encoding: 'utf8' },
+  )));
+  assert.deepEqual(results[0], ['2026-04-12', '2026-04-12', '2026-04-12', '2026-04-12']);
+  assert.deepEqual(results[1], results[0]);
+  assert.deepEqual(results[2], results[0]);
+  assert.equal(normalizeCore.normalizeDateCandidate('12/04/26'), null, 'two-digit-year input is unsupported');
+});
+
+test('pure statistical ordering is invariant across host locale settings', () => {
+  const script = `
+    const { computeBaseballStats } = require('./src/engine/baseball-engine');
+    const games = [
+      { meta:{gameId:'locale-a'}, boxScore:{batting:[{Player:'Zulu Example',own:true,TeamSide:'home',playerId:'same-id'}],pitching:[]}, plays:[{batterId:'same-id',text:'Single. Zulu Example singles to left field, Dana Pitcher pitching.'}] },
+      { meta:{gameId:'locale-b'}, boxScore:{batting:[{Player:'Älpha Example',own:true,TeamSide:'home',playerId:'same-id'}],pitching:[]}, plays:[{batterId:'same-id',text:'Walk. Älpha Example walks, Dana Pitcher pitching.'}] },
+    ];
+    console.log(JSON.stringify(computeBaseballStats(games)));
+  `;
+  const results = ['en_US.UTF-8', 'sv_SE.UTF-8', 'de_DE.UTF-8'].map((locale) => execFileSync(
+    process.execPath,
+    ['-e', script],
+    { cwd: process.cwd(), env: { ...process.env, LANG: locale, LC_ALL: locale }, encoding: 'utf8' },
+  ));
+  assert.equal(results[1], results[0]);
+  assert.equal(results[2], results[0]);
+  const parsed = JSON.parse(results[0]);
+  assert.equal(parsed.ownBatters['same-id'].H, 1);
+  assert.equal(parsed.ownBatters['same-id'].BB, 1);
+  assert.equal(parsed.ownBatters['same-id'].name, 'Zulu Example');
 });
 
 // ── Game integrity: reconstructBaseballTeamGames aggregates correctly ──────

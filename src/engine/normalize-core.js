@@ -137,14 +137,28 @@ function normalizeDateCandidate(value, options = {}) {
   const raw = String(value).trim();
   if (!raw) return null;
 
-  const isoDate = raw.match(/\b(20\d{2}|19\d{2})-(\d{2})-(\d{2})\b/);
-  if (isoDate) return `${isoDate[1]}-${isoDate[2]}-${isoDate[3]}`;
+  const normalizedYmd = (year, month, day) => {
+    const y = Number(year);
+    const m = Number(month);
+    const d = Number(day);
+    const leapYear = y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0);
+    const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if (m < 1 || m > 12 || d < 1 || d > daysInMonth[m - 1]) return null;
+    return `${String(y).padStart(4, '0')}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+  };
+
+  // Game identity follows the explicit source calendar date. Even when an
+  // ISO timestamp carries an offset, do not convert the instant into a host
+  // timezone (which could move it to another game date).
+  const isoDate = raw.match(/\b(20\d{2}|19\d{2})-(\d{2})-(\d{2})(?=$|[T\s])/);
+  if (isoDate) return normalizedYmd(isoDate[1], isoDate[2], isoDate[3]);
+
+  const yearFirstSlashDate = raw.match(/\b((?:20|19)\d{2})[\/.](\d{1,2})[\/.](\d{1,2})\b/);
+  if (yearFirstSlashDate) return normalizedYmd(yearFirstSlashDate[1], yearFirstSlashDate[2], yearFirstSlashDate[3]);
 
   const slashDate = raw.match(/\b(\d{1,2})[\/.-](\d{1,2})[\/.-]((?:20|19)\d{2})\b/);
   if (slashDate) {
-    const month = String(slashDate[1]).padStart(2, '0');
-    const day = String(slashDate[2]).padStart(2, '0');
-    return `${slashDate[3]}-${month}-${day}`;
+    return normalizedYmd(slashDate[3], slashDate[1], slashDate[2]);
   }
 
   const MONTHS = {
@@ -160,14 +174,7 @@ function normalizeDateCandidate(value, options = {}) {
     const day = String(monthName[2]).padStart(2, '0');
     const year = monthName[3] || (Number.isInteger(options.referenceYear) ? String(options.referenceYear) : null);
     if (!year) return null;
-    if (month) return `${year}-${month}-${day}`;
-  }
-
-  // Date parsing is only deterministic when the input itself carries a
-  // four-digit year. Yearless values require options.referenceYear above.
-  if (/\b(?:19|20)\d{2}\b/.test(raw)) {
-    const parsed = new Date(raw);
-    if (!Number.isNaN(parsed.getTime())) return parsed.toISOString().slice(0, 10);
+    if (month) return normalizedYmd(year, month, day);
   }
 
   return null;

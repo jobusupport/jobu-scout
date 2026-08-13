@@ -616,6 +616,76 @@ function idMapFor(rows, wantOwn) {
   return map;
 }
 
+function codePointCompare(left, right) {
+  const a = String(left);
+  const b = String(right);
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+// Player IDs are normalized to strings at this boundary because the public
+// result contract exposes object keys. Null/undefined mean "not supplied";
+// a blank supplied ID is retained as unresolved evidence rather than treated
+// as a valid durable identity.
+function normalizedPlayerId(value) {
+  return value === null || value === undefined ? null : String(value);
+}
+
+function idIndexFor(rows, role) {
+  const index = new Map();
+  for (const row of rows || []) {
+    const playerId = normalizedPlayerId(row?.playerId);
+    if (playerId === null || playerId.trim() === '') continue;
+    if (!index.has(playerId)) index.set(playerId, []);
+    index.get(playerId).push({
+      side: row.isOurTeam ? 'own' : 'opponent',
+      name: row.Player || null,
+      role,
+    });
+  }
+  return index;
+}
+
+function combinedIdIndex(...indexes) {
+  const combined = new Map();
+  for (const index of indexes) for (const [playerId, entries] of index) {
+    if (!combined.has(playerId)) combined.set(playerId, []);
+    combined.get(playerId).push(...entries);
+  }
+  return combined;
+}
+
+function unresolvedIdentityKey(context, playerId, name, role) {
+  return `unresolved-player:${JSON.stringify([context, playerId, name || null, role])}`;
+}
+
+function resolveSuppliedIdentity(providedId, index, expectedSide, context, role, fallbackName) {
+  const playerId = normalizedPlayerId(providedId);
+  if (playerId === null) return null;
+  const matches = playerId.trim() ? (index.get(playerId) || []) : [];
+  const sides = new Set(matches.map((entry) => entry.side));
+  const names = [...new Set(matches.map((entry) => entry.name).filter(Boolean))].sort(codePointCompare);
+  const displayName = names[0] || fallbackName || null;
+  const unresolved = (reason, side = expectedSide || null, matchedSide = null) => ({
+    key: unresolvedIdentityKey(context, playerId, displayName, role),
+    playerId,
+    resolved: false,
+    reason,
+    side,
+    matchedSide,
+    displayName,
+    matches,
+  });
+
+  if (!playerId.trim()) return unresolved('supplied durable player ID is blank');
+  if (!matches.length) return unresolved('supplied durable player ID was not found on either side');
+  if (sides.size > 1) return unresolved('supplied durable player ID appears on multiple sides');
+  const side = [...sides][0];
+  if (expectedSide && expectedSide !== side) {
+    return unresolved(`supplied durable player ID conflicts with explicit ${role} side context`, expectedSide, side);
+  }
+  return { key: playerId, playerId, resolved: true, side, displayName, matches };
+}
+
 // Durable ID takes precedence over the display name as the accumulator key.
 // Without one, the public mode creates an explicit context-scoped unresolved
 // key; only Travel compatibility mode keeps the former plain-name key.
@@ -628,7 +698,7 @@ function identityFor(name, providedId, idByName, context, legacyIdentity) {
   }
   if (legacyIdentity) return { key: name, playerId: null, resolved: null };
   return {
-    key: `unresolved:${context}:${name}`,
+    key: unresolvedIdentityKey(context, null, name, 'name'),
     playerId: null,
     resolved: false,
     reason: ids?.size > 1
@@ -665,12 +735,12 @@ function resolveOffenseSideFromInning(play, ourSideVenue) {
  */
 function processGames(games, options = {}) {
   const legacyIdentity = options.legacyIdentity === true;
-  const players  = {};  // our batters
-  const pitchers = {};  // opponent pitchers (who pitched against us)
-  const opponentBatters = {}; // opponent batters
-  const ourPitchers = {};     // our pitchers
-  const unresolvedBatters = {};  // NEW: cross-side name collisions inning data couldn't resolve
-  const unresolvedPitchers = {}; // NEW: same, for pitchers
+  const players  = new Map();  // our batters
+  const pitchers = new Map();  // opponent pitchers (who pitched against us)
+  const opponentBatters = new Map(); // opponent batters
+  const ourPitchers = new Map();     // our pitchers
+  const unresolvedBatters = new Map();
+  const unresolvedPitchers = new Map();
   // Errors whose fielder couldn't be matched to a named roster player (no
   // name in the play text, or the name didn't match either roster) — tallied
   // by which side committed them rather than silently dropped or misattributed.
@@ -703,6 +773,9 @@ function processGames(games, options = {}) {
     const oppBatterIdByName = idMapFor(batting, false);
     const ownPitcherIdByName = idMapFor(pitching, true);
     const oppPitcherIdByName = idMapFor(pitching, false);
+    const batterIdIndex = idIndexFor(batting, 'batter');
+    const pitcherIdIndex = idIndexFor(pitching, 'pitcher');
+    const fielderIdIndex = combinedIdIndex(batterIdIndex, pitcherIdIndex);
 
     // Process each play
     for (const play of plays) {
@@ -729,6 +802,8 @@ function processGames(games, options = {}) {
       // real players of swing-decision data after recalculation.
       const structuredBatter = playProvidedName(play, 'batterName', 'batter_name', 'Batter');
       const structuredPitcher = playProvidedName(play, 'pitcherName', 'pitcher_name', 'Pitcher');
+      const parsedBatterFromText = pa.batter;
+      const parsedPitcherFromText = pa.pitcher;
 
       const structuredBatterName = isValidPlayerName(structuredBatter)
         ? rosterCanonicalName(structuredBatter, ourBatterNames, oppBatterNames)
@@ -758,67 +833,57 @@ function processGames(games, options = {}) {
       // the wrong player, since a player's position can change mid-game.
       for (const fielderInfo of pa.fielders) {
         const fielderName = fielderInfo.name;
+        const suppliedFielderId = playProvidedName(play, 'fielderId', 'fielder_id', 'FielderId');
         let attributed = false;
 
         if (legacyIdentity && fielderName) {
           if (ourBatterNames.has(fielderName)) {
-            if (!players[fielderName]) players[fielderName] = emptyPlayerStats(fielderName);
-            players[fielderName].E++;
+            if (!players.has(fielderName)) players.set(fielderName, emptyPlayerStats(fielderName));
+            players.get(fielderName).E++;
             attributed = true;
           } else if (ourPitcherNames.has(fielderName)) {
-            if (!ourPitchers[fielderName]) ourPitchers[fielderName] = emptyPitcherStats(fielderName);
-            ourPitchers[fielderName].E++;
+            if (!ourPitchers.has(fielderName)) ourPitchers.set(fielderName, emptyPitcherStats(fielderName));
+            ourPitchers.get(fielderName).E++;
             attributed = true;
           } else if (oppBatterNames.has(fielderName)) {
-            if (!opponentBatters[fielderName]) opponentBatters[fielderName] = emptyPlayerStats(fielderName);
-            opponentBatters[fielderName].E++;
+            if (!opponentBatters.has(fielderName)) opponentBatters.set(fielderName, emptyPlayerStats(fielderName));
+            opponentBatters.get(fielderName).E++;
             attributed = true;
           } else if (oppPitcherNames.has(fielderName)) {
-            if (!pitchers[fielderName]) pitchers[fielderName] = emptyPitcherStats(fielderName);
-            pitchers[fielderName].E++;
+            if (!pitchers.has(fielderName)) pitchers.set(fielderName, emptyPitcherStats(fielderName));
+            pitchers.get(fielderName).E++;
             attributed = true;
           }
-        } else if (fielderName) {
-          const suppliedFielderId = playProvidedName(play, 'fielderId', 'fielder_id', 'FielderId');
-          const mapContainsId = (idMap) => suppliedFielderId != null
-            && [...idMap.values()].some((ids) => ids.has(String(suppliedFielderId)));
+        } else if (!legacyIdentity && (fielderName || suppliedFielderId != null)) {
           const inOwn = ourBatterNames.has(fielderName) || ourPitcherNames.has(fielderName);
           const inOpponent = oppBatterNames.has(fielderName) || oppPitcherNames.has(fielderName);
-          const idInOwnBatting = mapContainsId(ownBatterIdByName);
-          const idInOwnPitching = mapContainsId(ownPitcherIdByName);
-          const idInOpponentBatting = mapContainsId(oppBatterIdByName);
-          const idInOpponentPitching = mapContainsId(oppPitcherIdByName);
-          const idInOwn = idInOwnBatting || idInOwnPitching;
-          const idInOpponent = idInOpponentBatting || idInOpponentPitching;
           const offenseSide = resolveOffenseSideFromInning(play, ourSide);
           const defenseSide = offenseSide ? (offenseSide === 'own' ? 'opponent' : 'own') : null;
-          let fielderSide = null;
-          if (idInOwn !== idInOpponent) fielderSide = idInOwn ? 'own' : 'opponent';
-          else if (inOwn && inOpponent) fielderSide = defenseSide;
-          else if (inOwn) fielderSide = 'own';
-          else if (inOpponent) fielderSide = 'opponent';
-
-          const onBattingRoster = fielderSide === 'own'
-            ? ourBatterNames.has(fielderName)
-            : fielderSide === 'opponent' ? oppBatterNames.has(fielderName) : false;
-          const onPitchingRoster = fielderSide === 'own'
-            ? ourPitcherNames.has(fielderName)
-            : fielderSide === 'opponent' ? oppPitcherNames.has(fielderName) : false;
-          const idOnBattingRoster = fielderSide === 'own' ? idInOwnBatting : fielderSide === 'opponent' ? idInOpponentBatting : false;
-          const idOnPitchingRoster = fielderSide === 'own' ? idInOwnPitching : fielderSide === 'opponent' ? idInOpponentPitching : false;
-          const role = idOnBattingRoster || onBattingRoster ? 'batter'
-            : idOnPitchingRoster || onPitchingRoster ? 'pitcher' : 'batter';
+          const suppliedIdentity = resolveSuppliedIdentity(
+            suppliedFielderId,
+            fielderIdIndex,
+            defenseSide,
+            `${gameId}:${defenseSide || 'unresolved'}:fielder`,
+            'fielder',
+            fielderName,
+          );
+          let fielderSide = suppliedIdentity?.side || null;
+          if (!suppliedIdentity) {
+            if (inOwn && inOpponent) fielderSide = defenseSide;
+            else if (inOwn) fielderSide = 'own';
+            else if (inOpponent) fielderSide = 'opponent';
+          }
+          const matchedRoles = new Set(suppliedIdentity?.matches?.map((entry) => entry.role) || []);
+          const role = matchedRoles.has('batter') || (!matchedRoles.size && (
+            (fielderSide === 'own' && ourBatterNames.has(fielderName))
+            || (fielderSide === 'opponent' && oppBatterNames.has(fielderName))
+          )) ? 'batter' : matchedRoles.has('pitcher') ? 'pitcher' : 'batter';
           const idMap = fielderSide === 'own'
             ? (role === 'batter' ? ownBatterIdByName : ownPitcherIdByName)
-            : fielderSide === 'opponent'
-              ? (role === 'batter' ? oppBatterIdByName : oppPitcherIdByName)
-              : null;
-          const identity = identityFor(
-            fielderName,
-            suppliedFielderId,
-            idMap,
-            `${gameId}:${fielderSide || 'unresolved'}:fielder`,
-            false,
+            : fielderSide === 'opponent' ? (role === 'batter' ? oppBatterIdByName : oppPitcherIdByName) : null;
+          const displayName = suppliedIdentity?.displayName || fielderName || `Unresolved ${fielderInfo.position || 'fielder'}`;
+          const identity = suppliedIdentity || identityFor(
+            displayName, null, idMap, `${gameId}:${fielderSide || 'unresolved'}:fielder`, false,
           );
           const resolvedMap = role === 'pitcher'
             ? (fielderSide === 'own' ? ourPitchers : pitchers)
@@ -826,24 +891,27 @@ function processGames(games, options = {}) {
           const statMap = !fielderSide || identity.resolved === false
             ? (role === 'pitcher' ? unresolvedPitchers : unresolvedBatters)
             : resolvedMap;
-          if (!statMap[identity.key]) {
-            statMap[identity.key] = role === 'pitcher'
-              ? emptyPitcherStats(fielderName, identity.playerId)
-              : emptyPlayerStats(fielderName, identity.playerId);
+          if (!statMap.has(identity.key)) {
+            const created = role === 'pitcher'
+              ? emptyPitcherStats(displayName, identity.playerId)
+              : emptyPlayerStats(displayName, identity.playerId);
             if (!fielderSide || identity.resolved === false) {
-              statMap[identity.key].identity = {
+              created.identity = {
                 resolved: false,
                 playerIdentityResolved: identity.resolved,
                 playerId: identity.playerId,
-                displayName: fielderName,
-                reason: !fielderSide ? 'fielder side could not be resolved' : identity.reason,
+                displayName,
+                reason: identity.reason || 'fielder side could not be resolved',
                 context: `${gameId}:${fielderSide || 'unresolved'}:fielder`,
                 side: fielderSide,
+                matchedSide: identity.matchedSide || null,
+                position: fielderInfo.position || null,
               };
             }
+            statMap.set(identity.key, created);
           }
-          statMap[identity.key].E++;
-          statMap[identity.key].games.add(gameId);
+          statMap.get(identity.key).E++;
+          statMap.get(identity.key).games.add(gameId);
           attributed = true;
         }
 
@@ -860,6 +928,17 @@ function processGames(games, options = {}) {
         }
       }
 
+      const suppliedBatterId = playProvidedName(play, 'batterId', 'batter_id', 'BatterId');
+      const expectedBatterSide = resolveOffenseSideFromInning(play, ourSide);
+      const suppliedBatterIdentity = legacyIdentity ? null : resolveSuppliedIdentity(
+        suppliedBatterId,
+        batterIdIndex,
+        expectedBatterSide,
+        `${gameId}:${expectedBatterSide || 'unresolved'}:batter`,
+        'batter',
+        pa.batter || structuredBatter || parsedBatterFromText,
+      );
+      if (suppliedBatterIdentity?.displayName) pa.batter = suppliedBatterIdentity.displayName;
       if (!pa.batter) continue;
 
       // ── Own/opponent/unresolved side resolution for the BATTER ─────────
@@ -868,7 +947,9 @@ function processGames(games, options = {}) {
       const batterInOwn = ourBatterNames.has(pa.batter);
       const batterInOpp = oppBatterNames.has(pa.batter);
       let batterSide;
-      if (legacyIdentity) {
+      if (suppliedBatterIdentity) {
+        batterSide = suppliedBatterIdentity.resolved ? suppliedBatterIdentity.side : 'unresolved';
+      } else if (legacyIdentity) {
         batterSide = ourBatterNames.size > 0 ? (batterInOwn ? 'own' : 'opponent') : 'own';
       } else if (batterInOwn && batterInOpp) {
         const resolved = resolveOffenseSideFromInning(play, ourSide);
@@ -880,27 +961,30 @@ function processGames(games, options = {}) {
       }
 
       const batterIdByName = batterSide === 'own' ? ownBatterIdByName : batterSide === 'opponent' ? oppBatterIdByName : null;
-      const suppliedBatterId = playProvidedName(play, 'batterId', 'batter_id', 'BatterId');
-      const batterIdentity = batterSide === 'unresolved'
-        ? { key: `unresolved:${gameId}:side:${pa.batter}`, resolved: false, playerId: null, reason: 'side could not be resolved' }
-        : identityFor(pa.batter, suppliedBatterId, batterIdByName, `${gameId}:${batterSide}:batter`, legacyIdentity);
+      const batterIdentity = suppliedBatterIdentity || (batterSide === 'unresolved'
+        ? { key: unresolvedIdentityKey(`${gameId}:side`, null, pa.batter, 'batter'), resolved: false, playerId: null, reason: 'side could not be resolved' }
+        : identityFor(pa.batter, suppliedBatterId, batterIdByName, `${gameId}:${batterSide}:batter`, legacyIdentity));
       const batterKey = batterIdentity.key;
       const batterMap = batterIdentity.resolved === false
         ? unresolvedBatters
         : batterSide === 'own' ? players : batterSide === 'opponent' ? opponentBatters : unresolvedBatters;
-      if (!batterMap[batterKey]) {
-        batterMap[batterKey] = emptyPlayerStats(pa.batter, batterIdentity.playerId);
+      if (!batterMap.has(batterKey)) {
+        const created = emptyPlayerStats(pa.batter, batterIdentity.playerId);
         if (batterIdentity.resolved === false) {
-          batterMap[batterKey].identity = {
+          created.identity = {
             resolved: false,
+            playerId: batterIdentity.playerId,
             displayName: pa.batter,
             reason: batterIdentity.reason,
             context: `${gameId}:${batterSide}:batter`,
+            side: batterIdentity.side || null,
+            matchedSide: batterIdentity.matchedSide || null,
           };
         }
+        batterMap.set(batterKey, created);
       }
-      const batter = batterMap[batterKey];
-      if (batter.playerId && pa.batter.localeCompare(batter.name) < 0) batter.name = pa.batter;
+      const batter = batterMap.get(batterKey);
+      if (batter.playerId && codePointCompare(pa.batter, batter.name) < 0) batter.name = pa.batter;
       batter.games.add(gameId);
 
       // PA counting
@@ -965,14 +1049,28 @@ function processGames(games, options = {}) {
       }
 
       // ── Update pitcher stats ──
-      if (pa.pitcher) {
+      const suppliedPitcherId = playProvidedName(play, 'pitcherId', 'pitcher_id', 'PitcherId');
+      if (pa.pitcher || (!legacyIdentity && suppliedPitcherId != null)) {
         // ── Own/opponent/unresolved side resolution for the PITCHER ──────
         // The pitcher is on DEFENSE, i.e. the opposite side from the
         // batter's offense side for this same play.
         const pitcherInOwn = ourPitcherNames.has(pa.pitcher);
         const pitcherInOpp = oppPitcherNames.has(pa.pitcher);
         let pitcherSide;
-        if (legacyIdentity) {
+        const offenseSide = resolveOffenseSideFromInning(play, ourSide);
+        const expectedPitcherSide = offenseSide ? (offenseSide === 'own' ? 'opponent' : 'own') : null;
+        const suppliedPitcherIdentity = legacyIdentity ? null : resolveSuppliedIdentity(
+          suppliedPitcherId,
+          pitcherIdIndex,
+          expectedPitcherSide,
+          `${gameId}:${expectedPitcherSide || 'unresolved'}:pitcher`,
+          'pitcher',
+          pa.pitcher || structuredPitcher || parsedPitcherFromText,
+        );
+        if (suppliedPitcherIdentity?.displayName) pa.pitcher = suppliedPitcherIdentity.displayName;
+        if (suppliedPitcherIdentity) {
+          pitcherSide = suppliedPitcherIdentity.resolved ? suppliedPitcherIdentity.side : 'unresolved';
+        } else if (legacyIdentity) {
           pitcherSide = ourPitcherNames.size > 0 ? (pitcherInOwn ? 'own' : 'opponent') : 'opponent';
         } else if (pitcherInOwn && pitcherInOpp) {
           const resolvedOffense = resolveOffenseSideFromInning(play, ourSide);
@@ -984,27 +1082,30 @@ function processGames(games, options = {}) {
         }
 
         const pitcherIdByName = pitcherSide === 'own' ? ownPitcherIdByName : pitcherSide === 'opponent' ? oppPitcherIdByName : null;
-        const suppliedPitcherId = playProvidedName(play, 'pitcherId', 'pitcher_id', 'PitcherId');
-        const pitcherIdentity = pitcherSide === 'unresolved'
-          ? { key: `unresolved:${gameId}:side:${pa.pitcher}`, resolved: false, playerId: null, reason: 'side could not be resolved' }
-          : identityFor(pa.pitcher, suppliedPitcherId, pitcherIdByName, `${gameId}:${pitcherSide}:pitcher`, legacyIdentity);
+        const pitcherIdentity = suppliedPitcherIdentity || (pitcherSide === 'unresolved'
+          ? { key: unresolvedIdentityKey(`${gameId}:side`, null, pa.pitcher, 'pitcher'), resolved: false, playerId: null, reason: 'side could not be resolved' }
+          : identityFor(pa.pitcher, suppliedPitcherId, pitcherIdByName, `${gameId}:${pitcherSide}:pitcher`, legacyIdentity));
         const pitcherKey = pitcherIdentity.key;
         const pitcherMap = pitcherIdentity.resolved === false
           ? unresolvedPitchers
           : pitcherSide === 'own' ? ourPitchers : pitcherSide === 'opponent' ? pitchers : unresolvedPitchers;
-        if (!pitcherMap[pitcherKey]) {
-          pitcherMap[pitcherKey] = emptyPitcherStats(pa.pitcher, pitcherIdentity.playerId);
+        if (!pitcherMap.has(pitcherKey)) {
+          const created = emptyPitcherStats(pa.pitcher, pitcherIdentity.playerId);
           if (pitcherIdentity.resolved === false) {
-            pitcherMap[pitcherKey].identity = {
+            created.identity = {
               resolved: false,
+              playerId: pitcherIdentity.playerId,
               displayName: pa.pitcher,
               reason: pitcherIdentity.reason,
               context: `${gameId}:${pitcherSide}:pitcher`,
+              side: pitcherIdentity.side || null,
+              matchedSide: pitcherIdentity.matchedSide || null,
             };
           }
+          pitcherMap.set(pitcherKey, created);
         }
-        const pitcher = pitcherMap[pitcherKey];
-        if (pitcher.playerId && pa.pitcher.localeCompare(pitcher.name) < 0) pitcher.name = pa.pitcher;
+        const pitcher = pitcherMap.get(pitcherKey);
+        if (pitcher.playerId && codePointCompare(pa.pitcher, pitcher.name) < 0) pitcher.name = pa.pitcher;
         pitcher.games.add(gameId);
         pitcher.BF++;
 
@@ -1055,7 +1156,9 @@ function processGames(games, options = {}) {
 function finalizeStats(statMap) {
   const result = {};
 
-  for (const [name, raw] of Object.entries(statMap)) {
+  const entries = statMap instanceof Map ? [...statMap.entries()] : Object.entries(statMap);
+  entries.sort(([left], [right]) => codePointCompare(left, right));
+  for (const [name, raw] of entries) {
     const s = { ...raw };
     s.games = s.games.size;
 
@@ -1145,7 +1248,12 @@ function finalizeStats(statMap) {
     delete s.sprayByCount;
     delete s.battedBalls;
 
-    result[name] = s;
+    Object.defineProperty(result, name, {
+      value: s,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
   }
 
   return result;

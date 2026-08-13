@@ -157,7 +157,7 @@ test('a complete normalized schedule composite resolves and separates games', ()
   const result = reconstructBaseballTeamGames('team', [first, structuredClone(first), second]);
   assert.equal(result.summary.games, 2);
   assert.ok(result.gameResults.every(({ identity }) => identity.resolved && identity.method === 'scheduleComposite'));
-  assert.match(result.gameResults[0].identity.key, /^fallback:\[/);
+  assert.match(result.gameResults[0].identity.key, /^fallback:\{/);
 });
 
 test('fallback identity normalizes whitespace and case without changing meaning', () => {
@@ -207,4 +207,45 @@ test('identity helpers do not mutate input', () => {
   assert.equal(_internals.canonicalGameIdentity(game).key, 'source:["source-pure"]');
   _internals.reconcileGameCollection([game, structuredClone(game)]);
   assert.deepEqual(game, before);
+});
+
+test('shared start time cannot hide distinct game-number or doubleheader ordinals', () => {
+  const byGameNumber = [
+    scheduleGame('10:00 AM', { meta: { gameNumber: 1 } }),
+    scheduleGame('10:00 AM', { meta: { gameNumber: 2 } }),
+  ];
+  const byDoubleheaderLabel = [
+    scheduleGame('10:00 AM', { meta: { doubleheaderGame: 'Game 1' } }),
+    scheduleGame('10:00 AM', { meta: { doubleheaderGame: 'Game 2' } }),
+  ];
+  assert.equal(reconstructBaseballTeamGames('team', byGameNumber).summary.games, 2);
+  assert.equal(reconstructBaseballTeamGames('team', byDoubleheaderLabel).summary.games, 2);
+});
+
+test('schedule placeholders never establish fallback identity', () => {
+  for (const placeholder of ['TBA', ' tba ', 'TBD', 'unknown', 'N/A', 'none', '-']) {
+    const identity = _internals.canonicalGameIdentity(scheduleGame(placeholder));
+    assert.equal(identity.resolved, false, placeholder);
+    assert.equal(identity.method, 'unresolvedScoped', placeholder);
+  }
+});
+
+test('supported equivalent date and time forms identify one replay', () => {
+  const canonical = scheduleGame('10:00 AM');
+  const equivalent = scheduleGame('10:00AM', { meta: { gameDate: '04/01/2026' } });
+  assert.equal(_internals.canonicalGameIdentity(canonical).key, _internals.canonicalGameIdentity(equivalent).key);
+  assert.equal(reconstructBaseballTeamGames('team', [canonical, equivalent]).summary.games, 1);
+});
+
+test('case and whitespace variants of final status beat a larger compatible partial snapshot', () => {
+  for (const status of ['Final', ' FINAL ', 'final']) {
+    const completed = snapshot('case-final', { hits: 2, meta: { status, scoreUs: 4, scoreThem: 2 } });
+    const partial = snapshot('case-final', { hits: 1, plays: 5, meta: { status: 'in_progress' } });
+    partial.boxScore.batting.push({ Player: 'Extra Partial Row', own: false, TeamSide: 'away', AB: 1, H: 1 });
+    const forward = reconstructBaseballTeamGames('team', [partial, completed]);
+    const reverse = reconstructBaseballTeamGames('team', [completed, partial]);
+    assert.deepEqual(forward, reverse);
+    assert.equal(forward.summary.officialBatting.h, 2, status);
+    assert.equal(forward.gameResults[0].identity.reconciliation.status, 'reconciled');
+  }
 });
