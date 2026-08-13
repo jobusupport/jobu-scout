@@ -595,8 +595,18 @@ function rosterCanonicalName(name, ...sets) {
   return null;
 }
 
+// Presence, not truthiness: a falsy-but-meaningful supplied value (numeric
+// `0` is the concrete case a durable playerId can legitimately take) must
+// survive this lookup. `||` chaining would treat `0` the same as an absent
+// field, silently discarding a real ID before it ever reaches durable-ID
+// resolution -- so every candidate field is read with an explicit
+// null/undefined check instead of truthiness.
 function playProvidedName(play, camelName, snakeName, altName) {
-  return play?.[camelName] || play?.[snakeName] || play?.[altName] || null;
+  for (const candidateName of [camelName, snakeName, altName]) {
+    const value = play?.[candidateName];
+    if (value !== null && value !== undefined) return value;
+  }
+  return null;
 }
 
 // ─── Durable identity + side-disambiguation helpers (new in this file) ────
@@ -623,9 +633,15 @@ function codePointCompare(left, right) {
 }
 
 // Player IDs are normalized to strings at this boundary because the public
-// result contract exposes object keys. Null/undefined mean "not supplied";
-// a blank supplied ID is retained as unresolved evidence rather than treated
-// as a valid durable identity.
+// result contract exposes object keys. Numeric and string IDs are
+// deliberately treated as equivalent after this conversion (`0` and `"0"`
+// both become `"0"`) -- there is exactly one canonical form a durable ID can
+// take once it reaches an accumulator key or an index lookup. Null/undefined
+// mean "not supplied"; see resolveSuppliedIdentity for how a blank
+// (empty/whitespace-only) supplied string is handled -- it is NOT treated as
+// meaningful identity evidence here, but the two are kept as separate checks
+// because "field absent" and "field present but blank" remain distinguishable
+// facts about the input up to that point.
 function normalizedPlayerId(value) {
   return value === null || value === undefined ? null : String(value);
 }
@@ -658,10 +674,19 @@ function unresolvedIdentityKey(context, playerId, name, role) {
   return `unresolved-player:${JSON.stringify([context, playerId, name || null, role])}`;
 }
 
+// Returns null for BOTH "field absent" and "field present but blank"
+// (empty/whitespace-only) -- neither is meaningful identity evidence, and a
+// caller receiving null falls through to its own name/inning-based
+// heuristics exactly as if no ID had been supplied at all. This is
+// deliberate: a blank ID must never suppress a name that uniquely resolves
+// on its own. It is NOT the same as a meaningful-but-unmatched ID (a real
+// value not found on either roster), which instead returns an explicit
+// `resolved: false` record below so the caller stops guessing and reports
+// it as unresolved rather than silently falling back to name matching.
 function resolveSuppliedIdentity(providedId, index, expectedSide, context, role, fallbackName) {
   const playerId = normalizedPlayerId(providedId);
-  if (playerId === null) return null;
-  const matches = playerId.trim() ? (index.get(playerId) || []) : [];
+  if (playerId === null || playerId.trim() === '') return null;
+  const matches = index.get(playerId) || [];
   const sides = new Set(matches.map((entry) => entry.side));
   const names = [...new Set(matches.map((entry) => entry.name).filter(Boolean))].sort(codePointCompare);
   const displayName = names[0] || fallbackName || null;
@@ -676,7 +701,6 @@ function resolveSuppliedIdentity(providedId, index, expectedSide, context, role,
     matches,
   });
 
-  if (!playerId.trim()) return unresolved('supplied durable player ID is blank');
   if (!matches.length) return unresolved('supplied durable player ID was not found on either side');
   if (sides.size > 1) return unresolved('supplied durable player ID appears on multiple sides');
   const side = [...sides][0];
@@ -690,7 +714,15 @@ function resolveSuppliedIdentity(providedId, index, expectedSide, context, role,
 // Without one, the public mode creates an explicit context-scoped unresolved
 // key; only Travel compatibility mode keeps the former plain-name key.
 function identityFor(name, providedId, idByName, context, legacyIdentity) {
-  if (providedId != null) return { key: String(providedId), playerId: String(providedId), resolved: true };
+  // Same input-presence contract as resolveSuppliedIdentity: a blank
+  // (empty/whitespace-only) supplied ID is not meaningful evidence and must
+  // fall through to the name-based idByName lookup below, not be trusted as
+  // a resolved identity keyed by whitespace. `providedId != null` alone is
+  // not enough -- `"   " != null` is true, and String(providedId) would
+  // otherwise mint a bogus but "resolved" identity out of pure whitespace.
+  if (providedId != null && String(providedId).trim() !== '') {
+    return { key: String(providedId), playerId: String(providedId), resolved: true };
+  }
   const ids = idByName?.get(name);
   if (ids?.size === 1) {
     const playerId = [...ids][0];

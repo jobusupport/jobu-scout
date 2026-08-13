@@ -198,6 +198,16 @@ function canonicalScheduleTime(value) {
   return raw.toLowerCase();
 }
 
+// The four ANCHOR discriminators are the only ones allowed to establish that
+// a record is eligible for fallback (non-durable) identity at all -- this is
+// unchanged from the prior contract. FIELD/VENUE/EVENT are real evidence for
+// telling two candidates apart or proving two records are the same replay,
+// but a record consisting of ONLY field/venue/event (no anchor) stays
+// unresolved, exactly as before: on their own they are not "sufficiently
+// discriminating" (a single field can host many simultaneous games).
+const SCHEDULE_ANCHOR_KEYS = ['start', 'gameNumber', 'doubleheaderGame', 'scheduleOrdinal'];
+const SCHEDULE_DISCRIMINATOR_KEYS = [...SCHEDULE_ANCHOR_KEYS, 'field', 'venue', 'event'];
+
 function scheduleDiscriminators(meta) {
   const discriminators = {};
   const start = firstMeaningfulIdentityPart(meta.scheduledStart, meta.startTime);
@@ -225,10 +235,24 @@ function canonicalGameIdentity(game) {
   const home = canonicalTextIdentityPart(firstMeaningfulIdentityPart(meta.homeTeamId, meta.homeTeam, meta.homeTeamName));
   const away = canonicalTextIdentityPart(firstMeaningfulIdentityPart(meta.awayTeamId, meta.awayTeam, meta.awayTeamName));
   const discriminators = scheduleDiscriminators(meta);
-  const hasScheduleSlot = ['start', 'gameNumber', 'doubleheaderGame', 'scheduleOrdinal']
-    .some((name) => Object.prototype.hasOwnProperty.call(discriminators, name));
+  const hasScheduleSlot = SCHEDULE_ANCHOR_KEYS.some((name) => Object.prototype.hasOwnProperty.call(discriminators, name));
   if (date && home && away && hasScheduleSlot) {
-    return { key: `fallback:${stableStringify({ date, home, away, discriminators })}`, resolved: true, method: 'scheduleComposite', durable: false };
+    // `key` here is a PROVISIONAL, single-record identity -- useful on its
+    // own (e.g. direct canonicalGameIdentity() callers, or a record with no
+    // sibling in its collection) and used as a stable per-record fallback
+    // when this record ends up in an ambiguous cluster (see
+    // clusterFallbackIdentities below). It intentionally does NOT attempt to
+    // be collision-proof against a *differently-evidenced* snapshot of the
+    // same physical game -- reconcileGameCollection is what proves that,
+    // using discriminators/foundational below, never this key alone.
+    return {
+      key: `fallback:${stableStringify({ date, home, away, discriminators })}`,
+      resolved: true,
+      method: 'scheduleComposite',
+      durable: false,
+      foundational: { date, home, away },
+      discriminators,
+    };
   }
   return {
     key: null,
@@ -238,6 +262,119 @@ function canonicalGameIdentity(game) {
     fingerprint: stableStringify(game),
     reason: 'no durable source ID or sufficiently discriminating schedule composite',
   };
+}
+
+// Compares two records' schedule discriminator sets and classifies the pair:
+//   'conflict' -- they share at least one discriminator whose values differ.
+//                 This is proof the records are NOT the same physical game
+//                 (or the source data is contradictory); they must never be
+//                 merged, regardless of any other discriminator matching.
+//   'proof'    -- no discriminator conflicts, AND at least one shared
+//                 discriminator has an equal value. Positive evidence the
+//                 two records describe the same schedule slot.
+//   'neutral'  -- no discriminator conflicts, but no discriminator is shared
+//                 either. Absence of contradiction is NOT evidence of a
+//                 match (two genuinely different, still-undiscriminated
+//                 games would also look "neutral") -- this is the
+//                 "insufficient evidence" state, and is never sufficient by
+//                 itself to cluster two records together.
+function relateDiscriminators(a, b) {
+  let sawConflict = false;
+  let sawProof = false;
+  for (const discriminatorKey of SCHEDULE_DISCRIMINATOR_KEYS) {
+    const left = Object.prototype.hasOwnProperty.call(a, discriminatorKey) ? a[discriminatorKey] : undefined;
+    const right = Object.prototype.hasOwnProperty.call(b, discriminatorKey) ? b[discriminatorKey] : undefined;
+    if (left === undefined || right === undefined) continue;
+    if (left === right) sawProof = true;
+    else sawConflict = true;
+  }
+  if (sawConflict) return 'conflict';
+  if (sawProof) return 'proof';
+  return 'neutral';
+}
+
+// Every pairwise relation inside an accepted clique is 'proof' (verified by
+// clusterFallbackIdentities before this is ever called), so no two members
+// can disagree on a shared key -- the union below is conflict-free by
+// construction. This is the identity used for a MERGED cluster: it is a
+// function of the cluster's accumulated evidence, not of which specific
+// record happened to arrive first or last, so enrichment (a later replay
+// supplying a discriminator an earlier one lacked) converges on the SAME key
+// as the collection gains more complete data, instead of forking it.
+function unionDiscriminators(discriminatorSets) {
+  const merged = {};
+  for (const set of discriminatorSets) {
+    for (const [discriminatorKey, value] of Object.entries(set)) {
+      if (merged[discriminatorKey] === undefined) merged[discriminatorKey] = value;
+    }
+  }
+  return merged;
+}
+
+// Conservative candidate matching for non-durable (fallback) identities.
+// `entries` are candidates whose identity already passed canonicalGameIdentity
+// (durable:false, resolved:true). Partitions by the stable foundational
+// evidence (canonical date/home/away), then within each partition finds
+// connected components over 'proof' edges only ('neutral'/'conflict' pairs
+// never connect two records). A component only becomes a merge cluster when
+// it is a full clique -- every pair inside it directly proves a match. A
+// non-clique component (e.g. one incomplete record that is individually
+// compatible with two candidates that conflict with EACH OTHER, such as
+// Game 1 and Game 2 of a doubleheader) is never merged: every member of it
+// is returned as its own separate, ambiguous record instead, so an
+// unproven match is never arbitrarily attached to one of several
+// possibilities. Singleton components (no proof partner at all) are
+// clusters of size 1 and are never "ambiguous" -- there was nothing to be
+// ambiguous with.
+function clusterFallbackIdentities(entries) {
+  const byFoundation = new Map();
+  for (const entry of entries) {
+    const foundationKey = stableStringify(entry.identity.foundational);
+    if (!byFoundation.has(foundationKey)) byFoundation.set(foundationKey, []);
+    byFoundation.get(foundationKey).push(entry);
+  }
+
+  const clusters = [];
+  for (const group of byFoundation.values()) {
+    const size = group.length;
+    const relation = Array.from({ length: size }, () => new Array(size).fill('neutral'));
+    for (let i = 0; i < size; i += 1) {
+      for (let j = i + 1; j < size; j += 1) {
+        const rel = relateDiscriminators(group[i].identity.discriminators, group[j].identity.discriminators);
+        relation[i][j] = rel;
+        relation[j][i] = rel;
+      }
+    }
+
+    const visited = new Array(size).fill(false);
+    for (let start = 0; start < size; start += 1) {
+      if (visited[start]) continue;
+      visited[start] = true;
+      const component = [start];
+      const stack = [start];
+      while (stack.length) {
+        const current = stack.pop();
+        for (let candidate = 0; candidate < size; candidate += 1) {
+          if (!visited[candidate] && relation[current][candidate] === 'proof') {
+            visited[candidate] = true;
+            component.push(candidate);
+            stack.push(candidate);
+          }
+        }
+      }
+      let isClique = true;
+      for (let a = 0; a < component.length && isClique; a += 1) {
+        for (let b = a + 1; b < component.length; b += 1) {
+          if (relation[component[a]][component[b]] !== 'proof') { isClique = false; break; }
+        }
+      }
+      clusters.push({
+        members: component.map((index) => group[index]),
+        ambiguous: component.length > 1 && !isClique,
+      });
+    }
+  }
+  return clusters;
 }
 
 function snapshotScore(game) {
@@ -297,67 +434,130 @@ function materialSnapshotConflicts(candidates) {
   return [...conflicts].sort(codePointCompare);
 }
 
+// Builds one reconciled output record from a group of candidates already
+// PROVEN to describe the same physical game (an exact durable-key bucket, or
+// a fallback clique from clusterFallbackIdentities). `keyOverride` lets a
+// multi-member fallback cluster report the union-based cluster identity
+// instead of whichever single member's own provisional key happened to be
+// picked as `selected` -- so the same physical game converges on one key as
+// its evidence accumulates across replays, rather than forking per snapshot.
+function finalizeResolvedGroup(candidates, keyOverride) {
+  candidates.sort((a, b) => b.score - a.score || codePointCompare(a.serial, b.serial));
+  const selected = candidates[0];
+  const uniqueFingerprints = [...new Set(candidates.map((candidate) => candidate.serial))];
+  const conflictFields = materialSnapshotConflicts(candidates);
+  const status = conflictFields.length ? 'conflict'
+    : uniqueFingerprints.length === 1 ? (candidates.length > 1 ? 'deduplicated' : 'single')
+      : 'reconciled';
+  return {
+    game: selected.game,
+    identity: {
+      ...selected.identity,
+      ...(keyOverride ? { key: keyOverride } : {}),
+      reconciliation: {
+        status,
+        candidateCount: candidates.length,
+        conflictFields,
+        candidateFingerprints: uniqueFingerprints.sort(codePointCompare),
+        selectedFingerprint: selected.serial,
+      },
+    },
+  };
+}
+
+// Shared ordinal-disambiguation for candidates that could NOT be uniquely
+// resolved (either no evidence at all, or evidence proving nothing because
+// multiple mutually-incompatible candidates fit equally well). Content-based
+// (sorted by serialized fingerprint, never by original array position), so
+// output is deterministic under input reversal; an ordinal is only appended
+// when two candidates in the SAME scope are byte-identical, so identical
+// records are never accidentally fingerprint-deduplicated.
+function scopeUnmatchedCandidates(candidates, keyPrefix, reconciliationFor) {
+  const sorted = [...candidates].sort((a, b) => codePointCompare(a.serial, b.serial));
+  const ordinalByFingerprint = new Map();
+  return sorted.map((candidate) => {
+    const ordinal = (ordinalByFingerprint.get(candidate.serial) || 0) + 1;
+    ordinalByFingerprint.set(candidate.serial, ordinal);
+    return {
+      game: candidate.game,
+      identity: {
+        ...candidate.identity,
+        key: `${keyPrefix}:${stableStringify([candidate.serial, ordinal])}`,
+        scopeOrdinal: ordinal,
+        reconciliation: reconciliationFor(candidate),
+      },
+    };
+  });
+}
+
 function reconcileGameCollection(games) {
-  const resolvedBuckets = new Map();
+  const durableBuckets = new Map();
+  const fallbackEntries = [];
   const unresolved = [];
   for (const game of games) {
     const identity = canonicalGameIdentity(game);
     const candidate = { game, identity, score: snapshotScore(game), serial: stableStringify(game) };
     if (!identity.resolved) {
       unresolved.push(candidate);
-      continue;
+    } else if (identity.durable) {
+      if (!durableBuckets.has(identity.key)) durableBuckets.set(identity.key, []);
+      durableBuckets.get(identity.key).push(candidate);
+    } else {
+      fallbackEntries.push(candidate);
     }
-    if (!resolvedBuckets.has(identity.key)) resolvedBuckets.set(identity.key, []);
-    resolvedBuckets.get(identity.key).push(candidate);
   }
 
   const reconciled = [];
-  for (const [key, candidates] of resolvedBuckets) {
-    candidates.sort((a, b) => b.score - a.score || codePointCompare(a.serial, b.serial));
-    const selected = candidates[0];
-    const uniqueFingerprints = [...new Set(candidates.map((candidate) => candidate.serial))];
-    const conflictFields = materialSnapshotConflicts(candidates);
-    const status = conflictFields.length ? 'conflict'
-      : uniqueFingerprints.length === 1 ? (candidates.length > 1 ? 'deduplicated' : 'single')
-        : 'reconciled';
-    reconciled.push({
-      game: selected.game,
-      identity: {
-        ...selected.identity,
-        reconciliation: {
-          status,
-          candidateCount: candidates.length,
-          conflictFields,
-          candidateFingerprints: uniqueFingerprints.sort(codePointCompare),
-          selectedFingerprint: selected.serial,
-        },
-      },
-    });
+
+  // Durable identity is exact and authoritative -- unchanged from before:
+  // bucket strictly by the durable source-game key.
+  for (const candidates of durableBuckets.values()) {
+    reconciled.push(finalizeResolvedGroup(candidates));
   }
 
-  unresolved.sort((a, b) => codePointCompare(a.serial, b.serial));
-  const ordinalByFingerprint = new Map();
-  for (const candidate of unresolved) {
-    const ordinal = (ordinalByFingerprint.get(candidate.serial) || 0) + 1;
-    ordinalByFingerprint.set(candidate.serial, ordinal);
-    const key = `unresolved:${stableStringify([candidate.serial, ordinal])}`;
-    reconciled.push({
-      game: candidate.game,
-      identity: {
-        ...candidate.identity,
-        key,
-        scopeOrdinal: ordinal,
-        reconciliation: {
-          status: 'unresolved',
-          candidateCount: 1,
-          conflictFields: [],
-          candidateFingerprints: [candidate.serial],
-          selectedFingerprint: candidate.serial,
-          automaticDeduplication: false,
-        },
-      },
-    });
+  // Fallback identity is conservative candidate matching, not an exact key
+  // lookup: cluster first (see clusterFallbackIdentities), THEN decide
+  // status from the cluster's own members.
+  const ambiguousCandidates = [];
+  for (const cluster of clusterFallbackIdentities(fallbackEntries)) {
+    if (cluster.ambiguous) {
+      ambiguousCandidates.push(...cluster.members);
+      continue;
+    }
+    const keyOverride = cluster.members.length > 1
+      ? `fallback:${stableStringify({
+        ...cluster.members[0].identity.foundational,
+        discriminators: unionDiscriminators(cluster.members.map((member) => member.identity.discriminators)),
+      })}`
+      : undefined;
+    reconciled.push(finalizeResolvedGroup(cluster.members, keyOverride));
   }
+
+  // Ambiguous fallback candidates keep their OWN provisional per-record
+  // identity (never another candidate's), tagged with which sibling
+  // fingerprints made the match unprovable -- proof, not a coin flip,
+  // decides which record a caller sees data attached to.
+  if (ambiguousCandidates.length) {
+    const siblingFingerprints = [...new Set(ambiguousCandidates.map((candidate) => candidate.serial))].sort(codePointCompare);
+    reconciled.push(...scopeUnmatchedCandidates(ambiguousCandidates, 'ambiguous', (candidate) => ({
+      status: 'ambiguous',
+      candidateCount: ambiguousCandidates.length,
+      conflictFields: [],
+      candidateFingerprints: siblingFingerprints,
+      selectedFingerprint: candidate.serial,
+      automaticDeduplication: false,
+      reason: 'multiple schedule candidates are each individually compatible but conflict with one another; cannot uniquely reconcile',
+    })));
+  }
+
+  reconciled.push(...scopeUnmatchedCandidates(unresolved, 'unresolved', (candidate) => ({
+    status: 'unresolved',
+    candidateCount: 1,
+    conflictFields: [],
+    candidateFingerprints: [candidate.serial],
+    selectedFingerprint: candidate.serial,
+    automaticDeduplication: false,
+  })));
 
   return reconciled.sort((a, b) => codePointCompare(a.identity.key, b.identity.key));
 }
@@ -528,5 +728,8 @@ module.exports = {
   normalizeBaseballGame,
   // Exposed for the dependency-boundary/unit tests only -- not part of the
   // stable public contract other modules should depend on.
-  _internals: { toReconstructionInput, toStatsEngineGame, requireExplicitOwnBoolean, canonicalGameIdentity, reconcileGameCollection, stableStringify },
+  _internals: {
+    toReconstructionInput, toStatsEngineGame, requireExplicitOwnBoolean, canonicalGameIdentity,
+    reconcileGameCollection, stableStringify, clusterFallbackIdentities, relateDiscriminators, unionDiscriminators,
+  },
 };

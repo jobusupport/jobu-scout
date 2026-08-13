@@ -339,3 +339,177 @@ test('special-string durable IDs remain distinct and cannot corrupt accumulator 
     assert.equal(stats.ownBatters[id].H, 1);
   }
 });
+
+// ── Correction: falsy and whitespace-only supplied player IDs ──────────────
+//
+// Prior defects (fixed by this correction):
+//   (1) playProvidedName() used `||` chaining, so a supplied ID of numeric
+//       `0` was indistinguishable from an absent field -- it never reached
+//       durable-ID resolution at all, and was not even retained on the
+//       resulting unresolved record (playerId came back null, not 0).
+//   (2) A whitespace-only supplied ID reached resolveSuppliedIdentity as a
+//       "blank" value that still short-circuited side resolution to
+//       'unresolved', even when the play's name alone uniquely resolved to
+//       one roster entry -- worse than not supplying an ID at all.
+//   (3) identityFor()'s own `providedId != null` presence check had the same
+//       blind spot one layer down (reached whenever resolveSuppliedIdentity
+//       correctly returns null for a blank ID, since the raw un-vetted value
+//       was still passed through as a fallback).
+// Every test below fails against SHA b7becec2 for one of these three reasons.
+
+test('batterId: 0 reaches durable resolution instead of being treated as absent', () => {
+  const stats = computeBaseballStats([game('zero-batter', [
+    { Player: 'Jordan Smith', own: true, TeamSide: 'home', playerId: 0 },
+    { Player: 'Jordan Smith', own: false, TeamSide: 'away', playerId: 'opp-jordan' },
+  ], [
+    { batterId: 0, text: 'Single. Jordan Smith singles to left field, Dana Pitcher pitching.' },
+  ])]);
+  assert.deepEqual(Object.keys(stats.ownBatters), ['0']);
+  assert.equal(stats.ownBatters['0'].H, 1);
+  assert.deepEqual(stats.unresolvedBatters, {});
+});
+
+test('pitcherId: 0 reaches durable resolution instead of being treated as absent', () => {
+  const stats = computeBaseballStats([game('zero-pitcher', [
+    { Player: 'Alex Batter', own: true, TeamSide: 'home', playerId: 'alex-batter' },
+  ], [
+    { batterId: 'alex-batter', pitcherId: 0, text: 'Single. Alex Batter singles to left field, Jordan Smith pitching.' },
+  ], 'home', [
+    { Player: 'Jordan Smith', own: true, TeamSide: 'home', playerId: 1 },
+    { Player: 'Jordan Smith', own: false, TeamSide: 'away', playerId: 0 },
+  ])]);
+  assert.deepEqual(Object.keys(stats.opponentPitchers), ['0']);
+  assert.equal(stats.opponentPitchers['0'].H, 1);
+  assert.deepEqual(stats.unresolvedPitchers, {});
+});
+
+test('fielderId: 0 reaches position-only fielding resolution instead of being treated as absent', () => {
+  const stats = computeBaseballStats([game('zero-fielder', [
+    { Player: 'Bailey Example', own: true, TeamSide: 'home', playerId: 0 },
+    { Player: 'Away Hitter', own: false, TeamSide: 'away', playerId: 'away-id' },
+  ], [
+    { inning: 'Top 1', batterId: 'away-id', fielderId: 0, text: 'Error. Away Hitter reaches on an error by shortstop, Dana Pitcher pitching.' },
+  ])]);
+  assert.equal(stats.ownBatters['0'].E, 1);
+  assert.deepEqual(stats.unattributedErrors, { ownSide: 0, opponentSide: 0 });
+});
+
+test('a baserunner scoring event credited to a batter supplied with ID 0 is not lost', () => {
+  // This engine attributes baserunning outcomes (e.g. a run scored) to the
+  // BATTER identity who reached base -- there is no separate runnerId field
+  // in this play-text data model, so the batter-ID fix covers this path too.
+  const stats = computeBaseballStats([game('zero-runner', [
+    { Player: 'Jordan Smith', own: true, TeamSide: 'home', playerId: 0 },
+  ], [
+    { batterId: 0, text: 'Home Run. Jordan Smith homers to left field, Dana Pitcher pitching.' },
+  ])]);
+  assert.equal(stats.ownBatters['0'].HR, 1);
+});
+
+test('string "0" is canonically equivalent to numeric 0 for a supplied ID', () => {
+  const stats = computeBaseballStats([game('string-zero', [
+    { Player: 'Jordan Smith', own: true, TeamSide: 'home', playerId: 0 },
+    { Player: 'Jordan Smith', own: false, TeamSide: 'away', playerId: 'opp-jordan' },
+  ], [
+    { batterId: '0', text: 'Single. Jordan Smith singles to left field, Dana Pitcher pitching.' },
+  ])]);
+  assert.deepEqual(Object.keys(stats.ownBatters), ['0']);
+  assert.deepEqual(stats.unresolvedBatters, {});
+});
+
+test('a whitespace-only batter ID does not suppress a name that uniquely resolves on its own', () => {
+  const stats = computeBaseballStats([game('whitespace-batter', [
+    { Player: 'Solo Batter', own: true, TeamSide: 'home', playerId: 'solo-id' },
+  ], [
+    { batterId: '   ', text: 'Single. Solo Batter singles to left field, Dana Pitcher pitching.' },
+  ])]);
+  assert.deepEqual(Object.keys(stats.ownBatters), ['solo-id']);
+  assert.equal(stats.ownBatters['solo-id'].H, 1);
+  assert.deepEqual(stats.unresolvedBatters, {});
+});
+
+test('a whitespace-only pitcher ID does not suppress a name that uniquely resolves on its own', () => {
+  const stats = computeBaseballStats([game('whitespace-pitcher', [
+    { Player: 'Alex Batter', own: true, TeamSide: 'home', playerId: 'alex-batter' },
+  ], [
+    { batterId: 'alex-batter', pitcherId: '  ', text: 'Single. Alex Batter singles to left field, Solo Pitcher pitching.' },
+  ], 'home', [
+    { Player: 'Solo Pitcher', own: false, TeamSide: 'away', playerId: 'solo-pitcher-id' },
+  ])]);
+  assert.deepEqual(Object.keys(stats.opponentPitchers), ['solo-pitcher-id']);
+  assert.deepEqual(stats.unresolvedPitchers, {});
+});
+
+test('a whitespace-only position-only fielder ID falls back to the documented unresolved/name behavior, not a bogus whitespace identity', () => {
+  const stats = computeBaseballStats([game('whitespace-fielder', [
+    { Player: 'Solo Fielder', own: true, TeamSide: 'home', playerId: 'solo-fielder-id' },
+    { Player: 'Away Hitter', own: false, TeamSide: 'away', playerId: 'away-id' },
+  ], [
+    { inning: 'Top 1', batterId: 'away-id', fielderId: '   ', name: 'Solo Fielder', text: 'Error. Away Hitter reaches on an error by shortstop Solo Fielder, Dana Pitcher pitching.' },
+  ])]);
+  assert.ok(!Object.prototype.hasOwnProperty.call(stats.ownBatters, '   '), 'a whitespace-only fielderId must never become a resolved accumulator key');
+});
+
+test('a meaningful but unknown supplied ID remains explicit and retains its exact value (not lost, not guessed)', () => {
+  const stats = computeBaseballStats([game('unknown-id', [
+    { Player: 'Alex Batter', own: true, TeamSide: 'home', playerId: 'known-id' },
+  ], [
+    { batterId: 'unknown-id', text: 'Single. Alex Batter singles to left field, Dana Pitcher pitching.' },
+  ])]);
+  const record = Object.values(stats.unresolvedBatters)[0];
+  assert.equal(record.identity.playerId, 'unknown-id');
+  assert.match(record.identity.reason, /not found/i);
+});
+
+test('an ambiguous supplied ID does not fall back to a guessed name match', () => {
+  const stats = computeBaseballStats([game('ambiguous-id', [
+    { Player: 'Own Name', own: true, TeamSide: 'home', playerId: 'shared-id' },
+    { Player: 'Opponent Name', own: false, TeamSide: 'away', playerId: 'shared-id' },
+  ], [
+    { batterId: 'shared-id', batterName: 'Own Name', text: 'Single. Own Name singles to left field, Dana Pitcher pitching.' },
+  ])]);
+  assert.deepEqual(stats.ownBatters, {});
+  const record = Object.values(stats.unresolvedBatters)[0];
+  assert.equal(record.identity.playerId, 'shared-id');
+  assert.match(record.identity.reason, /multiple sides/i);
+});
+
+test('a contradictory supplied ID does not fall back to a guessed side', () => {
+  const stats = computeBaseballStats([game('contradictory-id', [
+    { Player: 'Jordan Smith', own: true, TeamSide: 'home', playerId: 'own-jordan' },
+    { Player: 'Jordan Smith', own: false, TeamSide: 'away', playerId: 'opp-jordan' },
+  ], [
+    { inning: 'Bottom 1', batterId: 'opp-jordan', text: 'Single. Jordan Smith singles to left field, Dana Pitcher pitching.' },
+  ])]);
+  assert.deepEqual(stats.ownBatters, {});
+  const record = Object.values(stats.unresolvedBatters)[0];
+  assert.equal(record.identity.playerId, 'opp-jordan');
+  assert.match(record.identity.reason, /conflict/i);
+});
+
+test('falsy/whitespace ID handling is deterministic under game-array reordering', () => {
+  const zeroIdGame = game('reorder-zero', [
+    { Player: 'Jordan Smith', own: true, TeamSide: 'home', playerId: 0 },
+  ], [
+    { batterId: 0, text: 'Single. Jordan Smith singles to left field, Dana Pitcher pitching.' },
+  ]);
+  const whitespaceIdGame = game('reorder-whitespace', [
+    { Player: 'Solo Batter', own: true, TeamSide: 'home', playerId: 'solo-id' },
+  ], [
+    { batterId: '   ', text: 'Single. Solo Batter singles to left field, Dana Pitcher pitching.' },
+  ]);
+  const forward = computeBaseballStats([zeroIdGame, whitespaceIdGame]);
+  const reversed = computeBaseballStats([whitespaceIdGame, zeroIdGame]);
+  assert.deepEqual(forward, reversed);
+  assert.deepEqual(Object.keys(forward.ownBatters).sort(), ['0', 'solo-id']);
+});
+
+test('falsy/whitespace ID resolution does not mutate any input record', () => {
+  const batting = [
+    { Player: 'Jordan Smith', own: true, TeamSide: 'home', playerId: 0 },
+  ];
+  const plays = [{ batterId: 0, text: 'Single. Jordan Smith singles to left field, Dana Pitcher pitching.' }];
+  const before = structuredClone({ batting, plays });
+  computeBaseballStats([game('mutation-check', batting, plays)]);
+  assert.deepEqual({ batting, plays }, before);
+});

@@ -249,3 +249,146 @@ test('case and whitespace variants of final status beat a larger compatible part
     assert.equal(forward.gameResults[0].identity.reconciliation.status, 'reconciled');
   }
 });
+
+// ── Correction: fallback identity must survive metadata enrichment ─────────
+//
+// Prior defect (fixed by this correction): the fallback identity KEY used to
+// embed every discriminator present in a given snapshot verbatim. Two
+// snapshots of the SAME physical game -- an early scrape missing an optional
+// discriminator (field/venue/event/gameNumber/...) and a later, more
+// complete scrape supplying it -- therefore produced two DIFFERENT exact
+// keys and were treated as two separate games instead of one reconciled
+// game. Every test below fails against SHA b7becec2 for exactly this reason.
+//
+// The fix separates three concerns (see baseball-engine.js's
+// clusterFallbackIdentities/relateDiscriminators/unionDiscriminators): (1)
+// durable identity is unchanged -- exact and authoritative; (2) fallback
+// EVIDENCE is the full discriminator set (start/gameNumber/doubleheaderGame/
+// scheduleOrdinal/field/venue/event); (3) fallback RECONCILIATION groups
+// records by proof (a shared, equal discriminator) rather than by exact key
+// equality, and refuses to merge whenever more than one candidate is
+// individually compatible -- so an unproven match is never arbitrarily
+// attached to one of several possibilities.
+
+test('an early snapshot without a field reconciles with a later snapshot that supplies one', () => {
+  const early = scheduleGame('10:00 AM');
+  const later = scheduleGame('10:00 AM', { meta: { field: 'Field 3' } });
+  const result = reconstructBaseballTeamGames('team', [early, later]);
+  assert.equal(result.summary.games, 1);
+  assert.equal(result.gameResults[0].identity.reconciliation.status, 'reconciled');
+});
+
+test('an early snapshot without a venue reconciles with a later snapshot that supplies one', () => {
+  const early = scheduleGame('10:00 AM');
+  const later = scheduleGame('10:00 AM', { meta: { venue: 'Main Complex' } });
+  const result = reconstructBaseballTeamGames('team', [early, later]);
+  assert.equal(result.summary.games, 1);
+  assert.equal(result.gameResults[0].identity.reconciliation.status, 'reconciled');
+});
+
+test('an early snapshot without an event reconciles with a later snapshot that supplies one', () => {
+  const early = scheduleGame('10:00 AM');
+  const later = scheduleGame('10:00 AM', { meta: { event: 'Spring Classic' } });
+  const result = reconstructBaseballTeamGames('team', [early, later]);
+  assert.equal(result.summary.games, 1);
+  assert.equal(result.gameResults[0].identity.reconciliation.status, 'reconciled');
+});
+
+test('an early snapshot without gameNumber reconciles when it has exactly one compatible candidate', () => {
+  const early = scheduleGame('10:00 AM');
+  const later = scheduleGame('10:00 AM', { meta: { gameNumber: 1 } });
+  const result = reconstructBaseballTeamGames('team', [early, later]);
+  assert.equal(result.summary.games, 1);
+  assert.equal(result.gameResults[0].identity.reconciliation.status, 'reconciled');
+});
+
+test('an early incomplete snapshot plus two later Game-1/Game-2 candidates stays ambiguous, not collapsed into either', () => {
+  const early = scheduleGame('10:00 AM');
+  const gameOne = scheduleGame('10:00 AM', { meta: { gameNumber: 1 } });
+  const gameTwo = scheduleGame('10:00 AM', { meta: { gameNumber: 2 } });
+  const forward = reconstructBaseballTeamGames('team', [early, gameOne, gameTwo]);
+  const reverse = reconstructBaseballTeamGames('team', [gameTwo, early, gameOne]);
+  assert.equal(forward.summary.games, 3, 'the incomplete record must not silently attach to either candidate');
+  assert.deepEqual(forward, reverse, 'ambiguity resolution must be deterministic under input reversal');
+  const early_out = forward.gameResults.find((r) => !('gameNumber' in r.identity.discriminators));
+  assert.equal(early_out.identity.reconciliation.status, 'ambiguous');
+  assert.equal(early_out.identity.reconciliation.candidateCount, 3);
+  const gameOne_out = forward.gameResults.find((r) => r.identity.discriminators.gameNumber === '1');
+  const gameTwo_out = forward.gameResults.find((r) => r.identity.discriminators.gameNumber === '2');
+  assert.ok(gameOne_out && gameTwo_out, 'Game 1 and Game 2 must both still be present and distinguishable');
+});
+
+test('same start time with explicit Game 1 and Game 2 remains two games (doubleheader protection not weakened)', () => {
+  const gameOne = scheduleGame('10:00 AM', { meta: { gameNumber: 1 } });
+  const gameTwo = scheduleGame('10:00 AM', { meta: { gameNumber: 2 } });
+  assert.equal(reconstructBaseballTeamGames('team', [gameOne, gameTwo]).summary.games, 2);
+});
+
+test('differing doubleheader ordinals remain separate (doubleheader protection not weakened)', () => {
+  const gameOne = scheduleGame('10:00 AM', { meta: { doubleheaderGame: 'Game 1' } });
+  const gameTwo = scheduleGame('10:00 AM', { meta: { doubleheaderGame: 'Game 2' } });
+  assert.equal(reconstructBaseballTeamGames('team', [gameOne, gameTwo]).summary.games, 2);
+});
+
+test('a conflicting field between two otherwise-matching snapshots surfaces conflict, never a silent merge', () => {
+  const a = scheduleGame('10:00 AM', { meta: { field: 'Field 3' } });
+  const b = scheduleGame('10:00 AM', { meta: { field: 'Field 4' } });
+  const result = reconstructBaseballTeamGames('team', [a, b]);
+  assert.equal(result.summary.games, 2, 'a real field disagreement must keep the games separate, not reconcile them');
+});
+
+test('adding optional metadata to a proven replay does not change game totals', () => {
+  const early = scheduleGame('10:00 AM', { hits: 3, plays: 2 });
+  const later = scheduleGame('10:00 AM', { hits: 3, plays: 2, meta: { field: 'Field 3', venue: 'Main Complex' } });
+  const result = reconstructBaseballTeamGames('team', [early, later]);
+  assert.equal(result.summary.games, 1);
+  assert.equal(result.summary.officialBatting.h, 3, 'enrichment must not double- or half-count the replay');
+});
+
+test('reversing input order for an enrichment pair produces semantically equivalent output', () => {
+  const early = scheduleGame('10:00 AM');
+  const later = scheduleGame('10:00 AM', { meta: { field: 'Field 3' } });
+  const forward = reconstructBaseballTeamGames('team', [early, later]);
+  const reverse = reconstructBaseballTeamGames('team', [later, early]);
+  assert.deepEqual(forward, reverse);
+});
+
+test('durable-ID snapshots remain governed by durable identity, not the fallback clustering rewrite', () => {
+  const early = snapshot('source-enrich', { hits: 1 });
+  const later = snapshot('source-enrich', { hits: 1, meta: { field: 'Field 3' } });
+  const result = reconstructBaseballTeamGames('team', [early, later]);
+  assert.equal(result.summary.games, 1);
+  assert.equal(result.gameResults[0].identity.method, 'sourceGameId');
+  assert.equal(result.gameResults[0].identity.durable, true);
+});
+
+test('identical unresolved games remain separate under the new clustering path too', () => {
+  const game = snapshot(null);
+  const result = reconstructBaseballTeamGames('team', [game, structuredClone(game)]);
+  assert.equal(result.summary.games, 2);
+});
+
+test('delimiter-bearing and special-string schedule evidence cannot collide across an enrichment merge', () => {
+  const left = scheduleGame('C', { meta: { homeTeam: 'A|B', awayTeam: 'D' } });
+  const right = scheduleGame('C', { meta: { homeTeam: 'A', awayTeam: 'B|D' } });
+  const leftEnriched = scheduleGame('C', { meta: { homeTeam: 'A|B', awayTeam: 'D', field: 'Field __proto__' } });
+  const result = reconstructBaseballTeamGames('team', [left, right, leftEnriched]);
+  assert.equal(result.summary.games, 2, 'A|B/D and A/B|D must never collide even after one of them gains extra evidence');
+});
+
+test('numeric and string game-number discriminators follow the documented canonical equivalence rule', () => {
+  const numeric = scheduleGame('10:00 AM', { meta: { gameNumber: 1 } });
+  const stringForm = scheduleGame('10:00 AM', { meta: { gameNumber: '1' } });
+  assert.equal(_internals.canonicalGameIdentity(numeric).key, _internals.canonicalGameIdentity(stringForm).key);
+  assert.equal(reconstructBaseballTeamGames('team', [numeric, stringForm]).summary.games, 1);
+});
+
+test('enrichment reconciliation does not mutate any input record', () => {
+  const early = scheduleGame('10:00 AM');
+  const later = scheduleGame('10:00 AM', { meta: { field: 'Field 3' } });
+  const beforeEarly = structuredClone(early);
+  const beforeLater = structuredClone(later);
+  reconstructBaseballTeamGames('team', [early, later]);
+  assert.deepEqual(early, beforeEarly);
+  assert.deepEqual(later, beforeLater);
+});
