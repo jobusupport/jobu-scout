@@ -877,20 +877,20 @@ test('the failed diagnostic message contains no stack trace or filesystem path',
   assert.ok(!('stack' in failed.diagnosticReconstruction));
 });
 
-test('a missing `own` boolean produces an isolated diagnostic failure', () => {
+test('a missing `own` boolean produces an isolated diagnostic failure with the fixed public message', () => {
   const [early, gameOne, gameTwo] = ambiguousTriple(malformedNoOwn);
   const result = reconstructBaseballTeamGames('team', [early, gameOne, gameTwo]);
   const failed = result.gameResults.find((r) => r.diagnosticReconstruction?.status === 'error');
-  assert.match(failed.diagnosticReconstruction.message, /own.*boolean/i);
+  assert.equal(failed.diagnosticReconstruction.message, 'Ambiguous game diagnostic reconstruction failed.');
   assert.equal(result.summary.games, 0);
 });
 
-test('contradictory side metadata produces an isolated diagnostic failure', () => {
+test('contradictory side metadata produces an isolated diagnostic failure with the fixed public message', () => {
   const [early, gameOne, gameTwo] = ambiguousTriple(malformedContradictorySide);
   const result = reconstructBaseballTeamGames('team', [early, gameOne, gameTwo]);
   const failed = result.gameResults.find((r) => r.diagnosticReconstruction?.status === 'error');
   assert.ok(failed, 'a contradictory-side-metadata ambiguous record must produce a failed diagnostic, not throw');
-  assert.match(failed.diagnosticReconstruction.message, /contradictory side metadata/i);
+  assert.equal(failed.diagnosticReconstruction.message, 'Ambiguous game diagnostic reconstruction failed.');
 });
 
 test('an invalid ambiguous box-score structure produces an isolated diagnostic failure', () => {
@@ -1029,19 +1029,235 @@ test('an unresolved (non-ambiguous) record follows the existing authoritative co
   assert.equal(result.summary.officialTotalsComplete, true);
 });
 
-test('a non-Error thrown value is normalized to a safe, deterministic string', () => {
-  assert.equal(_internals.normalizeThrownValue(new Error('plain error')), 'plain error');
-  assert.equal(_internals.normalizeThrownValue('a plain string throw'), 'a plain string throw');
-  assert.equal(
-    _internals.normalizeThrownValue({ weird: 'object' }),
-    'non-Error value thrown during ambiguous diagnostic reconstruction',
+// ── Correction: the public diagnostic-failure message is now fixed and
+//    bounded, and the failure-reporting path cannot throw for any value ───
+//
+// Prior defects (fixed by this correction), both in the diagnostic error
+// boundary the previous correction pass introduced:
+//
+//   (1) The failed-diagnostic result exposed the raw, uninspected
+//       Error.message from whatever reconstructBaseballGame() threw.
+//       assertNoContradictorySideMetadata's message interpolates `venue`
+//       (sourced from a box-score row's TeamSide/teamSide field, which this
+//       module does not control the contents of) with no length bound and
+//       no control-character filtering. A crafted TeamSide value was
+//       reproduced flowing verbatim into the public diagnosticReconstruction
+//       .message field, including a raw NUL byte, a raw ANSI escape
+//       sequence, secret-shaped text, and 5,000+ characters of attacker-
+//       controlled content. Fixed by replacing the message with a single
+//       fixed, bounded constant (AMBIGUOUS_RECONSTRUCTION_FAILURE_MESSAGE)
+//       that is never a function of the caught value.
+//   (2) normalizeThrownValue (now removed) read `err.message` inside the
+//       catch block; a Error-shaped value whose `.message` is a throwing
+//       getter caused normalization itself to throw, uncaught, aborting the
+//       whole reconstructBaseballTeamGames() call and discarding already-
+//       computed authoritative results -- reintroducing the exact failure
+//       mode this whole correction chain exists to eliminate. Fixed by
+//       never reading, coercing, or otherwise touching the caught value at
+//       all (`catch { ... }` with no binding) -- the catch body cannot be
+//       affected by what was thrown, for any JavaScript value.
+//
+// Every test below fails against SHA 1355ded for exactly one of these two
+// reasons.
+
+const FIXED_DIAGNOSTIC_MESSAGE = 'Ambiguous game diagnostic reconstruction failed.';
+
+function malformedWithHostileTeamSide(startTime, teamSideValue, extraMeta = {}) {
+  return {
+    meta: { complete: false, gameDate: '2026-04-01', homeTeam: 'Synthetic Home', awayTeam: 'Synthetic Away', startTime, ...extraMeta },
+    boxScore: {
+      batting: [
+        { Player: 'A', own: true, TeamSide: teamSideValue, AB: 1, H: 1 },
+        { Player: 'B', own: false, TeamSide: teamSideValue, AB: 1, H: 0 },
+      ],
+      pitching: [],
+    },
+    plays: [],
+  };
+}
+
+function messageLeakTest(label, hostileTeamSideValue) {
+  test(`${label} does not appear in the public diagnostic message`, () => {
+    const [early, gameOne, gameTwo] = ambiguousTriple((st, extra) => malformedWithHostileTeamSide(st, hostileTeamSideValue, extra));
+    const result = reconstructBaseballTeamGames('team', [early, gameOne, gameTwo]);
+    const failed = result.gameResults.find((r) => r.diagnosticReconstruction?.status === 'error');
+    assert.ok(failed, 'the hostile TeamSide value must still produce a contradictory-side-metadata failure, not throw');
+    assert.equal(failed.diagnosticReconstruction.message, FIXED_DIAGNOSTIC_MESSAGE);
+  });
+}
+
+messageLeakTest('a malicious TeamSide value', 'Bearer sk-live-FAKE1234567890');
+messageLeakTest('a Windows path', String.raw`C:\Users\arthur\.secrets\config.json`);
+messageLeakTest('a POSIX path', '/home/arthur/.ssh/id_rsa_FAKE');
+messageLeakTest('a URL with query string', 'https://api.example.test/v1/x?token=FAKE123&user=troy');
+messageLeakTest('a synthetic bearer token', 'Authorization: Bearer sk-live-FAKE1234567890abcdef');
+messageLeakTest('a synthetic GameChanger-session token', 'gc_session=FAKE_SESSION_TOKEN_1234567890');
+messageLeakTest('synthetic database credentials', 'postgres://user:FAKEPASS@db.internal:5432/prod');
+messageLeakTest('NUL and ANSI escape characters', '\x00\x1b[31mFAKE\x1b[0m');
+messageLeakTest('newlines, carriage returns, tabs, and other C0/C1 controls', '\n\r\t\x01\x02\x1f\x7f');
+
+test('a 100,000-character source value produces only the fixed bounded message', () => {
+  const [early, gameOne, gameTwo] = ambiguousTriple((st, extra) => malformedWithHostileTeamSide(st, 'X'.repeat(100000), extra));
+  const result = reconstructBaseballTeamGames('team', [early, gameOne, gameTwo]);
+  const failed = result.gameResults.find((r) => r.diagnosticReconstruction?.status === 'error');
+  assert.equal(failed.diagnosticReconstruction.message, FIXED_DIAGNOSTIC_MESSAGE);
+  assert.equal(failed.diagnosticReconstruction.message.length, FIXED_DIAGNOSTIC_MESSAGE.length);
+});
+
+test('different underlying domain-validation failures produce the identical public message and code', () => {
+  const cases = [malformedNoOwn, malformedContradictorySide, malformedBoxScoreStructure];
+  const messages = cases.map((factory) => {
+    const [early, gameOne, gameTwo] = ambiguousTriple(factory);
+    const result = reconstructBaseballTeamGames('team', [early, gameOne, gameTwo]);
+    const failed = result.gameResults.find((r) => r.diagnosticReconstruction?.status === 'error');
+    return { message: failed.diagnosticReconstruction.message, code: failed.diagnosticReconstruction.code };
+  });
+  assert.ok(messages.every((m) => m.message === FIXED_DIAGNOSTIC_MESSAGE));
+  assert.ok(messages.every((m) => m.code === 'AMBIGUOUS_RECONSTRUCTION_FAILED'));
+});
+
+test('no raw caught exception, message, or stack is present in the diagnosticReconstruction object', () => {
+  // Scoped to diagnosticReconstruction specifically -- identity.reconciliation
+  // .candidateFingerprints/selectedFingerprint are a DIFFERENT, pre-existing,
+  // already-reviewed mechanism that deliberately embeds full game content as
+  // content-addressed provenance (see finalizeAmbiguousComponent); this
+  // correction only concerns what the diagnostic failure ITSELF exposes.
+  const [early, gameOne, gameTwo] = ambiguousTriple((st, extra) => malformedWithHostileTeamSide(st, 'Bearer sk-live-FAKE-UNIQUE-MARKER-999', extra));
+  const result = reconstructBaseballTeamGames('team', [early, gameOne, gameTwo]);
+  const failed = result.gameResults.find((r) => r.diagnosticReconstruction?.status === 'error');
+  const serializedDiagnostic = JSON.stringify(failed.diagnosticReconstruction);
+  assert.ok(!serializedDiagnostic.includes('FAKE-UNIQUE-MARKER'), 'the hostile value must not surface in the diagnostic failure object');
+  assert.ok(!serializedDiagnostic.includes('.js:'), 'no stack-trace-shaped content in the diagnostic failure object');
+  assert.deepEqual(Object.keys(failed.diagnosticReconstruction).sort(), ['code', 'message', 'status']);
+});
+
+// ── Non-throwing failure path: unit-level coverage via the exposed
+//    reconstructAmbiguousDiagnostic, which is the only way to exercise
+//    thrown-value types (hostile getters, Proxy, Symbol, BigInt, function,
+//    hostile toString/valueOf, circular objects) that reconstructBaseballGame
+//    itself can never actually throw through real malformed DATA -- this
+//    codebase's domain validation only ever does `throw new Error(string)`.
+//    The realistic, publicly-reachable failure cases (missing `own`,
+//    contradictory side metadata, invalid box-score structure) are already
+//    covered above and elsewhere through the full public API. ─────────────
+
+function gameWithHostileOwnGetter(thrownValue) {
+  const row = { Player: 'Bad', TeamSide: 'home', AB: 1, H: 1 };
+  Object.defineProperty(row, 'own', { get() { throw thrownValue; }, enumerable: true, configurable: true });
+  return { meta: {}, boxScore: { batting: [row], pitching: [] }, plays: [] };
+}
+const testIdentity = { key: 'test-key', reconciliation: { componentId: 'test-component' } };
+
+function nonThrowingTest(label, thrownValue) {
+  test(`reconstructAmbiguousDiagnostic does not throw for: ${label}`, () => {
+    const result = _internals.reconstructAmbiguousDiagnostic(gameWithHostileOwnGetter(thrownValue), testIdentity);
+    assert.equal(result.diagnosticReconstruction.status, 'error');
+    assert.equal(result.diagnosticReconstruction.code, 'AMBIGUOUS_RECONSTRUCTION_FAILED');
+    assert.equal(result.diagnosticReconstruction.message, FIXED_DIAGNOSTIC_MESSAGE);
+    assert.equal(result.excludedFromOfficialTotals, true);
+    assert.equal(result.identity, testIdentity);
+    assert.ok(!('own' in result), 'a failed diagnostic must never carry stat fields');
+  });
+}
+
+nonThrowingTest('ordinary Error', new Error('plain'));
+{
+  const hostileMessageError = Object.create(Error.prototype);
+  Object.defineProperty(hostileMessageError, 'message', { get() { throw new TypeError('gotcha'); }, configurable: true });
+  nonThrowingTest('Error with throwing `message` getter', hostileMessageError);
+}
+{
+  const hostileNameError = Object.create(Error.prototype);
+  Object.defineProperty(hostileNameError, 'name', { get() { throw new TypeError('gotcha-name'); }, configurable: true });
+  Object.defineProperty(hostileNameError, 'message', { value: 'ok', configurable: true });
+  nonThrowingTest('Error with throwing `name` getter', hostileNameError);
+}
+nonThrowingTest('Proxy that throws on property access', new Proxy({}, { get() { throw new Error('proxy trap fired'); } }));
+nonThrowingTest('string', 'plain string throw');
+nonThrowingTest('Symbol', Symbol('secret'));
+nonThrowingTest('number', 42);
+nonThrowingTest('boolean', true);
+nonThrowingTest('BigInt', 10n);
+nonThrowingTest('function', function unusedFn() {});
+{
+  const circular = {};
+  circular.self = circular;
+  nonThrowingTest('circular object', circular);
+}
+nonThrowingTest('null', null);
+nonThrowingTest('undefined', undefined);
+
+test('hostile toString and valueOf are never invoked by the failure path', () => {
+  let toStringCalled = false;
+  let valueOfCalled = false;
+  const hostile = {
+    toString() { toStringCalled = true; return 'called'; },
+    valueOf() { valueOfCalled = true; return 1; },
+  };
+  const result = _internals.reconstructAmbiguousDiagnostic(gameWithHostileOwnGetter(hostile), testIdentity);
+  assert.equal(result.diagnosticReconstruction.status, 'error');
+  assert.equal(toStringCalled, false);
+  assert.equal(valueOfCalled, false);
+});
+
+// ── Error-boundary contract preserved end to end through the public API ──
+
+test('authoritative totals remain available beside each of several hostile ambiguous failures', () => {
+  const proven = provenDurableGame('source-hostile-adjacent', 2);
+  const [early, gameOne, gameTwo] = ambiguousTriple((st, extra) => malformedWithHostileTeamSide(st, '\x00\x1b[31m' + 'Z'.repeat(10000), extra));
+  const result = reconstructBaseballTeamGames('team', [proven, early, gameOne, gameTwo]);
+  assert.equal(result.summary.games, 1);
+  assert.equal(result.summary.officialBatting.h, 2);
+  assert.equal(result.summary.failedAmbiguousDiagnostics, 1);
+});
+
+test('failedAmbiguousDiagnostics increments correctly and the failed record remains represented exactly once', () => {
+  const [early, gameOne, gameTwo] = ambiguousTriple((st, extra) => malformedWithHostileTeamSide(st, 'hostile', extra));
+  const result = reconstructBaseballTeamGames('team', [early, gameOne, gameTwo]);
+  const failed = result.gameResults.filter((r) => r.diagnosticReconstruction?.status === 'error');
+  assert.equal(failed.length, 1);
+  assert.equal(result.summary.failedAmbiguousDiagnostics, 1);
+  assert.equal(result.summary.ambiguousInputRecords, 3);
+});
+
+test('the failure record remains excluded from official totals and contains no stat fields', () => {
+  const [early, gameOne, gameTwo] = ambiguousTriple((st, extra) => malformedWithHostileTeamSide(st, 'hostile', extra));
+  const result = reconstructBaseballTeamGames('team', [early, gameOne, gameTwo]);
+  const failed = result.gameResults.find((r) => r.diagnosticReconstruction?.status === 'error');
+  assert.equal(failed.excludedFromOfficialTotals, true);
+  for (const field of ['own', 'opponent', 'ownSide', 'opponentSide']) {
+    assert.ok(!(field in failed), `failure record must not carry ${field}`);
+  }
+});
+
+test('successful ambiguous diagnostics remain unchanged by this correction', () => {
+  const early = scheduleGame('10:00 AM');
+  const gameOne = scheduleGame('10:00 AM', { meta: { gameNumber: 1 } });
+  const gameTwo = scheduleGame('10:00 AM', { meta: { gameNumber: 2 } });
+  const result = reconstructBaseballTeamGames('team', [early, gameOne, gameTwo]);
+  assert.ok(result.gameResults.every((r) => r.diagnosticReconstruction.status === 'ok'));
+  assert.ok(result.gameResults.every((r) => 'own' in r));
+});
+
+test('a malformed authoritative game still throws, unaffected by this correction', () => {
+  const badAuthoritative = { meta: { gameId: 'source-bad-2' }, boxScore: { batting: [{ Player: 'Bad', TeamSide: 'home', AB: 1, H: 1 }], pitching: [] }, plays: [] };
+  assert.throws(
+    () => reconstructBaseballTeamGames('team', [badAuthoritative]),
+    /missing the required explicit "own" boolean/,
   );
-  assert.equal(
-    _internals.normalizeThrownValue(42),
-    'non-Error value thrown during ambiguous diagnostic reconstruction',
-  );
-  assert.equal(
-    _internals.normalizeThrownValue(undefined),
-    'non-Error value thrown during ambiguous diagnostic reconstruction',
-  );
+});
+
+test('input reversal remains deterministic with a hostile-message-triggering ambiguous record present', () => {
+  const proven = provenDurableGame('source-hostile-reversal');
+  const [early, gameOne, gameTwo] = ambiguousTriple((st, extra) => malformedWithHostileTeamSide(st, 'reversal-check', extra));
+  const forward = reconstructBaseballTeamGames('team', [proven, early, gameOne, gameTwo]);
+  const reverse = reconstructBaseballTeamGames('team', [gameTwo, gameOne, early, proven]);
+  assert.deepEqual(forward, reverse);
+});
+
+test('inputs remain deeply unmodified when a hostile TeamSide value triggers a diagnostic failure', () => {
+  const [early, gameOne, gameTwo] = ambiguousTriple((st, extra) => malformedWithHostileTeamSide(st, 'mutation-check', extra));
+  const before = [early, gameOne, gameTwo].map((g) => structuredClone(g));
+  reconstructBaseballTeamGames('team', [early, gameOne, gameTwo]);
+  assert.deepEqual([early, gameOne, gameTwo], before);
 });

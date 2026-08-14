@@ -626,19 +626,18 @@ function reconcileGameCollection(games) {
   return reconciled.sort((a, b) => codePointCompare(a.identity.key, b.identity.key));
 }
 
-// Normalizes a thrown value from ambiguous-diagnostic reconstruction into a
-// safe, deterministic string for a public result: an Error's `.message`
-// only -- never `.stack`, which can embed filesystem paths and is not part
-// of this module's public error contract -- the thrown value itself when
-// it is already a plain string, or a fixed fallback for anything else. This
-// codebase's domain validation only ever throws plain Error objects with a
-// static-shaped, content-derived (never timestamped/random) message, so the
-// non-Error/non-string branch is defensive rather than expected to fire.
-function normalizeThrownValue(err) {
-  if (err instanceof Error && typeof err.message === 'string') return err.message;
-  if (typeof err === 'string') return err;
-  return 'non-Error value thrown during ambiguous diagnostic reconstruction';
-}
+// The fixed, bounded public message for a failed ambiguous diagnostic
+// reconstruction. Deliberately a constant, not a function of the caught
+// value: a thrown Error's message can embed raw row content (see
+// assertNoContradictorySideMetadata's `venue` interpolation) sourced from a
+// captured game object this module does not control the contents of --
+// scraped or otherwise malformed input could put a secret-shaped string,
+// a filesystem path, a URL, control characters, or an unbounded amount of
+// text into that message. Arbitrary exception content cannot be reliably
+// sanitized through a finite pattern list, so the fix is a fixed fail-safe
+// boundary: this string is the ONLY thing ever returned here, never
+// anything derived from the exception.
+const AMBIGUOUS_RECONSTRUCTION_FAILURE_MESSAGE = 'Ambiguous game diagnostic reconstruction failed.';
 
 // Reconstructs ONE ambiguous record's own/opponent totals for diagnostic
 // display, with its own narrow error boundary. This wraps ONLY
@@ -654,6 +653,19 @@ function normalizeThrownValue(err) {
 // fabricated zero stats, or shaped so a caller could mistake it for a valid
 // game result: the two branches below return deliberately different shapes
 // (only the success branch carries own/opponent/ownSide/etc. stat fields).
+//
+// The catch block intentionally never reads or coerces the caught value --
+// no `err.message`, `err.stack`, `err.name`, `String(err)`, template-literal
+// interpolation, or property access of any kind. This is not merely a
+// stylistic choice: touching a caught value can itself throw (a hostile
+// Error subclass with a throwing `message`/`name` getter, or a Proxy that
+// traps property access) and invoke arbitrary `toString`/`valueOf` methods,
+// either of which would defeat this exact error boundary by raising a NEW
+// exception from inside the handler meant to contain the first one. Because
+// nothing about `err` is ever inspected, this catch cannot throw for any
+// JavaScript value that could be thrown here -- Error, hostile-getter
+// Error, Proxy, string, Symbol, number, boolean, BigInt, function, object
+// with hostile toString/valueOf, circular object, null, or undefined.
 function reconstructAmbiguousDiagnostic(game, identity) {
   try {
     return {
@@ -662,14 +674,14 @@ function reconstructAmbiguousDiagnostic(game, identity) {
       excludedFromOfficialTotals: true,
       diagnosticReconstruction: { status: 'ok' },
     };
-  } catch (err) {
+  } catch {
     return {
       identity,
       excludedFromOfficialTotals: true,
       diagnosticReconstruction: {
         status: 'error',
         code: 'AMBIGUOUS_RECONSTRUCTION_FAILED',
-        message: normalizeThrownValue(err),
+        message: AMBIGUOUS_RECONSTRUCTION_FAILURE_MESSAGE,
       },
     };
   }
@@ -911,6 +923,6 @@ module.exports = {
   _internals: {
     toReconstructionInput, toStatsEngineGame, requireExplicitOwnBoolean, canonicalGameIdentity,
     reconcileGameCollection, stableStringify, clusterFallbackIdentities, relateDiscriminators, unionDiscriminators,
-    finalizeAmbiguousComponent, normalizeThrownValue,
+    finalizeAmbiguousComponent, reconstructAmbiguousDiagnostic,
   },
 };
