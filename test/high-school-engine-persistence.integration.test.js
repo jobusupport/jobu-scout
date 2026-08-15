@@ -439,21 +439,52 @@ function independentRepository() {
   return require('../src/high-school-import-repository').createHighSchoolImportRepository(client);
 }
 
-async function simultaneousStart(operations) {
-  let release;
-  const gate = new Promise((resolve) => { release = resolve; });
-  let ready = 0;
-  let allReady;
-  const readyGate = new Promise((resolve) => { allReady = resolve; });
-  const started = operations.map((operation) => (async () => {
-    ready += 1;
-    if (ready === operations.length) allReady();
-    await gate;
-    return operation();
-  })());
-  await readyGate;
-  release();
-  return Promise.allSettled(started);
+const OVERLAP_TIMEOUT_MS = 5_000;
+const OVERLAP_REPEAT_COUNT = 3;
+
+async function waitForDatabaseOverlap() {
+  const deadline = Date.now() + OVERLAP_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const result = await fixtureDb.query(
+      `select count(*)::int reached,
+              count(*) filter (where wait_event_type = 'Lock')::int lock_waiters
+         from pg_stat_activity
+        where pid <> pg_backend_pid()
+          and state = 'active'
+          and query ilike '%persist_hs_engine_collection%'`,
+    );
+    if (result.rows[0].reached >= 2 && result.rows[0].lock_waiters >= 2) return result.rows[0];
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error('database overlap witness timed out before two RPC sessions reached the held hierarchy lock');
+}
+
+test('concurrency harness requires a PostgreSQL lock-wait witness rather than dispatch timing', () => {
+  assert.equal(OVERLAP_REPEAT_COUNT, 3);
+  assert.match(waitForDatabaseOverlap.toString(), /pg_stat_activity/);
+  assert.match(waitForDatabaseOverlap.toString(), /wait_event_type = 'Lock'/);
+  assert.match(databaseWitnessedOverlap.toString(), /for update/);
+});
+
+async function databaseWitnessedOverlap(operations) {
+  const blocker = await fixtureDb.connect();
+  let released = false;
+  try {
+    await blocker.query('begin');
+    await blocker.query('select id from public.hs_teams where id=$1 for update', [ids.teamId]);
+    const started = operations.map((operation) => operation());
+    const witness = await waitForDatabaseOverlap();
+    await blocker.query('commit');
+    released = true;
+    const timeout = new Promise((_, reject) => setTimeout(
+      () => reject(new Error('overlapped RPC operations did not complete within the bounded timeout')),
+      OVERLAP_TIMEOUT_MS,
+    ));
+    return { witness, settled: await Promise.race([Promise.allSettled(started), timeout]) };
+  } finally {
+    if (!released) await blocker.query('rollback').catch(() => {});
+    blocker.release();
+  }
 }
 
 function refinalizeDto(dto) {
@@ -473,7 +504,7 @@ function refinalizeDto(dto) {
 }
 
 async function assertNoPublicationForRun(runId) {
-  for (const table of ['hs_import_run_games', 'hs_raw_snapshots', 'hs_game_validation_results', 'hs_stat_generations', 'hs_verified_totals']) {
+  for (const table of ['hs_import_run_games', 'hs_raw_snapshots', 'hs_game_validation_results', 'hs_stat_generations', 'hs_verified_totals', 'hs_player_advanced_stats', 'hs_pitcher_advanced_stats']) {
     const column = table === 'hs_stat_generations' || table === 'hs_verified_totals' ? 'import_run_id' : 'import_run_id';
     const result = await fixtureDb.query(`select count(*)::int count from public.${table} where ${column} = $1`, [runId]);
     assert.equal(result.rows[0].count, 0, `${table} must roll back for failed run`);
@@ -481,52 +512,65 @@ async function assertNoPublicationForRun(runId) {
 }
 
 relationalTest('concurrent same-key different-content publication commits one consistent identity', { skip }, async () => {
-  const runA = await createRun();
-  const runB = await createRun();
-  const first = dto(runA, [capturedGame('same-key-a')]);
-  const secondBase = dto(runB, [capturedGame('same-key-b')]);
-  const second = refinalizeDto({ ...secondBase, inputSetHash: first.inputSetHash });
-  const settled = await simultaneousStart([
-    () => independentRepository().persistEngineCollection(first),
-    () => independentRepository().persistEngineCollection(second),
-  ]);
-  assert.equal(settled.filter((item) => item.status === 'fulfilled').length, 1);
-  assert.equal(settled.filter((item) => item.status === 'rejected' && item.reason.code === 'IDEMPOTENCY_CONTENT_MISMATCH').length, 1);
-  const generations = await fixtureDb.query(
-    'select id, content_hash, is_current from public.hs_stat_generations where org_id=$1 and team_id=$2 and season_id=$3 and input_set_hash=$4',
-    [ids.orgId, ids.teamId, ids.seasonId, first.inputSetHash],
-  );
-  assert.equal(generations.rowCount, 1);
-  assert.equal(generations.rows[0].is_current, true);
-  const losingRun = settled[0].status === 'rejected' ? runA : runB;
-  await assertNoPublicationForRun(losingRun.id);
+  for (let repeat = 0; repeat < OVERLAP_REPEAT_COUNT; repeat += 1) {
+    const runA = await createRun();
+    const runB = await createRun();
+    const first = dto(runA, [capturedGame(`same-key-a-${repeat}`)]);
+    const secondBase = dto(runB, [capturedGame(`same-key-b-${repeat}`)]);
+    const second = refinalizeDto({ ...secondBase, inputSetHash: first.inputSetHash });
+    const { witness, settled } = await databaseWitnessedOverlap([
+      () => independentRepository().persistEngineCollection(first),
+      () => independentRepository().persistEngineCollection(second),
+    ]);
+    assert.ok(witness.reached >= 2 && witness.lock_waiters >= 2);
+    assert.equal(settled.filter((item) => item.status === 'fulfilled').length, 1);
+    assert.equal(settled.filter((item) => item.status === 'rejected' && item.reason.code === 'IDEMPOTENCY_CONTENT_MISMATCH').length, 1);
+    const generations = await fixtureDb.query(
+      'select id, content_hash, is_current from public.hs_stat_generations where org_id=$1 and team_id=$2 and season_id=$3 and input_set_hash=$4',
+      [ids.orgId, ids.teamId, ids.seasonId, first.inputSetHash],
+    );
+    assert.equal(generations.rowCount, 1);
+    assert.equal(generations.rows[0].is_current, true);
+    const winning = settled[0].status === 'fulfilled' ? first : second;
+    const losing = settled[0].status === 'rejected' ? first : second;
+    const losingRun = settled[0].status === 'rejected' ? runA : runB;
+    await assertNoPublicationForRun(losingRun.id);
+    assert.equal((await independentRepository().persistEngineCollection(winning)).id, generations.rows[0].id);
+    await assert.rejects(() => independentRepository().persistEngineCollection(losing), (error) => error.code === 'IDEMPOTENCY_CONTENT_MISMATCH');
+  }
 });
 
 relationalTest('concurrent successor generations serialize with one internally consistent current generation', { skip }, async () => {
-  const initialRun = await createRun();
-  await repository.persistEngineCollection(dto(initialRun, [capturedGame('supersession-base')]));
-  const runA = await createRun();
-  const runB = await createRun();
-  const successorA = dto(runA, [capturedGame('supersession-a')]);
-  const successorBGame = capturedGame('supersession-b');
-  successorBGame.boxScore.batting = [];
-  successorBGame.plays = [];
-  const successorB = dto(runB, [successorBGame]);
-  const settled = await simultaneousStart([
-    () => independentRepository().persistEngineCollection(successorA),
-    () => independentRepository().persistEngineCollection(successorB),
-  ]);
-  assert.ok(settled.every((item) => item.status === 'fulfilled'), JSON.stringify(settled));
-  const current = await fixtureDb.query(
-    'select id from public.hs_stat_generations where org_id=$1 and team_id=$2 and season_id=$3 and is_current',
-    [ids.orgId, ids.teamId, ids.seasonId],
-  );
-  assert.equal(current.rowCount, 1);
-  const stale = await fixtureDb.query(
-    'select count(*)::int count from public.hs_player_advanced_stats where org_id=$1 and team_id=$2 and season_id=$3 and is_current and generation_id<>$4',
-    [ids.orgId, ids.teamId, ids.seasonId, current.rows[0].id],
-  );
-  assert.equal(stale.rows[0].count, 0);
+  for (let repeat = 0; repeat < OVERLAP_REPEAT_COUNT; repeat += 1) {
+    const initialRun = await createRun();
+    await repository.persistEngineCollection(dto(initialRun, [capturedGame(`supersession-base-${repeat}`)]));
+    const runA = await createRun();
+    const runB = await createRun();
+    const successorA = dto(runA, [capturedGame(`supersession-a-${repeat}`)]);
+    const successorBGame = capturedGame(`supersession-b-${repeat}`);
+    successorBGame.boxScore.batting = [];
+    successorBGame.plays = [];
+    const successorB = dto(runB, [successorBGame]);
+    const { witness, settled } = await databaseWitnessedOverlap([
+      () => independentRepository().persistEngineCollection(successorA),
+      () => independentRepository().persistEngineCollection(successorB),
+    ]);
+    assert.ok(witness.reached >= 2 && witness.lock_waiters >= 2);
+    assert.ok(settled.every((item) => item.status === 'fulfilled'), JSON.stringify(settled));
+    const current = await fixtureDb.query(
+      'select id, import_run_id from public.hs_stat_generations where org_id=$1 and team_id=$2 and season_id=$3 and is_current',
+      [ids.orgId, ids.teamId, ids.seasonId],
+    );
+    assert.equal(current.rowCount, 1);
+    const stale = await fixtureDb.query(
+      'select count(*)::int count from public.hs_player_advanced_stats where org_id=$1 and team_id=$2 and season_id=$3 and is_current and generation_id<>$4',
+      [ids.orgId, ids.teamId, ids.seasonId, current.rows[0].id],
+    );
+    assert.equal(stale.rows[0].count, 0);
+    assert.ok([runA.id, runB.id].includes(current.rows[0].import_run_id));
+    await independentRepository().persistEngineCollection(successorA);
+    await independentRepository().persistEngineCollection(successorB);
+  }
 });
 
 relationalTest('every externally supplied tenant foreign key rejects cross-organization substitution atomically', { skip }, async () => {
@@ -570,12 +614,36 @@ relationalTest('near-limit valid JSON commits through the real local service-rol
 });
 
 relationalTest('hostile nested and malformed JSON rejects boundedly and leaves the local stack healthy', { skip }, async () => {
+  const baselineRun = await createRun();
+  const baseline = await independentRepository().persistEngineCollection(dto(baselineRun, [capturedGame('malformed-baseline')]));
+  const mutateObservation = (mutator) => (value) => {
+    const observation = structuredClone(value.observations[0]);
+    mutator(observation);
+    return { ...value, observations: [observation] };
+  };
   const cases = [
     (value) => ({ ...value, observations: {} }),
     (value) => ({ ...value, canonicalPlayers: 'wrong' }),
     (value) => ({ ...value, teamTotals: [] }),
     (value) => ({ ...value, observations: Array.from({ length: 128 }, () => ({ unexpected: true })) }),
     (value) => ({ ...value, unexpectedTopLevel: { nested: { nested: { nested: true } } } }),
+    mutateObservation((o) => { delete o.identityMethod; }),
+    mutateObservation((o) => { o.unexpected = true; }),
+    mutateObservation((o) => { o.unexpected = { deeply: { nested: [{ hostile: true }] } }; }),
+    ...[null, 17, true, '', '   ', ` ${'a'.repeat(64)}`, `${'a'.repeat(64)} `, 'a'.repeat(63), 'g'.repeat(64), 'A'.repeat(64), `\u0430${'a'.repeat(63)}`, `e\u0301${'a'.repeat(62)}`, `\u00e9${'a'.repeat(63)}`]
+      .map((key) => mutateObservation((o) => { o.observationKey = key; })),
+    ...['identityMethod', 'identityStatus', 'identityDigest', 'engineVersion', 'authoritative', 'excludedFromOfficialTotals', 'discriminators', 'conflictFields', 'diagnostic', 'validation', 'snapshots']
+      .map((field) => mutateObservation((o) => { o[field] = 17; })),
+    (value) => {
+      const first = structuredClone(value.observations[0]);
+      const second = { ...structuredClone(first) };
+      return { ...value, observations: [second, first] };
+    },
+    (value) => {
+      const first = structuredClone(value.observations[0]);
+      const second = { ...structuredClone(first), unexpected: true };
+      return { ...value, observations: [second, first] };
+    },
   ];
   for (const [index, mutate] of cases.entries()) {
     const run = await createRun();
@@ -586,6 +654,11 @@ relationalTest('hostile nested and malformed JSON rejects boundedly and leaves t
       `hostile malformed case ${index} must reject`,
     );
     await assertNoPublicationForRun(run.id);
+    const current = await fixtureDb.query(
+      'select id from public.hs_stat_generations where org_id=$1 and team_id=$2 and season_id=$3 and is_current',
+      [ids.orgId, ids.teamId, ids.seasonId],
+    );
+    assert.deepEqual(current.rows.map((row) => row.id), [baseline.id], `hostile malformed case ${index} changed current publication`);
   }
   const healthyRun = await createRun();
   const healthy = await independentRepository().persistEngineCollection(dto(healthyRun, [capturedGame('healthy-after-hostile')]));

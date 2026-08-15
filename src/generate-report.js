@@ -30,7 +30,8 @@ require('dotenv').config({ quiet: true });
 const path     = require('path');
 const { isValidUuid, resolveReportOutputDir } = require('./report-access');
 const { requireJobOrgContext } = require('./job-org-context');
-const { resolveDatabaseMode } = require('./db-mode');
+const { OrgContextRequiredError } = require('./org-context-errors');
+const { resolveDatabaseMode, DatabaseModeConfigError } = require('./db-mode');
 const { resolveTeamMatch, formatTeamListLine, formatAmbiguousMatchLine, runTeamsSequentially } = require('./report-team-selection');
 
 const DB_PATH     = path.join(__dirname, '..', 'voodoo-scout.db');
@@ -50,7 +51,11 @@ let JOB_ORG_ID;
 try {
   JOB_ORG_ID = requireJobOrgContext();
 } catch (error) {
-  console.error('[report] OrgContextRequiredError: JOBU_JOB_ORG_ID is required.');
+  if (error instanceof OrgContextRequiredError) {
+    console.error('[report] OrgContextRequiredError: JOBU_JOB_ORG_ID is required.');
+  } else {
+    console.error('[report] InternalBootstrapError: organization-context bootstrap failed.');
+  }
   process.exit(1);
 }
 if (!isValidUuid(JOB_ORG_ID)) {
@@ -61,7 +66,11 @@ if (!isValidUuid(JOB_ORG_ID)) {
 try {
   resolveDatabaseMode();
 } catch (error) {
-  console.error(`[report] DatabaseModeConfigError: ${error.message}`);
+  if (error instanceof DatabaseModeConfigError) {
+    console.error(`[report] DatabaseModeConfigError: ${error.message}`);
+  } else {
+    console.error('[report] InternalBootstrapError: database-mode bootstrap failed.');
+  }
   process.exit(1);
 }
 

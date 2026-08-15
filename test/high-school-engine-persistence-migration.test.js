@@ -131,3 +131,11 @@ test('RPC locks hierarchy before writes and supersedes complete generations atom
   assert.match(fn, /update public\.hs_pitcher_advanced_stats set is_current = false/i);
   assert.match(fn, /update public\.hs_import_runs[\s\S]*?set status = 'succeeded'/i);
 });
+
+test('RPC closes the observation shape and requires the mapper canonical lowercase SHA-256 key', () => {
+  assert.match(sql, /jsonb_object_keys\(observation\)/i);
+  assert.match(sql, /observation_key not in \([\s\S]*?'observationKey'[\s\S]*?'engineVersion'/i);
+  assert.match(sql, /observation ->> 'observationKey'\) !~ '\^\[0-9a-f\]\{64\}\$'/i);
+  assert.match(sql, /jsonb_object_keys\(snapshot\)/i);
+  assert.match(sql, /jsonb_object_keys\(observation -> 'validation'\)/i);
+});

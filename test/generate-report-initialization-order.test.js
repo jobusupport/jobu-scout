@@ -11,6 +11,7 @@ const SCRIPT = path.join(REPO_ROOT, 'src', 'generate-report.js');
 const SOURCE = fs.readFileSync(SCRIPT, 'utf8');
 const VALID_ORG_ID = '99999999-9999-4999-8999-999999999999';
 const SECRET_SENTINEL = 'synthetic-service-secret-must-not-leak';
+const FAILURE_INJECTOR = path.join(__dirname, 'helpers', 'generate-report-bootstrap-failure-injector.js');
 
 function runReport(envOverrides = {}) {
   const env = { ...process.env, ...envOverrides };
@@ -25,6 +26,19 @@ function runReport(envOverrides = {}) {
     child.stderr.on('data', (chunk) => { stderr += chunk; });
     child.on('error', reject);
     child.on('exit', (code) => resolve({ code, stdout, stderr, output: stdout + stderr }));
+  });
+}
+
+function runInjectedBootstrapFailure(kind) {
+  return runReport({
+    NODE_ENV: 'production',
+    JOBU_JOB_ORG_ID: VALID_ORG_ID,
+    USE_SUPABASE: 'true',
+    SUPABASE_URL: 'http://127.0.0.1:54321',
+    SUPABASE_ANON_KEY: 'synthetic-anon',
+    SUPABASE_SERVICE_ROLE_KEY: SECRET_SENTINEL,
+    HS_BOOTSTRAP_FAILURE_KIND: kind,
+    NODE_OPTIONS: `--require=${FAILURE_INJECTOR}`,
   });
 }
 
@@ -81,3 +95,14 @@ test('shared server modules can load in validated SQLite mode without constructi
   assert.equal(result.code, 0, result.output);
   assert.doesNotMatch(result.output, /supabaseUrl is required|node_modules|[A-Z]:\\/i);
 });
+
+for (const [kind, label] of [['org', 'organization-context'], ['mode', 'database-mode']]) {
+  test(`unexpected ${label} failure is distinctly classified, bounded, and stops dependency loading`, async () => {
+    const result = await runInjectedBootstrapFailure(kind);
+    assert.notEqual(result.code, 0);
+    assert.match(result.output, new RegExp(`InternalBootstrapError: ${label} bootstrap failed\\.`));
+    assert.doesNotMatch(result.output, /OrgContextRequiredError|DatabaseModeConfigError|DATABASE_DEPENDENCY_LOADED/);
+    assert.doesNotMatch(result.output, /synthetic-bootstrap-secret|private\\\\bootstrap|node_modules|\bat [^(\r\n]+\(/i);
+    assert.ok(Buffer.byteLength(result.output, 'utf8') < 500);
+  });
+}

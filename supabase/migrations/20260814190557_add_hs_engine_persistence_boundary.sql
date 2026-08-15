@@ -398,12 +398,81 @@ begin
   if exists (
     select 1 from jsonb_array_elements(p_dto -> 'observations') observation
      where jsonb_typeof(observation) <> 'object'
-        or nullif(observation ->> 'observationKey', '') is null
-        or nullif(observation ->> 'identityMethod', '') is null
-        or nullif(observation ->> 'identityStatus', '') is null
+        or not (observation ?& array[
+          'observationKey', 'sourceGameRef', 'sourceGameUrl', 'opponentName', 'gameDate',
+          'identityMethod', 'identityStatus', 'identityDigest', 'foundationalDigest',
+          'discriminators', 'authoritative', 'excludedFromOfficialTotals',
+          'ambiguityComponentDigest', 'conflictFields', 'diagnostics', 'diagnostic',
+          'validation', 'snapshots', 'engineVersion'
+        ])
+        or exists (
+          select 1 from jsonb_object_keys(observation) observation_key
+           where observation_key not in (
+             'observationKey', 'sourceGameRef', 'sourceGameUrl', 'opponentName', 'gameDate',
+             'identityMethod', 'identityStatus', 'identityDigest', 'foundationalDigest',
+             'discriminators', 'authoritative', 'excludedFromOfficialTotals',
+             'ambiguityComponentDigest', 'conflictFields', 'diagnostics', 'diagnostic',
+             'validation', 'snapshots', 'engineVersion'
+           )
+        )
+        or jsonb_typeof(observation -> 'observationKey') <> 'string'
+        or (observation ->> 'observationKey') !~ '^[0-9a-f]{64}$'
+        or jsonb_typeof(observation -> 'identityMethod') <> 'string'
+        or btrim(observation ->> 'identityMethod') = ''
+        or jsonb_typeof(observation -> 'identityStatus') <> 'string'
+        or btrim(observation ->> 'identityStatus') = ''
+        or jsonb_typeof(observation -> 'identityDigest') <> 'string'
         or coalesce(observation ->> 'identityDigest', '') !~ '^[0-9a-f]{64}$'
+        or jsonb_typeof(observation -> 'engineVersion') <> 'string'
+        or observation ->> 'engineVersion' <> v_engine_version
+        or jsonb_typeof(observation -> 'authoritative') <> 'boolean'
+        or jsonb_typeof(observation -> 'excludedFromOfficialTotals') <> 'boolean'
+        or jsonb_typeof(observation -> 'discriminators') <> 'object'
+        or jsonb_typeof(observation -> 'conflictFields') <> 'array'
+        or jsonb_typeof(observation -> 'diagnostics') <> 'object'
+        or jsonb_typeof(observation -> 'diagnostic') <> 'object'
         or jsonb_typeof(observation -> 'snapshots') <> 'array'
         or jsonb_typeof(observation -> 'validation') <> 'object'
+        or (jsonb_typeof(observation -> 'sourceGameRef') not in ('string', 'null'))
+        or (jsonb_typeof(observation -> 'sourceGameUrl') not in ('string', 'null'))
+        or (jsonb_typeof(observation -> 'opponentName') not in ('string', 'null'))
+        or (jsonb_typeof(observation -> 'gameDate') not in ('string', 'null'))
+        or (jsonb_typeof(observation -> 'foundationalDigest') not in ('string', 'null'))
+        or (jsonb_typeof(observation -> 'ambiguityComponentDigest') not in ('string', 'null'))
+        or (jsonb_typeof(observation -> 'foundationalDigest') = 'string' and (observation ->> 'foundationalDigest') !~ '^[0-9a-f]{64}$')
+        or (jsonb_typeof(observation -> 'ambiguityComponentDigest') = 'string' and (observation ->> 'ambiguityComponentDigest') !~ '^[0-9a-f]{64}$')
+        or exists (
+          select 1 from jsonb_array_elements(observation -> 'snapshots') snapshot
+           where jsonb_typeof(snapshot) <> 'object'
+              or not (snapshot ?& array['kind', 'sourceRef', 'capturedAt', 'payload', 'integrityHash'])
+              or exists (select 1 from jsonb_object_keys(snapshot) k where k not in ('kind', 'sourceRef', 'capturedAt', 'payload', 'integrityHash'))
+              or jsonb_typeof(snapshot -> 'kind') <> 'string' or btrim(snapshot ->> 'kind') = ''
+              or jsonb_typeof(snapshot -> 'capturedAt') <> 'string' or btrim(snapshot ->> 'capturedAt') = ''
+              or jsonb_typeof(snapshot -> 'integrityHash') <> 'string' or (snapshot ->> 'integrityHash') !~ '^[0-9a-f]{64}$'
+              or jsonb_typeof(snapshot -> 'sourceRef') not in ('string', 'null')
+              or jsonb_typeof(snapshot -> 'payload') not in ('object', 'array')
+        )
+        or exists (
+          select 1 from jsonb_object_keys(observation -> 'validation') k
+           where k not in ('hasBoxScore', 'hasPlayByPlay', 'ownSide', 'opponentSide', 'boxScoreBatting',
+             'boxScorePitching', 'reconstructedBatting', 'reconstructedPitching', 'deltas',
+             'battingMatchesBox', 'quality', 'warnings', 'confidence', 'status')
+        )
+        or not ((observation -> 'validation') ?& array['hasBoxScore','hasPlayByPlay','ownSide','opponentSide','boxScoreBatting','boxScorePitching','reconstructedBatting','reconstructedPitching','deltas','battingMatchesBox','quality','warnings','confidence','status'])
+        or jsonb_typeof(observation #> '{validation,hasBoxScore}') <> 'boolean'
+        or jsonb_typeof(observation #> '{validation,hasPlayByPlay}') <> 'boolean'
+        or jsonb_typeof(observation #> '{validation,battingMatchesBox}') <> 'boolean'
+        or jsonb_typeof(observation #> '{validation,warnings}') <> 'array'
+        or jsonb_typeof(observation #> '{validation,confidence}') <> 'string'
+        or jsonb_typeof(observation #> '{validation,status}') <> 'string'
+        or jsonb_typeof(observation #> '{validation,ownSide}') not in ('string', 'null')
+        or jsonb_typeof(observation #> '{validation,opponentSide}') not in ('string', 'null')
+        or jsonb_typeof(observation #> '{validation,boxScoreBatting}') <> 'object'
+        or jsonb_typeof(observation #> '{validation,boxScorePitching}') <> 'object'
+        or jsonb_typeof(observation #> '{validation,reconstructedBatting}') <> 'object'
+        or jsonb_typeof(observation #> '{validation,reconstructedPitching}') <> 'object'
+        or jsonb_typeof(observation #> '{validation,deltas}') <> 'object'
+        or jsonb_typeof(observation #> '{validation,quality}') <> 'object'
   ) then
     raise exception 'malformed_engine_collection: invalid observation shape' using errcode = 'P0001';
   end if;
