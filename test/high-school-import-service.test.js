@@ -34,6 +34,53 @@ function setup() {
   return { client, repository, service };
 }
 
+function engineCapturedGame(extraBoxScore = {}) {
+  return {
+    meta: {
+      sourceGameId: 'synthetic-engine-game',
+      gameDate: '2026-04-01',
+      homeTeam: 'Synthetic High',
+      awayTeam: 'Synthetic Rival',
+      ourSide: 'home',
+      capturedAt: '2026-04-01T20:00:00.000Z',
+    },
+    boxScore: {
+      batting: [{ Player: 'Alice Smith', TeamSide: 'home', isHighSchoolTeam: true, playerId: 'gc-alice' }],
+      pitching: [],
+      ...extraBoxScore,
+    },
+    plays: [{ inning: 'Bottom 1', batterId: 'gc-alice', text: 'Single. Alice Smith singles to left field, Pat Fixture pitching.' }],
+  };
+}
+
+test('persistEngineCollection maps and publishes one complete DTO through one repository RPC', async () => {
+  const { client, service } = setup();
+  const result = await service.persistEngineCollection({
+    context: { ...ctx(), importRunId: RUN_ID, sourceProvider: 'gamechanger' },
+    capturedGames: [engineCapturedGame()],
+    rosterMemberships: [{ playerId: PLAYER_ID, gcExternalPlayerId: 'gc-alice' }],
+  });
+  assert.equal(client.__rpcCalls.length, 1);
+  assert.equal(client.__rpcCalls[0].name, 'persist_hs_engine_collection');
+  assert.equal(client.__rpcCalls[0].params.p_dto.canonicalPlayers[0].playerId, PLAYER_ID);
+  assert.equal(result.engineVersion, 'hs-baseball-engine/v1');
+});
+
+test('persistEngineCollection rejects an oversized DTO before any repository call', async () => {
+  const { client, service } = setup();
+  const oversized = engineCapturedGame({ evidencePadding: 'x'.repeat(4_194_305) });
+  await assert.rejects(
+    () => service.persistEngineCollection({
+      context: { ...ctx(), importRunId: RUN_ID, sourceProvider: 'gamechanger' },
+      capturedGames: [oversized],
+      rosterMemberships: [{ playerId: PLAYER_ID, gcExternalPlayerId: 'gc-alice' }],
+    }),
+    (error) => error.code === 'HS_ENGINE_COLLECTION_TOO_LARGE' && error.statusCode === 413,
+  );
+  assert.equal(client.__rpcCalls.length, 0);
+  assert.equal(client.__touchedTables.size, 0);
+});
+
 // A single-play game, box score and play-by-play IN AGREEMENT (one single,
 // no other events). isHighSchoolTeam: true marks Alice's row as the
 // imported High School team's OWN data, in this module's natural

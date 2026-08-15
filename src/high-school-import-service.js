@@ -39,6 +39,7 @@
 
 const { createHighSchoolImportRepository } = require('./high-school-import-repository');
 const { reconstructGame, reconstructTeamGames } = require('./game-reconstructor');
+const { mapHighSchoolEngineCollection } = require('./high-school-engine-persistence-mapper');
 const {
   importError,
   requireEnum,
@@ -415,6 +416,16 @@ function createHighSchoolImportService({ repository }) {
     return repository.publishPitcherAdvancedStats({ ...ctx, importRunId: resolvedImportRunId, playerId: hsPlayerId, stats: sanitizedStats });
   }
 
+  // Slice 2C trusted publication boundary. Mapping and the 4 MiB UTF-8 cap
+  // are completed before the repository is touched. An oversized or
+  // malformed collection therefore makes zero database calls, and a valid
+  // collection makes exactly one atomic RPC call.
+  async function persistEngineCollection({ context, capturedGames, rosterMemberships }) {
+    const { dto, payloadBytes } = mapHighSchoolEngineCollection({ context, capturedGames, rosterMemberships });
+    const generation = await repository.persistEngineCollection(dto);
+    return { generation, payloadBytes, engineVersion: dto.engineVersion, inputSetHash: dto.inputSetHash };
+  }
+
   return {
     startImportRun,
     recordDiscoveredCount,
@@ -428,6 +439,7 @@ function createHighSchoolImportService({ repository }) {
     publishVerifiedTotals,
     publishPlayerAdvancedStats,
     publishPitcherAdvancedStats,
+    persistEngineCollection,
     deriveGameConfidenceAndStatus,
     invertRowOwnershipForReconstruction,
     toReconstructionInput,

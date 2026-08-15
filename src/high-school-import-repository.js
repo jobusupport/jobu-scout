@@ -659,6 +659,41 @@ function createHighSchoolImportRepository(adminClient) {
     });
   }
 
+  // Slice 2C complete-generation publication. The mapper has already
+  // computed, sanitized, canonically serialized, hashed, and size-checked
+  // this DTO. One RPC call is the entire repository contract: Postgres owns
+  // every identity upsert, evidence append, generation supersession, and run
+  // finalization in one transaction.
+  const ENGINE_COLLECTION_RPC_ERRORS = [
+    ['malformed_engine_collection', 'INVALID_ENGINE_COLLECTION', 400],
+    ['invalid_engine_version', 'INVALID_ENGINE_VERSION', 400],
+    ['invalid_collection_digest', 'INVALID_ENGINE_COLLECTION_DIGEST', 400],
+    ['engine_collection_payload_too_large', 'HS_ENGINE_COLLECTION_TOO_LARGE', 413],
+    ['invalid_source_provider', 'INVALID_SOURCE_PROVIDER', 400],
+    ['team_not_found_for_org_program', 'TEAM_NOT_FOUND_FOR_ORG', 404],
+    ['season_not_found_for_org_program', 'SEASON_NOT_FOUND_FOR_ORG', 404],
+    ['invalid_import_run_state', 'INVALID_IMPORT_RUN_STATE', 409],
+    ['idempotency_content_mismatch', 'IDEMPOTENCY_CONTENT_MISMATCH', 409],
+    ['player_not_on_roster', 'PLAYER_NOT_ON_ROSTER', 409],
+    ['invalid_canonical_player_role', 'INVALID_CANONICAL_PLAYER_ROLE', 400],
+  ];
+
+  async function persistEngineCollection(dto) {
+    const { data, error } = await adminClient.rpc('persist_hs_engine_collection', { p_dto: dto });
+    if (!error) return data;
+    const rawMessage = String(error.message || '');
+    const match = ENGINE_COLLECTION_RPC_ERRORS.find(([prefix]) => rawMessage.startsWith(prefix));
+    if (match) {
+      const [prefix, code, statusCode] = match;
+      throw importError(code, prefix.replaceAll('_', ' '), {
+        statusCode,
+        retryable: code === 'INVALID_IMPORT_RUN_STATE',
+        context: { table: 'hs_stat_generations' },
+      });
+    }
+    throw persistenceFailed('hs_stat_generations', error);
+  }
+
   return {
     createImportRun,
     getImportRun,
@@ -677,6 +712,7 @@ function createHighSchoolImportRepository(adminClient) {
     publishVerifiedTotals,
     publishPlayerAdvancedStats,
     publishPitcherAdvancedStats,
+    persistEngineCollection,
     getCurrentVerifiedTotals,
     listCurrentPlayerAdvancedStats,
     listCurrentPitcherAdvancedStats,
