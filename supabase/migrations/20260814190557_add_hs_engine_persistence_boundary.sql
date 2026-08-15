@@ -385,6 +385,34 @@ begin
      or jsonb_typeof(v_totals) <> 'object' then
     raise exception 'malformed_engine_collection: arrays and teamTotals are required' using errcode = 'P0001';
   end if;
+  if exists (
+    select 1 from jsonb_object_keys(p_dto) key
+     where key not in (
+       'complete', 'context', 'engineVersion', 'inputSetHash', 'contentHash', 'payloadBytes',
+       'observations', 'snapshotCount', 'canonicalPlayers', 'noncanonicalPlayers',
+       'teamTotals', 'officialTotalsComplete'
+     )
+  ) then
+    raise exception 'malformed_engine_collection: unexpected top-level property' using errcode = 'P0001';
+  end if;
+  if exists (
+    select 1 from jsonb_array_elements(p_dto -> 'observations') observation
+     where jsonb_typeof(observation) <> 'object'
+        or nullif(observation ->> 'observationKey', '') is null
+        or nullif(observation ->> 'identityMethod', '') is null
+        or nullif(observation ->> 'identityStatus', '') is null
+        or coalesce(observation ->> 'identityDigest', '') !~ '^[0-9a-f]{64}$'
+        or jsonb_typeof(observation -> 'snapshots') <> 'array'
+        or jsonb_typeof(observation -> 'validation') <> 'object'
+  ) then
+    raise exception 'malformed_engine_collection: invalid observation shape' using errcode = 'P0001';
+  end if;
+  if (
+    select count(*) <> count(distinct observation ->> 'observationKey')
+      from jsonb_array_elements(p_dto -> 'observations') observation
+  ) then
+    raise exception 'malformed_engine_collection: duplicate observation key' using errcode = 'P0001';
+  end if;
 
   perform 1 from public.hs_teams
    where id = v_team_id and org_id = v_org_id and program_id = v_program_id

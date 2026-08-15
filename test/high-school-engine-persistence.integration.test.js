@@ -203,6 +203,20 @@ test.before(async () => {
     primary_product: 'high_school',
     enabled_products: ['high_school'],
   });
+  const otherProgram = await fixtureInsert('hs_programs', { org_id: otherOrg.id, name: `Other program ${suffix}` });
+  const otherSeason = await fixtureInsert('hs_seasons', {
+    org_id: otherOrg.id, program_id: otherProgram.id, name: `Other season ${suffix}`, school_year: '2025-2026',
+  });
+  const otherTeam = await fixtureInsert('hs_teams', {
+    org_id: otherOrg.id, program_id: otherProgram.id, level: 'varsity', name: `Other team ${suffix}`,
+  });
+  const otherPlayer = await fixtureInsert('hs_players', {
+    org_id: otherOrg.id, program_id: otherProgram.id, first_name: 'Other', last_name: `Player ${suffix}`,
+  });
+  await fixtureInsert('hs_roster_memberships', {
+    org_id: otherOrg.id, team_id: otherTeam.id, season_id: otherSeason.id,
+    player_id: otherPlayer.id, status: 'active', gc_external_player_id: 'other-provider-player',
+  });
   const authorizedUserId = await createFixtureIdentity(org.id);
   const crossTenantUserId = await createFixtureIdentity(otherOrg.id);
   const unaffiliatedUserId = await createFixtureIdentity();
@@ -215,7 +229,9 @@ test.before(async () => {
   unaffiliatedUser = authenticatedClient(unaffiliatedUserId);
   ids = {
     orgId: org.id, programId: program.id, teamId: team.id, seasonId: season.id, playerId: player.id,
-    otherOrgId: otherOrg.id, fixtureUserIds: [authorizedUserId, crossTenantUserId, unaffiliatedUserId],
+    otherOrgId: otherOrg.id, otherProgramId: otherProgram.id, otherSeasonId: otherSeason.id,
+    otherTeamId: otherTeam.id, otherPlayerId: otherPlayer.id,
+    fixtureUserIds: [authorizedUserId, crossTenantUserId, unaffiliatedUserId],
   };
 });
 
@@ -414,4 +430,185 @@ relationalTest('cross-tenant references and mid-publication player failures roll
   } finally {
     await fixtureDb.query('update public.organizations set enabled_products = $2, primary_product = $3, customer_type = $3 where id = $1', [ids.orgId, ['high_school'], 'high_school']);
   }
+});
+
+function independentRepository() {
+  const client = createSupabaseClient(localUrl, process.env.HS_LOCAL_SUPABASE_SERVICE_ROLE_KEY, {
+    auth: { persistSession: false },
+  });
+  return require('../src/high-school-import-repository').createHighSchoolImportRepository(client);
+}
+
+async function simultaneousStart(operations) {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let ready = 0;
+  let allReady;
+  const readyGate = new Promise((resolve) => { allReady = resolve; });
+  const started = operations.map((operation) => (async () => {
+    ready += 1;
+    if (ready === operations.length) allReady();
+    await gate;
+    return operation();
+  })());
+  await readyGate;
+  release();
+  return Promise.allSettled(started);
+}
+
+function refinalizeDto(dto) {
+  const { canonicalSerialize } = require('../src/high-school-engine-persistence-mapper');
+  const base = { ...dto };
+  delete base.contentHash;
+  delete base.payloadBytes;
+  const contentHash = crypto.createHash('sha256').update(canonicalSerialize(base), 'utf8').digest('hex');
+  let payloadBytes = 0;
+  let result;
+  while (true) {
+    result = { ...base, contentHash, payloadBytes };
+    const measured = Buffer.byteLength(canonicalSerialize(result), 'utf8');
+    if (measured === payloadBytes) return result;
+    payloadBytes = measured;
+  }
+}
+
+async function assertNoPublicationForRun(runId) {
+  for (const table of ['hs_import_run_games', 'hs_raw_snapshots', 'hs_game_validation_results', 'hs_stat_generations', 'hs_verified_totals']) {
+    const column = table === 'hs_stat_generations' || table === 'hs_verified_totals' ? 'import_run_id' : 'import_run_id';
+    const result = await fixtureDb.query(`select count(*)::int count from public.${table} where ${column} = $1`, [runId]);
+    assert.equal(result.rows[0].count, 0, `${table} must roll back for failed run`);
+  }
+}
+
+relationalTest('concurrent same-key different-content publication commits one consistent identity', { skip }, async () => {
+  const runA = await createRun();
+  const runB = await createRun();
+  const first = dto(runA, [capturedGame('same-key-a')]);
+  const secondBase = dto(runB, [capturedGame('same-key-b')]);
+  const second = refinalizeDto({ ...secondBase, inputSetHash: first.inputSetHash });
+  const settled = await simultaneousStart([
+    () => independentRepository().persistEngineCollection(first),
+    () => independentRepository().persistEngineCollection(second),
+  ]);
+  assert.equal(settled.filter((item) => item.status === 'fulfilled').length, 1);
+  assert.equal(settled.filter((item) => item.status === 'rejected' && item.reason.code === 'IDEMPOTENCY_CONTENT_MISMATCH').length, 1);
+  const generations = await fixtureDb.query(
+    'select id, content_hash, is_current from public.hs_stat_generations where org_id=$1 and team_id=$2 and season_id=$3 and input_set_hash=$4',
+    [ids.orgId, ids.teamId, ids.seasonId, first.inputSetHash],
+  );
+  assert.equal(generations.rowCount, 1);
+  assert.equal(generations.rows[0].is_current, true);
+  const losingRun = settled[0].status === 'rejected' ? runA : runB;
+  await assertNoPublicationForRun(losingRun.id);
+});
+
+relationalTest('concurrent successor generations serialize with one internally consistent current generation', { skip }, async () => {
+  const initialRun = await createRun();
+  await repository.persistEngineCollection(dto(initialRun, [capturedGame('supersession-base')]));
+  const runA = await createRun();
+  const runB = await createRun();
+  const successorA = dto(runA, [capturedGame('supersession-a')]);
+  const successorBGame = capturedGame('supersession-b');
+  successorBGame.boxScore.batting = [];
+  successorBGame.plays = [];
+  const successorB = dto(runB, [successorBGame]);
+  const settled = await simultaneousStart([
+    () => independentRepository().persistEngineCollection(successorA),
+    () => independentRepository().persistEngineCollection(successorB),
+  ]);
+  assert.ok(settled.every((item) => item.status === 'fulfilled'), JSON.stringify(settled));
+  const current = await fixtureDb.query(
+    'select id from public.hs_stat_generations where org_id=$1 and team_id=$2 and season_id=$3 and is_current',
+    [ids.orgId, ids.teamId, ids.seasonId],
+  );
+  assert.equal(current.rowCount, 1);
+  const stale = await fixtureDb.query(
+    'select count(*)::int count from public.hs_player_advanced_stats where org_id=$1 and team_id=$2 and season_id=$3 and is_current and generation_id<>$4',
+    [ids.orgId, ids.teamId, ids.seasonId, current.rows[0].id],
+  );
+  assert.equal(stale.rows[0].count, 0);
+});
+
+relationalTest('every externally supplied tenant foreign key rejects cross-organization substitution atomically', { skip }, async () => {
+  const otherRun = await fixtureInsert('hs_import_runs', {
+    org_id: ids.otherOrgId, program_id: ids.otherProgramId, team_id: ids.otherTeamId,
+    season_id: ids.otherSeasonId, source_provider: 'gamechanger', trigger_kind: 'manual', status: 'running',
+  });
+  const substitutions = [
+    ['orgId', ids.otherOrgId], ['programId', ids.otherProgramId], ['teamId', ids.otherTeamId],
+    ['seasonId', ids.otherSeasonId], ['importRunId', otherRun.id],
+  ];
+  for (const [field, value] of substitutions) {
+    const run = await createRun();
+    const hostile = dto(run, [capturedGame(`cross-${field}`)]);
+    hostile.context = { ...hostile.context, [field]: value };
+    await assert.rejects(() => independentRepository().persistEngineCollection(hostile));
+    await assertNoPublicationForRun(run.id);
+  }
+  const playerRun = await createRun();
+  const hostilePlayer = dto(playerRun, [capturedGame('cross-player')]);
+  hostilePlayer.canonicalPlayers[0].playerId = ids.otherPlayerId;
+  await assert.rejects(() => independentRepository().persistEngineCollection(hostilePlayer), (error) => error.code === 'PLAYER_NOT_ON_ROSTER');
+  await assertNoPublicationForRun(playerRun.id);
+});
+
+relationalTest('near-limit valid JSON commits through the real local service-role RPC without truncation', { skip }, async () => {
+  const run = await createRun();
+  const collection = dto(run, [capturedGame('near-limit')]);
+  const target = 4_194_000;
+  collection.observations[0].snapshots[0].payload.reviewPadding = 'x'.repeat(target - collection.payloadBytes - 200);
+  let finalDto = refinalizeDto(collection);
+  const adjustment = target - finalDto.payloadBytes;
+  collection.observations[0].snapshots[0].payload.reviewPadding += 'x'.repeat(Math.max(0, adjustment));
+  finalDto = refinalizeDto(collection);
+  assert.ok(finalDto.payloadBytes <= 4_194_304 && finalDto.payloadBytes >= 4_193_900);
+  const generation = await independentRepository().persistEngineCollection(finalDto);
+  assert.equal(generation.payload_bytes, finalDto.payloadBytes);
+  assert.equal(generation.content_hash, finalDto.contentHash);
+  const snapshot = await fixtureDb.query('select payload from public.hs_raw_snapshots where import_run_id=$1 and snapshot_kind=$2', [run.id, 'box_score']);
+  assert.equal(snapshot.rows[0].payload.reviewPadding.length, collection.observations[0].snapshots[0].payload.reviewPadding.length);
+});
+
+relationalTest('hostile nested and malformed JSON rejects boundedly and leaves the local stack healthy', { skip }, async () => {
+  const cases = [
+    (value) => ({ ...value, observations: {} }),
+    (value) => ({ ...value, canonicalPlayers: 'wrong' }),
+    (value) => ({ ...value, teamTotals: [] }),
+    (value) => ({ ...value, observations: Array.from({ length: 128 }, () => ({ unexpected: true })) }),
+    (value) => ({ ...value, unexpectedTopLevel: { nested: { nested: { nested: true } } } }),
+  ];
+  for (const [index, mutate] of cases.entries()) {
+    const run = await createRun();
+    const hostile = refinalizeDto(mutate(dto(run, [capturedGame(`malformed-${index}`)])));
+    await assert.rejects(
+      () => independentRepository().persistEngineCollection(hostile),
+      (error) => !/node_modules|[A-Z]:\\|postgres(?:ql)?:\/\/|eyJ|reviewPadding/i.test(String(error.message)),
+      `hostile malformed case ${index} must reject`,
+    );
+    await assertNoPublicationForRun(run.id);
+  }
+  const healthyRun = await createRun();
+  const healthy = await independentRepository().persistEngineCollection(dto(healthyRun, [capturedGame('healthy-after-hostile')]));
+  assert.ok(healthy.id);
+});
+
+relationalTest('retry after deliberate mid-transaction failure leaves no reservation and commits exactly once', { skip }, async () => {
+  const run = await createRun();
+  const intended = dto(run, [capturedGame('retry-after-failure')]);
+  const failing = structuredClone(intended);
+  failing.canonicalPlayers[0].playerId = ids.otherPlayerId;
+  await assert.rejects(() => independentRepository().persistEngineCollection(failing), (error) => error.code === 'PLAYER_NOT_ON_ROSTER');
+  await assertNoPublicationForRun(run.id);
+  const generation = await independentRepository().persistEngineCollection(intended);
+  const retry = await independentRepository().persistEngineCollection(intended);
+  assert.equal(retry.id, generation.id);
+  for (const table of ['hs_stat_generations', 'hs_verified_totals']) {
+    const result = await fixtureDb.query(`select count(*)::int count from public.${table} where import_run_id=$1`, [run.id]);
+    assert.equal(result.rows[0].count, 1, `${table} must contain exactly one committed row`);
+  }
+  const current = await fixtureDb.query(
+    'select count(*)::int count from public.hs_stat_generations where org_id=$1 and team_id=$2 and season_id=$3 and is_current',
+    [ids.orgId, ids.teamId, ids.seasonId],
+  );
+  assert.equal(current.rows[0].count, 1);
 });
