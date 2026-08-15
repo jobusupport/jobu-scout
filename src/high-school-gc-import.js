@@ -67,10 +67,23 @@ function tagRowsWithOwnership(rows, side) {
   return (rows || []).map((row) => ({ ...row, isHighSchoolTeam: (row.TeamSide || row.teamSide) === side }));
 }
 
-function buildCapturedGame(gameData, ourSide) {
+function buildCapturedGame(gameData, ourSide, evidence = {}) {
+  if (ourSide !== 'home' && ourSide !== 'away') {
+    const err = new Error('Collected game requires an explicit owned side of home or away.');
+    err.code = 'MISSING_TEAM_OWNED_SIDE';
+    throw err;
+  }
   const boxScore = gameData?.boxScore || {};
   return {
+    meta: {
+      ...(gameData?.meta || {}),
+      ourSide,
+      ...(evidence.sourceGameRef ? { sourceGameId: evidence.sourceGameRef } : {}),
+      ...(evidence.sourceGameUrl ? { sourceGameUrl: evidence.sourceGameUrl } : {}),
+      ...(evidence.capturedAt ? { capturedAt: evidence.capturedAt } : {}),
+    },
     boxScore: {
+      ...boxScore,
       batting: tagRowsWithOwnership(boxScore.batting, ourSide),
       pitching: tagRowsWithOwnership(boxScore.pitching, ourSide),
     },
@@ -119,6 +132,7 @@ async function runHighSchoolImportCollection({
   existingPlayers, // hs_players rows scoped to this org/program: [{id, normalizedFirstName, normalizedLastName}]
   discoverCompletedGames, // async () => [{ sourceGameRef, sourceGameUrl, opponentName, gameDate }]
   collectGame, // async (gameEntry) => gameData { meta:{ourSide,...}, boxScore, plays }
+  useEnginePersistence = false,
   isCancelled = () => false,
   // Defaults to the same live env re-check this always did before -- kept
   // as the default so every pre-existing test (which flips
@@ -144,6 +158,7 @@ async function runHighSchoolImportCollection({
     unmatchedPlayers: new Map(),
     stopped: null, // null | 'kill_switch' | 'cancelled' | 'max_games'
   };
+  const engineCapturedGames = [];
 
   if (isKillSwitchTriggered()) {
     summary.stopped = 'kill_switch';
@@ -164,6 +179,7 @@ async function runHighSchoolImportCollection({
   summary.gamesFound = entries.length;
   const maxGames = policy.getMaxGamesPerRun();
   const boundedEntries = entries.slice(0, maxGames);
+  const collectionWasTruncated = entries.length > maxGames;
   if (entries.length > maxGames) {
     onProgress({ type: 'info', message: `Found ${entries.length} completed games; processing the first ${maxGames} per this run's game limit.` });
   }
@@ -180,13 +196,16 @@ async function runHighSchoolImportCollection({
       break;
     }
 
-    const { row: runGame } = await importService.recordSourceGame({
-      orgId: ctx.orgId,
-      importRunId: ctx.importRunId,
-      sourceGameRef: entry.sourceGameRef,
-      sourceGameUrl: entry.sourceGameUrl || null,
-      discoveryStatus: 'discovered',
-    });
+    let runGame = null;
+    if (!useEnginePersistence) {
+      ({ row: runGame } = await importService.recordSourceGame({
+        orgId: ctx.orgId,
+        importRunId: ctx.importRunId,
+        sourceGameRef: entry.sourceGameRef,
+        sourceGameUrl: entry.sourceGameUrl || null,
+        discoveryStatus: 'discovered',
+      }));
+    }
 
     let attempt = 0;
     let gameData = null;
@@ -206,7 +225,7 @@ async function runHighSchoolImportCollection({
           // signaling it wants collection to slow down or stop, not just
           // this one page) safely, preserving everything captured so far.
           onProgress({ type: 'access_control_challenge', game: entry.sourceGameRef, message: policy.sanitizeCollectionErrorMessage(err?.message) });
-          await importService.updateSourceGameOutcome({ orgId: ctx.orgId, runGameId: runGame.id, discoveryStatus: 'failed', gameOutcome: 'failed' });
+          if (runGame) await importService.updateSourceGameOutcome({ orgId: ctx.orgId, runGameId: runGame.id, discoveryStatus: 'failed', gameOutcome: 'failed' });
           summary.gamesFailed += 1;
           summary.stopped = 'kill_switch';
           break;
@@ -239,10 +258,26 @@ async function runHighSchoolImportCollection({
     }
 
     if (!gameData) {
-      await importService.updateSourceGameOutcome({ orgId: ctx.orgId, runGameId: runGame.id, discoveryStatus: 'failed', gameOutcome: 'failed' });
+      if (runGame) await importService.updateSourceGameOutcome({ orgId: ctx.orgId, runGameId: runGame.id, discoveryStatus: 'failed', gameOutcome: 'failed' });
       onProgress({ type: 'game_failed', game: entry.sourceGameRef, message: policy.sanitizeCollectionErrorMessage(lastErr?.message) });
       summary.gamesFailed += 1;
       await sleep(policy.getMinRequestDelayMs());
+      continue;
+    }
+
+    if (useEnginePersistence) {
+      const ourSide = gameData.meta?.ourSide;
+      const capturedGame = buildCapturedGame(gameData, ourSide, {
+        sourceGameRef: entry.sourceGameRef || null,
+        sourceGameUrl: entry.sourceGameUrl || null,
+        capturedAt: new Date(now()).toISOString(),
+      });
+      engineCapturedGames.push(capturedGame);
+      summary.gamesImported += 1;
+      onProgress({ type: 'game_collected', game: entry.sourceGameRef || null });
+      await sleep(policy.getMinRequestDelayMs());
+      if (isCancelled()) { summary.stopped = 'cancelled'; onProgress({ type: 'stopped', reason: 'cancelled' }); break; }
+      if (isKillSwitchTriggered()) { summary.stopped = 'kill_switch'; onProgress({ type: 'stopped', reason: 'kill_switch' }); break; }
       continue;
     }
 
@@ -269,8 +304,12 @@ async function runHighSchoolImportCollection({
       continue;
     }
 
-    const ourSide = gameData.meta?.ourSide || 'home';
-    const capturedGame = buildCapturedGame(gameData, ourSide);
+    const ourSide = gameData.meta?.ourSide;
+    const capturedGame = buildCapturedGame(gameData, ourSide, {
+      sourceGameRef: entry.sourceGameRef,
+      sourceGameUrl: entry.sourceGameUrl || null,
+      capturedAt: new Date(now()).toISOString(),
+    });
 
     // The box-score snapshot stores the ALREADY-TAGGED capturedGame.boxScore
     // (isHighSchoolTeam already resolved), not the raw untagged scrape --
@@ -365,6 +404,31 @@ async function runHighSchoolImportCollection({
         ? 'Automated GameChanger collection was disabled while this run was in progress.'
         : 'Cancelled by user.',
     });
+  } else if (useEnginePersistence) {
+    if (collectionWasTruncated || summary.gamesFailed > 0 || engineCapturedGames.length !== boundedEntries.length) {
+      await importService.failImportRun({
+        orgId: ctx.orgId,
+        importRunId: ctx.importRunId,
+        failureStage: 'aggregation',
+        rawErrorMessage: 'The complete engine collection was not available; no partial generation was published.',
+      });
+    } else {
+      const published = await importService.persistEngineCollection({
+        context: {
+          orgId: ctx.orgId,
+          programId: ctx.programId,
+          teamId: ctx.teamId,
+          seasonId: ctx.seasonId,
+          importRunId: ctx.importRunId,
+          sourceProvider: 'gamechanger',
+        },
+        capturedGames: engineCapturedGames,
+        rosterMemberships: existingPlayers,
+      });
+      summary.generationId = published.generation?.id || null;
+      summary.payloadBytes = published.payloadBytes;
+      summary.inputSetHash = published.inputSetHash;
+    }
   } else {
     await importService.completeImportRun({ orgId: ctx.orgId, importRunId: ctx.importRunId });
   }
@@ -385,6 +449,8 @@ function summarizeForLog(summary) {
     ambiguousPlayerCount: summary.ambiguousPlayers.size,
     unmatchedPlayerCount: summary.unmatchedPlayers.size,
     stopped: summary.stopped,
+    generationId: summary.generationId || null,
+    payloadBytes: summary.payloadBytes || null,
   };
 }
 
@@ -565,7 +631,7 @@ if (require.main === module) {
       const discoverCompletedGames = async () => {
         const entries = await scraper.getVisibleCompletedGameEntries(page);
         return entries.map((e) => ({
-          sourceGameRef: e.gameId || e.href,
+          sourceGameRef: e.gameId || null,
           sourceGameUrl: e.href,
           opponentName: e.opponentName || null,
           gameDate: e.gameDate || null,
@@ -585,6 +651,7 @@ if (require.main === module) {
         existingPlayers,
         discoverCompletedGames,
         collectGame,
+        useEnginePersistence: process.env.HS_IMPORT_ENGINE_PERSISTENCE_ENABLED === '1',
         isCancelled,
         isKillSwitchTriggered,
         onProgress: (event) => {

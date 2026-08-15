@@ -36,8 +36,21 @@ test('new-table policies require both tenant membership and High School entitlem
 test('new tables grant authenticated read only and reserve writes for service_role', () => {
   assert.match(sql, /revoke all on public\.hs_game_identity_aliases[\s\S]*?from public, anon, authenticated;/i);
   assert.match(sql, /grant select on public\.hs_game_identity_aliases[\s\S]*?to authenticated;/i);
-  assert.match(sql, /grant all on public\.hs_game_identity_aliases[\s\S]*?to service_role;/i);
+  assert.doesNotMatch(sql, /grant\s+all[\s\S]*?to\s+service_role/i);
+  assert.match(sql, /grant select, insert, update on public\.hs_games, public\.hs_import_run_games,[\s\S]*?public\.hs_game_identity_aliases, public\.hs_stat_generations to service_role;/i);
+  assert.match(sql, /grant select, insert on public\.hs_game_identity_resolutions, public\.hs_raw_snapshots,[\s\S]*?public\.hs_noncanonical_player_stats to service_role;/i);
   assert.doesNotMatch(sql, /grant\s+(insert|update|delete|all)[\s\S]*?to\s+(anon|authenticated)/i);
+});
+
+test('SECURITY INVOKER closure is explicit and never grants organization mutation', () => {
+  assert.match(sql, /grant select, update on public\.hs_teams, public\.hs_seasons to service_role;/i);
+  assert.match(sql, /grant select, update on public\.hs_import_runs to service_role;/i);
+  assert.match(sql, /grant select on public\.hs_roster_memberships to service_role;/i);
+  assert.match(sql, /revoke insert, update, delete, truncate on public\.organizations from service_role;/i);
+  assert.match(sql, /grant select on public\.organizations to authenticated;/i);
+  assert.match(sql, /revoke insert, update, delete, truncate on public\.organizations, public\.hs_teams,[\s\S]*?from public, anon, authenticated;/i);
+  assert.doesNotMatch(sql, /grant\s+(?:select|insert|update|delete|all)[^;]*public\.organizations[^;]*to\s+service_role/i);
+  assert.doesNotMatch(sql, /grant[^;]*all tables|alter default privileges/i);
 });
 
 test('collection RPC is invoker-security and executable only by trusted database roles', () => {
@@ -91,3 +104,30 @@ test('unresolved and ambiguous observations cannot manufacture aliases inside th
   assert.match(sql, /identity_status in \('single', 'deduplicated', 'reconciled', 'conflict', 'unresolved', 'ambiguous'\)/i);
 });
 
+test('collection observations replace legacy one-resolved-game-per-run uniqueness', () => {
+  assert.match(sql, /drop constraint hs_import_run_games_run_source_ref_key/i);
+  assert.match(sql, /drop index public\.idx_hs_import_run_games_run_hs_game/i);
+  assert.match(sql, /drop constraint hs_game_validation_results_run_game_key/i);
+  assert.match(sql, /create unique index idx_hs_import_run_games_run_observation[\s\S]*?\(import_run_id, observation_key\)/i);
+});
+
+test('RPC appends resolution history for durable reuse and fallback enrichment', () => {
+  const fn = sql.match(/create or replace function public\.persist_hs_engine_collection[\s\S]*?\$function\$;/i)?.[0] || '';
+  assert.match(fn, /v_resolution_kind := 'automatic_durable'/i);
+  assert.match(fn, /v_resolution_kind := 'automatic_fallback_enrichment'/i);
+  assert.match(fn, /insert into public\.hs_game_identity_resolutions/i);
+  assert.match(fn, /on conflict \(org_id, import_run_game_id, hs_game_id, evidence_digest\) do nothing/i);
+});
+
+test('RPC locks hierarchy before writes and supersedes complete generations atomically', () => {
+  const fn = sql.match(/create or replace function public\.persist_hs_engine_collection[\s\S]*?\$function\$;/i)?.[0] || '';
+  const teamLock = fn.indexOf('perform 1 from public.hs_teams');
+  const seasonLock = fn.indexOf('perform 1 from public.hs_seasons');
+  const runLock = fn.indexOf('perform 1 from public.hs_import_runs');
+  const observationWrite = fn.indexOf('insert into public.hs_import_run_games');
+  assert.ok(teamLock >= 0 && teamLock < seasonLock && seasonLock < runLock && runLock < observationWrite);
+  assert.match(fn, /update public\.hs_stat_generations set is_current = false, status = 'superseded'/i);
+  assert.match(fn, /update public\.hs_player_advanced_stats set is_current = false/i);
+  assert.match(fn, /update public\.hs_pitcher_advanced_stats set is_current = false/i);
+  assert.match(fn, /update public\.hs_import_runs[\s\S]*?set status = 'succeeded'/i);
+});

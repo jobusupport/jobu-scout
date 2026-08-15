@@ -180,7 +180,8 @@ function registerHighSchoolImportRoutes(router, deps) {
 
   // Existing, currently-active roster for this team+season, shaped exactly
   // as src/high-school-importer-contract.js's matchPlayerCandidates
-  // expects ({id, normalizedFirstName, normalizedLastName}) -- reads
+  // expects, plus the roster-scoped stable provider ID Slice 2C may use for
+  // verified canonical player mapping -- reads
   // hs_players.normalized_first_name/normalized_last_name, the generated
   // columns that module's own matching logic is built against, never a
   // freshly-lowercased copy computed here (would risk silently diverging
@@ -188,7 +189,7 @@ function registerHighSchoolImportRoutes(router, deps) {
   async function loadActiveRosterForReconciliation(orgId, teamId, seasonId) {
     const { data, error } = await adminClient
       .from('hs_roster_memberships')
-      .select('player_id, hs_players!inner(id, normalized_first_name, normalized_last_name)')
+      .select('player_id, gc_external_player_id, hs_players!inner(id, normalized_first_name, normalized_last_name)')
       .eq('org_id', orgId)
       .eq('team_id', teamId)
       .eq('season_id', seasonId)
@@ -196,6 +197,8 @@ function registerHighSchoolImportRoutes(router, deps) {
     if (error) throw error;
     return (data || []).map((row) => ({
       id: row.hs_players.id,
+      playerId: row.hs_players.id,
+      gcExternalPlayerId: row.gc_external_player_id,
       normalizedFirstName: row.hs_players.normalized_first_name,
       normalizedLastName: row.hs_players.normalized_last_name,
     }));
@@ -292,6 +295,7 @@ function registerHighSchoolImportRoutes(router, deps) {
           HS_IMPORT_TEAM_LABEL: team.name,
           HS_IMPORT_GC_TEAM_URL: team.gc_team_url,
           HS_IMPORT_EXISTING_PLAYERS_JSON: JSON.stringify(existingPlayers),
+          HS_IMPORT_ENGINE_PERSISTENCE_ENABLED: '1',
         },
         // 'ipc' makes proc.send()/process.on('message', ...) actually work
         // between this server and the child -- without it, send() is
@@ -442,6 +446,20 @@ function registerHighSchoolImportRoutes(router, deps) {
       }
       if (run.status !== 'succeeded') {
         return res.status(409).json({ error: 'Only a fully succeeded import run can be published.' });
+      }
+
+      // Slice 2C collection runs are already published atomically by the
+      // ingestion RPC that finalized them. A later review-button click is a
+      // read-only acknowledgement, never a second generation write.
+      if (run.result_summary?.generationId) {
+        const published = await importService.getPublishedStats({ orgId: req._orgId, teamId: team.id, seasonId: season.id });
+        return res.json({
+          alreadyPublished: true,
+          generationId: run.result_summary.generationId,
+          verifiedTotals: published.verifiedTotals,
+          publishedPlayers: published.playerAdvancedStats,
+          publishedPitchers: published.pitcherAdvancedStats,
+        });
       }
 
       // The publish service call independently re-derives and re-checks

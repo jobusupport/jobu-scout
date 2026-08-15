@@ -222,6 +222,7 @@ test('a fully authorized start for a source-connected team creates a tenant-boun
     assert.equal(spawnCalls[0].opts.env.HS_IMPORT_TEAM_ID, TEAM_A);
     assert.equal(spawnCalls[0].opts.env.HS_IMPORT_SEASON_ID, SEASON_A);
     assert.equal(spawnCalls[0].opts.env.HS_IMPORT_GC_TEAM_URL, 'https://web.gc.com/teams/org1/team1');
+    assert.equal(spawnCalls[0].opts.env.HS_IMPORT_ENGINE_PERSISTENCE_ENABLED, '1');
   } finally { await close(); restoreEnv(); }
 });
 
@@ -312,6 +313,41 @@ test('a successful publish returns the published totals from the service, unmodi
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.verifiedTotals.is_current, true);
+  } finally { await close(); restoreEnv(); }
+});
+
+test('publishing a Slice 2C run is read-only because its atomic ingestion already created the generation', async () => {
+  let legacyPublishCalled = false;
+  let capturedGamesRead = false;
+  const { app, restoreEnv } = buildApp({
+    importServiceOverrides: {
+      async getImportRunDetail({ importRunId }) {
+        return {
+          run: {
+            id: importRunId,
+            org_id: ORG_A,
+            team_id: TEAM_A,
+            season_id: SEASON_A,
+            status: 'succeeded',
+            result_summary: { generationId: 'generation-2c' },
+          },
+          games: [],
+          validations: [],
+        };
+      },
+      async getCapturedGamesForRun() { capturedGamesRead = true; return []; },
+      async publishVerifiedTotals() { legacyPublishCalled = true; return {}; },
+    },
+  });
+  const { url, close } = listen(app);
+  try {
+    const res = await apiFetch(url, `/api/high-school/teams/${TEAM_A}/seasons/${SEASON_A}/import-runs/22222222-8888-4888-8888-888888888888/publish`, { method: 'POST', token: USER_TOKEN_HS });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.alreadyPublished, true);
+    assert.equal(body.generationId, 'generation-2c');
+    assert.equal(legacyPublishCalled, false);
+    assert.equal(capturedGamesRead, false);
   } finally { await close(); restoreEnv(); }
 });
 

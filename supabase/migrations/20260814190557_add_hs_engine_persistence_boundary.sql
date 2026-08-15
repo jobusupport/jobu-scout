@@ -17,6 +17,14 @@ alter table public.hs_import_run_games
   add column engine_version text,
   add column input_set_hash text;
 
+-- Slice 1A allowed only one row per resolved game in an import run.  The
+-- collection engine deliberately retains every source observation (including
+-- replays and fallback-enrichment evidence), so observation_key replaces the
+-- resolved game as the per-run idempotency boundary.
+alter table public.hs_import_run_games
+  drop constraint hs_import_run_games_run_source_ref_key;
+drop index public.idx_hs_import_run_games_run_hs_game;
+
 alter table public.hs_import_run_games
   add constraint hs_import_run_games_observation_key_digest_check
     check (observation_key is null or observation_key ~ '^[0-9a-f]{64}$'),
@@ -56,6 +64,9 @@ alter table public.hs_game_validation_results
   add column ambiguity_component_digest text,
   add column engine_version text,
   add column input_set_hash text;
+
+alter table public.hs_game_validation_results
+  drop constraint hs_game_validation_results_run_game_key;
 
 alter table public.hs_game_validation_results
   add constraint hs_game_validation_results_identity_method_check
@@ -284,8 +295,36 @@ revoke all on public.hs_game_identity_aliases, public.hs_game_identity_resolutio
   public.hs_stat_generations, public.hs_noncanonical_player_stats from public, anon, authenticated;
 grant select on public.hs_game_identity_aliases, public.hs_game_identity_resolutions,
   public.hs_stat_generations, public.hs_noncanonical_player_stats to authenticated;
-grant all on public.hs_game_identity_aliases, public.hs_game_identity_resolutions,
-  public.hs_stat_generations, public.hs_noncanonical_player_stats to service_role;
+-- SECURITY INVOKER privilege closure for persist_hs_engine_collection(jsonb).
+-- Prerequisite hierarchy rows are provisioned outside this boundary; the RPC
+-- only locks/validates them. Persistence writes are limited to the tables the
+-- function mutates below. No organization privilege is required or granted.
+revoke insert, update, delete, truncate on public.organizations from service_role;
+grant select on public.organizations to authenticated;
+revoke insert, update, delete, truncate on public.organizations, public.hs_teams,
+  public.hs_seasons, public.hs_import_runs, public.hs_roster_memberships,
+  public.hs_games, public.hs_import_run_games, public.hs_game_identity_aliases,
+  public.hs_game_identity_resolutions, public.hs_raw_snapshots,
+  public.hs_game_validation_results, public.hs_stat_generations,
+  public.hs_noncanonical_player_stats, public.hs_verified_totals,
+  public.hs_player_advanced_stats, public.hs_pitcher_advanced_stats
+  from public, anon, authenticated;
+revoke delete, truncate, references, trigger on public.hs_teams, public.hs_seasons,
+  public.hs_import_runs, public.hs_roster_memberships, public.hs_games,
+  public.hs_import_run_games, public.hs_game_identity_aliases,
+  public.hs_game_identity_resolutions, public.hs_raw_snapshots,
+  public.hs_game_validation_results, public.hs_stat_generations,
+  public.hs_noncanonical_player_stats, public.hs_verified_totals,
+  public.hs_player_advanced_stats, public.hs_pitcher_advanced_stats from service_role;
+grant select, update on public.hs_teams, public.hs_seasons to service_role;
+grant select, update on public.hs_import_runs to service_role;
+grant select on public.hs_roster_memberships to service_role;
+grant select, insert, update on public.hs_games, public.hs_import_run_games,
+  public.hs_game_identity_aliases, public.hs_stat_generations to service_role;
+grant select, insert on public.hs_game_identity_resolutions, public.hs_raw_snapshots,
+  public.hs_game_validation_results, public.hs_noncanonical_player_stats to service_role;
+grant select, insert, update on public.hs_verified_totals, public.hs_player_advanced_stats,
+  public.hs_pitcher_advanced_stats to service_role;
 
 create or replace function public.persist_hs_engine_collection(p_dto jsonb)
 returns public.hs_stat_generations
@@ -320,6 +359,8 @@ declare
   v_identity_digest text;
   v_foundation_digest text;
   v_discriminators jsonb;
+  v_resolution_kind text;
+  v_prior_status text;
   v_totals jsonb := p_dto -> 'teamTotals';
   v_now timestamptz := now();
 begin
@@ -380,6 +421,9 @@ begin
 
   for v_observation in select value from jsonb_array_elements(p_dto -> 'observations') order by value ->> 'observationKey'
   loop
+    v_candidate_count := 0;
+    v_candidate_game_id := null;
+    v_resolution_kind := null;
     v_method := v_observation ->> 'identityMethod';
     v_identity_digest := v_observation ->> 'identityDigest';
     v_foundation_digest := v_observation ->> 'foundationalDigest';
@@ -397,6 +441,7 @@ begin
       if v_game_id is null and v_method = 'sourceGameId' and v_source_ref is not null then
         select id into v_game_id from public.hs_games
          where org_id = v_org_id and team_id = v_team_id and source_game_ref = v_source_ref;
+        if v_game_id is not null then v_resolution_kind := 'automatic_durable'; end if;
       end if;
 
       if v_game_id is null and v_method = 'scheduleComposite' then
@@ -414,7 +459,10 @@ begin
              select 1 from jsonb_each_text(a.discriminators) old_d
              join jsonb_each_text(v_discriminators) new_d on new_d.key = old_d.key and new_d.value <> old_d.value
            );
-        if v_candidate_count = 1 then v_game_id := v_candidate_game_id; end if;
+        if v_candidate_count = 1 then
+          v_game_id := v_candidate_game_id;
+          v_resolution_kind := 'automatic_fallback_enrichment';
+        end if;
         if v_candidate_count > 1 then
           v_game_id := null;
         end if;
@@ -452,6 +500,20 @@ begin
     on conflict (import_run_id, observation_key) where observation_key is not null
     do update set diagnostics = excluded.diagnostics
     returning id into v_run_game_id;
+
+    if v_resolution_kind is not null and v_game_id is not null then
+      v_prior_status := case v_observation ->> 'identityStatus'
+        when 'deduplicated' then 'single'
+        else v_observation ->> 'identityStatus'
+      end;
+      insert into public.hs_game_identity_resolutions
+        (org_id, team_id, season_id, import_run_id, import_run_game_id, hs_game_id,
+         resolution_kind, prior_identity_status, evidence_digest)
+      values
+        (v_org_id, v_team_id, v_season_id, v_import_run_id, v_run_game_id, v_game_id,
+         v_resolution_kind, v_prior_status, v_identity_digest)
+      on conflict (org_id, import_run_game_id, hs_game_id, evidence_digest) do nothing;
+    end if;
 
     for v_snapshot in select value from jsonb_array_elements(coalesce(v_observation -> 'snapshots', '[]'::jsonb)) order by value ->> 'kind'
     loop
