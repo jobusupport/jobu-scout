@@ -431,6 +431,30 @@ begin
         or jsonb_typeof(observation -> 'conflictFields') <> 'array'
         or jsonb_typeof(observation -> 'diagnostics') <> 'object'
         or jsonb_typeof(observation -> 'diagnostic') <> 'object'
+        or not ((observation -> 'diagnostic') ? 'status')
+        or exists (
+          select 1 from jsonb_object_keys(observation -> 'diagnostic') diagnostic_key
+           where diagnostic_key not in ('status', 'code', 'message')
+        )
+        or jsonb_typeof(observation #> '{diagnostic,status}') <> 'string'
+        or btrim(observation #>> '{diagnostic,status}') = ''
+        or observation #>> '{diagnostic,status}' not in ('not_run', 'ok', 'error')
+        or case observation #>> '{diagnostic,status}'
+          when 'not_run' then not (
+            (observation -> 'diagnostic') ?& array['status', 'code']
+            and not ((observation -> 'diagnostic') ? 'message')
+            and jsonb_typeof(observation #> '{diagnostic,code}') = 'null'
+          )
+          when 'ok' then (select count(*) from jsonb_object_keys(observation -> 'diagnostic')) <> 1
+          when 'error' then not (
+            (observation -> 'diagnostic') ?& array['status', 'code', 'message']
+            and jsonb_typeof(observation #> '{diagnostic,code}') = 'string'
+            and observation #>> '{diagnostic,code}' = 'AMBIGUOUS_RECONSTRUCTION_FAILED'
+            and jsonb_typeof(observation #> '{diagnostic,message}') = 'string'
+            and observation #>> '{diagnostic,message}' = 'Ambiguous game diagnostic reconstruction failed.'
+          )
+          else true
+        end
         or jsonb_typeof(observation -> 'snapshots') <> 'array'
         or jsonb_typeof(observation -> 'validation') <> 'object'
         or (jsonb_typeof(observation -> 'sourceGameRef') not in ('string', 'null'))
@@ -650,7 +674,7 @@ begin
        coalesce((v_observation ->> 'authoritative')::boolean, false),
        coalesce((v_observation ->> 'excludedFromOfficialTotals')::boolean, false),
        coalesce(v_observation -> 'conflictFields', '[]'::jsonb),
-       coalesce(v_observation #>> '{diagnostic,status}', 'not_run'), nullif(v_observation #>> '{diagnostic,code}', ''),
+       v_observation #>> '{diagnostic,status}', nullif(v_observation #>> '{diagnostic,code}', ''),
        nullif(v_observation ->> 'ambiguityComponentDigest', ''), v_engine_version, v_input_hash)
     on conflict (import_run_id, import_run_game_id) where import_run_game_id is not null do nothing;
   end loop;

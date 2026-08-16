@@ -41,6 +41,7 @@ let createSupabaseClient;
 let repository;
 let mapper;
 let ids;
+let PgClient;
 
 function relationalTest(name, options, fn) {
   if (!process.env.HS_RELATIONAL_TEST_NAME || process.env.HS_RELATIONAL_TEST_NAME === name) {
@@ -51,7 +52,8 @@ function relationalTest(name, options, fn) {
 if (canRun) {
   const { createClient } = require('@supabase/supabase-js');
   createSupabaseClient = createClient;
-  const { Pool } = require('pg');
+  const { Pool, Client } = require('pg');
+  PgClient = Client;
   const { createHighSchoolImportRepository } = require('../src/high-school-import-repository');
   ({ mapHighSchoolEngineCollection: mapper } = require('../src/high-school-engine-persistence-mapper'));
   admin = createClient(localUrl, process.env.HS_LOCAL_SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
@@ -442,21 +444,34 @@ function independentRepository() {
 const OVERLAP_TIMEOUT_MS = 5_000;
 const OVERLAP_REPEAT_COUNT = 3;
 
-async function waitForDatabaseOverlap() {
+async function waitForDatabaseOverlap(blockerPid, baselinePids) {
   const deadline = Date.now() + OVERLAP_TIMEOUT_MS;
+  let lastSeen = [];
   while (Date.now() < deadline) {
     const result = await fixtureDb.query(
-      `select count(*)::int reached,
-              count(*) filter (where wait_event_type = 'Lock')::int lock_waiters
-         from pg_stat_activity
-        where pid <> pg_backend_pid()
+      `select a.pid, a.wait_event_type, a.wait_event, pg_blocking_pids(a.pid) blocking_pids,
+              array(select distinct l.locktype from pg_locks l where l.pid=a.pid order by l.locktype) lock_types
+         from pg_stat_activity a
+        where a.pid <> pg_backend_pid()
           and state = 'active'
-          and query ilike '%persist_hs_engine_collection%'`,
+          and query ilike '%persist_hs_engine_collection%'
+          and not (a.pid = any($2::int[]))
+          and a.wait_event_type = 'Lock'
+          and $1::int = any(pg_blocking_pids(a.pid))
+        order by a.pid`,
+      [blockerPid, baselinePids],
     );
-    if (result.rows[0].reached >= 2 && result.rows[0].lock_waiters >= 2) return result.rows[0];
+    if (result.rowCount === 2) return result.rows;
+    const observed = await fixtureDb.query(
+      `select pid, state, wait_event_type, wait_event, pg_blocking_pids(pid) blocking_pids
+         from pg_stat_activity
+        where pid <> pg_backend_pid() and query ilike '%persist_hs_engine_collection%'
+        order by pid`,
+    );
+    lastSeen = observed.rows;
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
-  throw new Error('database overlap witness timed out before two RPC sessions reached the held hierarchy lock');
+  throw new Error(`database overlap witness timed out ${JSON.stringify({ blockerPid, baselinePids, observed: lastSeen })}`);
 }
 
 test('concurrency harness requires a PostgreSQL lock-wait witness rather than dispatch timing', () => {
@@ -472,19 +487,90 @@ async function databaseWitnessedOverlap(operations) {
   try {
     await blocker.query('begin');
     await blocker.query('select id from public.hs_teams where id=$1 for update', [ids.teamId]);
-    const started = operations.map((operation) => operation());
-    const witness = await waitForDatabaseOverlap();
+    // PostgreSQL queues same-tuple waiters behind one another. Retain the exact
+    // row lock and additionally gate relation access in this same transaction so
+    // both current RPC backends directly identify this blocker PID.
+    await blocker.query('lock table public.hs_teams in access exclusive mode');
+    const blockerIdentity = await blocker.query("select pg_backend_pid() pid, 'public.hs_teams'::regclass::oid team_relation_oid");
+    const blockerPid = blockerIdentity.rows[0].pid;
+    const baseline = await fixtureDb.query(
+      "select pid from pg_stat_activity where state='active' and query ilike '%persist_hs_engine_collection%'",
+    );
+    const baselinePids = baseline.rows.map((row) => row.pid);
+    const started = operations.map((operation) => operation().then(
+      (value) => ({ status: 'fulfilled', value }),
+      (reason) => ({ status: 'rejected', reason }),
+    ));
+    const waiters = await waitForDatabaseOverlap(blockerPid, baselinePids);
     await blocker.query('commit');
     released = true;
     const timeout = new Promise((_, reject) => setTimeout(
       () => reject(new Error('overlapped RPC operations did not complete within the bounded timeout')),
       OVERLAP_TIMEOUT_MS,
     ));
-    return { witness, settled: await Promise.race([Promise.allSettled(started), timeout]) };
+    return {
+      witness: { blockerPid, teamRelationOid: blockerIdentity.rows[0].team_relation_oid, baselinePids, waiters },
+      settled: await Promise.race([Promise.all(started), timeout]),
+    };
   } finally {
     if (!released) await blocker.query('rollback').catch(() => {});
     blocker.release();
   }
+}
+
+function pgClient() {
+  return new PgClient({
+    host: process.env.HS_LOCAL_PG_HOST, port: Number(process.env.HS_LOCAL_PG_PORT),
+    database: process.env.HS_LOCAL_PG_DATABASE, user: process.env.HS_LOCAL_PG_USER,
+    password: process.env.HS_LOCAL_PG_PASSWORD,
+  });
+}
+
+async function startDecoyWaiter() {
+  const blocker = pgClient();
+  const waiter = pgClient();
+  await blocker.connect();
+  await waiter.connect();
+  await blocker.query('begin');
+  await blocker.query('select id from public.hs_seasons where id=$1 for update', [ids.otherSeasonId]);
+  const waiterPid = (await waiter.query('select pg_backend_pid() pid')).rows[0].pid;
+  const pending = waiter.query("select id from public.hs_seasons where id=$1 for update /* persist_hs_engine_collection decoy */", [ids.otherSeasonId]);
+  const deadline = Date.now() + OVERLAP_TIMEOUT_MS;
+  let witnessed = false;
+  while (Date.now() < deadline) {
+    const active = await fixtureDb.query("select 1 from pg_stat_activity where pid=$1 and wait_event_type='Lock'", [waiterPid]);
+    if (active.rowCount === 1) { witnessed = true; break; }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  if (!witnessed) {
+    await blocker.query('rollback').catch(() => {});
+    await pending.catch(() => {});
+    await Promise.all([blocker.end(), waiter.end()]);
+    throw new Error(`decoy waiter ${waiterPid} did not reach a lock wait`);
+  }
+  return {
+    waiterPid,
+    async close() {
+      await blocker.query('rollback').catch(() => {});
+      await pending.catch(() => {});
+      await Promise.all([blocker.end(), waiter.end()]);
+    },
+  };
+}
+
+function assertAttributableWitness(witness, label, repeat) {
+  assert.equal(witness.waiters.length, 2);
+  const waiterPids = witness.waiters.map((row) => row.pid);
+  assert.equal(new Set(waiterPids).size, 2);
+  for (const waiter of witness.waiters) {
+    assert.notEqual(waiter.pid, witness.blockerPid);
+    assert.ok(!witness.baselinePids.includes(waiter.pid));
+    assert.ok(waiter.blocking_pids.includes(witness.blockerPid));
+    assert.equal(waiter.wait_event_type, 'Lock');
+    assert.ok(waiter.lock_types.length > 0);
+  }
+  console.log(`# overlap-witness ${JSON.stringify({ label, repeat, blockerPid: witness.blockerPid, teamRelationOid: witness.teamRelationOid, baselinePids: witness.baselinePids, waiters: witness.waiters })}`);
+  return waiterPids;
 }
 
 function refinalizeDto(dto) {
@@ -515,14 +601,26 @@ relationalTest('concurrent same-key different-content publication commits one co
   for (let repeat = 0; repeat < OVERLAP_REPEAT_COUNT; repeat += 1) {
     const runA = await createRun();
     const runB = await createRun();
-    const first = dto(runA, [capturedGame(`same-key-a-${repeat}`)]);
+    const freshInputHash = crypto.createHash('sha256').update(`same-key-overlap-${repeat}-${runA.id}`).digest('hex');
+    const first = refinalizeDto({ ...dto(runA, [capturedGame(`same-key-a-${repeat}`)]), inputSetHash: freshInputHash });
     const secondBase = dto(runB, [capturedGame(`same-key-b-${repeat}`)]);
-    const second = refinalizeDto({ ...secondBase, inputSetHash: first.inputSetHash });
-    const { witness, settled } = await databaseWitnessedOverlap([
-      () => independentRepository().persistEngineCollection(first),
-      () => independentRepository().persistEngineCollection(second),
-    ]);
-    assert.ok(witness.reached >= 2 && witness.lock_waiters >= 2);
+    const second = refinalizeDto({ ...secondBase, inputSetHash: freshInputHash });
+    const decoy = repeat === 0 ? await startDecoyWaiter() : null;
+    let overlap;
+    try {
+      overlap = await databaseWitnessedOverlap([
+        () => independentRepository().persistEngineCollection(first),
+        () => independentRepository().persistEngineCollection(second),
+      ]);
+      const waiterPids = assertAttributableWitness(overlap.witness, 'same-key', repeat);
+      if (decoy) {
+        assert.ok(overlap.witness.baselinePids.includes(decoy.waiterPid));
+        assert.ok(!waiterPids.includes(decoy.waiterPid));
+      }
+    } finally {
+      if (decoy) await decoy.close();
+    }
+    const { settled } = overlap;
     assert.equal(settled.filter((item) => item.status === 'fulfilled').length, 1);
     assert.equal(settled.filter((item) => item.status === 'rejected' && item.reason.code === 'IDEMPOTENCY_CONTENT_MISMATCH').length, 1);
     const generations = await fixtureDb.query(
@@ -546,28 +644,75 @@ relationalTest('concurrent successor generations serialize with one internally c
     await repository.persistEngineCollection(dto(initialRun, [capturedGame(`supersession-base-${repeat}`)]));
     const runA = await createRun();
     const runB = await createRun();
-    const successorA = dto(runA, [capturedGame(`supersession-a-${repeat}`)]);
+    const successorASeed = dto(runA, [capturedGame(`supersession-a-${repeat}`)]);
+    const successorA = refinalizeDto({ ...successorASeed, inputSetHash: crypto.createHash('sha256').update(`supersession-a-${repeat}-${runA.id}`).digest('hex') });
     const successorBGame = capturedGame(`supersession-b-${repeat}`);
     successorBGame.boxScore.batting = [];
     successorBGame.plays = [];
-    const successorB = dto(runB, [successorBGame]);
+    const successorBSeed = dto(runB, [successorBGame]);
+    const successorB = refinalizeDto({ ...successorBSeed, inputSetHash: crypto.createHash('sha256').update(`supersession-b-${repeat}-${runB.id}`).digest('hex') });
     const { witness, settled } = await databaseWitnessedOverlap([
       () => independentRepository().persistEngineCollection(successorA),
       () => independentRepository().persistEngineCollection(successorB),
     ]);
-    assert.ok(witness.reached >= 2 && witness.lock_waiters >= 2);
+    assertAttributableWitness(witness, 'supersession', repeat);
     assert.ok(settled.every((item) => item.status === 'fulfilled'), JSON.stringify(settled));
     const current = await fixtureDb.query(
-      'select id, import_run_id from public.hs_stat_generations where org_id=$1 and team_id=$2 and season_id=$3 and is_current',
+      'select id, import_run_id, content_hash, observation_count, snapshot_count from public.hs_stat_generations where org_id=$1 and team_id=$2 and season_id=$3 and is_current',
       [ids.orgId, ids.teamId, ids.seasonId],
     );
     assert.equal(current.rowCount, 1);
-    const stale = await fixtureDb.query(
-      'select count(*)::int count from public.hs_player_advanced_stats where org_id=$1 and team_id=$2 and season_id=$3 and is_current and generation_id<>$4',
-      [ids.orgId, ids.teamId, ids.seasonId, current.rows[0].id],
+    const survivor = current.rows[0];
+    const winner = survivor.import_run_id === runA.id ? successorA : successorB;
+    assert.ok([runA.id, runB.id].includes(survivor.import_run_id));
+    assert.equal(survivor.content_hash, winner.contentHash);
+    assert.equal(survivor.observation_count, winner.observations.length);
+    assert.equal(survivor.snapshot_count, winner.snapshotCount);
+    for (const table of ['hs_verified_totals', 'hs_player_advanced_stats', 'hs_pitcher_advanced_stats']) {
+      const rows = await fixtureDb.query(
+        `select generation_id, import_run_id from public.${table} where org_id=$1 and team_id=$2 and season_id=$3 and is_current`,
+        [ids.orgId, ids.teamId, ids.seasonId],
+      );
+      for (const row of rows.rows) {
+        assert.equal(row.generation_id, survivor.id, `${table} generation must match survivor`);
+        assert.equal(row.import_run_id, survivor.import_run_id, `${table} run must match survivor`);
+      }
+      if (table === 'hs_verified_totals') assert.equal(rows.rowCount, 1);
+      if (table === 'hs_player_advanced_stats') assert.equal(rows.rowCount, winner.canonicalPlayers.filter((row) => row.role === 'batter').length);
+      if (table === 'hs_pitcher_advanced_stats') assert.equal(rows.rowCount, winner.canonicalPlayers.filter((row) => row.role === 'pitcher').length);
+    }
+    const noncanonical = await fixtureDb.query('select count(*)::int count from public.hs_noncanonical_player_stats where generation_id=$1', [survivor.id]);
+    assert.equal(noncanonical.rows[0].count, winner.noncanonicalPlayers.length);
+    for (const candidate of [{ run: runA, dto: successorA }, { run: runB, dto: successorB }]) {
+      const observations = await fixtureDb.query('select count(*)::int count from public.hs_import_run_games where import_run_id=$1', [candidate.run.id]);
+      const snapshots = await fixtureDb.query('select count(*)::int count from public.hs_raw_snapshots where import_run_id=$1', [candidate.run.id]);
+      const validations = await fixtureDb.query('select count(*)::int count from public.hs_game_validation_results where import_run_id=$1', [candidate.run.id]);
+      const resolutions = await fixtureDb.query(
+        `select count(*)::int count, count(*) filter (where g.id is null)::int orphan_count
+           from public.hs_game_identity_resolutions r
+           left join public.hs_import_run_games g on g.id=r.import_run_game_id and g.import_run_id=r.import_run_id
+          where r.import_run_id=$1`,
+        [candidate.run.id],
+      );
+      assert.equal(observations.rows[0].count, candidate.dto.observations.length);
+      assert.equal(snapshots.rows[0].count, candidate.dto.snapshotCount);
+      assert.equal(validations.rows[0].count, candidate.dto.observations.length);
+      assert.equal(resolutions.rows[0].orphan_count, 0);
+    }
+    const orphanedAliases = await fixtureDb.query(
+      `select count(*)::int count from public.hs_game_identity_aliases a
+        where a.org_id=$1 and a.team_id=$2 and a.season_id=$3
+          and not exists (select 1 from public.hs_games g where g.id=a.hs_game_id and g.org_id=a.org_id)`,
+      [ids.orgId, ids.teamId, ids.seasonId],
     );
-    assert.equal(stale.rows[0].count, 0);
-    assert.ok([runA.id, runB.id].includes(current.rows[0].import_run_id));
+    assert.equal(orphanedAliases.rows[0].count, 0);
+    const orphaned = await fixtureDb.query(
+      `select count(*)::int count from public.hs_stat_generations g
+        where g.import_run_id=any($1::uuid[]) and not exists
+          (select 1 from public.hs_import_runs r where r.id=g.import_run_id and r.org_id=g.org_id)`,
+      [[runA.id, runB.id]],
+    );
+    assert.equal(orphaned.rows[0].count, 0);
     await independentRepository().persistEngineCollection(successorA);
     await independentRepository().persistEngineCollection(successorB);
   }
@@ -615,12 +760,38 @@ relationalTest('near-limit valid JSON commits through the real local service-rol
 
 relationalTest('hostile nested and malformed JSON rejects boundedly and leaves the local stack healthy', { skip }, async () => {
   const baselineRun = await createRun();
-  const baseline = await independentRepository().persistEngineCollection(dto(baselineRun, [capturedGame('malformed-baseline')]));
+  let baseline = await independentRepository().persistEngineCollection(dto(baselineRun, [capturedGame('malformed-baseline')]));
   const mutateObservation = (mutator) => (value) => {
     const observation = structuredClone(value.observations[0]);
     mutator(observation);
     return { ...value, observations: [observation] };
   };
+  for (const [index, diagnostic] of [
+    { status: 'not_run', code: null },
+    { status: 'ok' },
+    { status: 'error', code: 'AMBIGUOUS_RECONSTRUCTION_FAILED', message: 'Ambiguous game diagnostic reconstruction failed.' },
+  ].entries()) {
+    const run = await createRun();
+    const valid = refinalizeDto(mutateObservation((o) => { o.diagnostic = diagnostic; })(dto(run, [capturedGame(`valid-diagnostic-${index}`)])));
+    baseline = await independentRepository().persistEngineCollection(valid);
+  }
+  const invalidDiagnostics = [
+    {}, { status: 'unknown' }, { status: null }, { status: 17 }, { status: true }, { status: [] }, { status: {} },
+    { status: '' }, { status: '   ' }, { status: 'ok', unexpected: true },
+    { status: 'ok', unexpected: { deeply: { nested: true } } }, { unexpected: true },
+    { status: 'not_run', code: 17 }, { status: 'error', code: 17, message: 'Ambiguous game diagnostic reconstruction failed.' },
+    { status: 'error', code: 'AMBIGUOUS_RECONSTRUCTION_FAILED', message: 17 },
+    { status: 'not_run' }, { status: 'not_run', code: 'UNEXPECTED' }, { status: 'not_run', code: null, message: 'unexpected' },
+    { status: 'ok', code: null }, { status: 'ok', message: 'unexpected' },
+    { status: 'error', message: 'Ambiguous game diagnostic reconstruction failed.' },
+    { status: 'error', code: 'AMBIGUOUS_RECONSTRUCTION_FAILED' },
+    { status: 'error', code: null, message: 'Ambiguous game diagnostic reconstruction failed.' },
+    { status: 'error', code: 'AMBIGUOUS_RECONSTRUCTION_FAILED', message: null },
+    { status: 'error', code: 'AMBIGUOUS_RECONSTRUCTION_FAILED', message: '' },
+    { status: 'error', code: 'AMBIGUOUS_RECONSTRUCTION_FAILED', message: '   ' },
+    { status: 'error', code: 'WRONG', message: 'Ambiguous game diagnostic reconstruction failed.' },
+    { status: 'error', code: 'AMBIGUOUS_RECONSTRUCTION_FAILED', message: 'wrong' },
+  ];
   const cases = [
     (value) => ({ ...value, observations: {} }),
     (value) => ({ ...value, canonicalPlayers: 'wrong' }),
@@ -634,6 +805,7 @@ relationalTest('hostile nested and malformed JSON rejects boundedly and leaves t
       .map((key) => mutateObservation((o) => { o.observationKey = key; })),
     ...['identityMethod', 'identityStatus', 'identityDigest', 'engineVersion', 'authoritative', 'excludedFromOfficialTotals', 'discriminators', 'conflictFields', 'diagnostic', 'validation', 'snapshots']
       .map((field) => mutateObservation((o) => { o[field] = 17; })),
+    ...invalidDiagnostics.map((diagnostic) => mutateObservation((o) => { o.diagnostic = diagnostic; })),
     (value) => {
       const first = structuredClone(value.observations[0]);
       const second = { ...structuredClone(first) };
@@ -669,16 +841,21 @@ relationalTest('retry after deliberate mid-transaction failure leaves no reserva
   const run = await createRun();
   const intended = dto(run, [capturedGame('retry-after-failure')]);
   const failing = structuredClone(intended);
-  failing.canonicalPlayers[0].playerId = ids.otherPlayerId;
-  await assert.rejects(() => independentRepository().persistEngineCollection(failing), (error) => error.code === 'PLAYER_NOT_ON_ROSTER');
+  delete failing.observations[0].diagnostic.status;
+  const correctlyRehashedFailing = refinalizeDto(failing);
+  await assert.rejects(() => independentRepository().persistEngineCollection(correctlyRehashedFailing));
   await assertNoPublicationForRun(run.id);
   const generation = await independentRepository().persistEngineCollection(intended);
   const retry = await independentRepository().persistEngineCollection(intended);
   assert.equal(retry.id, generation.id);
-  for (const table of ['hs_stat_generations', 'hs_verified_totals']) {
+  for (const table of ['hs_import_run_games', 'hs_raw_snapshots', 'hs_game_validation_results', 'hs_stat_generations', 'hs_verified_totals']) {
     const result = await fixtureDb.query(`select count(*)::int count from public.${table} where import_run_id=$1`, [run.id]);
-    assert.equal(result.rows[0].count, 1, `${table} must contain exactly one committed row`);
+    const expected = table === 'hs_raw_snapshots' ? intended.snapshotCount : 1;
+    assert.equal(result.rows[0].count, expected, `${table} must contain exactly the committed publication rows`);
   }
+  await assert.rejects(() => independentRepository().persistEngineCollection(correctlyRehashedFailing));
+  const unchanged = await fixtureDb.query('select id, content_hash, is_current from public.hs_stat_generations where import_run_id=$1', [run.id]);
+  assert.deepEqual(unchanged.rows, [{ id: generation.id, content_hash: intended.contentHash, is_current: true }]);
   const current = await fixtureDb.query(
     'select count(*)::int count from public.hs_stat_generations where org_id=$1 and team_id=$2 and season_id=$3 and is_current',
     [ids.orgId, ids.teamId, ids.seasonId],

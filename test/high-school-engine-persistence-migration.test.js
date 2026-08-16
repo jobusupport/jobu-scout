@@ -139,3 +139,13 @@ test('RPC closes the observation shape and requires the mapper canonical lowerca
   assert.match(sql, /jsonb_object_keys\(snapshot\)/i);
   assert.match(sql, /jsonb_object_keys\(observation -> 'validation'\)/i);
 });
+
+test('RPC enforces the exact production diagnostic discriminated union without a fallback', () => {
+  assert.match(sql, /not \(\(observation -> 'diagnostic'\) \? 'status'\)/i);
+  assert.match(sql, /diagnostic_key not in \('status', 'code', 'message'\)/i);
+  assert.match(sql, /not in \('not_run', 'ok', 'error'\)/i);
+  assert.match(sql, /when 'not_run'[\s\S]*?array\['status', 'code'\][\s\S]*?jsonb_typeof\(observation #> '\{diagnostic,code\}'\) = 'null'/i);
+  assert.match(sql, /when 'ok'[\s\S]*?jsonb_object_keys\(observation -> 'diagnostic'\)/i);
+  assert.match(sql, /when 'error'[\s\S]*?AMBIGUOUS_RECONSTRUCTION_FAILED[\s\S]*?Ambiguous game diagnostic reconstruction failed\./i);
+  assert.doesNotMatch(sql, /coalesce\(v_observation #>> '\{diagnostic,status\}', 'not_run'\)/i);
+});
