@@ -434,6 +434,39 @@ relationalTest('cross-tenant references and mid-publication player failures roll
   }
 });
 
+relationalTest('service_role privilege closure denies direct UPDATE while preserving publication', { skip }, async () => {
+  const affected = ['hs_game_identity_resolutions', 'hs_noncanonical_player_stats'];
+  const expected = ['INSERT', 'SELECT'];
+  for (const table of affected) {
+    const grants = await fixtureDb.query(
+      `select privilege_type from information_schema.role_table_grants
+        where table_schema = 'public' and table_name = $1 and grantee = 'service_role'
+        order by privilege_type`,
+      [table],
+    );
+    assert.deepEqual(grants.rows.map((row) => row.privilege_type), expected, `${table}: service_role ACL`);
+
+    const client = await fixtureDb.connect();
+    try {
+      await client.query('begin');
+      await client.query('set local role service_role');
+      await assert.rejects(
+        client.query(`update public.${table} set created_at = created_at where false`),
+        (error) => error.code === '42501'
+          && /permission denied/i.test(error.message)
+          && !/postgres(?:ql)?:\/\/|service[_-]?role[_-]?key|eyJ/i.test(error.message),
+      );
+      await client.query('rollback');
+    } finally {
+      client.release();
+    }
+  }
+
+  const run = await createRun();
+  const published = await repository.persistEngineCollection(dto(run, [capturedGame('privilege-closure-publication')]));
+  assert.ok(published.id, 'SECURITY INVOKER publication must still succeed after UPDATE revocation');
+});
+
 function independentRepository() {
   const client = createSupabaseClient(localUrl, process.env.HS_LOCAL_SUPABASE_SERVICE_ROLE_KEY, {
     auth: { persistSession: false },

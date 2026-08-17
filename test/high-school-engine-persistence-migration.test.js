@@ -4,9 +4,13 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
 const migrationPath = path.join(__dirname, '..', 'supabase', 'migrations', '20260814190557_add_hs_engine_persistence_boundary.sql');
 const sql = fs.readFileSync(migrationPath, 'utf8');
+const forwardMigrationName = '20260817151031_close_hs_engine_service_role_update_privileges.sql';
+const forwardMigrationPath = path.join(__dirname, '..', 'supabase', 'migrations', forwardMigrationName);
+const forwardSql = fs.readFileSync(forwardMigrationPath, 'utf8');
 
 const newTables = [
   'hs_game_identity_aliases',
@@ -14,6 +18,29 @@ const newTables = [
   'hs_stat_generations',
   'hs_noncanonical_player_stats',
 ];
+
+test('already-applied Slice 2C migration remains byte-for-byte unchanged', () => {
+  const digest = crypto.createHash('sha256').update(fs.readFileSync(migrationPath)).digest('hex');
+  assert.equal(digest, 'b19bd3f060aa5989e86605e7ac3215a0e643f883c82947f8f7b221c3555e4f61');
+});
+
+test('a distinct later forward migration revokes only the two excess UPDATE privileges', () => {
+  assert.ok(forwardMigrationName > path.basename(migrationPath));
+  const normalized = forwardSql.replace(/\s+/g, ' ').trim().toLowerCase();
+  assert.equal(normalized,
+    'revoke update on table public.hs_game_identity_resolutions from service_role; '
+    + 'revoke update on table public.hs_noncanonical_player_stats from service_role;');
+  assert.doesNotMatch(forwardSql, /\bgrant\b|\bselect\b|\binsert\b|\bdelete\b|\btruncate\b|\breferences\b|\btrigger\b/i);
+});
+
+test('forward privilege correction has no unrelated schema or role effects', () => {
+  assert.doesNotMatch(forwardSql,
+    /hs_game_identity_aliases|hs_stat_generations|\b(anon|authenticated|postgres)\b|\b(create|alter|drop|function|policy|constraint|index)\b/i);
+  assert.deepEqual(
+    [...forwardSql.matchAll(/public\.([a-z0-9_]+)/gi)].map((match) => match[1]),
+    ['hs_game_identity_resolutions', 'hs_noncanonical_player_stats'],
+  );
+});
 
 test('Slice 2C migration creates the four approved tenant-owned tables', () => {
   for (const table of newTables) {
