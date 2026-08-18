@@ -500,6 +500,7 @@ class FakeQueryBuilder {
 function createFakeSupabaseClient() {
   const state = { tables: new Map() };
   const touchedTables = new Set();
+  const rpcCalls = [];
   const client = {
     from(table) {
       touchedTables.add(table);
@@ -507,11 +508,28 @@ function createFakeSupabaseClient() {
     },
     rpc(name, params) {
       touchedTables.add(`rpc:${name}`);
+      rpcCalls.push({ name, params: structuredClone(params || {}) });
+      if (name === 'persist_hs_engine_collection') {
+        const dto = params?.p_dto || {};
+        return Promise.resolve({
+          data: {
+            id: nextId(),
+            engine_version: dto.engineVersion,
+            input_set_hash: dto.inputSetHash,
+            content_hash: dto.contentHash,
+            payload_bytes: dto.payloadBytes,
+            status: 'completed',
+            is_current: true,
+          },
+          error: null,
+        });
+      }
       const targetTable = PUBLISH_RPC_TABLE[name];
       if (targetTable) touchedTables.add(targetTable);
       return Promise.resolve(executePublishRpc(state, name, params || {}));
     },
     __touchedTables: touchedTables,
+    __rpcCalls: rpcCalls,
     __getRows(table) {
       return (state.tables.get(table) || []).map((r) => ({ ...r }));
     },

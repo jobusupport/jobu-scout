@@ -41,6 +41,41 @@ function setup() {
   return { client, repo };
 }
 
+test('persistEngineCollection makes exactly one atomic RPC call with the complete DTO', async () => {
+  const { client, repo } = setup();
+  const dto = {
+    complete: true,
+    context: { orgId: ORG_A, programId: PROGRAM_A, teamId: TEAM_A, seasonId: SEASON_A, importRunId: RUN_1, sourceProvider: 'gamechanger' },
+    engineVersion: 'hs-baseball-engine/v1',
+    inputSetHash: 'a'.repeat(64),
+    contentHash: 'b'.repeat(64),
+    payloadBytes: 100,
+    observations: [],
+    canonicalPlayers: [],
+    noncanonicalPlayers: [],
+    teamTotals: {},
+  };
+  const result = await repo.persistEngineCollection(dto);
+  assert.equal(client.__rpcCalls.length, 1);
+  assert.equal(client.__rpcCalls[0].name, 'persist_hs_engine_collection');
+  assert.deepEqual(client.__rpcCalls[0].params, { p_dto: dto });
+  assert.equal(result.engine_version, 'hs-baseball-engine/v1');
+});
+
+test('persistEngineCollection maps RPC failures to stable sanitized application errors', async () => {
+  const client = {
+    from() { throw new Error('not expected'); },
+    rpc: async () => ({ data: null, error: { message: 'idempotency_content_mismatch: raw provider material must not escape' } }),
+  };
+  const repo = createHighSchoolImportRepository(client);
+  await assert.rejects(
+    () => repo.persistEngineCollection({}),
+    (error) => error.code === 'IDEMPOTENCY_CONTENT_MISMATCH'
+      && error.statusCode === 409
+      && !error.message.includes('raw provider material'),
+  );
+});
+
 // ── hs_import_runs lifecycle ──────────────────────────────────────────────
 
 test('createImportRun persists a running run with the supplied hierarchy context', async () => {

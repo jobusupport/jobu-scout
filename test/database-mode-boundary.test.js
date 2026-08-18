@@ -44,9 +44,9 @@ function productionFiles() {
   return ALL_JS_FILES.filter((f) => !relPath(f).startsWith('test/'));
 }
 
-// ── src/db-mode.js is required by exactly its two authoritative callers ────
+// ── src/db-mode.js is required only by authoritative bootstrap callers ─────
 
-const ALLOWED_DB_MODE_REQUIRERS = new Set(['server.js', 'src/db.js']);
+const ALLOWED_DB_MODE_REQUIRERS = new Set(['server.js', 'src/db.js', 'src/generate-report.js']);
 
 test('src/db-mode.js is required ONLY by server.js and src/db.js -- an exact, independently-scanned allowlist, ' +
      'not an assumed count. A new caller appearing here (or an expected one disappearing) must fail this test', () => {
@@ -58,9 +58,7 @@ test('src/db-mode.js is required ONLY by server.js and src/db.js -- an exact, in
     .sort();
 
   assert.deepEqual(actualRequirers, [...ALLOWED_DB_MODE_REQUIRERS].sort(),
-    'the set of files requiring src/db-mode.js must be exactly {server.js, src/db.js} -- every other production ' +
-    'entrypoint reaches the same decision indirectly via db.init()/pipeline.init(), never by requiring the ' +
-    'resolver module a second, independent time');
+    'only reviewed process/bootstrap boundaries may invoke the centralized resolver directly');
 });
 
 // ── No independent re-implementation of USE_SUPABASE boolean coercion ──────

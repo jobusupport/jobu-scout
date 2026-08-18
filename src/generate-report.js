@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 
 /**
  * generate-report.js
@@ -28,11 +28,10 @@ require('dotenv').config();
  */
 
 const path     = require('path');
-const db       = require('./db');
-const analyzer = require('./analyzer');
-const report   = require('./report');
 const { isValidUuid, resolveReportOutputDir } = require('./report-access');
 const { requireJobOrgContext } = require('./job-org-context');
+const { OrgContextRequiredError } = require('./org-context-errors');
+const { resolveDatabaseMode, DatabaseModeConfigError } = require('./db-mode');
 const { resolveTeamMatch, formatTeamListLine, formatAmbiguousMatchLine, runTeamsSequentially } = require('./report-team-selection');
 
 const DB_PATH     = path.join(__dirname, '..', 'voodoo-scout.db');
@@ -48,11 +47,38 @@ const OUR_TEAM_ID = process.env.OUR_TEAM_ID || '489f5656-205a-49a5-a3de-d1c8c3f2
 // organization," a client-supplied value, or a team-derived guess -- see
 // src/job-org-context.js and reingest-games.js, which establish this same
 // contract for the reingestion job.
-const JOB_ORG_ID = requireJobOrgContext();
+let JOB_ORG_ID;
+try {
+  JOB_ORG_ID = requireJobOrgContext();
+} catch (error) {
+  if (error instanceof OrgContextRequiredError) {
+    console.error('[report] OrgContextRequiredError: JOBU_JOB_ORG_ID is required.');
+  } else {
+    console.error('[report] InternalBootstrapError: organization-context bootstrap failed.');
+  }
+  process.exit(1);
+}
 if (!isValidUuid(JOB_ORG_ID)) {
   console.error('[report] JOBU_JOB_ORG_ID is not a valid organization id. Refusing to run.');
   process.exit(1);
 }
+
+try {
+  resolveDatabaseMode();
+} catch (error) {
+  if (error instanceof DatabaseModeConfigError) {
+    console.error(`[report] DatabaseModeConfigError: ${error.message}`);
+  } else {
+    console.error('[report] InternalBootstrapError: database-mode bootstrap failed.');
+  }
+  process.exit(1);
+}
+
+// The database adapter and its dependants may construct the Supabase client
+// while loading. Keep them behind both trusted bootstrap gates above.
+const db       = require('./db');
+const analyzer = require('./analyzer');
+const report   = require('./report');
 
 // Security Slice T3B: when this process is spawned by a server.js HTTP
 // route, JOBU_USAGE_ORG_ID / JOBU_USAGE_REPORT_ID are already set (see

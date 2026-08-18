@@ -77,9 +77,112 @@ function fakeImportService() {
       calls.push(['recordGameValidation', args]);
       return { row: { validation_status: 'validated', confidence: 'high' } };
     },
+    async persistEngineCollection(args) {
+      calls.push(['persistEngineCollection', args]);
+      return {
+        generation: { id: 'generation-1' },
+        payloadBytes: 1234,
+        inputSetHash: 'a'.repeat(64),
+      };
+    },
     async completeImportRun(args) { calls.push(['completeImportRun', args]); completed = true; },
   };
 }
+
+test('Slice 2C mode publishes the complete collection once and never uses legacy per-game writes', async () => {
+  const importService = fakeImportService();
+  const entries = [
+    { sourceGameRef: 'gc-1', sourceGameUrl: 'https://web.gc.com/g/1' },
+    { sourceGameRef: 'gc-2', sourceGameUrl: 'https://web.gc.com/g/2' },
+  ];
+  const summary = await runHighSchoolImportCollection({
+    ctx: CTX,
+    importService,
+    existingPlayers: [{ playerId: 'player-1', gcExternalPlayerId: 'gc-alice' }],
+    discoverCompletedGames: async () => entries,
+    collectGame: async (entry) => agreeingGame(entry.sourceGameRef),
+    useEnginePersistence: true,
+    now: () => Date.parse('2026-04-01T20:00:00.000Z'),
+    sleep: noSleep,
+  });
+  assert.equal(importService.calls.filter(([name]) => name === 'persistEngineCollection').length, 1);
+  const publication = importService.calls.find(([name]) => name === 'persistEngineCollection')[1];
+  assert.equal(publication.capturedGames.length, 2);
+  assert.deepEqual(publication.capturedGames.map((item) => item.meta.sourceGameId), ['gc-1', 'gc-2']);
+  assert.ok(publication.capturedGames.every((item) => item.meta.capturedAt === '2026-04-01T20:00:00.000Z'));
+  for (const legacyCall of ['recordSourceGame', 'resolveCanonicalGame', 'captureSnapshot', 'recordGameValidation', 'completeImportRun']) {
+    assert.equal(importService.calls.some(([name]) => name === legacyCall), false, `${legacyCall} must not split the atomic publication`);
+  }
+  assert.equal(summary.generationId, 'generation-1');
+});
+
+test('Slice 2C mode reingests repeated source games as evidence instead of skipping existing games', async () => {
+  const importService = fakeImportService();
+  const entries = [
+    { sourceGameRef: 'gc-replay', sourceGameUrl: 'https://web.gc.com/g/replay' },
+    { sourceGameRef: 'gc-replay', sourceGameUrl: 'https://web.gc.com/g/replay' },
+  ];
+  await runHighSchoolImportCollection({
+    ctx: CTX,
+    importService,
+    existingPlayers: [],
+    discoverCompletedGames: async () => entries,
+    collectGame: async () => agreeingGame('gc-replay'),
+    useEnginePersistence: true,
+    now: () => Date.parse('2026-04-01T20:00:00.000Z'),
+    sleep: noSleep,
+  });
+  const publication = importService.calls.find(([name]) => name === 'persistEngineCollection')[1];
+  assert.equal(publication.capturedGames.length, 2);
+  assert.equal(importService.calls.some(([name]) => name === 'resolveCanonicalGame'), false);
+});
+
+test('Slice 2C mode refuses partial publication when any collection fails', async () => {
+  await withEnv({ GC_RETRY_CEILING: '1' }, async () => {
+    const importService = fakeImportService();
+    const entries = [
+      { sourceGameRef: 'gc-good', sourceGameUrl: 'https://web.gc.com/g/good' },
+      { sourceGameRef: 'gc-bad', sourceGameUrl: 'https://web.gc.com/g/bad' },
+    ];
+    await runHighSchoolImportCollection({
+      ctx: CTX,
+      importService,
+      existingPlayers: [],
+      discoverCompletedGames: async () => entries,
+      collectGame: async (entry) => {
+        if (entry.sourceGameRef === 'gc-bad') throw new Error('synthetic collection failure');
+        return agreeingGame(entry.sourceGameRef);
+      },
+      useEnginePersistence: true,
+      now: () => Date.parse('2026-04-01T20:00:00.000Z'),
+      sleep: noSleep,
+    });
+    assert.equal(importService.calls.some(([name]) => name === 'persistEngineCollection'), false);
+    const failed = importService.calls.find(([name]) => name === 'failImportRun');
+    assert.equal(failed[1].failureStage, 'aggregation');
+  });
+});
+
+test('Slice 2C mode refuses to publish a collection truncated by the per-run game ceiling', async () => {
+  await withEnv({ GC_MAX_GAMES_PER_RUN: '1' }, async () => {
+    const importService = fakeImportService();
+    await runHighSchoolImportCollection({
+      ctx: CTX,
+      importService,
+      existingPlayers: [],
+      discoverCompletedGames: async () => [
+        { sourceGameRef: 'gc-1', sourceGameUrl: 'https://web.gc.com/g/1' },
+        { sourceGameRef: 'gc-2', sourceGameUrl: 'https://web.gc.com/g/2' },
+      ],
+      collectGame: async (entry) => agreeingGame(entry.sourceGameRef),
+      useEnginePersistence: true,
+      now: () => Date.parse('2026-04-01T20:00:00.000Z'),
+      sleep: noSleep,
+    });
+    assert.equal(importService.calls.some(([name]) => name === 'persistEngineCollection'), false);
+    assert.equal(importService.calls.some(([name]) => name === 'failImportRun'), true);
+  });
+});
 
 function noSleep() { return Promise.resolve(); }
 

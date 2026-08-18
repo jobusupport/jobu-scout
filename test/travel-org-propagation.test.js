@@ -287,17 +287,21 @@ test('generate-report.js: all three team-discovery call sites (listTeams, findTe
 test('generate-report.js: requires job org context and validates it against the established UUID ' +
      'contract before db.init() or any team query', () => {
   assert.match(GENERATE_REPORT_SRC, /require\(['"]\.\/job-org-context['"]\)/, 'must reuse the shared job-org-context contract, not a new ad-hoc env read');
-  assert.match(GENERATE_REPORT_SRC, /const JOB_ORG_ID = requireJobOrgContext\(\)/);
+  assert.match(GENERATE_REPORT_SRC, /JOB_ORG_ID = requireJobOrgContext\(\)/);
   assert.match(GENERATE_REPORT_SRC, /require\(['"]\.\/report-access['"]\)/, 'must reuse the existing isValidUuid helper, not a new ad-hoc regex');
   assert.match(GENERATE_REPORT_SRC, /if\s*\(!isValidUuid\(JOB_ORG_ID\)\)/);
 
-  const jobOrgIdAssignIdx = GENERATE_REPORT_SRC.indexOf('const JOB_ORG_ID = requireJobOrgContext()');
+  const jobOrgIdAssignIdx = GENERATE_REPORT_SRC.indexOf('JOB_ORG_ID = requireJobOrgContext()');
+  const modeCheckIdx = GENERATE_REPORT_SRC.indexOf('resolveDatabaseMode()');
+  const dbLoadIdx = GENERATE_REPORT_SRC.indexOf("require('./db')");
   const uuidCheckIdx = GENERATE_REPORT_SRC.indexOf('if (!isValidUuid(JOB_ORG_ID))');
   const dbInitIdx = GENERATE_REPORT_SRC.indexOf('db.init(DB_PATH)');
   const firstListTeamsIdx = GENERATE_REPORT_SRC.indexOf('db.listTeamsForOrg(JOB_ORG_ID)');
 
-  assert.ok(jobOrgIdAssignIdx !== -1 && uuidCheckIdx !== -1 && dbInitIdx !== -1 && firstListTeamsIdx !== -1);
+  assert.ok(jobOrgIdAssignIdx !== -1 && uuidCheckIdx !== -1 && modeCheckIdx !== -1 && dbLoadIdx !== -1 && dbInitIdx !== -1 && firstListTeamsIdx !== -1);
   assert.ok(jobOrgIdAssignIdx < uuidCheckIdx, 'the raw env value must be resolved before its format is validated');
+  assert.ok(uuidCheckIdx < modeCheckIdx, 'organization validation must happen before database-mode validation');
+  assert.ok(modeCheckIdx < dbLoadIdx, 'database mode must be validated before the database adapter is loaded');
   assert.ok(uuidCheckIdx < dbInitIdx, 'format validation must happen before db.init()');
   assert.ok(uuidCheckIdx < firstListTeamsIdx, 'format validation must happen before any team query');
 });
