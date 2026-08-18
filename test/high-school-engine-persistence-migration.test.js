@@ -19,27 +19,65 @@ const newTables = [
   'hs_noncanonical_player_stats',
 ];
 
-test('already-applied Slice 2C migration remains byte-for-byte unchanged', () => {
-  const digest = crypto.createHash('sha256').update(fs.readFileSync(migrationPath)).digest('hex');
-  assert.equal(digest, 'b19bd3f060aa5989e86605e7ac3215a0e643f883c82947f8f7b221c3555e4f61');
+// The applied Slice 2C migration is pinned by the sha256 of its canonical LF
+// content, so the guard behaves identically on LF-only checkouts and on Windows
+// checkouts where core.autocrlf materialises CRLF in the working tree.
+const APPLIED_SLICE_2C_DIGEST = '637c05d0d98d46791d6d61cf0dbdf4ffef75a972c84f0ffcea3fd1c7e3a7ac4f';
+
+function canonicalDigest(text) {
+  return crypto.createHash('sha256').update(text.replace(/\r\n/g, '\n'), 'utf8').digest('hex');
+}
+
+// Substantive SQL: comments stripped, whitespace collapsed. Keeps the contract
+// assertion about statements rather than about formatting or commentary.
+function substantiveSql(text) {
+  return text.replace(/--[^\n]*/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+const FORWARD_SUBSTANTIVE_SQL =
+  'revoke update on table public.hs_game_identity_aliases, '
+  + 'public.hs_game_identity_resolutions, '
+  + 'public.hs_noncanonical_player_stats from service_role; '
+  + 'revoke maintain on table public.hs_game_identity_aliases, '
+  + 'public.hs_game_identity_resolutions, '
+  + 'public.hs_stat_generations, '
+  + 'public.hs_noncanonical_player_stats from service_role;';
+
+test('already-applied Slice 2C migration remains unchanged, independent of line endings', () => {
+  assert.equal(canonicalDigest(fs.readFileSync(migrationPath, 'utf8')), APPLIED_SLICE_2C_DIGEST);
 });
 
-test('a distinct later forward migration revokes only the two excess UPDATE privileges', () => {
+test('applied-migration digest is identical for equivalent LF and CRLF content', () => {
+  const lf = fs.readFileSync(migrationPath, 'utf8').replace(/\r\n/g, '\n');
+  const crlf = lf.replace(/\n/g, '\r\n');
+  assert.notEqual(lf, crlf, 'fixture must genuinely differ in line endings');
+  assert.equal(canonicalDigest(lf), APPLIED_SLICE_2C_DIGEST);
+  assert.equal(canonicalDigest(crlf), APPLIED_SLICE_2C_DIGEST);
+  // Raw-byte hashing (the superseded approach) is line-ending dependent, which
+  // is exactly why the digest above is taken over normalised content.
+  const rawDigest = (text) => crypto.createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
+  assert.notEqual(rawDigest(lf), rawDigest(crlf), 'raw-byte hashing must be shown to be line-ending dependent');
+});
+
+test('a distinct later forward migration revokes exactly the excess UPDATE and MAINTAIN privileges', () => {
   assert.ok(forwardMigrationName > path.basename(migrationPath));
-  const normalized = forwardSql.replace(/\s+/g, ' ').trim().toLowerCase();
-  assert.equal(normalized,
-    'revoke update on table public.hs_game_identity_resolutions from service_role; '
-    + 'revoke update on table public.hs_noncanonical_player_stats from service_role;');
-  assert.doesNotMatch(forwardSql, /\bgrant\b|\bselect\b|\binsert\b|\bdelete\b|\btruncate\b|\breferences\b|\btrigger\b/i);
+  assert.equal(substantiveSql(forwardSql), FORWARD_SUBSTANTIVE_SQL);
+  assert.doesNotMatch(substantiveSql(forwardSql),
+    /\bgrant\b|\bselect\b|\binsert\b|\bdelete\b|\btruncate\b|\breferences\b|\btrigger\b|\bcreate\b|\balter\b|\bdrop\b|\bfunction\b|\bpolicy\b|\bindex\b|\b(anon|authenticated|postgres|public)\s*;/);
 });
 
-test('forward privilege correction has no unrelated schema or role effects', () => {
-  assert.doesNotMatch(forwardSql,
-    /hs_game_identity_aliases|hs_stat_generations|\b(anon|authenticated|postgres)\b|\b(create|alter|drop|function|policy|constraint|index)\b/i);
-  assert.deepEqual(
-    [...forwardSql.matchAll(/public\.([a-z0-9_]+)/gi)].map((match) => match[1]),
-    ['hs_game_identity_resolutions', 'hs_noncanonical_player_stats'],
-  );
+test('forward correction retains generation supersession UPDATE and strips MAINTAIN everywhere', () => {
+  const normalized = substantiveSql(forwardSql);
+  const revokeUpdate = normalized.match(/revoke update[^;]*;/)[0];
+  const revokeMaintain = normalized.match(/revoke maintain[^;]*;/)[0];
+  // hs_stat_generations is the one table the RPC updates (generation supersession).
+  assert.doesNotMatch(revokeUpdate, /hs_stat_generations/);
+  for (const table of ['hs_game_identity_aliases', 'hs_game_identity_resolutions', 'hs_noncanonical_player_stats']) {
+    assert.match(revokeUpdate, new RegExp(`public\\.${table}\\b`));
+  }
+  for (const table of newTables) {
+    assert.match(revokeMaintain, new RegExp(`public\\.${table}\\b`));
+  }
 });
 
 test('Slice 2C migration creates the four approved tenant-owned tables', () => {

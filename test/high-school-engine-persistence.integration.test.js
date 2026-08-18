@@ -17,6 +17,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const localUrl = process.env.HS_LOCAL_SUPABASE_URL || '';
 const explicitlyEnabled = process.env.RUN_HS_ENGINE_LOCAL_DB_TESTS === '1';
@@ -434,27 +436,153 @@ relationalTest('cross-tenant references and mid-publication player failures roll
   }
 });
 
-relationalTest('service_role privilege closure denies direct UPDATE while preserving publication', { skip }, async () => {
-  const affected = ['hs_game_identity_resolutions', 'hs_noncanonical_player_stats'];
-  const expected = ['INSERT', 'SELECT'];
-  for (const table of affected) {
-    const grants = await fixtureDb.query(
-      `select privilege_type from information_schema.role_table_grants
-        where table_schema = 'public' and table_name = $1 and grantee = 'service_role'
-        order by privilege_type`,
-      [table],
-    );
-    assert.deepEqual(grants.rows.map((row) => row.privilege_type), expected, `${table}: service_role ACL`);
+const SLICE_2C_TABLES = [
+  'hs_game_identity_aliases',
+  'hs_game_identity_resolutions',
+  'hs_stat_generations',
+  'hs_noncanonical_player_stats',
+];
+const TABLE_PRIVILEGES = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN'];
+const forwardMigrationSql = () => fs.readFileSync(
+  path.join(__dirname, '..', 'supabase', 'migrations', '20260817151031_close_hs_engine_service_role_update_privileges.sql'),
+  'utf8',
+);
+
+// Effective privileges. has_table_privilege resolves direct grants, grants held
+// through role membership, and grants made to PUBLIC, so this is the real
+// authorization answer rather than information_schema's direct-grant view
+// (which additionally omits PostgreSQL 17's MAINTAIN entirely).
+async function effectivePrivileges(queryable, role, table) {
+  const { rows } = await queryable.query(
+    `select p as privilege from unnest($1::text[]) as p
+      where has_table_privilege($2::regrole, $3::regclass, p) order by 1`,
+    [TABLE_PRIVILEGES, role, `public.${table}`],
+  );
+  return rows.map((row) => row.privilege).sort();
+}
+
+// Catalog ACL expansion, including grants made to PUBLIC (grantee OID 0).
+async function catalogPrivileges(queryable, grantee, table) {
+  const { rows } = await queryable.query(
+    `select a.privilege_type
+       from pg_class c
+       join pg_namespace n on n.oid = c.relnamespace
+       cross join lateral aclexplode(c.relacl) a
+      where n.nspname = 'public' and c.relname = $2
+        and (case when a.grantee = 0 then 'PUBLIC' else pg_get_userbyid(a.grantee) end) = $1
+      order by 1`,
+    [grantee, table],
+  );
+  return rows.map((row) => row.privilege_type).sort();
+}
+
+relationalTest('forward migration converts hosted default privileges into the least-privilege contract', { skip }, async () => {
+  const migrationSql = forwardMigrationSql();
+  const defaultAclBefore = await fixtureDb.query(
+    'select defaclrole, defaclnamespace, defaclobjtype, defaclacl::text as acl from pg_default_acl order by 1, 2, 3');
+  const aclBefore = {};
+  for (const table of SLICE_2C_TABLES) {
+    aclBefore[table] = await catalogPrivileges(fixtureDb, 'service_role', table);
+  }
+
+  const client = await fixtureDb.connect();
+  try {
+    await client.query('begin');
+
+    // Hosted Supabase grants service_role ALL (arwdDxtm) on newly created public
+    // tables; the local stack's default privileges grant only Dxtm. Recreate the
+    // hosted residue so this assertion tests the migration, not the environment.
+    for (const table of SLICE_2C_TABLES) {
+      await client.query(`grant update, maintain on table public.${table} to service_role`);
+    }
+
+    for (const table of SLICE_2C_TABLES) {
+      assert.deepEqual(await effectivePrivileges(client, 'service_role', table),
+        ['INSERT', 'MAINTAIN', 'SELECT', 'UPDATE'], `${table}: simulated hosted precondition`);
+    }
+
+    // Execute the migration exactly as production will, read from the file itself.
+    await client.query(migrationSql);
+
+    const expected = {
+      hs_game_identity_aliases: ['INSERT', 'SELECT'],
+      hs_game_identity_resolutions: ['INSERT', 'SELECT'],
+      hs_stat_generations: ['INSERT', 'SELECT', 'UPDATE'],
+      hs_noncanonical_player_stats: ['INSERT', 'SELECT'],
+    };
+    for (const table of SLICE_2C_TABLES) {
+      const effective = await effectivePrivileges(client, 'service_role', table);
+      assert.deepEqual(effective, expected[table], `${table}: corrected effective service_role contract`);
+      assert.deepEqual(await catalogPrivileges(client, 'service_role', table), expected[table],
+        `${table}: corrected service_role catalog ACL`);
+      for (const privilege of ['DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN']) {
+        assert.equal(effective.includes(privilege), false, `${table}: service_role must not hold ${privilege}`);
+      }
+      assert.deepEqual(await catalogPrivileges(client, 'PUBLIC', table), [], `${table}: PUBLIC must hold nothing`);
+      assert.deepEqual(await effectivePrivileges(client, 'anon', table), [], `${table}: anon must hold nothing`);
+      assert.deepEqual(await effectivePrivileges(client, 'authenticated', table), ['SELECT'],
+        `${table}: authenticated must remain read-only`);
+    }
+
+    await client.query('rollback');
+  } finally {
+    client.release();
+  }
+
+  // The simulation must leave nothing behind: every table ACL returns to exactly
+  // the state captured before the transaction, and no default privilege changed.
+  for (const table of SLICE_2C_TABLES) {
+    assert.deepEqual(await catalogPrivileges(fixtureDb, 'service_role', table), aclBefore[table],
+      `${table}: simulation must be rolled back, not persisted`);
+  }
+  const defaultAclAfter = await fixtureDb.query(
+    'select defaclrole, defaclnamespace, defaclobjtype, defaclacl::text as acl from pg_default_acl order by 1, 2, 3');
+  assert.deepEqual(defaultAclAfter.rows, defaultAclBefore.rows, 'default privileges must be untouched');
+});
+
+relationalTest('privilege closure is behaviourally enforced against real matching rows', { skip }, async () => {
+  // Two publications over a schedule-composite identity: the first creates the
+  // game, alias, generation and noncanonical rows; the second reconciles against
+  // that identity, which is what appends resolution history. Both are needed so
+  // every affected table holds a real matching row for the probes below.
+  // A date/time unique to this test, so the schedule-composite identity cannot
+  // collide with fixtures published by any other case in this file.
+  const slot = { startTime: '18:30', gameDate: '2026-05-22' };
+  const firstRun = await createRun();
+  const published = await repository.persistEngineCollection(
+    dto(firstRun, [capturedGame(null, slot)]));
+  assert.ok(published.id, 'SECURITY INVOKER publication must succeed under the corrected privilege closure');
+  const secondRun = await createRun();
+  const republished = await repository.persistEngineCollection(dto(secondRun, [
+    capturedGame(null, slot),
+    capturedGame(null, { ...slot, field: 'South' }),
+  ]));
+  assert.ok(republished.id, 'identity reconciliation must still publish under the corrected privilege closure');
+  assert.notEqual(republished.id, published.id, 'the superseding generation must be distinct');
+
+  const denied = {
+    hs_game_identity_aliases: 'identity_method',
+    hs_game_identity_resolutions: 'resolution_kind',
+    hs_noncanonical_player_stats: 'unresolved_reason',
+  };
+  for (const [table, column] of Object.entries(denied)) {
+    const { rows: [{ count }] } = await fixtureDb.query(
+      `select count(*)::int as count from public.${table} where org_id = $1`, [ids.orgId]);
+    assert.ok(count > 0, `${table}: probe requires at least one matching row`);
 
     const client = await fixtureDb.connect();
     try {
       await client.query('begin');
       await client.query('set local role service_role');
+      // A matching row exists and service_role bypasses RLS, so a retained
+      // privilege would produce a successful non-zero-row update. Rejection with
+      // 42501 therefore distinguishes ACL denial from an RLS-filtered no-op.
       await assert.rejects(
-        client.query(`update public.${table} set created_at = created_at where false`),
+        client.query(`update public.${table} set ${column} = ${column} where org_id = $1`, [ids.orgId]),
         (error) => error.code === '42501'
           && /permission denied/i.test(error.message)
           && !/postgres(?:ql)?:\/\/|service[_-]?role[_-]?key|eyJ/i.test(error.message),
+        `${table}: service_role UPDATE must fail with SQLSTATE 42501`,
       );
       await client.query('rollback');
     } finally {
@@ -462,9 +590,52 @@ relationalTest('service_role privilege closure denies direct UPDATE while preser
     }
   }
 
-  const run = await createRun();
-  const published = await repository.persistEngineCollection(dto(run, [capturedGame('privilege-closure-publication')]));
-  assert.ok(published.id, 'SECURITY INVOKER publication must still succeed after UPDATE revocation');
+  const client = await fixtureDb.connect();
+  try {
+    await client.query('begin');
+    await client.query('set local role service_role');
+    const superseded = await client.query(
+      'update public.hs_stat_generations set is_current = is_current where org_id = $1', [ids.orgId]);
+    assert.ok(superseded.rowCount > 0, 'service_role must retain UPDATE on hs_stat_generations for supersession');
+    for (const table of SLICE_2C_TABLES) {
+      const privileges = await effectivePrivileges(client, 'service_role', table);
+      assert.ok(privileges.includes('SELECT'), `${table}: SELECT must remain effective`);
+      assert.ok(privileges.includes('INSERT'), `${table}: INSERT must remain effective`);
+      assert.equal(privileges.includes('MAINTAIN'), false, `${table}: MAINTAIN must be ineffective`);
+      assert.deepEqual(await catalogPrivileges(client, 'service_role', table), privileges,
+        `${table}: catalog ACL must agree with effective privileges`);
+    }
+    await client.query('rollback');
+  } finally {
+    client.release();
+  }
+
+  for (const role of ['anon', 'authenticated']) {
+    for (const table of SLICE_2C_TABLES) {
+      const probe = await fixtureDb.connect();
+      try {
+        await probe.query('begin');
+        await probe.query(`set local role ${role}`);
+        await assert.rejects(
+          probe.query(`update public.${table} set org_id = org_id where org_id = $1`, [ids.orgId]),
+          (error) => error.code === '42501',
+          `${role} must not update ${table}`,
+        );
+        await probe.query('rollback');
+      } finally {
+        probe.release();
+      }
+    }
+  }
+
+  for (const table of SLICE_2C_TABLES) {
+    const admin = await effectivePrivileges(fixtureDb, 'postgres', table);
+    assert.deepEqual(admin, TABLE_PRIVILEGES.slice().sort(), `${table}: postgres must retain administrative privileges`);
+    // has_table_privilege above is membership- and PUBLIC-aware, so the denials
+    // already account for indirect grants; assert no PUBLIC grant exists at all.
+    assert.deepEqual(await catalogPrivileges(fixtureDb, 'PUBLIC', table), [],
+      `${table}: no PUBLIC grant may restore a denied privilege`);
+  }
 });
 
 function independentRepository() {
