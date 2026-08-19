@@ -676,13 +676,18 @@ test('opponent player lines persist as noncanonical observations without inventi
 // ── Publication, currency and isolation ────────────────────────────────
 
 test('two opponents each hold a current generation in the same season', { skip }, async () => {
-  const first = await ingest(A, await startRun(A, A.opponent), [capturedGame(`multi1-${A.suffix}`)], A.opponent);
-  const second = await ingest(A, await startRun(A, A.opponentTwo), [capturedGame(`multi2-${A.suffix}`)], A.opponentTwo);
+  // Fresh subjects: reusing an opponent that already holds a verified
+  // generation would exercise the completeness-regression gate instead of
+  // per-opponent currency.
+  const alpha = await createOpponent(A.orgId, A.programId, A.seasonId, `multiA ${crypto.randomUUID().slice(0, 6)}`);
+  const beta = await createOpponent(A.orgId, A.programId, A.seasonId, `multiB ${crypto.randomUUID().slice(0, 6)}`);
+  const first = await ingest(A, await startRun(A, alpha), [capturedGame(`multi1-${A.suffix}`)], alpha);
+  const second = await ingest(A, await startRun(A, beta), [capturedGame(`multi2-${A.suffix}`)], beta);
   assert.notEqual(first.generation.id, second.generation.id);
   const current = await db.query(
     `select opponent_team_id from public.hs_opponent_stat_generations
       where org_id = $1 and season_id = $2 and is_current and opponent_team_id = any($3)`,
-    [A.orgId, A.seasonId, [A.opponent.teamId, A.opponentTwo.teamId]]);
+    [A.orgId, A.seasonId, [alpha.teamId, beta.teamId]]);
   assert.equal(current.rowCount, 2, 'publishing for one opponent must not supersede another');
 
   // And the first opponent's generation is untouched by the second publication.
@@ -885,4 +890,182 @@ test('concurrent publication for two different opponents never interferes', { sk
     `select opponent_team_id from public.hs_opponent_stat_generations
       where is_current and opponent_team_id = any($1)`, [[first.teamId, second.teamId]]);
   assert.equal(current.rowCount, 2, 'both opponents publish independently');
+});
+
+// ── Slice 2D corrections: schedule-only vs verified, and the
+//    completeness-regression gate ───────────────────────────────────────
+
+test('a schedule-only generation is explicitly labelled and replays idempotently', { skip }, async () => {
+  const opponent = await createOpponent(A.orgId, A.programId, A.seasonId, `sched ${crypto.randomUUID().slice(0, 6)}`);
+  const games = [
+    capturedGame(`so1-${A.suffix}`, { gameStatus: 'scheduled', gameDate: '2026-05-01' }),
+    capturedGame(`so2-${A.suffix}`, { gameStatus: 'scheduled', gameDate: '2026-05-08' }),
+  ];
+  const first = await ingest(A, await startRun(A, opponent), games, opponent);
+  assert.equal(first.state, 'published_schedule_only');
+  assert.equal(first.publicationState, 'schedule_only');
+  assert.equal(first.verifiedGenerationPublished, false);
+
+  const replay = await ingest(A, await startRun(A, opponent), structuredClone(games), opponent);
+  assert.equal(replay.generation.id, first.generation.id, 'schedule-only replay is idempotent');
+  const rows = await db.query(
+    'select count(*)::int c from public.hs_opponent_stat_generations where opponent_team_id = $1', [opponent.teamId]);
+  assert.equal(rows.rows[0].c, 1);
+});
+
+test('a privileged caller cannot label schedule-only data as verified through the RPC', { skip }, async () => {
+  const opponent = await createOpponent(A.orgId, A.programId, A.seasonId, `direct ${crypto.randomUUID().slice(0, 6)}`);
+  const run = await startRun(A, opponent);
+  const dto = opponentDto(A, run, [capturedGame(`dir-${A.suffix}`, { gameStatus: 'scheduled', gameDate: '2026-05-01' })], opponent);
+  // Assert the strongest available claim directly against the reviewed boundary.
+  dto.officialTotalsComplete = true;
+  const published = await repository.persistEngineCollection(dto);
+  assert.equal(published.publication_state, 'schedule_only',
+    'the state is derived from what was reconstructed, never from the caller');
+  assert.equal(published.official_totals_complete, false);
+  assert.equal(published.final_game_count, 0);
+
+  // And the table itself refuses the claim even bypassing the RPC entirely.
+  await assert.rejects(
+    () => db.query(
+      `update public.hs_opponent_stat_generations set publication_state = 'verified' where id = $1`,
+      [published.id]),
+    (error) => /state_matches_finals/.test(String(error.message)),
+    'the check constraint blocks a direct table-level relabel',
+  );
+});
+
+test('a doubleheader where only one game is final publishes verified with exactly that one game', { skip }, async () => {
+  const opponent = await createOpponent(A.orgId, A.programId, A.seasonId, `dhmix ${crypto.randomUUID().slice(0, 6)}`);
+  const result = await ingest(A, await startRun(A, opponent), [
+    capturedGame(`dhm1-${A.suffix}`, { startTime: '10:00 AM', gameStatus: 'final' }),
+    capturedGame(`dhm2-${A.suffix}`, { startTime: '1:00 PM', gameStatus: 'suspended' }),
+  ], opponent);
+  assert.equal(result.state, 'published_verified');
+  assert.equal(result.finalGameCount, 1, 'only the completed half counts');
+  const games = await db.query(
+    `select game_status from public.hs_opponent_games where opponent_team_id = $1 order by game_status`, [opponent.teamId]);
+  assert.deepEqual(games.rows.map((r) => r.game_status), ['final', 'suspended'],
+    'both halves of the doubleheader remain distinct games');
+  const generation = await db.query(
+    'select final_game_count, array_length(final_identity_digests, 1) as digests from public.hs_opponent_stat_generations where id = $1',
+    [result.generation.id]);
+  assert.equal(generation.rows[0].final_game_count, 1);
+  assert.equal(generation.rows[0].digests, 1);
+});
+
+test('a cancelled future game does not count as a completed game or block publication', { skip }, async () => {
+  const opponent = await createOpponent(A.orgId, A.programId, A.seasonId, `canc ${crypto.randomUUID().slice(0, 6)}`);
+  const first = await ingest(A, await startRun(A, opponent), [capturedGame(`cz1-${A.suffix}`, { gameStatus: 'final' })], opponent);
+  assert.equal(first.publicationState, 'verified');
+  // A later capture keeps the completed game and cancels an upcoming one.
+  const second = await ingest(A, await startRun(A, opponent), [
+    capturedGame(`cz1-${A.suffix}`, { gameStatus: 'final' }),
+    capturedGame(`cz2-${A.suffix}`, { gameStatus: 'cancelled', gameDate: '2026-05-20' }),
+  ], opponent);
+  assert.equal(second.state, 'published_verified');
+  assert.equal(second.finalGameCount, 1, 'cancelling an unplayed game is not a completeness regression');
+  assert.notEqual(second.generation.id, first.generation.id);
+});
+
+test('concurrent schedule-only and verified candidates leave exactly one current generation', { skip }, async () => {
+  for (let repeat = 0; repeat < 3; repeat += 1) {
+    const opponent = await createOpponent(A.orgId, A.programId, A.seasonId, `mix ${crypto.randomUUID().slice(0, 6)}`);
+    const scheduleOnly = opponentDto(A, await startRun(A, opponent),
+      [capturedGame(`mix-s-${repeat}-${A.suffix}`, { gameStatus: 'scheduled', gameDate: '2026-05-01' })], opponent);
+    const verified = opponentDto(A, await startRun(A, opponent),
+      [capturedGame(`mix-v-${repeat}-${A.suffix}`, { gameStatus: 'final' })], opponent);
+    await Promise.allSettled([
+      (await independentRepository()).persistEngineCollection(scheduleOnly),
+      (await independentRepository()).persistEngineCollection(verified),
+    ]);
+    const current = await db.query(
+      `select publication_state from public.hs_opponent_stat_generations
+        where opponent_team_id = $1 and is_current`, [opponent.teamId]);
+    assert.equal(current.rowCount, 1, 'never zero and never multiple current generations');
+    // Whichever won, a verified generation can never be replaced by schedule-only.
+    const verifiedExists = await db.query(
+      `select count(*)::int c from public.hs_opponent_stat_generations
+        where opponent_team_id = $1 and publication_state = 'verified'`, [opponent.teamId]);
+    if (verifiedExists.rows[0].c > 0) {
+      assert.equal(current.rows[0].publication_state, 'verified',
+        'a schedule-only capture must never supersede verified statistics');
+    }
+  }
+});
+
+test('the subject advisory lock serializes two genuinely concurrent transactions', { skip }, async () => {
+  const opponent = await createOpponent(A.orgId, A.programId, A.seasonId, `lock ${crypto.randomUUID().slice(0, 6)}`);
+  const other = await createOpponent(A.orgId, A.programId, A.seasonId, `lock2 ${crypto.randomUUID().slice(0, 6)}`);
+
+  // The key the RPC computes, reproduced exactly.
+  const keyFor = (org, subject, season) => db.query(
+    `select pg_catalog.hashtextextended($1 || ':' || $2 || ':' || $3, 0) as key`,
+    [org, subject, season]).then((r) => r.rows[0].key);
+
+  const sameA = await keyFor(A.orgId, opponent.teamId, A.seasonId);
+  const sameB = await keyFor(A.orgId, opponent.teamId, A.seasonId);
+  const differentOpponent = await keyFor(A.orgId, other.teamId, A.seasonId);
+  const differentTenant = await keyFor(B.orgId, opponent.teamId, A.seasonId);
+
+  assert.equal(sameA, sameB, 'the same opponent and season always produce the same key');
+  assert.notEqual(sameA, differentOpponent, 'different opponents do not share a key');
+  assert.notEqual(sameA, differentTenant, 'different tenants do not share a key');
+
+  // Two real transactions on two real connections. The first holds the lock;
+  // the second must block until the first commits, proving serialization
+  // rather than two promises that merely interleave.
+  const connection = () => new PgClient({
+    host: process.env.HS_LOCAL_PG_HOST,
+    port: Number(process.env.HS_LOCAL_PG_PORT),
+    database: process.env.HS_LOCAL_PG_DATABASE,
+    user: process.env.HS_LOCAL_PG_USER,
+    password: process.env.HS_LOCAL_PG_PASSWORD,
+  });
+  const holder = connection();
+  const waiter = connection();
+  await holder.connect();
+  await waiter.connect();
+  try {
+    await holder.query('begin');
+    await holder.query('select pg_catalog.pg_advisory_xact_lock($1)', [sameA]);
+
+    let waiterAcquired = false;
+    const waiting = (async () => {
+      await waiter.query('begin');
+      await waiter.query('select pg_catalog.pg_advisory_xact_lock($1)', [sameA]);
+      waiterAcquired = true;
+      await waiter.query('commit');
+    })();
+
+    // Observe the waiter actually blocked in the database, not merely pending
+    // in the JavaScript event loop.
+    let blocked = false;
+    for (let attempt = 0; attempt < 100 && !blocked; attempt += 1) {
+      const probe = await db.query(
+        `select count(*)::int c from pg_locks where locktype = 'advisory' and not granted`);
+      if (probe.rows[0].c > 0) blocked = true;
+      else await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(blocked, true, 'the second transaction is genuinely blocked in PostgreSQL');
+    assert.equal(waiterAcquired, false, 'the second transaction must not hold the lock while the first does');
+
+    // A different opponent's key is free the whole time.
+    const free = await holder.query('select pg_catalog.pg_try_advisory_lock($1) as got', [differentOpponent]);
+    assert.equal(free.rows[0].got, true, 'a different opponent never waits on this one');
+    await holder.query('select pg_catalog.pg_advisory_unlock($1)', [differentOpponent]);
+
+    await holder.query('commit');
+    await waiting;
+    assert.equal(waiterAcquired, true, 'the lock is released on commit and the waiter proceeds');
+
+    const leftover = await db.query(
+      `select count(*)::int c from pg_locks where locktype = 'advisory' and not granted`);
+    assert.equal(leftover.rows[0].c, 0, 'the advisory lock is transaction-scoped and auto-released');
+  } finally {
+    try { await holder.query('rollback'); } catch { /* already committed */ }
+    try { await waiter.query('rollback'); } catch { /* already committed */ }
+    await holder.end();
+    await waiter.end();
+  }
 });

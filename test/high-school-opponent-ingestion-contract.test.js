@@ -295,11 +295,19 @@ test('a materially changed capture yields a different snapshot integrity hash', 
   assert.notEqual(box(updated), box(original), 'changed content must not reuse the prior snapshot identity');
 });
 
-test('capture timestamps never leak into the input set hash', () => {
+test('capture timestamps are provenance and never decide collection identity', () => {
   const first = map([capturedGame('g-1', { capturedAt: '2026-04-01T20:00:00.000Z' })]).dto;
   const later = map([capturedGame('g-1', { capturedAt: '2026-09-09T09:09:09.000Z' })]).dto;
-  assert.notEqual(later.contentHash, first.contentHash, 'the snapshot itself records when it was captured');
+  // An opponent schedule is re-scraped on a schedule. If WHEN it was read
+  // participated in identity, every unchanged re-scrape would mint a new
+  // generation and supersede the last one for no reason.
+  assert.equal(later.inputSetHash, first.inputSetHash);
+  assert.equal(later.contentHash, first.contentHash);
   assert.equal(canonicalSerialize(first.subject), canonicalSerialize(later.subject));
+  // The evidence of when each observation was actually taken is still preserved
+  // on the snapshots themselves.
+  assert.equal(first.observations[0].snapshots[0].capturedAt, '2026-04-01T20:00:00.000Z');
+  assert.equal(later.observations[0].snapshots[0].capturedAt, '2026-09-09T09:09:09.000Z');
 });
 
 test('the own-team mapper is unaffected by the opponent subject work', () => {
@@ -326,4 +334,34 @@ test('the own-team mapper is unaffected by the opponent subject work', () => {
   assert.equal(Object.hasOwn(dto.observations[0], 'gameStatus'), false,
     'an own-team observation gains no gameStatus field, so its content hash is unchanged');
   assert.equal(dto.canonicalPlayers.length, 1, 'own-team roster gating is untouched');
+});
+
+// ── RPC return-contract compatibility (Slice 2D audit) ──────────────────
+
+test('the repository fails closed when the RPC returns no generation envelope', async () => {
+  const { createHighSchoolImportRepository } = require('../src/high-school-import-repository');
+  const stub = (data) => createHighSchoolImportRepository({
+    rpc: async () => ({ data, error: null }),
+    from() { throw new Error('unused'); },
+  });
+  // A database older than this code would return the bare Slice 2C composite
+  // row. Returning it silently would hand a publication caller a row with no
+  // subject discrimination; returning undefined would be worse.
+  for (const legacyShape of [{ id: 'x', status: 'completed' }, null, 'not-an-object', {}]) {
+    await assert.rejects(
+      () => stub(legacyShape).persistEngineCollection({}),
+      (error) => error.code === 'PERSISTENCE_FAILED',
+      `must fail closed for ${JSON.stringify(legacyShape)}`,
+    );
+  }
+});
+
+test('the repository unwraps the envelope to exactly the generation row', async () => {
+  const { createHighSchoolImportRepository } = require('../src/high-school-import-repository');
+  const generation = { id: 'gen-1', publication_state: 'verified', final_game_count: 2 };
+  const repo = createHighSchoolImportRepository({
+    rpc: async () => ({ data: { subjectKind: 'opponent_team', generation }, error: null }),
+    from() { throw new Error('unused'); },
+  });
+  assert.deepEqual(await repo.persistEngineCollection({}), generation);
 });
