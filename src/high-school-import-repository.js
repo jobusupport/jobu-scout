@@ -689,6 +689,9 @@ function createHighSchoolImportRepository(adminClient) {
     // A later incomplete capture tried to replace a generation that already
     // carried verified statistics. Fails closed; the prior generation stays current.
     ['opponent_completeness_regression', 'OPPONENT_COMPLETENESS_REGRESSION', 409],
+    // Two distinct observations claim one stable upstream game identity; the
+    // collection could conceal a second real game, so nothing is published.
+    ['opponent_source_event_identity_collision', 'OPPONENT_SOURCE_EVENT_IDENTITY_COLLISION', 409],
   ];
 
   // Slice 2D widened the RPC's return from a bare hs_stat_generations row to a

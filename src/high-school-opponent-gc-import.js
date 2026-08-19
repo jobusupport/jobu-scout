@@ -137,7 +137,48 @@ function toOpponentScheduleEntry(row) {
     venue: row.venue || null,
     gameNumber: Number.isFinite(row.gameNumber) ? row.gameNumber : null,
     rawStatusText: row.rawStatusText || null,
+    // Provenance carried only so a collision can be explained; never hashed,
+    // never canonical identity.
+    sourceRowIndex: Number.isFinite(row.visibleIndex) ? row.visibleIndex : null,
+    identityCollision: row.identityCollision === true,
+    collidingRowIndexes: Array.isArray(row.collidingRowIndexes) ? [...row.collidingRowIndexes] : [],
   };
+}
+
+// Two DISTINCT source rows claiming one stable upstream identifier could be one
+// game published twice, or two real games the source failed to distinguish.
+// Nothing downstream can tell which, so this fails closed rather than choosing.
+// Both observations are preserved in the returned diagnostic, no field is
+// combined across them, no row is arbitrarily selected, and no substitute
+// identifier is manufactured.
+function detectSourceEventIdentityCollisions(entries) {
+  const byRef = new Map();
+  for (const entry of entries) {
+    if (!entry.sourceGameRef) continue;
+    if (!byRef.has(entry.sourceGameRef)) byRef.set(entry.sourceGameRef, []);
+    byRef.get(entry.sourceGameRef).push(entry);
+  }
+  const collisions = [];
+  for (const [sourceGameRef, colliding] of byRef) {
+    if (colliding.length < 2) continue;
+    collisions.push({
+      sourceGameRef,
+      // Sorted so the diagnostic is identical however the source ordered the
+      // rows in the DOM.
+      sourceRowIndexes: colliding.map((entry) => entry.sourceRowIndex).sort((a, b) => a - b),
+      observations: colliding
+        .map((entry) => ({
+          sourceRowIndex: entry.sourceRowIndex,
+          gameDate: entry.gameDate,
+          gameStatus: entry.gameStatus,
+          startTime: entry.startTime,
+          gameNumber: entry.gameNumber,
+          rawStatusText: entry.rawStatusText,
+        }))
+        .sort((a, b) => a.sourceRowIndex - b.sourceRowIndex),
+    });
+  }
+  return collisions.sort((a, b) => (a.sourceGameRef < b.sourceGameRef ? -1 : 1));
 }
 
 function summarizeForLog(summary) {
@@ -154,6 +195,7 @@ function summarizeForLog(summary) {
     manualReconciliationRequired: summary.manualReconciliationRequired,
     generationId: summary.generationId || null,
     publicationState: summary.publicationState || null,
+    identityCollisionCount: (summary.identityCollisions || []).length,
     stopped: summary.stopped,
   };
 }
@@ -184,6 +226,7 @@ async function runOpponentImportCollection({
     publicationState: null,
     stopped: null,
     failureReason: null,
+    identityCollisions: [],
   };
 
   const failRun = async (stage, message) => {
@@ -229,10 +272,37 @@ async function runOpponentImportCollection({
     gameNumber: Number.isFinite(entry?.gameNumber) ? entry.gameNumber : null,
     homeAway: entry?.homeAway || null,
     rawStatusText: entry?.rawStatusText || null,
+    // Provenance for collision diagnostics. Never hashed, never canonical
+    // identity -- it exists only so a reviewer can see WHICH source rows
+    // collided.
+    sourceRowIndex: Number.isFinite(entry?.sourceRowIndex) ? entry.sourceRowIndex : null,
+    identityCollision: entry?.identityCollision === true,
   }));
   summary.gamesDiscovered = normalized.length;
   summary.finalGamesDiscovered = normalized.filter((e) => COLLECTABLE_STATUSES.has(e.gameStatus)).length;
   onProgress({ type: 'discovered', count: summary.gamesDiscovered, finals: summary.finalGamesDiscovered });
+
+  // Evaluated before ANY capture or publication: if the source presented two
+  // distinct rows under one identifier, this collection could conceal a second
+  // real game, so neither a verified nor a schedule-only generation may be
+  // published from it. Any existing verified generation is left untouched.
+  const collisions = detectSourceEventIdentityCollisions(normalized);
+  if (collisions.length > 0) {
+    summary.failureReason = 'opponent_source_event_identity_collision';
+    summary.identityCollisions = collisions;
+    summary.manualReconciliationRequired = true;
+    summary.priorVerifiedGenerationPreserved = true;
+    onProgress({
+      type: 'source_event_identity_collision',
+      collisions: collisions.map((collision) => ({
+        sourceGameRef: collision.sourceGameRef,
+        sourceRowIndexes: collision.sourceRowIndexes,
+      })),
+    });
+    await failRun('discovery',
+      `Two or more distinct schedule rows claim the same source game identity (${collisions.map((c) => c.sourceGameRef).join(', ')}); no generation was published.`);
+    return summary;
+  }
 
   const capturedGames = [];
   for (const entry of normalized) {
@@ -332,6 +402,7 @@ async function runOpponentImportCollection({
     summary.priorVerifiedGenerationPreserved = true;
     summary.manualReconciliationRequired = err?.code === 'OPPONENT_COMPLETENESS_REGRESSION'
       || err?.code === 'OPPONENT_IDENTITY_UNRESOLVED'
+      || err?.code === 'OPPONENT_SOURCE_EVENT_IDENTITY_COLLISION'
       || err?.code === 'OPPONENT_SOURCE_LINK_NOT_LINKED';
     onProgress({ type: 'publication_failed', code: summary.failureReason });
     await failRun('publication', err?.message);
@@ -350,6 +421,7 @@ async function runOpponentImportCollection({
 module.exports = {
   runOpponentImportCollection,
   toOpponentScheduleEntry,
+  detectSourceEventIdentityCollisions,
   buildOpponentCapturedGame,
   buildScheduleOnlyCapturedGame,
   normalizeStatus,

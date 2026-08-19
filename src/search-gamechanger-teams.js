@@ -1268,6 +1268,13 @@ const SCHEDULE_ENTRY_STATUSES = Object.freeze([
   'scheduled', 'in_progress', 'final', 'postponed', 'cancelled', 'suspended', 'unknown',
 ]);
 
+// Identifies the element that delimits ONE schedule row, so grouping is done by
+// row rather than by href. Ordered from the most explicit marker to the most
+// generic list/table container. An anchor that matches nothing here is treated
+// as its own row -- deliberately over-reporting rather than risking a merge of
+// two real games. There is no href-based fallback anywhere in this module.
+const ROW_ROOT_SELECTOR = '[data-schedule-row], [data-game-id], .schedule-row, li, tr';
+
 // Pure, browser-free, and exported so the classification rules can be tested
 // directly rather than only through a DOM fixture.
 //
@@ -1357,128 +1364,175 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
       homeAway: parseHomeAway(entry.cardText),
       venue: null,
       gameNumber: parseGameNumber(entry.cardText),
+      rowAnchorCount: 1,
+      identityCollision: false,
+      collidingRowIndexes: [],
       ...parseScheduledTimeText(entry.cardText),
     }));
   }
 
   await dismissDontMissOutPopup(page);
-  const rowLocator = page.locator('a[href*="/schedule/"]');
-  const count = await rowLocator.count();
-  const entries = [];
-  const seenHrefs = new Set();
 
-  for (let index = 0; index < count; index += 1) {
-    const item = rowLocator.nth(index);
-    try {
-      const box = await item.boundingBox();
-      if (!box || box.width <= 0 || box.height <= 0) continue;
+  // ── The extraction unit is the schedule ROW, never the href ───────────
+  //
+  // Anchors are grouped by their row root, so a row component that renders two
+  // anchors to the same game (a thumbnail link plus a title link, or a mobile
+  // and a desktop variant) yields ONE observation, while two distinct row roots
+  // yield TWO observations even when every extracted value matches.
+  //
+  // Nothing is ever merged across row roots. Two real games that the source
+  // happens to publish under one identifier must reach the identity layer as two
+  // colliding observations: keeping whichever row parsed first would discard a
+  // real game, and with it a real result.
+  const rawRows = await page.evaluate((rowRootSelector) => {
+    function clean(value) { return String(value || '').replace(/\s+/g, ' ').trim(); }
+    function looksLikeDate(value) {
+      return /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\.?[,]?\s*(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}(?:,?\s+(?:20\d{2}|19\d{2}))?\b/i.test(value) ||
+        /\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/.test(value);
+    }
+    const CARDTEXT_MAX_LEN = 260;
 
-      const raw = await item.evaluate((element) => {
-        function clean(value) { return String(value || '').replace(/\s+/g, ' ').trim(); }
-        function looksLikeDate(value) {
-          return /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\.?[,]?\s*(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}(?:,?\s+(?:20\d{2}|19\d{2}))?\b/i.test(value) ||
-            /\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/.test(value);
+    // The nearest ancestor the established markup uses to delimit one schedule
+    // row. When an anchor has no such ancestor the anchor is treated as its own
+    // row: that can only ever over-report, never merge two real rows into one.
+    // There is deliberately no href-based fallback.
+    function rowRootFor(anchor) {
+      let node = anchor;
+      for (let depth = 0; depth < 12 && node; depth += 1) {
+        if (node.matches && node.matches(rowRootSelector)) return node;
+        node = node.parentElement;
+      }
+      return anchor;
+    }
+
+    const anchors = Array.from(document.querySelectorAll('a[href*="/schedule/"]'));
+    const roots = [];
+    const rootIndex = new Map();
+    for (const anchor of anchors) {
+      const anchorRect = anchor.getBoundingClientRect();
+      if (anchorRect.width <= 0 || anchorRect.height <= 0) continue;
+      const root = rowRootFor(anchor);
+      if (rootIndex.has(root)) {
+        roots[rootIndex.get(root)].anchors.push(anchor);
+        continue;
+      }
+      rootIndex.set(root, roots.length);
+      roots.push({ root, anchors: [anchor] });
+    }
+
+    return roots.map(({ root, anchors: rowAnchors }, index) => {
+      // Read the WHOLE row, not just its first anchor. A thumbnail-first row
+      // previously lost its score because only the first anchor was parsed.
+      const cardText = clean(root.innerText || root.textContent || '');
+      const hrefs = Array.from(new Set(rowAnchors.map((a) => a.getAttribute('href') || '').filter(Boolean)));
+
+      const searchRoots = [root];
+      if (root.previousElementSibling) searchRoots.push(root.previousElementSibling);
+      const parentPrev = root.parentElement && root.parentElement.previousElementSibling;
+      if (parentPrev) searchRoots.push(parentPrev);
+
+      const rect = root.getBoundingClientRect();
+      const dateCandidates = [];
+      const seen = new Set();
+      for (const searchRoot of searchRoots) {
+        const nodes = [searchRoot, ...Array.from(searchRoot.querySelectorAll('*'))];
+        for (const candidate of nodes) {
+          if (seen.has(candidate)) continue;
+          seen.add(candidate);
+          const text = clean(candidate.innerText || candidate.textContent || '');
+          if (!text || text.length > 300 || !looksLikeDate(text)) continue;
+          const candidateRect = candidate.getBoundingClientRect();
+          const distance = Math.abs(candidateRect.top - rect.top);
+          const abovePenalty = candidateRect.top <= rect.top + 20 ? 0 : 10000;
+          dateCandidates.push({ text, distance: distance + abovePenalty, top: candidateRect.top });
         }
-        const CARDTEXT_MAX_LEN = 260;
+      }
+      dateCandidates.sort((a, b) => a.distance - b.distance || b.top - a.top);
 
-        const cardText = clean(element.innerText || element.textContent || '');
-        const href = element.getAttribute('href') || '';
+      const within = (selector, attr) => Array.from(root.querySelectorAll(selector))
+        .map((node) => clean((attr && node.getAttribute(attr)) || node.innerText || node.textContent))
+        .find(Boolean) || '';
 
-        // Same scoping rule the completed-game extractor uses: the row's own
-        // subtree plus the immediately preceding sibling (a date-group header
-        // commonly sits just above a block of that day's games). Never the whole
-        // document -- that collapses an entire schedule onto one date.
-        const searchRoots = [element];
-        if (element.previousElementSibling) searchRoots.push(element.previousElementSibling);
-        const parentPrev = element.parentElement && element.parentElement.previousElementSibling;
-        if (parentPrev) searchRoots.push(parentPrev);
+      // Prefer a dedicated score element. Falling back to "the first descendant
+      // whose text matches" would capture the whole row once the row root is a
+      // container rather than the anchor itself, so the fallback takes the
+      // SHORTEST matching text -- the badge, not the row that contains it.
+      const scoreCandidates = Array.from(root.querySelectorAll('*'))
+        .map((node) => clean(node.innerText || node.textContent || ''))
+        .filter((text) => /\b[WLT]\s*\d+\s*[-–—]\s*\d+\b/i.test(text) && text.length <= 40)
+        .sort((a, b) => a.length - b.length);
+      const scoreNode = within('[data-score], .score', 'data-score') || scoreCandidates[0] || '';
 
-        const rect = element.getBoundingClientRect();
-        const dateCandidates = [];
-        const seen = new Set();
-        for (const root of searchRoots) {
-          const nodes = [root, ...Array.from(root.querySelectorAll('*'))];
-          for (const candidate of nodes) {
-            if (seen.has(candidate)) continue;
-            seen.add(candidate);
-            const text = clean(candidate.innerText || candidate.textContent || '');
-            if (!text || text.length > 300 || !looksLikeDate(text)) continue;
-            const candidateRect = candidate.getBoundingClientRect();
-            const distance = Math.abs(candidateRect.top - rect.top);
-            const abovePenalty = candidateRect.top <= rect.top + 20 ? 0 : 10000;
-            dateCandidates.push({ text, distance: distance + abovePenalty, top: candidateRect.top });
-          }
-        }
-        dateCandidates.sort((a, b) => a.distance - b.distance || b.top - a.top);
+      return {
+        index,
+        anchorCount: rowAnchors.length,
+        hrefs,
+        cardText: cardText.length <= CARDTEXT_MAX_LEN ? cardText : cardText.slice(0, CARDTEXT_MAX_LEN),
+        dateText: dateCandidates[0]?.text || '',
+        scoreText: scoreNode || '',
+        statusText: within('[data-status], .status, .game-status', 'data-status'),
+        venueText: within('[data-venue], .venue, .location', 'data-venue'),
+        gameNumberAttr: (root.getAttribute && root.getAttribute('data-game-number')) || '',
+        gameNumberText: within('[data-game-number], .game-number', 'data-game-number'),
+      };
+    });
+  }, ROW_ROOT_SELECTOR);
 
-        const scoreNode = Array.from(element.querySelectorAll('*'))
-          .map((node) => clean(node.innerText || node.textContent || ''))
-          .find((text) => /\b[WLT]\s*\d+\s*[-–—]\s*\d+\b/i.test(text) && text.length <= 40);
+  const entries = rawRows.map((rawRow) => {
+    const href = rawRow.hrefs.length ? new URL(rawRow.hrefs[0], page.url()).href : '';
+    const scoreParts = parseScoreText(rawRow.scoreText || rawRow.cardText || '');
+    const rawStatusText = normalizeScheduleEntryText(`${rawRow.statusText} ${rawRow.cardText}`);
+    const status = classifyScheduleEntryStatus({ rawStatusText, scoreText: rawRow.scoreText });
+    const timing = parseScheduledTimeText(rawRow.cardText);
 
-        const statusNode = Array.from(element.querySelectorAll('[data-status], .status, .game-status'))
-          .map((node) => clean(node.innerText || node.textContent || node.getAttribute('data-status')))
-          .find(Boolean);
+    return {
+      // Provenance only. Row order never enters canonical identity, and every
+      // hash the publication path computes excludes it.
+      visibleIndex: rawRow.index,
+      rowAnchorCount: rawRow.anchorCount,
+      status,
+      rawStatusText,
+      scoreText: normalizeScheduleEntryText(rawRow.scoreText),
+      cardText: normalizeScheduleEntryText(rawRow.cardText),
+      dateText: normalizeScheduleEntryText(rawRow.dateText),
+      gameDate: normalizeScheduleDateText(`${rawRow.cardText || ''} ${rawRow.dateText || ''}`),
+      result: scoreParts.result,
+      scoreUs: scoreParts.scoreUs,
+      scoreThem: scoreParts.scoreThem,
+      counterpartyName: parseCounterpartyName(rawRow.cardText),
+      homeAway: parseHomeAway(rawRow.cardText),
+      venue: normalizeScheduleEntryText(rawRow.venueText) || null,
+      gameNumber: rawRow.gameNumberAttr
+        ? Number(rawRow.gameNumberAttr)
+        : (parseGameNumber(rawRow.gameNumberText) ?? parseGameNumber(rawRow.cardText)),
+      scheduledTimeText: timing.scheduledTimeText,
+      timezone: timing.timezone,
+      timezoneKnown: timing.timezoneKnown,
+      href,
+      gameId: href ? extractGameIdFromUrl(href) : '',
+      identityCollision: false,
+      collidingRowIndexes: [],
+    };
+  });
 
-        const venueNode = Array.from(element.querySelectorAll('[data-venue], .venue, .location'))
-          .map((node) => clean(node.getAttribute('data-venue') || node.innerText || node.textContent))
-          .find(Boolean);
-
-        // Read from a dedicated element where one exists rather than relying on
-        // the row's concatenated text: adjacent inline nodes run together
-        // without a separator ("Riverside ParkGame 1"), which destroys the word
-        // boundary any text-level parse would need.
-        const gameNumberNode = Array.from(element.querySelectorAll('[data-game-number], .game-number'))
-          .map((node) => clean(node.getAttribute('data-game-number') || node.innerText || node.textContent))
-          .find(Boolean);
-
-        return {
-          cardText: cardText.length <= CARDTEXT_MAX_LEN ? cardText : cardText.slice(0, CARDTEXT_MAX_LEN),
-          href,
-          dateText: dateCandidates[0]?.text || '',
-          scoreText: scoreNode || '',
-          statusText: statusNode || '',
-          venueText: venueNode || '',
-          gameNumberAttr: element.getAttribute('data-game-number') || '',
-          gameNumberText: gameNumberNode || '',
-        };
-      });
-
-      const href = raw.href ? new URL(raw.href, page.url()).href : '';
-      // A schedule page can legitimately render the same game link twice
-      // (mobile + desktop layouts). Row order is provenance, never identity.
-      if (href && seenHrefs.has(href)) continue;
-      if (href) seenHrefs.add(href);
-
-      const scoreParts = parseScoreText(raw.scoreText || raw.cardText || '');
-      const rawStatusText = normalizeScheduleEntryText(`${raw.statusText} ${raw.cardText}`);
-      const status = classifyScheduleEntryStatus({ rawStatusText, scoreText: raw.scoreText });
-      const timing = parseScheduledTimeText(raw.cardText);
-
-      entries.push({
-        visibleIndex: entries.length,
-        status,
-        rawStatusText,
-        scoreText: normalizeScheduleEntryText(raw.scoreText),
-        cardText: normalizeScheduleEntryText(raw.cardText),
-        dateText: normalizeScheduleEntryText(raw.dateText),
-        gameDate: normalizeScheduleDateText(`${raw.cardText || ''} ${raw.dateText || ''}`),
-        result: scoreParts.result,
-        scoreUs: scoreParts.scoreUs,
-        scoreThem: scoreParts.scoreThem,
-        counterpartyName: parseCounterpartyName(raw.cardText),
-        homeAway: parseHomeAway(raw.cardText),
-        venue: normalizeScheduleEntryText(raw.venueText) || null,
-        gameNumber: raw.gameNumberAttr
-          ? Number(raw.gameNumberAttr)
-          : (parseGameNumber(raw.gameNumberText) ?? parseGameNumber(raw.cardText)),
-        scheduledTimeText: timing.scheduledTimeText,
-        timezone: timing.timezone,
-        timezoneKnown: timing.timezoneKnown,
-        href,
-        gameId: href ? extractGameIdFromUrl(href) : '',
-      });
-    } catch {
-      // Ignore stale rows, exactly as the completed-game extractor does.
+  // Two DISTINCT rows claiming one stable upstream identifier are surfaced as a
+  // collision rather than resolved here. Deciding which row is the real game --
+  // or whether there are two -- is reconciliation's job, and it needs both rows
+  // plus the provenance explaining which ones collided. Sorting the indexes
+  // keeps the marking identical when the source renders the rows in the
+  // opposite DOM order.
+  const rowsByGameId = new Map();
+  for (const entry of entries) {
+    if (!entry.gameId) continue;
+    if (!rowsByGameId.has(entry.gameId)) rowsByGameId.set(entry.gameId, []);
+    rowsByGameId.get(entry.gameId).push(entry);
+  }
+  for (const colliding of rowsByGameId.values()) {
+    if (colliding.length < 2) continue;
+    const indexes = colliding.map((entry) => entry.visibleIndex).sort((a, b) => a - b);
+    for (const entry of colliding) {
+      entry.identityCollision = true;
+      entry.collidingRowIndexes = indexes;
     }
   }
 
@@ -3607,6 +3661,7 @@ if (require.main !== module) {
     getVisibleScheduleEntries,
     SCHEDULE_EXTRACTION_MODES,
     SCHEDULE_ENTRY_STATUSES,
+    ROW_ROOT_SELECTOR,
     classifyScheduleEntryStatus,
     parseScheduledTimeText,
     parseHomeAway,
