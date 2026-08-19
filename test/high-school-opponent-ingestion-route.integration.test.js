@@ -205,7 +205,10 @@ test('the registered route drives discovery, capture and verified publication th
   const app = buildApp(A, { entries: [finalEntry(`e2e-${A.s}`)] });
   const res = await startRun(app, A);
   assert.equal(res.status, 201, JSON.stringify(res.body));
-  assert.equal(res.body.state, 'captured');
+  // 201 asserts only that the run record was created and the collector was
+  // dispatched -- never that anything has been captured.
+  assert.equal(res.body.state, 'dispatched');
+  assert.match(res.body.meaning, /no capture or publication has occurred yet/);
   assert.ok(res.body.opponentImportRun?.id);
 
   const summary = app.locals.lastSummary;

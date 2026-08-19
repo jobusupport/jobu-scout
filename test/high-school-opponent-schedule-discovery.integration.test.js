@@ -583,3 +583,125 @@ test('the database rejects a collision even when the application check is bypass
     'select count(*)::int c from public.hs_opponent_games where opponent_team_id = $1', [tenant.opponentTeamId]);
   assert.equal(games.rows[0].c, 0, 'the transaction rolled back completely');
 });
+
+// ── Generic wrappers, production-shaped (HS 2D review correction) ───────
+//
+// Against 57c4d5f these same wrappers collapsed to ONE entry and a real game
+// vanished before the collector ever saw it:
+//   dateGroupLi  entries=1 ids=["game-AAA"] collision=false
+//   tableRow     entries=1 ids=["game-CCC"] collision=false
+// These drive the corrected extractor through the registered route, the real
+// collector, service, repository and RPC, and prove both games survive all the
+// way into the published generation.
+
+test('a date-group wrapper publishes BOTH games through the real route', { skip }, async () => {
+  const tenant = await buildTenant('wrapli');
+  const app = buildApp(tenant, { html: fixtures.dateGroupLiTwoDatedGames });
+  const res = await startRun(app, tenant);
+  assert.equal(res.status, 201, JSON.stringify(res.body));
+
+  // Both left the extractor.
+  const extracted = app.locals.trace.find(([kind]) => kind === 'extracted')[1].split(',');
+  assert.equal(extracted.length, 2, 'both games left the extractor');
+  assert.deepEqual(extracted.sort(), ['game-alpha:final', 'game-beta:final']);
+
+  // Both reached collection assembly and were captured.
+  const collected = app.locals.trace.filter(([kind]) => kind === 'collect').map(([, id]) => id).sort();
+  assert.deepEqual(collected, ['game-alpha', 'game-beta'], 'both completed games were captured');
+
+  const summary = app.locals.lastSummary;
+  assert.equal(summary.state, 'published_verified');
+  assert.equal(summary.finalGameCount, 2, 'official counts reflect both games');
+
+  // Both are represented in the published collection.
+  const generation = await db.query(
+    `select final_game_count, observation_count, array_length(final_identity_digests, 1) as digests
+       from public.hs_opponent_stat_generations where id = $1`, [summary.generationId]);
+  assert.equal(generation.rows[0].final_game_count, 2);
+  assert.equal(generation.rows[0].observation_count, 2);
+  assert.equal(generation.rows[0].digests, 2, 'two distinct completed-game identities are recorded');
+
+  const games = await db.query(
+    `select source_game_ref from public.hs_opponent_games where opponent_team_id = $1 order by source_game_ref`,
+    [tenant.opponentTeamId]);
+  assert.deepEqual(games.rows.map((r) => r.source_game_ref), ['game-alpha', 'game-beta']);
+
+  const totals = await db.query(
+    'select games, validated_games from public.hs_opponent_verified_totals where generation_id = $1', [summary.generationId]);
+  assert.equal(totals.rows[0].games, 2, 'totals reflect both games');
+
+  // Replay of the same fixture is idempotent.
+  const replay = buildApp(tenant, { html: fixtures.dateGroupLiTwoDatedGames });
+  await startRun(replay, tenant);
+  assert.equal(replay.locals.lastSummary.generationId, summary.generationId);
+
+  // Reversed DOM order does not mint a new generation.
+  const reversed = buildApp(tenant, { html: fixtures.dateGroupLiTwoDatedGamesReversed });
+  await startRun(reversed, tenant);
+  assert.equal(reversed.locals.lastSummary.generationId, summary.generationId,
+    'DOM order is provenance; it must not mint a new generation');
+  const generations = await db.query(
+    'select count(*)::int c from public.hs_opponent_stat_generations where opponent_team_id = $1', [tenant.opponentTeamId]);
+  assert.equal(generations.rows[0].c, 1);
+});
+
+test('a table-row wrapper publishes BOTH games through the real route', { skip }, async () => {
+  const tenant = await buildTenant('wraptr');
+  const app = buildApp(tenant, { html: fixtures.tableRowTwoDatedGames });
+  const res = await startRun(app, tenant);
+  assert.equal(res.status, 201, JSON.stringify(res.body));
+  const summary = app.locals.lastSummary;
+  assert.equal(summary.state, 'published_verified');
+  assert.equal(summary.finalGameCount, 2);
+  const games = await db.query(
+    `select source_game_ref from public.hs_opponent_games where opponent_team_id = $1 order by source_game_ref`,
+    [tenant.opponentTeamId]);
+  assert.deepEqual(games.rows.map((r) => r.source_game_ref), ['game-delta', 'game-gamma']);
+});
+
+test('a generic wrapper with two same-href anchors fails closed as a collision', { skip }, async () => {
+  const tenant = await buildTenant('wrapcol');
+  const app = buildApp(tenant, { html: fixtures.genericWrapperSameHref });
+  const res = await startRun(app, tenant);
+  assert.equal(res.status, 201);
+
+  // All observations survive extraction.
+  const extracted = app.locals.trace.find(([kind]) => kind === 'extracted')[1].split(',');
+  assert.equal(extracted.length, 2, 'neither anchor is discarded');
+
+  const summary = app.locals.lastSummary;
+  assert.equal(summary.state, 'failed');
+  assert.equal(summary.failureReason, 'opponent_source_event_identity_collision');
+  assert.equal(summary.identityCollisions[0].observations.length, 2);
+  assert.equal(app.locals.trace.some(([kind]) => kind === 'collect'), false,
+    'no capture is attempted while identity is ambiguous');
+
+  const generations = await db.query(
+    'select count(*)::int c from public.hs_opponent_stat_generations where opponent_team_id = $1', [tenant.opponentTeamId]);
+  assert.equal(generations.rows[0].c, 0, 'no partial generation remains');
+  const games = await db.query(
+    'select count(*)::int c from public.hs_opponent_games where opponent_team_id = $1', [tenant.opponentTeamId]);
+  assert.equal(games.rows[0].c, 0);
+  const totals = await db.query(
+    'select count(*)::int c from public.hs_opponent_verified_totals where opponent_team_id = $1', [tenant.opponentTeamId]);
+  assert.equal(totals.rows[0].c, 0);
+});
+
+test('a wrapper collision cannot retire a prior verified generation', { skip }, async () => {
+  const tenant = await buildTenant('wrapprior');
+  const verified = buildApp(tenant, { html: fixtures.dateGroupLiTwoDatedGames });
+  await startRun(verified, tenant);
+  const verifiedId = verified.locals.lastSummary.generationId;
+  assert.equal(verified.locals.lastSummary.state, 'published_verified');
+
+  const colliding = buildApp(tenant, { html: fixtures.genericWrapperSameHref });
+  await startRun(colliding, tenant);
+  assert.equal(colliding.locals.lastSummary.state, 'failed');
+
+  const current = await db.query(
+    `select id, publication_state, final_game_count from public.hs_opponent_stat_generations
+      where opponent_team_id = $1 and is_current`, [tenant.opponentTeamId]);
+  assert.equal(current.rowCount, 1);
+  assert.equal(current.rows[0].id, verifiedId, 'the prior verified generation remains current');
+  assert.equal(current.rows[0].final_game_count, 2);
+});

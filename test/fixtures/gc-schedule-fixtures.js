@@ -272,3 +272,116 @@ module.exports.twoRowsSharedHrefGameNumbers = twoRowsSharedHrefGameNumbers;
 module.exports.twoRowsSharedIdDifferentScores = twoRowsSharedIdDifferentScores;
 module.exports.twoIdenticalRowRoots = twoIdenticalRowRoots;
 module.exports.responsiveSingleRow = responsiveSingleRow;
+
+// ── Generic-wrapper fixtures (HS 2D review correction) ─────────────────
+//
+// A generic container is NOT a per-game boundary. A date-group `li` or a table
+// `tr` routinely holds several games, so accepting the nearest such ancestor
+// silently collapsed them into one entry and dropped real games. These fixtures
+// pin the corrected rule: only an explicit per-game marker that contains a
+// single distinct schedule reference may group anchors.
+
+const gameLink = (id, label, score = '') =>
+  `<a href="${ORIGIN}/teams/opponent-high/schedule/${id}">`
+  + `<span class="matchup">vs ${label}</span>`
+  + (score ? `<span class="score">${score}</span>` : '')
+  + `</a>`;
+
+// 1. A date-group <li> holding two DIFFERENT games.
+const dateGroupLiTwoGames = page(`
+  <li class="date-group">
+    <div class="date-header">Apr 11, 2026</div>
+    ${gameLink('game-alpha', 'Alpha High', 'W 5-1')}
+    ${gameLink('game-beta', 'Beta High', 'L 2-7')}
+  </li>`);
+
+// 3a. The same date group with the anchors in the opposite order.
+const dateGroupLiTwoGamesReversed = page(`
+  <li class="date-group">
+    <div class="date-header">Apr 11, 2026</div>
+    ${gameLink('game-beta', 'Beta High', 'L 2-7')}
+    ${gameLink('game-alpha', 'Alpha High', 'W 5-1')}
+  </li>`);
+
+// 2. A table <tr> holding two DIFFERENT games, one per cell.
+const tableRowTwoGames = page(`
+  <table><tbody><tr>
+    <td><div class="date-header">Apr 12, 2026</div>${gameLink('game-gamma', 'Gamma High', 'W 3-0')}</td>
+    <td>${gameLink('game-delta', 'Delta High', 'L 1-9')}</td>
+  </tr></tbody></table>`);
+
+// 3b. The same table row reversed.
+const tableRowTwoGamesReversed = page(`
+  <table><tbody><tr>
+    <td><div class="date-header">Apr 12, 2026</div>${gameLink('game-delta', 'Delta High', 'L 1-9')}</td>
+    <td>${gameLink('game-gamma', 'Gamma High', 'W 3-0')}</td>
+  </tr></tbody></table>`);
+
+// 4. A generic wrapper holding two anchors to the SAME href, with no explicit
+//    per-game element. This might be one game rendered twice or two ambiguous
+//    rows; without affirmative structure it must not be silently merged.
+const genericWrapperSameHref = page(`
+  <li class="date-group">
+    <div class="date-header">Apr 13, 2026</div>
+    ${gameLink('game-shared', 'Iota High')}
+    ${gameLink('game-shared', 'Iota High')}
+  </li>`);
+
+// 5. Two explicit per-game elements nested inside one generic date wrapper.
+const nestedExplicitRowsInGenericWrapper = page(`
+  <li class="date-group">
+    <div class="date-header">Apr 14, 2026</div>
+    <div class="schedule-row">${gameLink('game-kappa', 'Kappa High', 'W 8-0')}</div>
+    <div class="schedule-row">${gameLink('game-lambda', 'Lambda High', 'L 3-5')}</div>
+  </li>`);
+
+// 7. Control: one game per <li>, no explicit marker.
+const perGameLiRows = page(`
+  <div class="date-header">Apr 15, 2026</div>
+  <li>${gameLink('game-mu', 'Mu High', 'W 4-2')}</li>
+  <li>${gameLink('game-nu', 'Nu High', 'L 0-3')}</li>`);
+
+// 8. Control: one game per <tr>.
+const perGameTrRows = page(`
+  <table><tbody>
+    <tr><td><div class="date-header">Apr 16, 2026</div>${gameLink('game-xi', 'Xi High', 'W 6-1')}</td></tr>
+    <tr><td>${gameLink('game-omicron', 'Omicron High', 'L 2-4')}</td></tr>
+  </tbody></table>`);
+
+module.exports.dateGroupLiTwoGames = dateGroupLiTwoGames;
+module.exports.dateGroupLiTwoGamesReversed = dateGroupLiTwoGamesReversed;
+module.exports.tableRowTwoGames = tableRowTwoGames;
+module.exports.tableRowTwoGamesReversed = tableRowTwoGamesReversed;
+module.exports.genericWrapperSameHref = genericWrapperSameHref;
+module.exports.nestedExplicitRowsInGenericWrapper = nestedExplicitRowsInGenericWrapper;
+module.exports.perGameLiRows = perGameLiRows;
+module.exports.perGameTrRows = perGameTrRows;
+
+// A generic date-group wrapper in which each game carries its own date header,
+// so both rows resolve a date in either DOM order. Used for the production-shaped
+// two-game proof, where the point is that a generic wrapper never costs a game.
+const dateGroupLiTwoDatedGames = page(`
+  <li class="date-group">
+    <div class="date-header">Apr 11, 2026</div>
+    ${gameLink('game-alpha', 'Alpha High', 'W 5-1')}
+    <div class="date-header">Apr 12, 2026</div>
+    ${gameLink('game-beta', 'Beta High', 'L 2-7')}
+  </li>`);
+
+const dateGroupLiTwoDatedGamesReversed = page(`
+  <li class="date-group">
+    <div class="date-header">Apr 12, 2026</div>
+    ${gameLink('game-beta', 'Beta High', 'L 2-7')}
+    <div class="date-header">Apr 11, 2026</div>
+    ${gameLink('game-alpha', 'Alpha High', 'W 5-1')}
+  </li>`);
+
+const tableRowTwoDatedGames = page(`
+  <table><tbody><tr>
+    <td><div class="date-header">Apr 13, 2026</div>${gameLink('game-gamma', 'Gamma High', 'W 3-0')}</td>
+    <td><div class="date-header">Apr 14, 2026</div>${gameLink('game-delta', 'Delta High', 'L 1-9')}</td>
+  </tr></tbody></table>`);
+
+module.exports.dateGroupLiTwoDatedGames = dateGroupLiTwoDatedGames;
+module.exports.dateGroupLiTwoDatedGamesReversed = dateGroupLiTwoDatedGamesReversed;
+module.exports.tableRowTwoDatedGames = tableRowTwoDatedGames;

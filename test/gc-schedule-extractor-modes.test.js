@@ -320,3 +320,120 @@ test('the collision detector is deterministic and never selects a winner', () =>
     { sourceGameRef: null, sourceRowIndex: 0 }, { sourceGameRef: null, sourceRowIndex: 1 },
   ]), []);
 });
+
+// ── Generic wrappers are not per-game boundaries (HS 2D review correction) ──
+//
+// Before the correction a date-group `li` or a table `tr` was accepted as the
+// nearest row root, so every game under it collapsed into ONE entry and the
+// extras vanished with collision=false. Measured then:
+//   dateGroupLi  entries=1 ids=["game-AAA"] collision=false
+//   tableRow     entries=1 ids=["game-CCC"] collision=false
+// The assertions below pin the corrected behaviour.
+
+const ids = (entries) => entries.map((entry) => entry.gameId).sort();
+const results = (entries) => entries.map((entry) => entry.result).sort();
+
+test('a date-group li holding two distinct games yields two entries', async () => {
+  const entries = await entriesFrom(fixtures.dateGroupLiTwoGames);
+  assert.equal(entries.length, 2, 'a generic wrapper is not a per-game boundary');
+  assert.deepEqual(ids(entries), ['game-alpha', 'game-beta']);
+  assert.deepEqual(results(entries), ['L', 'W'], 'both scores survive; neither game is discarded');
+  assert.ok(entries.every((entry) => entry.identityCollision === false),
+    'two genuinely distinct games are not a collision');
+  assert.ok(entries.every((entry) => entry.rowAnchorCount === 1),
+    'each game is its own observation, not a merged row');
+});
+
+test('a table tr holding two distinct games yields two entries', async () => {
+  const entries = await entriesFrom(fixtures.tableRowTwoGames);
+  assert.equal(entries.length, 2);
+  assert.deepEqual(ids(entries), ['game-delta', 'game-gamma']);
+  assert.deepEqual(results(entries), ['L', 'W']);
+  assert.ok(entries.every((entry) => entry.identityCollision === false));
+});
+
+test('reversing anchor order inside a generic wrapper never changes which games survive', async () => {
+  const forwardsLi = await entriesFrom(fixtures.dateGroupLiTwoGames);
+  const reversedLi = await entriesFrom(fixtures.dateGroupLiTwoGamesReversed);
+  const forwardsTr = await entriesFrom(fixtures.tableRowTwoGames);
+  const reversedTr = await entriesFrom(fixtures.tableRowTwoGamesReversed);
+
+  // Identity, score and collision classification are order-independent.
+  const identity = (list) => list
+    .map(({ gameId, result, scoreUs, scoreThem, status, identityCollision }) =>
+      ({ gameId, result, scoreUs, scoreThem, status, identityCollision }))
+    .sort((a, b) => (a.gameId < b.gameId ? -1 : 1));
+  assert.deepEqual(identity(reversedLi), identity(forwardsLi));
+  assert.deepEqual(identity(reversedTr), identity(forwardsTr));
+  assert.deepEqual(ids(reversedLi), ['game-alpha', 'game-beta'], 'DOM order never decides which game survives');
+  assert.deepEqual(ids(reversedTr), ['game-delta', 'game-gamma']);
+
+  // KNOWN LIMITATION, asserted rather than hidden: when a date-group container
+  // holds the header INSIDE it above several games, only the game adjacent to
+  // that header resolves a date within the deliberately narrow date scope. The
+  // rest report gameDate = null rather than borrowing a neighbouring row's
+  // date. That is order-dependent, so it is pinned here as a gap for follow-up,
+  // not asserted as correct. Widening the scope to fix it was tried and
+  // rejected: it made rows adopt each other's dates.
+  const datedCount = (list) => list.filter((entry) => entry.gameDate).length;
+  assert.equal(datedCount(forwardsLi), 1, 'date-group headers reach only the adjacent game today');
+  assert.equal(datedCount(reversedLi), 1);
+  assert.ok(forwardsLi.every((entry) => entry.gameDate === null || entry.gameDate === '2026-04-11'),
+    'no row ever adopts a date that is not its own group header');
+});
+
+test('a generic wrapper holding two same-href anchors over-reports and collides rather than merging', async () => {
+  const entries = await entriesFrom(fixtures.genericWrapperSameHref);
+  assert.equal(entries.length, 2, 'without an explicit per-game boundary nothing may be merged');
+  assert.deepEqual(ids(entries), ['game-shared', 'game-shared']);
+  assert.ok(entries.every((entry) => entry.identityCollision),
+    'the ambiguity is surfaced for reconciliation, not silently resolved');
+  assert.deepEqual(entries[0].collidingRowIndexes, [0, 1]);
+});
+
+test('explicit per-game rows nested in a generic wrapper are each their own game', async () => {
+  const entries = await entriesFrom(fixtures.nestedExplicitRowsInGenericWrapper);
+  assert.equal(entries.length, 2);
+  assert.deepEqual(ids(entries), ['game-kappa', 'game-lambda']);
+  assert.deepEqual(results(entries), ['L', 'W']);
+  assert.ok(entries.every((entry) => entry.identityCollision === false));
+});
+
+test('an explicit per-game row with several anchors for ONE game is still one entry', async () => {
+  const entries = await entriesFrom(fixtures.singleRowTwoAnchors);
+  assert.equal(entries.length, 1, 'affirmative per-game markup may group anchors');
+  assert.equal(entries[0].rowAnchorCount, 2);
+  assert.equal(entries[0].result, 'W', 'the whole row is read, so the score is not lost');
+  assert.equal(entries[0].identityCollision, false);
+});
+
+test('ordinary per-game li and tr markup still yields one entry per game', async () => {
+  const li = await entriesFrom(fixtures.perGameLiRows);
+  assert.equal(li.length, 2);
+  assert.deepEqual(ids(li), ['game-mu', 'game-nu']);
+  assert.deepEqual(results(li), ['L', 'W']);
+  const tr = await entriesFrom(fixtures.perGameTrRows);
+  assert.equal(tr.length, 2);
+  assert.deepEqual(ids(tr), ['game-omicron', 'game-xi']);
+  assert.deepEqual(results(tr), ['L', 'W']);
+  assert.ok([...li, ...tr].every((entry) => entry.identityCollision === false));
+});
+
+test('no generic wrapper case ever reports fewer entries than distinct games present', async () => {
+  // The invariant the correction exists to guarantee: grouping may never reduce
+  // the number of distinct games the source published.
+  const cases = [
+    ['dateGroupLiTwoGames', fixtures.dateGroupLiTwoGames, 2],
+    ['dateGroupLiTwoGamesReversed', fixtures.dateGroupLiTwoGamesReversed, 2],
+    ['tableRowTwoGames', fixtures.tableRowTwoGames, 2],
+    ['tableRowTwoGamesReversed', fixtures.tableRowTwoGamesReversed, 2],
+    ['nestedExplicitRowsInGenericWrapper', fixtures.nestedExplicitRowsInGenericWrapper, 2],
+    ['perGameLiRows', fixtures.perGameLiRows, 2],
+    ['perGameTrRows', fixtures.perGameTrRows, 2],
+  ];
+  for (const [name, html, distinctGames] of cases) {
+    const entries = await entriesFrom(html);
+    const distinctIds = new Set(entries.map((entry) => entry.gameId).filter(Boolean));
+    assert.equal(distinctIds.size, distinctGames, `${name}: every distinct game must survive extraction`);
+  }
+});
