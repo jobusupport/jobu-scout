@@ -39,7 +39,10 @@
 
 const { createHighSchoolImportRepository } = require('./high-school-import-repository');
 const { reconstructGame, reconstructTeamGames } = require('./game-reconstructor');
-const { mapHighSchoolEngineCollection } = require('./high-school-engine-persistence-mapper');
+const {
+  mapHighSchoolEngineCollection,
+  mapHighSchoolOpponentEngineCollection,
+} = require('./high-school-engine-persistence-mapper');
 const {
   importError,
   requireEnum,
@@ -426,6 +429,79 @@ function createHighSchoolImportService({ repository }) {
     return { generation, payloadBytes, engineVersion: dto.engineVersion, inputSetHash: dto.inputSetHash };
   }
 
+  // ── Slice 2D: opponent-game ingestion ────────────────────────────────
+  //
+  //   subject/context validation
+  //     -> reviewed source-link authorization
+  //     -> deterministic reconstruction (the Slice 2B engine, unchanged)
+  //     -> validation
+  //     -> identity reconciliation
+  //     -> DTO mapping
+  //     -> one atomic persist_hs_engine_collection call
+  //
+  // Every stage before the RPC is pure and side-effect free, so an oversized,
+  // malformed, or unauthorized collection makes ZERO publication calls. The
+  // whole publication is one transaction inside the RPC; there is no
+  // application-side multi-statement publication path.
+  async function ingestOpponentGameCollection({ orgId, programId, seasonId, opponentTeamId, opponentImportRunId, sourceTeamId, capturedGames }) {
+    const orgIdValue = requireUuid(orgId, 'orgId');
+    const programIdValue = requireUuid(programId, 'programId');
+    const seasonIdValue = requireUuid(seasonId, 'seasonId');
+    const opponentTeamIdValue = requireUuid(opponentTeamId, 'opponentTeamId');
+    const opponentImportRunIdValue = requireUuid(opponentImportRunId, 'opponentImportRunId');
+
+    // Tenant scope always comes from the caller's already-authorized request
+    // context, never from anything inside the captured payload. The database
+    // re-checks every one of these against authoritative ownership regardless.
+    const link = await repository.getLinkedOpponentSource({
+      orgId: orgIdValue,
+      programId: programIdValue,
+      opponentTeamId: opponentTeamIdValue,
+      seasonId: seasonIdValue,
+    });
+    if (!link) {
+      throw importError('OPPONENT_SOURCE_LINK_NOT_LINKED',
+        'This opponent has no currently linked source identity; ingestion cannot publish a verified generation.',
+        { statusCode: 409, context: { opponentTeamId: opponentTeamIdValue } });
+    }
+    // A caller-supplied source team never overrides the reviewed link.
+    if (sourceTeamId && requireUuid(sourceTeamId, 'sourceTeamId') !== link.source_team_id) {
+      throw importError('OPPONENT_SOURCE_LINK_NOT_LINKED',
+        'The supplied source team is not the one currently linked to this opponent.',
+        { statusCode: 409, context: { opponentTeamId: opponentTeamIdValue } });
+    }
+
+    const { dto, payloadBytes, finalGameCount } = mapHighSchoolOpponentEngineCollection({
+      context: {
+        orgId: orgIdValue,
+        programId: programIdValue,
+        seasonId: seasonIdValue,
+        sourceProvider: 'gamechanger',
+      },
+      subject: {
+        opponentTeamId: opponentTeamIdValue,
+        sourceTeamId: link.source_team_id,
+        importRunId: opponentImportRunIdValue,
+      },
+      capturedGames,
+    });
+
+    const generation = await repository.persistEngineCollection(dto);
+    return {
+      generation,
+      payloadBytes,
+      finalGameCount,
+      engineVersion: dto.engineVersion,
+      inputSetHash: dto.inputSetHash,
+      observationCount: dto.observations.length,
+      noncanonicalPlayerCount: dto.noncanonicalPlayers.length,
+      // Capture success and verified publication are reported separately: a
+      // generation with no final game is schedule knowledge, not a completed
+      // statistical result.
+      officialTotalsComplete: dto.officialTotalsComplete === true,
+    };
+  }
+
   return {
     startImportRun,
     recordDiscoveredCount,
@@ -440,6 +516,7 @@ function createHighSchoolImportService({ repository }) {
     publishPlayerAdvancedStats,
     publishPitcherAdvancedStats,
     persistEngineCollection,
+    ingestOpponentGameCollection,
     deriveGameConfidenceAndStatus,
     invertRowOwnershipForReconstruction,
     toReconstructionInput,

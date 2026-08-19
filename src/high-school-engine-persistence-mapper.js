@@ -72,6 +72,74 @@ function requireContext(context) {
   return result;
 }
 
+// Slice 2D. An opponent collection's context deliberately carries NO teamId and
+// NO importRunId: both of those identify own-team records, and an opponent
+// subject must never borrow one. The run identifier moves onto the subject
+// instead, where it identifies the opponent-side import run.
+function requireOpponentContext(context) {
+  if (!context || typeof context !== 'object') {
+    throw importError('INVALID_ENGINE_COLLECTION_CONTEXT', 'A trusted engine collection context is required.', { statusCode: 400 });
+  }
+  if (context.teamId !== undefined && context.teamId !== null) {
+    throw importError('AMBIGUOUS_COLLECTION_SUBJECT', 'An opponent collection context must not carry an own-team teamId.', {
+      statusCode: 400, context: { field: 'context.teamId' },
+    });
+  }
+  if (context.importRunId !== undefined && context.importRunId !== null) {
+    throw importError('AMBIGUOUS_COLLECTION_SUBJECT', 'An opponent collection context must not carry an own-team importRunId.', {
+      statusCode: 400, context: { field: 'context.importRunId' },
+    });
+  }
+  const result = {
+    orgId: requireUuid(context.orgId, 'orgId'),
+    programId: requireUuid(context.programId, 'programId'),
+    seasonId: requireUuid(context.seasonId, 'seasonId'),
+    sourceProvider: context.sourceProvider,
+  };
+  if (result.sourceProvider !== 'gamechanger') {
+    throw importError('INVALID_FIELD', 'sourceProvider must be gamechanger', { statusCode: 400, context: { field: 'sourceProvider' } });
+  }
+  return result;
+}
+
+function requireOpponentSubject(subject) {
+  if (!subject || typeof subject !== 'object') {
+    throw importError('MISSING_COLLECTION_SUBJECT', 'An opponent collection requires an explicit subject.', { statusCode: 400 });
+  }
+  if (subject.teamId !== undefined && subject.teamId !== null) {
+    throw importError('AMBIGUOUS_COLLECTION_SUBJECT', 'A collection subject carries either teamId or opponentTeamId, never both.', {
+      statusCode: 400, context: { field: 'subject.teamId' },
+    });
+  }
+  return {
+    kind: 'opponent_team',
+    opponentTeamId: requireUuid(subject.opponentTeamId, 'opponentTeamId'),
+    sourceTeamId: requireUuid(subject.sourceTeamId, 'sourceTeamId'),
+    importRunId: requireUuid(subject.importRunId, 'importRunId'),
+  };
+}
+
+// Scheduled, in-progress, final, postponed, cancelled and suspended stay
+// distinguishable all the way from the source through to the canonical game
+// row. An unrecognised status is rejected rather than coerced to 'unknown',
+// because silently downgrading a status the source actually reported would
+// let a completed game be published as if its state were merely unobserved.
+const OPPONENT_GAME_STATUSES = new Set([
+  'scheduled', 'in_progress', 'final', 'postponed', 'cancelled', 'suspended', 'unknown',
+]);
+
+function opponentGameStatusFor(game, index) {
+  const raw = meaningful(game?.meta?.gameStatus);
+  if (!raw) return 'unknown';
+  const normalized = raw.toLowerCase().replace(/[\s-]+/g, '_');
+  if (!OPPONENT_GAME_STATUSES.has(normalized)) {
+    throw importError('INVALID_GAME_STATUS', `capturedGames[${index}].meta.gameStatus is not a recognised game status`, {
+      statusCode: 400, context: { field: `capturedGames[${index}].meta.gameStatus` },
+    });
+  }
+  return normalized;
+}
+
 function meaningful(value) {
   if (value === null || value === undefined) return null;
   const normalized = String(value).replace(/\s+/g, ' ').trim();
@@ -279,7 +347,10 @@ function opponentNameFor(game) {
   return meaningful(meta.opponentName ?? (meta.ourSide === 'home' ? meta.awayTeamName ?? meta.awayTeam : meta.homeTeamName ?? meta.homeTeam));
 }
 
-function observationsFor(games, rawGames, reconstruction, engineVersion) {
+// `includeGameStatus` is set only for an opponent collection. An own-team
+// observation is emitted byte-for-byte as Slice 2C emitted it, so own-team
+// content hashes and idempotency keys are unaffected by this slice.
+function observationsFor(games, rawGames, reconstruction, engineVersion, includeGameStatus = false) {
   const occurrenceByFingerprint = new Map();
   const observationOrdinalByFingerprint = new Map();
   const entries = games.map((game, index) => ({ game, rawGame: rawGames[index], fingerprint: canonicalSerialize(game) }));
@@ -317,6 +388,7 @@ function observationsFor(games, rawGames, reconstruction, engineVersion) {
       validation: validationFor(result, reconstruction.summary),
       snapshots,
       engineVersion,
+      ...(includeGameStatus ? { gameStatus: meaningful(game.meta?.gameStatus) || 'unknown' } : {}),
     };
   }).sort((a, b) => codePointCompare(a.observationKey, b.observationKey));
 }
@@ -361,8 +433,14 @@ function canonicalAndNoncanonicalPlayers(stats, roster) {
   return { canonicalPlayers, noncanonicalPlayers };
 }
 
-function finalizeDto(base) {
-  const contentHash = sha256(base);
+// `hashBase` defaults to the full DTO body, which is exactly what Slice 2C
+// hashed, so own-team content hashes are unchanged. An opponent collection
+// passes a projection that omits run-scoped provenance: re-ingesting an
+// unchanged opponent schedule on a NEW import run must recognise the existing
+// generation rather than report a content mismatch, so the run identifier is
+// carried in the DTO for the RPC but deliberately kept out of the content hash.
+function finalizeDto(base, hashBase = base) {
+  const contentHash = sha256(hashBase);
   let payloadBytes = 0;
   let dto;
   let serializedDto;
@@ -414,10 +492,83 @@ function mapHighSchoolEngineCollection({ context, capturedGames, rosterMembershi
   return finalizeDto(base);
 }
 
+// Slice 2D. Maps one opponent-team collection into the same DTO the widened
+// persist_hs_engine_collection RPC consumes, differing from the own-team mapper
+// in exactly three ways:
+//
+//   1. The subject is an hs_opponent_teams id, carried in the discriminated
+//      `subject` block rather than in `context.teamId`.
+//   2. There is no roster, so `canonicalPlayers` is always empty and every
+//      player line the engine produces is preserved as a noncanonical
+//      observation. HS 2D never invents opponent roster membership -- resolving
+//      opponent players to durable identities is HS 2F's job.
+//   3. Each observation carries the source-reported game status, so a scheduled
+//      or postponed game is never published as a completed statistical result.
+//
+// The reconstruction and statistics engines are the SAME characterized Slice 2B
+// components the own-team path uses; no second statistics algorithm exists.
+// `reconstructBaseballTeamGames`'s first argument is an opaque subject label, so
+// passing the opponent team id reuses the engine unchanged.
+function mapHighSchoolOpponentEngineCollection({ context, subject, capturedGames }) {
+  const trustedContext = requireOpponentContext(context);
+  const trustedSubject = requireOpponentSubject(subject);
+  const safeGames = sanitizeJsonPayload(capturedGames, 'capturedGames');
+  if (!Array.isArray(safeGames)) {
+    throw importError('INVALID_FIELD', 'capturedGames must be an array', { statusCode: 400, context: { field: 'capturedGames' } });
+  }
+  // Validated before any engine work so an unrecognised status fails fast and
+  // identically regardless of how far reconstruction would otherwise get.
+  const gameStatuses = safeGames.map((game, index) => opponentGameStatusFor(game, index));
+  const roster = normalizeRosterMemberships([]);
+  const games = safeGames.map((game, index) => {
+    const adapted = adaptGame(game, index, roster);
+    return { ...adapted, meta: { ...adapted.meta, gameStatus: gameStatuses[index] } };
+  });
+  const reconstruction = reconstructBaseballTeamGames(trustedSubject.opponentTeamId, games);
+  const statistics = computeBaseballStats(games);
+  const observations = observationsFor(games, safeGames, reconstruction, HS_BASEBALL_ENGINE_VERSION, true);
+  const { canonicalPlayers, noncanonicalPlayers } = canonicalAndNoncanonicalPlayers(statistics, roster);
+  if (canonicalPlayers.length > 0) {
+    throw importError('OPPONENT_COLLECTION_FORBIDS_CANONICAL_PLAYERS',
+      'An opponent collection cannot carry canonical players.', { statusCode: 500 });
+  }
+  // A season is a set of observations, not an arrival-order sequence. The
+  // subject's identity evidence participates so two different opponents can
+  // never collide on one input-set hash; capture timestamps and JSON key order
+  // deliberately do not.
+  const inputSetHash = sha256({
+    subject: [trustedSubject.kind, trustedSubject.opponentTeamId, trustedSubject.sourceTeamId],
+    games: safeGames.map(canonicalSerialize).sort(codePointCompare),
+    gameStatuses: [...gameStatuses].sort(codePointCompare),
+  });
+  const finalGameCount = gameStatuses.filter((status) => status === 'final').length;
+  const base = {
+    complete: true,
+    context: trustedContext,
+    subject: trustedSubject,
+    engineVersion: HS_BASEBALL_ENGINE_VERSION,
+    inputSetHash,
+    observations,
+    snapshotCount: observations.reduce((total, observation) => total + observation.snapshots.length, 0),
+    canonicalPlayers,
+    noncanonicalPlayers,
+    teamTotals: reconstruction.summary,
+    // A collection with no final game is schedule knowledge, never a completed
+    // statistical generation -- the database enforces the same rule.
+    officialTotalsComplete: reconstruction.summary.officialTotalsComplete === true
+      && statistics.officialTotalsComplete === true
+      && finalGameCount > 0,
+  };
+  const { importRunId, ...subjectContent } = trustedSubject;
+  return { ...finalizeDto(base, { ...base, subject: subjectContent }), finalGameCount };
+}
+
 module.exports = {
   HS_BASEBALL_ENGINE_VERSION,
   MAX_HS_ENGINE_COLLECTION_BYTES,
+  OPPONENT_GAME_STATUSES,
   canonicalSerialize,
   assertCollectionPayloadWithinLimit,
   mapHighSchoolEngineCollection,
+  mapHighSchoolOpponentEngineCollection,
 };
