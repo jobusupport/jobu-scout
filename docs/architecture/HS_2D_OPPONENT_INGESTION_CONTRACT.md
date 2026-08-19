@@ -286,3 +286,124 @@ work around a privilege gap.
 * No existing table gains a required column; no existing column changes type or nullability.
 * No existing constraint, index, policy, or grant is dropped or loosened.
 * The Slice 2C relational suite must continue to pass 50/50 with zero skips, unmodified.
+
+---
+
+# Addendum: registered entry point, publication states, and the completeness-regression gate
+
+Corrects two gaps in the first HS 2D candidate (`ef2f21c`): opponent ingestion had no
+production-reachable entry point, and a collection containing zero completed games still
+produced a current opponent statistical generation.
+
+## A1. Registered application call graph
+
+```
+POST /api/high-school/opponents/:opponentTeamId/seasons/:seasonId/import-runs
+  requireAuth → resolveSupportSession → requireHighSchoolAccess → blockWriteDuringReadOnlySupport
+  → loadOpponentAndSeason(req._orgId, …)          org from the session, never the body
+  → policy.isCollectionEnabled / concurrency cap
+  → importService.getLinkedOpponentSource(…)      pending/needs_review/rejected/superseded stop here
+  → importService.startOpponentImportRun(…)       hs_opponent_import_runs
+  → dispatchOpponentCollection(…)                 spawns src/high-school-opponent-gc-import.js
+       → runOpponentImportCollection
+            → discoverScheduleEntries()           injected seam (Playwright in production)
+            → collectGame(entry)                  injected seam, retry/backoff via gc-collection-policy
+            → importService.ingestOpponentGameCollection
+                 → mapHighSchoolOpponentEngineCollection   Slice 2B engine, unchanged
+                 → repository.persistEngineCollection
+                      → rpc persist_hs_engine_collection(jsonb)   subject.kind = opponent_team
+```
+
+The route is mounted by `src/high-school-api.js` under `/api/high-school`, which `server.js`
+registers. `dispatchOpponentCollection` and `spawn` are injectable exactly as `spawn` already
+was, so the end-to-end test drives the real service, repository and RPC with only the upstream
+source mocked.
+
+**Known gap, deliberately not worked around.** `src/search-gamechanger-teams.js` recognises a
+played game by its score badge, so it yields completed games only. Not-yet-played schedule rows
+therefore do not reach the collector in production today. The adapter, the schedule-only
+publication state and its database constraints all support them; supplying them needs a
+schedule-row extractor that does not exist yet. Inventing a second scraper here was rejected.
+
+## A2. Ingestion outcome states
+
+`OPPONENT_INGEST_STATES` in `src/high-school-import-service.js`, reported by both the collector
+summary and the service result:
+
+| state | meaning |
+|---|---|
+| `captured` | source schedule/game observations were stored |
+| `validated` | everything captured passed applicable validation |
+| `published_schedule_only` | valid schedule knowledge exists; no completed game is eligible for statistical reconstruction |
+| `published_verified` | at least one completed game was reconstructed and the verified generation was atomically published |
+| `failed` | validation or publication failed; any previously verified generation is preserved |
+
+The result reports separately whether `scheduleCaptured`, `eligibleForVerifiedPublication`,
+`verifiedGenerationPublished`, `priorVerifiedGenerationPreserved`, and
+`manualReconciliationRequired`.
+
+## A3. Schedule-only versus verified, enforced in PostgreSQL
+
+`hs_opponent_stat_generations.publication_state` is `schedule_only` or `verified`, **derived by
+the RPC from what was actually reconstructed and never taken from the caller**. Three check
+constraints make the distinction unforgeable even for a privileged caller invoking the RPC
+directly or writing the table by hand:
+
+* `…_state_matches_finals_check` — `verified` ⇔ `final_game_count > 0`.
+* `…_final_digests_match_count_check` — the recorded completed-game identities agree with the count.
+* `…_official_totals_check` (pre-existing) — `official_totals_complete` implies a completed game.
+
+`official_totals_complete = false` is therefore no longer the only signal: a schedule-only row is
+named as such, so downstream 2E–2I code cannot mistake it for verified analysis.
+
+## A4. Completeness-regression rules
+
+The dangerous case is not "zero completed games" — it is a later incomplete scrape replacing a
+generation that already carried verified statistics. The gate compares the **set** of completed-game
+identity digests (`final_identity_digests`), evaluated before any supersession:
+
+| candidate vs current verified generation | outcome |
+|---|---|
+| no current verified generation | publish (schedule-only or verified) |
+| candidate is a superset (games added) | publish new verified generation |
+| candidate has the same set, different content (correction) | publish new verified generation |
+| candidate has zero completed games | `opponent_completeness_regression`, prior stays current |
+| candidate is missing a previously verified completed game | `opponent_completeness_regression`, prior stays current |
+
+Cancelling or postponing a game that was never completed is not a regression. Losing a game that
+*was* completed fails closed and is surfaced as `manualReconciliationRequired`, rather than being
+guessed at as either a correction or a transient failure.
+
+Preseason ingestion is unaffected: a brand-new opponent with no completed games publishes
+schedule-only knowledge. The gate never requires a completed game unconditionally.
+
+The collector applies the same principle one level up: if any discovered completed game fails to
+capture, the whole run fails before the publication boundary is touched, so a partial scrape can
+never be mistaken for a complete season.
+
+## A5. Capture time is provenance, not identity
+
+`capturedAt` is excluded from the opponent collection's `inputSetHash`, `contentHash` and
+observation keys. An opponent schedule is re-scraped on a cadence; if *when* it was read
+participated in identity, every unchanged re-scrape would mint a new generation and supersede the
+last one for no reason. The `diagnostics` block is excluded from the content hash for the same
+reason — it carries digests derived from fingerprints that embed capture time. Both are still
+stored in full on the rows they belong to, so the evidence of when each observation was taken is
+preserved; they simply do not decide identity. Own-team collections are untouched.
+
+## A6. Advisory-lock construction
+
+Key: `pg_catalog.hashtextextended(org_id || ':' || opponent_team_id || ':' || season_id, 0)`,
+acquired with `pg_advisory_xact_lock` before any current-generation state is read or written.
+
+* Identical for every publication targeting the same organization, opponent and season.
+* Different for a different tenant, opponent, or season.
+* Transaction-scoped — released automatically on commit or rollback.
+* Requires no table privilege, which is why it is used instead of `SELECT … FOR UPDATE` on
+  `hs_opponent_teams`: that would require granting `service_role` UPDATE on the identity
+  foundation, the exact privilege ingestion must not hold.
+
+A hash collision between two unrelated subjects is theoretically possible and would only cause
+harmless extra waiting, never an incorrect result. The namespace is the single-argument advisory
+lock space; no other code path in this repository takes advisory locks, so there is no avoidable
+namespace collision to fix.
