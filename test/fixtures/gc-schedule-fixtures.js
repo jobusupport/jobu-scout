@@ -385,3 +385,187 @@ const tableRowTwoDatedGames = page(`
 module.exports.dateGroupLiTwoDatedGames = dateGroupLiTwoDatedGames;
 module.exports.dateGroupLiTwoDatedGamesReversed = dateGroupLiTwoDatedGamesReversed;
 module.exports.tableRowTwoDatedGames = tableRowTwoDatedGames;
+
+// -- Deterministic date-scoping fixtures (HS 2D date-attribution correction) --
+//
+// A date header governs its own scope and nothing beyond it. These pin that
+// contract from both directions: every game inside a group must receive the
+// group's date, and no game may ever receive a NEIGHBOURING group's date.
+//
+// Every team name, game id, venue and date below is invented. There are no
+// credentials, cookies, tokens, sessions, rosters or customer records here, and
+// nothing is ever fetched: the markup is loaded with page.setContent()/route
+// fulfilment and test/helpers/gc-network-guard.js aborts any gc.com request.
+
+// Spans are separated by real whitespace, exactly as rendered markup is. Without
+// it adjacent inline nodes concatenate ("Alpha High4:00 PM") and a status the
+// source really did express stops being readable.
+const dg = (id, label, { score = '', time = '', gameNumber = null, gameDate = '' } = {}) =>
+  `<a href="${ORIGIN}/teams/opponent-high/schedule/${id}">`
+  + `<span class="matchup">vs ${label}</span> `
+  + (gameDate ? `<span class="game-date">${gameDate}</span> ` : '')
+  + (time ? `<span class="time">${time}</span> ` : '')
+  + (score ? `<span class="score">${score}</span> ` : '')
+  + (gameNumber ? `<span class="game-number">Game ${gameNumber}</span>` : '')
+  + `</a>`;
+
+const group = (headerText, ...games) =>
+  `<li class="date-group"><div class="date-header">${headerText}</div>${games.join('')}</li>`;
+
+// 1. One date group holding two SCHEDULED games.
+const dateGroupTwoScheduled = page(group('Apr 11, 2026',
+  dg('sched-alpha', 'Alpha High', { time: '4:00 PM' }),
+  dg('sched-bravo', 'Bravo High', { time: '7:00 PM' })));
+
+// 2. One date group holding two COMPLETED games.
+const dateGroupTwoCompleted = page(group('Apr 11, 2026',
+  dg('done-alpha', 'Alpha High', { score: 'W 5-1' }),
+  dg('done-bravo', 'Bravo High', { score: 'L 2-7' })));
+
+// 3. One date group holding one completed and one scheduled game.
+const dateGroupMixedStatuses = page(group('Apr 11, 2026',
+  dg('mixed-alpha', 'Alpha High', { score: 'W 5-1' }),
+  dg('mixed-bravo', 'Bravo High', { time: '7:00 PM' })));
+
+// 4. TWO sibling date groups, two games each. This is the exact shape whose
+//    fourth game used to inherit the FIRST group's date.
+const twoDateGroupsTwoGamesEach = page([
+  group('Apr 11, 2026', dg('grp-a', 'Alpha High', { score: 'W 1-0' }), dg('grp-b', 'Bravo High', { score: 'L 0-1' })),
+  group('Apr 18, 2026', dg('grp-c', 'Charlie High', { score: 'W 2-0' }), dg('grp-d', 'Delta High', { score: 'L 0-2' })),
+].join(''));
+
+// 5. The same two groups with the GAMES reversed inside each group.
+const twoDateGroupsGamesReversedWithinGroups = page([
+  group('Apr 11, 2026', dg('grp-b', 'Bravo High', { score: 'L 0-1' }), dg('grp-a', 'Alpha High', { score: 'W 1-0' })),
+  group('Apr 18, 2026', dg('grp-d', 'Delta High', { score: 'L 0-2' }), dg('grp-c', 'Charlie High', { score: 'W 2-0' })),
+].join(''));
+
+// 6. The same two groups with the whole GROUPS reversed.
+const twoDateGroupsGroupOrderReversed = page([
+  group('Apr 18, 2026', dg('grp-c', 'Charlie High', { score: 'W 2-0' }), dg('grp-d', 'Delta High', { score: 'L 0-2' })),
+  group('Apr 11, 2026', dg('grp-a', 'Alpha High', { score: 'W 1-0' }), dg('grp-b', 'Bravo High', { score: 'L 0-1' })),
+].join(''));
+
+// 7. Every game carries its own explicit date; there is no group header at all.
+const explicitDateOnEveryGame = page(`
+  <div class="schedule-row">${dg('own-a', 'Alpha High', { score: 'W 3-1', gameDate: 'Apr 11, 2026' })}</div>
+  <div class="schedule-row">${dg('own-b', 'Bravo High', { score: 'L 1-3', gameDate: 'Apr 18, 2026' })}</div>`);
+
+// 8. A group date plus a per-game date that AGREES with it. Confirmation, not
+//    conflict.
+const groupDateWithMatchingGameDate = page(group('Apr 11, 2026',
+  dg('agree-a', 'Alpha High', { score: 'W 4-2', gameDate: 'Apr 11, 2026' }),
+  dg('agree-b', 'Bravo High', { score: 'L 2-4' })));
+
+// 9. A group date plus a per-game date that CONTRADICTS it. Must be reported as
+//    a conflict, never resolved in either direction.
+const groupDateWithConflictingGameDate = page(group('Apr 11, 2026',
+  dg('clash-a', 'Alpha High', { score: 'W 4-2', gameDate: 'Apr 25, 2026' }),
+  dg('clash-b', 'Bravo High', { score: 'L 2-4' })));
+
+// 10. A date group whose header carries no recognizable date.
+const dateGroupWithUnrecognizableHeader = page(
+  `<li class="date-group"><div class="date-header">Upcoming Fixtures</div>`
+  + dg('nohdr-a', 'Alpha High', { time: '4:00 PM' })
+  + dg('nohdr-b', 'Bravo High', { time: '7:00 PM' })
+  + `</li>`);
+
+// 11. A game that sits outside every date group.
+const gameOutsideAnyDateGroup = page(
+  `<div class="schedule-row">${dg('loose-a', 'Alpha High', { score: 'W 6-0' })}</div>`
+  + group('Apr 18, 2026', dg('grouped-b', 'Bravo High', { score: 'L 0-6' })));
+
+// 12. Two INDEPENDENT schedule sections. A date in one must never reach the
+//     other, in either direction.
+const twoIndependentScheduleSections = `<!doctype html><html><body>
+  <header><h1>Opponent High Varsity Baseball</h1></header>
+  <section class="schedule schedule-varsity">
+    ${group('Apr 11, 2026', dg('sec1-a', 'Alpha High', { score: 'W 1-0' }), dg('sec1-b', 'Bravo High', { score: 'L 0-1' }))}
+  </section>
+  <section class="schedule schedule-jv">
+    ${group('May 2, 2026', dg('sec2-a', 'Charlie High', { score: 'W 3-2' }), dg('sec2-b', 'Delta High', { score: 'L 2-3' }))}
+  </section>
+</body></html>`;
+
+// 13. A rescheduled game keeping its stable upstream id while its group date
+//     moves. Identity must survive; the date must follow the source.
+const rescheduledStableIdBefore = page(group('Apr 10, 2026',
+  dg('resched-1', 'Alpha High', { time: '4:30 PM' }),
+  dg('resched-2', 'Bravo High', { time: '7:00 PM' })));
+const rescheduledStableIdAfter = page(group('Apr 17, 2026',
+  dg('resched-1', 'Alpha High', { score: 'L 3-6' }),
+  dg('resched-2', 'Bravo High', { score: 'W 5-1' })));
+
+// 14. A completed doubleheader under ONE date header. Both games are on that
+//     date; Game 1 / Game 2 keep them apart.
+const doubleheaderUnderOneDateHeader = page(group('Apr 11, 2026',
+  dg('dh-one', 'Alpha High', { score: 'W 3-2', time: '10:00 AM', gameNumber: 1 }),
+  dg('dh-two', 'Alpha High', { score: 'L 1-4', time: '1:00 PM', gameNumber: 2 })));
+
+// 15. The same doubleheader before it is played.
+const futureDoubleheaderUnderOneDateHeader = page(group('May 9, 2026',
+  dg('fdh-one', 'Alpha High', { time: '10:00 AM', gameNumber: 1 }),
+  dg('fdh-two', 'Alpha High', { time: '1:00 PM', gameNumber: 2 })));
+
+// 16. Malformed header text: a day number no calendar has.
+const malformedDateHeaderText = page(group('Apr 99, 2026',
+  dg('mal-a', 'Alpha High', { score: 'W 2-1' }),
+  dg('mal-b', 'Bravo High', { score: 'L 1-2' })));
+
+// 17. Harmless format and whitespace variation. Must normalize to exactly the
+//     same date as dateGroupTwoCompleted, so a cosmetic source change cannot
+//     mint a new generation.
+const dateFormatAndWhitespaceVariation = page(group('  Saturday,   April   11,    2026  ',
+  dg('done-alpha', 'Alpha High', { score: 'W 5-1' }),
+  dg('done-bravo', 'Bravo High', { score: 'L 2-7' })));
+
+// 18. A header that names MORE THAN ONE date. Nothing may pick a winner.
+const dateGroupWithTwoDatesInHeader = page(group('Apr 11, 2026 - Apr 13, 2026',
+  dg('amb-a', 'Alpha High', { score: 'W 2-0' }),
+  dg('amb-b', 'Bravo High', { score: 'L 0-2' })));
+
+module.exports.dateGroupTwoScheduled = dateGroupTwoScheduled;
+module.exports.dateGroupTwoCompleted = dateGroupTwoCompleted;
+module.exports.dateGroupMixedStatuses = dateGroupMixedStatuses;
+module.exports.twoDateGroupsTwoGamesEach = twoDateGroupsTwoGamesEach;
+module.exports.twoDateGroupsGamesReversedWithinGroups = twoDateGroupsGamesReversedWithinGroups;
+module.exports.twoDateGroupsGroupOrderReversed = twoDateGroupsGroupOrderReversed;
+module.exports.explicitDateOnEveryGame = explicitDateOnEveryGame;
+module.exports.groupDateWithMatchingGameDate = groupDateWithMatchingGameDate;
+module.exports.groupDateWithConflictingGameDate = groupDateWithConflictingGameDate;
+module.exports.dateGroupWithUnrecognizableHeader = dateGroupWithUnrecognizableHeader;
+module.exports.gameOutsideAnyDateGroup = gameOutsideAnyDateGroup;
+module.exports.twoIndependentScheduleSections = twoIndependentScheduleSections;
+module.exports.rescheduledStableIdBefore = rescheduledStableIdBefore;
+module.exports.rescheduledStableIdAfter = rescheduledStableIdAfter;
+module.exports.doubleheaderUnderOneDateHeader = doubleheaderUnderOneDateHeader;
+module.exports.futureDoubleheaderUnderOneDateHeader = futureDoubleheaderUnderOneDateHeader;
+module.exports.malformedDateHeaderText = malformedDateHeaderText;
+module.exports.dateFormatAndWhitespaceVariation = dateFormatAndWhitespaceVariation;
+module.exports.dateGroupWithTwoDatesInHeader = dateGroupWithTwoDatesInHeader;
+
+// Relative-vs-absolute reference forms for ONE game inside one explicit row.
+// These are the same game and must group as one observation, not collide.
+module.exports.relativeAndAbsoluteSameGame = page(`
+  <div class="date-header">Apr 11, 2026</div>
+  <div class="schedule-row">
+    <a href="/teams/opponent-high/schedule/rel-abs-1"><span class="thumb">box score</span></a>
+    <a href="${ORIGIN}/teams/opponent-high/schedule/rel-abs-1">
+      <span class="matchup">vs Alpha High</span><span class="score">W 9-1</span>
+    </a>
+  </div>`);
+
+// Two genuinely different schedule paths must stay two games even though they
+// differ only in their final segment.
+module.exports.relativeAndAbsoluteDifferentGames = page(`
+  <div class="date-header">Apr 11, 2026</div>
+  <div class="schedule-row"><a href="/teams/opponent-high/schedule/rel-abs-1"><span class="matchup">vs Alpha High</span><span class="score">W 9-1</span></a></div>
+  <div class="schedule-row"><a href="${ORIGIN}/teams/opponent-high/schedule/rel-abs-2"><span class="matchup">vs Bravo High</span><span class="score">L 1-9</span></a></div>`);
+
+// A visible schedule anchor carrying no game id segment at all: an unresolved
+// identity that must never reach a published generation.
+module.exports.anchorWithNoGameIdSegment = page(`
+  <div class="date-header">Apr 11, 2026</div>
+  <div class="schedule-row">
+    <a href="${ORIGIN}/teams/opponent-high/schedule/"><span class="matchup">vs Alpha High</span><span class="score">W 3-1</span></a>
+  </div>`);

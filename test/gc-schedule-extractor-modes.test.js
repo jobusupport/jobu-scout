@@ -368,18 +368,18 @@ test('reversing anchor order inside a generic wrapper never changes which games 
   assert.deepEqual(ids(reversedLi), ['game-alpha', 'game-beta'], 'DOM order never decides which game survives');
   assert.deepEqual(ids(reversedTr), ['game-delta', 'game-gamma']);
 
-  // KNOWN LIMITATION, asserted rather than hidden: when a date-group container
-  // holds the header INSIDE it above several games, only the game adjacent to
-  // that header resolves a date within the deliberately narrow date scope. The
-  // rest report gameDate = null rather than borrowing a neighbouring row's
-  // date. That is order-dependent, so it is pinned here as a gap for follow-up,
-  // not asserted as correct. Widening the scope to fix it was tried and
-  // rejected: it made rows adopt each other's dates.
+  // The former limitation is gone. A date-group header now governs its whole
+  // scope, so EVERY game under one header resolves that header's date -- in
+  // either DOM order -- instead of only the game that happened to sit next to
+  // it. Nothing borrows a date from a neighbouring row or a neighbouring group.
   const datedCount = (list) => list.filter((entry) => entry.gameDate).length;
-  assert.equal(datedCount(forwardsLi), 1, 'date-group headers reach only the adjacent game today');
-  assert.equal(datedCount(reversedLi), 1);
-  assert.ok(forwardsLi.every((entry) => entry.gameDate === null || entry.gameDate === '2026-04-11'),
-    'no row ever adopts a date that is not its own group header');
+  assert.equal(datedCount(forwardsLi), 2, 'a date group governs every game inside it');
+  assert.equal(datedCount(reversedLi), 2, 'and does so independently of DOM order');
+  assert.ok([...forwardsLi, ...reversedLi].every((entry) => entry.gameDate === '2026-04-11'),
+    'every game under the Apr 11 header resolves to Apr 11, never to another row or group');
+  assert.ok([...forwardsLi, ...reversedLi].every(
+    (entry) => entry.dateResolutionStatus === 'resolved_date_group' && entry.dateSourceKind === 'date_group'),
+  'and each says so explicitly rather than leaving the resolution unexplained');
 });
 
 test('a generic wrapper holding two same-href anchors over-reports and collides rather than merging', async () => {

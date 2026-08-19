@@ -1285,6 +1285,44 @@ const SCHEDULE_ENTRY_STATUSES = Object.freeze([
 // no href-based fallback anywhere in this module.
 const EXPLICIT_ROW_ROOT_SELECTOR = '[data-schedule-row], [data-game-id], .schedule-row';
 
+// ── Date scoping is a SEPARATE concept from row grouping ────────────────
+//
+// A game-row boundary answers "which anchors are one game". A date scope
+// answers "which date header governs this game". Conflating them is what
+// produced the original defect in two different ways: first by accepting a
+// date-group container as a game row (merging games), then -- after that was
+// corrected -- by letting a row hunt for a date through its parent's previous
+// sibling, which reaches into the PREVIOUS date group's entire subtree and
+// hands its date to a game that belongs to the next group.
+//
+// These selectors mark date evidence only. They never make an element a row
+// root, and no generic container is ever reinstated as one.
+const DATE_HEADER_SELECTOR = '[data-schedule-date], [data-date-header], .date-header, .schedule-date';
+const GAME_DATE_SELECTOR = '[data-game-date], .game-date';
+
+// How a schedule row's date was established. Carried through the collector as
+// provenance so an unsafe date can fail closed with a reason instead of being
+// silently published or silently dropped.
+//
+//   resolved_game_row   the row itself expressed a date
+//   resolved_date_group an enclosing date group expressed exactly one date
+//   not_expressed       neither did; the source simply did not say
+//   ambiguous           the governing date evidence names more than one date
+//   conflicting         the row and its date group disagree
+const DATE_RESOLUTION_STATUSES = Object.freeze({
+  RESOLVED_GAME_ROW: 'resolved_game_row',
+  RESOLVED_DATE_GROUP: 'resolved_date_group',
+  NOT_EXPRESSED: 'not_expressed',
+  AMBIGUOUS: 'ambiguous',
+  CONFLICTING: 'conflicting',
+});
+
+const DATE_SOURCE_KINDS = Object.freeze({
+  GAME_ROW: 'game_row',
+  DATE_GROUP: 'date_group',
+  NONE: 'none',
+});
+
 // Pure, browser-free, and exported so the classification rules can be tested
 // directly rather than only through a DOM fixture.
 //
@@ -1355,6 +1393,95 @@ function normalizeScheduleEntryText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
+// Resolves ONE row's date from the two independent pieces of evidence the DOM
+// pass collected: whatever the row itself said, and whatever its governing date
+// group said. Pure and exported so the rules can be tested without a browser.
+//
+// The rules, in order:
+//   * the row's own date wins over its group's -- a per-game date is the more
+//     specific claim, and confirming it against a matching group date is not a
+//     conflict;
+//   * a row and group that name DIFFERENT dates are a conflict, never silently
+//     resolved in either direction;
+//   * evidence naming more than one date is ambiguous, never resolved to
+//     whichever matched first;
+//   * no evidence at all is 'not_expressed' -- the source did not say, and
+//     nothing is invented to fill the gap.
+//
+// Nothing here consults DOM position, row order, or neighbouring rows, so
+// reversing rows within a group, or reversing whole groups, cannot change what
+// any game resolves to.
+function resolveScheduleEntryDate({ rowDateTexts = [], groupDateTexts = [], groupHeaderText = '' } = {}) {
+  const distinct = (values) => Array.from(new Set(values.filter(Boolean)));
+  const rowRaw = distinct(rowDateTexts.map(normalizeScheduleEntryText));
+  const groupRaw = distinct(groupDateTexts.map(normalizeScheduleEntryText));
+  const rowDates = distinct(rowRaw.map((text) => normalizeScheduleDateText(text)));
+  const groupDates = distinct(groupRaw.map((text) => normalizeScheduleDateText(text)));
+
+  const base = {
+    gameDate: null,
+    dateResolutionStatus: DATE_RESOLUTION_STATUSES.NOT_EXPRESSED,
+    dateSourceKind: DATE_SOURCE_KINDS.NONE,
+    rawDateText: '',
+    dateConflict: null,
+  };
+
+  if (rowDates.length > 1) {
+    return {
+      ...base,
+      dateResolutionStatus: DATE_RESOLUTION_STATUSES.AMBIGUOUS,
+      dateSourceKind: DATE_SOURCE_KINDS.GAME_ROW,
+      rawDateText: rowRaw.join(' | '),
+      dateConflict: { reason: 'multiple_game_row_dates', candidates: rowDates.slice().sort() },
+    };
+  }
+  if (groupDates.length > 1) {
+    return {
+      ...base,
+      dateResolutionStatus: DATE_RESOLUTION_STATUSES.AMBIGUOUS,
+      dateSourceKind: DATE_SOURCE_KINDS.DATE_GROUP,
+      rawDateText: normalizeScheduleEntryText(groupHeaderText),
+      dateConflict: { reason: 'multiple_date_group_dates', candidates: groupDates.slice().sort() },
+    };
+  }
+
+  const rowDate = rowDates[0] || null;
+  const groupDate = groupDates[0] || null;
+
+  if (rowDate && groupDate && rowDate !== groupDate) {
+    return {
+      ...base,
+      dateResolutionStatus: DATE_RESOLUTION_STATUSES.CONFLICTING,
+      dateSourceKind: DATE_SOURCE_KINDS.GAME_ROW,
+      rawDateText: `${rowRaw.join(' ')} | ${normalizeScheduleEntryText(groupHeaderText)}`,
+      dateConflict: {
+        reason: 'game_row_contradicts_date_group',
+        gameRowDate: rowDate,
+        dateGroupDate: groupDate,
+      },
+    };
+  }
+  if (rowDate) {
+    return {
+      ...base,
+      gameDate: rowDate,
+      dateResolutionStatus: DATE_RESOLUTION_STATUSES.RESOLVED_GAME_ROW,
+      dateSourceKind: DATE_SOURCE_KINDS.GAME_ROW,
+      rawDateText: rowRaw.join(' '),
+    };
+  }
+  if (groupDate) {
+    return {
+      ...base,
+      gameDate: groupDate,
+      dateResolutionStatus: DATE_RESOLUTION_STATUSES.RESOLVED_DATE_GROUP,
+      dateSourceKind: DATE_SOURCE_KINDS.DATE_GROUP,
+      rawDateText: normalizeScheduleEntryText(groupHeaderText),
+    };
+  }
+  return base;
+}
+
 // The single schedule-row extraction boundary. `mode` is required and explicit.
 async function getVisibleScheduleEntries(page, { mode } = {}) {
   if (mode !== SCHEDULE_EXTRACTION_MODES.COMPLETED_ONLY
@@ -1377,6 +1504,15 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
       rowAnchorCount: 1,
       identityCollision: false,
       collidingRowIndexes: [],
+      // Purely additive provenance so both modes report the same shape. The
+      // completed-only path's own date logic is untouched -- own-team and
+      // Travel keep exactly the dates they already produced.
+      rawDateText: normalizeScheduleEntryText(entry.dateText),
+      dateResolutionStatus: entry.gameDate
+        ? DATE_RESOLUTION_STATUSES.RESOLVED_GAME_ROW
+        : DATE_RESOLUTION_STATUSES.NOT_EXPRESSED,
+      dateSourceKind: entry.gameDate ? DATE_SOURCE_KINDS.GAME_ROW : DATE_SOURCE_KINDS.NONE,
+      dateConflict: null,
       ...parseScheduledTimeText(entry.cardText),
     }));
   }
@@ -1394,27 +1530,65 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
   // happens to publish under one identifier must reach the identity layer as two
   // colliding observations: keeping whichever row parsed first would discard a
   // real game, and with it a real result.
-  const rawRows = await page.evaluate((rowRootSelector) => {
+  const rawRows = await page.evaluate(({ rowRootSelector, dateHeaderSelector, gameDateSelector }) => {
     function clean(value) { return String(value || '').replace(/\s+/g, ' ').trim(); }
-    function looksLikeDate(value) {
-      return /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\.?[,]?\s*(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}(?:,?\s+(?:20\d{2}|19\d{2}))?\b/i.test(value) ||
-        /\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/.test(value);
-    }
-    const CARDTEXT_MAX_LEN = 260;
 
-    // Normalized schedule reference: query string and fragment stripped, so two
-    // anchors to the same game with different tracking parameters still count
-    // as one reference.
+    // Every date-like substring, not just the first. A header that names two
+    // dates ("Apr 11 - Apr 13") must be reported as ambiguous rather than
+    // silently resolving to whichever one happens to match first.
+    const DATE_PATTERN = '(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\\.?,?\\s*)?'
+      + '(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?'
+      + '|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)'
+      + '\\.?\\s+\\d{1,2}(?:,?\\s+(?:20\\d{2}|19\\d{2}))?'
+      + '|\\d{1,2}\\/\\d{1,2}(?:\\/\\d{2,4})?';
+    function allDateTexts(value) {
+      const matched = String(value || '').match(new RegExp(DATE_PATTERN, 'gi'));
+      return matched ? matched.map(clean).filter(Boolean) : [];
+    }
+    function looksLikeDate(value) { return allDateTexts(value).length > 0; }
+
+    const CARDTEXT_MAX_LEN = 260;
+    // A date header is a short label. Capping its length is what keeps a whole
+    // schedule section from being mistaken for one, and bounds the scan.
+    const DATE_HEADER_MAX_LEN = 120;
+    // A per-game date lives in its own small element, never in the row's whole
+    // card text (which also carries the opponent, score and time).
+    const ROW_DATE_MAX_LEN = 60;
+
+    const SCHEDULE_ANCHOR_SELECTOR = 'a[href*="/schedule/"]';
+
+    // -- Normalized schedule reference -----------------------------------
+    //
+    // Two anchors point at the same game when they resolve to the same schedule
+    // PATH. Origin is deliberately ignored so a relative `/teams/x/schedule/g1`
+    // and an absolute `https://web.gc.com/teams/x/schedule/g1` are recognised as
+    // one reference instead of colliding as two. Query and fragment are dropped
+    // because neither is identity-bearing here. Path segments are compared
+    // verbatim -- never decoded or case-folded -- so two genuinely different
+    // games can never be normalized into each other.
+    //
+    // An href the URL parser rejects yields a reference distinct from every real
+    // one and from every differently-malformed one, so a broken anchor can never
+    // be merged with a real game.
     function scheduleRef(anchor) {
-      const href = anchor.getAttribute('href') || '';
-      return href.split('#')[0].split('?')[0];
+      const raw = anchor.getAttribute('href') || '';
+      if (!raw) return '';
+      let parsed;
+      try {
+        parsed = new URL(raw, document.baseURI);
+      } catch (err) {
+        return ' unparseable:' + raw;
+      }
+      let path = parsed.pathname || '';
+      if (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1);
+      return path || (' unparseable:' + raw);
     }
 
     // Counts the DISTINCT games a candidate row root claims to contain. A node
     // describing one game contains exactly one.
     function distinctScheduleRefs(node) {
       const refs = new Set();
-      for (const link of node.querySelectorAll('a[href*="/schedule/"]')) {
+      for (const link of node.querySelectorAll(SCHEDULE_ANCHOR_SELECTOR)) {
         const ref = scheduleRef(link);
         if (ref) refs.add(ref);
       }
@@ -1441,7 +1615,62 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
       return anchor;
     }
 
-    const anchors = Array.from(document.querySelectorAll('a[href*="/schedule/"]'));
+    // -- One document-order pass ------------------------------------------
+    //
+    // Position is read once, here, and used only to decide which date header
+    // governs which row. It never becomes canonical identity: `visibleIndex`
+    // stays provenance and every published hash excludes it.
+    const docIndex = new Map();
+    {
+      const walker = document.createTreeWalker(document.documentElement, NodeFilter.SHOW_ELEMENT);
+      let i = 1;
+      docIndex.set(document.documentElement, i);
+      while (walker.nextNode()) {
+        i += 1;
+        docIndex.set(walker.currentNode, i);
+      }
+    }
+    const positionOf = (node) => (docIndex.has(node) ? docIndex.get(node) : -1);
+
+    // A date header is an element that expresses a date and contains NO schedule
+    // anchor -- a container that holds games is a group, not a header. Only the
+    // innermost such element counts, so a wrapper never shadows the label it
+    // wraps.
+    function isDateEvidence(element, maxLen) {
+      if (!element || element.nodeType !== 1) return false;
+      if (element.querySelector(SCHEDULE_ANCHOR_SELECTOR)) return false;
+      const text = clean(element.textContent || '');
+      if (!text || text.length > maxLen) return false;
+      if (element.matches && element.matches(dateHeaderSelector)) return looksLikeDate(text);
+      return looksLikeDate(text);
+    }
+    function isInnermostDateEvidence(element, maxLen) {
+      if (!isDateEvidence(element, maxLen)) return false;
+      for (const child of element.querySelectorAll('*')) {
+        if (isDateEvidence(child, maxLen)) return false;
+      }
+      return true;
+    }
+
+    // A header governs exactly its own parent's subtree. That single rule is
+    // what stops a date crossing from one sibling date group into the next: the
+    // Apr 11 header inside date-group #1 has scope #1, which does not contain
+    // any game in date-group #2. When headers and rows are flat siblings the
+    // scope is the shared section and the LATEST preceding header wins, which is
+    // exactly "the next header ends the previous date's scope". There is no
+    // global last-date-seen variable, so nothing can leak between sections.
+    const headers = [];
+    for (const element of document.querySelectorAll('*')) {
+      if (!isInnermostDateEvidence(element, DATE_HEADER_MAX_LEN)) continue;
+      headers.push({
+        element,
+        scope: element.parentElement || document.body,
+        position: positionOf(element),
+        text: clean(element.textContent || ''),
+      });
+    }
+
+    const anchors = Array.from(document.querySelectorAll(SCHEDULE_ANCHOR_SELECTOR));
     const roots = [];
     const rootIndex = new Map();
     for (const anchor of anchors) {
@@ -1462,34 +1691,35 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
       const cardText = clean(root.innerText || root.textContent || '');
       const hrefs = Array.from(new Set(rowAnchors.map((a) => a.getAttribute('href') || '').filter(Boolean)));
 
-      // Date scoping is deliberately narrow: the row's own subtree, its
-      // immediate previous sibling, and its parent's previous sibling. Widening
-      // it to the parent's whole subtree was tried and rejected -- it lets a row
-      // adopt a neighbouring row's date, which is the failure the original
-      // completed-game extractor documents. A row that can see no date in that
-      // scope reports gameDate = null rather than borrowing one.
-      const searchRoots = [root];
-      if (root.previousElementSibling) searchRoots.push(root.previousElementSibling);
-      const parentPrev = root.parentElement && root.parentElement.previousElementSibling;
-      if (parentPrev) searchRoots.push(parentPrev);
-
-      const rect = root.getBoundingClientRect();
-      const dateCandidates = [];
-      const seen = new Set();
-      for (const searchRoot of searchRoots) {
-        const nodes = [searchRoot, ...Array.from(searchRoot.querySelectorAll('*'))];
-        for (const candidate of nodes) {
-          if (seen.has(candidate)) continue;
-          seen.add(candidate);
-          const text = clean(candidate.innerText || candidate.textContent || '');
-          if (!text || text.length > 300 || !looksLikeDate(text)) continue;
-          const candidateRect = candidate.getBoundingClientRect();
-          const distance = Math.abs(candidateRect.top - rect.top);
-          const abovePenalty = candidateRect.top <= rect.top + 20 ? 0 : 10000;
-          dateCandidates.push({ text, distance: distance + abovePenalty, top: candidateRect.top });
+      // -- The row's OWN date, if it has one -----------------------------
+      // Searched strictly inside the row root. An explicit marker wins; failing
+      // that, a small innermost date element counts. The row's full card text
+      // never does -- that is how neighbouring content used to leak in.
+      const rowDateTexts = [];
+      for (const node of root.querySelectorAll(gameDateSelector)) {
+        const text = clean(node.getAttribute('data-game-date') || node.textContent || '');
+        if (text) rowDateTexts.push(...allDateTexts(text));
+      }
+      if (!rowDateTexts.length) {
+        const candidates = [root, ...Array.from(root.querySelectorAll('*'))];
+        for (const node of candidates) {
+          if (!isInnermostDateEvidence(node, ROW_DATE_MAX_LEN)) continue;
+          rowDateTexts.push(...allDateTexts(node.textContent || ''));
         }
       }
-      dateCandidates.sort((a, b) => a.distance - b.distance || b.top - a.top);
+
+      // -- The governing date group, if any ------------------------------
+      // The latest header that precedes this row AND whose scope contains it.
+      // A header inside the row is the row's own date, never a group date.
+      const rootPosition = positionOf(root);
+      let governing = null;
+      for (const header of headers) {
+        if (header.position < 0 || rootPosition < 0) continue;
+        if (header.position >= rootPosition) continue;
+        if (root.contains(header.element)) continue;
+        if (!header.scope.contains(root)) continue;
+        if (!governing || header.position > governing.position) governing = header;
+      }
 
       const within = (selector, attr) => Array.from(root.querySelectorAll(selector))
         .map((node) => clean((attr && node.getAttribute(attr)) || node.innerText || node.textContent))
@@ -1510,7 +1740,9 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
         anchorCount: rowAnchors.length,
         hrefs,
         cardText: cardText.length <= CARDTEXT_MAX_LEN ? cardText : cardText.slice(0, CARDTEXT_MAX_LEN),
-        dateText: dateCandidates[0]?.text || '',
+        rowDateTexts,
+        groupDateTexts: governing ? allDateTexts(governing.text) : [],
+        groupHeaderText: governing ? governing.text : '',
         scoreText: scoreNode || '',
         statusText: within('[data-status], .status, .game-status', 'data-status'),
         venueText: within('[data-venue], .venue, .location', 'data-venue'),
@@ -1518,7 +1750,11 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
         gameNumberText: within('[data-game-number], .game-number', 'data-game-number'),
       };
     });
-  }, EXPLICIT_ROW_ROOT_SELECTOR);
+  }, {
+    rowRootSelector: EXPLICIT_ROW_ROOT_SELECTOR,
+    dateHeaderSelector: DATE_HEADER_SELECTOR,
+    gameDateSelector: GAME_DATE_SELECTOR,
+  });
 
   const entries = rawRows.map((rawRow) => {
     const href = rawRow.hrefs.length ? new URL(rawRow.hrefs[0], page.url()).href : '';
@@ -1526,6 +1762,10 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
     const rawStatusText = normalizeScheduleEntryText(`${rawRow.statusText} ${rawRow.cardText}`);
     const status = classifyScheduleEntryStatus({ rawStatusText, scoreText: rawRow.scoreText });
     const timing = parseScheduledTimeText(rawRow.cardText);
+    // The row's card text is deliberately NOT a date source. Folding it in is
+    // what let a merged or neighbouring row's text supply a date; the date now
+    // comes only from the row's own date evidence or its governing date group.
+    const date = resolveScheduleEntryDate(rawRow);
 
     return {
       // Provenance only. Row order never enters canonical identity, and every
@@ -1536,8 +1776,12 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
       rawStatusText,
       scoreText: normalizeScheduleEntryText(rawRow.scoreText),
       cardText: normalizeScheduleEntryText(rawRow.cardText),
-      dateText: normalizeScheduleEntryText(rawRow.dateText),
-      gameDate: normalizeScheduleDateText(`${rawRow.cardText || ''} ${rawRow.dateText || ''}`),
+      dateText: date.rawDateText,
+      rawDateText: date.rawDateText,
+      gameDate: date.gameDate,
+      dateResolutionStatus: date.dateResolutionStatus,
+      dateSourceKind: date.dateSourceKind,
+      dateConflict: date.dateConflict,
       result: scoreParts.result,
       scoreUs: scoreParts.scoreUs,
       scoreThem: scoreParts.scoreThem,
@@ -3704,6 +3948,11 @@ if (require.main !== module) {
     SCHEDULE_EXTRACTION_MODES,
     SCHEDULE_ENTRY_STATUSES,
     EXPLICIT_ROW_ROOT_SELECTOR,
+    DATE_HEADER_SELECTOR,
+    GAME_DATE_SELECTOR,
+    DATE_RESOLUTION_STATUSES,
+    DATE_SOURCE_KINDS,
+    resolveScheduleEntryDate,
     classifyScheduleEntryStatus,
     parseScheduledTimeText,
     parseHomeAway,
