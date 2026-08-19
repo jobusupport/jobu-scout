@@ -9,9 +9,13 @@
 //   * src/gc-collection-policy.js supplies the kill switch, rate limiting,
 //     retry/backoff, failure classification and error sanitisation. None of
 //     that is reimplemented here.
-//   * The DOM extraction functions in src/search-gamechanger-teams.js are
-//     reused UNMODIFIED through the injected `discoverScheduleEntries` /
-//     `collectGame` seam. This module contains no selectors and no scraping.
+//   * DOM extraction stays in src/search-gamechanger-teams.js and is reached
+//     through the injected `discoverScheduleEntries` / `collectGame` seam. This
+//     module contains no selectors and no scraping. That module gained a second
+//     explicit extraction mode for opponent monitoring
+//     (SCHEDULE_EXTRACTION_MODES.ALL_SCHEDULE_ENTRIES); its existing
+//     completed-games-only path is untouched and still serves Travel and
+//     own-team import.
 //   * Reconstruction and statistics go through the import service's
 //     ingestOpponentGameCollection, which uses the characterized Slice 2B
 //     engine. There is no second statistics algorithm here.
@@ -62,6 +66,9 @@ function buildScheduleOnlyCapturedGame(entry, capturedAt) {
       ourSide: 'home',
       gameStatus: entry.gameStatus,
       capturedAt,
+      ...(entry.startTime ? { startTime: entry.startTime } : {}),
+      ...(entry.venue ? { venue: entry.venue } : {}),
+      ...(Number.isFinite(entry.gameNumber) ? { gameNumber: entry.gameNumber } : {}),
       ...(entry.sourceGameRef ? { sourceGameId: entry.sourceGameRef } : {}),
       ...(entry.sourceGameUrl ? { sourceGameUrl: entry.sourceGameUrl } : {}),
     },
@@ -93,6 +100,9 @@ function buildOpponentCapturedGame(gameData, entry, capturedAt) {
       ourSide: side,
       gameStatus: entry.gameStatus,
       capturedAt,
+      ...(entry.startTime ? { startTime: entry.startTime } : {}),
+      ...(entry.venue ? { venue: entry.venue } : {}),
+      ...(Number.isFinite(entry.gameNumber) ? { gameNumber: entry.gameNumber } : {}),
       ...(entry.sourceGameRef ? { sourceGameId: entry.sourceGameRef } : {}),
       ...(entry.sourceGameUrl ? { sourceGameUrl: entry.sourceGameUrl } : {}),
     },
@@ -102,6 +112,31 @@ function buildOpponentCapturedGame(gameData, entry, capturedAt) {
       pitching: tag(boxScore.pitching),
     },
     plays: gameData?.plays || [],
+  };
+}
+
+// Normalizes one row from the shared schedule extractor into the entry shape
+// this adapter consumes. Nothing is invented: a field the source did not
+// express stays null, and the extractor's own status classification is carried
+// through rather than re-derived here.
+//
+// startTime, venue and gameNumber are carried because they are the deterministic
+// discriminators the identity layer uses to keep two same-day games apart when
+// the source supplies no distinct upstream id. visibleIndex is deliberately NOT
+// carried: DOM row order is provenance, never canonical identity.
+function toOpponentScheduleEntry(row) {
+  return {
+    sourceGameRef: row.gameId || null,
+    sourceGameUrl: row.href || null,
+    counterpartyName: row.counterpartyName || null,
+    gameDate: row.gameDate || null,
+    gameStatus: normalizeStatus(row.status),
+    startTime: row.scheduledTimeText || null,
+    timezoneKnown: row.timezoneKnown === true,
+    homeAway: row.homeAway || null,
+    venue: row.venue || null,
+    gameNumber: Number.isFinite(row.gameNumber) ? row.gameNumber : null,
+    rawStatusText: row.rawStatusText || null,
   };
 }
 
@@ -186,6 +221,14 @@ async function runOpponentImportCollection({
     counterpartyName: entry?.counterpartyName || entry?.opponentName || null,
     gameDate: entry?.gameDate || null,
     gameStatus: normalizeStatus(entry?.gameStatus),
+    // Deterministic discriminators for two same-day games that share an
+    // opponent and carry no distinct upstream id. Absent evidence stays absent,
+    // which is what leaves such a pair ambiguous rather than merged.
+    startTime: entry?.startTime || null,
+    venue: entry?.venue || null,
+    gameNumber: Number.isFinite(entry?.gameNumber) ? entry.gameNumber : null,
+    homeAway: entry?.homeAway || null,
+    rawStatusText: entry?.rawStatusText || null,
   }));
   summary.gamesDiscovered = normalized.length;
   summary.finalGamesDiscovered = normalized.filter((e) => COLLECTABLE_STATUSES.has(e.gameStatus)).length;
@@ -306,6 +349,7 @@ async function runOpponentImportCollection({
 
 module.exports = {
   runOpponentImportCollection,
+  toOpponentScheduleEntry,
   buildOpponentCapturedGame,
   buildScheduleOnlyCapturedGame,
   normalizeStatus,
@@ -386,22 +430,16 @@ if (require.main === module) {
       await page.goto(scraper.normalizeTeamUrl(String(sourceTeamUrl).replace(/\/schedule.*$/, '') + '/schedule'));
       sessionLoader.assertLandedOnAuthenticatedGameChangerPage(page.url());
 
-      // The existing extractor recognises a played game by its score badge, so
-      // it yields completed games only. Not-yet-played schedule rows therefore
-      // do not appear here today; the adapter, the schedule-only publication
-      // state and its database constraints all support them, and supplying them
-      // needs a schedule-row extractor that src/search-gamechanger-teams.js does
-      // not have yet. That gap is deliberately NOT worked around by inventing a
-      // second scraper in this file.
+      // Opponent monitoring needs the WHOLE schedule -- a future game, a
+      // postponement, a cancellation and a doubleheader entry all matter before
+      // either half is final -- so the shared extractor is asked explicitly for
+      // every schedule row rather than completed games only. Own-team import
+      // continues to ask for COMPLETED_ONLY and is unaffected.
       const discoverScheduleEntries = async () => {
-        const entries = await scraper.getVisibleCompletedGameEntries(page);
-        return entries.map((e) => ({
-          sourceGameRef: e.gameId || null,
-          sourceGameUrl: e.href,
-          counterpartyName: e.opponentName || null,
-          gameDate: e.gameDate || null,
-          gameStatus: 'final',
-        }));
+        const entries = await scraper.getVisibleScheduleEntries(page, {
+          mode: scraper.SCHEDULE_EXTRACTION_MODES.ALL_SCHEDULE_ENTRIES,
+        });
+        return entries.map(toOpponentScheduleEntry);
       };
 
       const collectGame = async (entry) => {
