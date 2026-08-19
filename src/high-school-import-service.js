@@ -64,6 +64,26 @@ const {
   SIDES,
 } = require('./high-school-import-sanitizer');
 
+// Slice 2D opponent ingestion outcome vocabulary. Deliberately NOT customer-
+// facing analysis language: these describe how far ingestion got, not whether
+// scouting analysis is ready. 2E-2I consumers branch on these.
+//
+//   captured                 source schedule/game observations were stored
+//   validated                everything captured passed applicable validation
+//   published_schedule_only  valid schedule knowledge exists, but no completed
+//                            game is eligible for statistical reconstruction
+//   published_verified       at least one completed game was reconstructed and
+//                            the verified generation was atomically published
+//   failed                   validation or publication failed; any previously
+//                            verified generation is preserved unchanged
+const OPPONENT_INGEST_STATES = Object.freeze({
+  CAPTURED: 'captured',
+  VALIDATED: 'validated',
+  PUBLISHED_SCHEDULE_ONLY: 'published_schedule_only',
+  PUBLISHED_VERIFIED: 'published_verified',
+  FAILED: 'failed',
+});
+
 function createHighSchoolImportService({ repository }) {
   if (!repository) {
     throw importError('INVALID_SERVICE_DEPENDENCY', 'createHighSchoolImportService requires an injected repository', { statusCode: 500 });
@@ -443,6 +463,41 @@ function createHighSchoolImportService({ repository }) {
   // malformed, or unauthorized collection makes ZERO publication calls. The
   // whole publication is one transaction inside the RPC; there is no
   // application-side multi-statement publication path.
+  async function startOpponentImportRun({ orgId, programId, seasonId, opponentTeamId, sourceTeamId, triggerKind, config }) {
+    requireUuid(orgId, 'orgId');
+    requireUuid(programId, 'programId');
+    requireUuid(seasonId, 'seasonId');
+    requireUuid(opponentTeamId, 'opponentTeamId');
+    requireUuid(sourceTeamId, 'sourceTeamId');
+    requireEnum(triggerKind, TRIGGER_KINDS, 'triggerKind');
+    return repository.createOpponentImportRun({
+      orgId, programId, seasonId, opponentTeamId, sourceTeamId,
+      sourceProvider: 'gamechanger',
+      triggerKind,
+      config: config !== undefined ? sanitizeJsonPayload(config, 'config') : {},
+    });
+  }
+
+  async function failOpponentImportRun({ orgId, opponentImportRunId, failureStage, errorSummary }) {
+    requireUuid(orgId, 'orgId');
+    requireUuid(opponentImportRunId, 'opponentImportRunId');
+    optionalEnum(failureStage, FAILURE_STAGES, 'failureStage');
+    return repository.failOpponentImportRun({
+      orgId, opponentImportRunId, failureStage: failureStage ?? null, errorSummary: errorSummary ?? null,
+    });
+  }
+
+  // Resolves the reviewed source identity that authorises opponent ingestion.
+  // Returns null unless a CURRENTLY linked row exists, so pending, needs_review,
+  // rejected and superseded identities are all reported rather than assumed.
+  async function getLinkedOpponentSource({ orgId, programId, opponentTeamId, seasonId }) {
+    requireUuid(orgId, 'orgId');
+    requireUuid(programId, 'programId');
+    requireUuid(opponentTeamId, 'opponentTeamId');
+    requireUuid(seasonId, 'seasonId');
+    return repository.getLinkedOpponentSource({ orgId, programId, opponentTeamId, seasonId });
+  }
+
   async function ingestOpponentGameCollection({ orgId, programId, seasonId, opponentTeamId, opponentImportRunId, sourceTeamId, capturedGames }) {
     const orgIdValue = requireUuid(orgId, 'orgId');
     const programIdValue = requireUuid(programId, 'programId');
@@ -487,7 +542,20 @@ function createHighSchoolImportService({ repository }) {
     });
 
     const generation = await repository.persistEngineCollection(dto);
+    // The publication state is derived by the database from what was actually
+    // reconstructed, never from anything the caller asserted, so this reports
+    // back what was really published rather than what was requested.
+    const publicationState = generation.publication_state
+      || (generation.final_game_count > 0 ? 'verified' : 'schedule_only');
     return {
+      state: publicationState === 'verified' ? OPPONENT_INGEST_STATES.PUBLISHED_VERIFIED
+        : OPPONENT_INGEST_STATES.PUBLISHED_SCHEDULE_ONLY,
+      publicationState,
+      scheduleCaptured: true,
+      eligibleForVerifiedPublication: finalGameCount > 0,
+      verifiedGenerationPublished: publicationState === 'verified',
+      priorVerifiedGenerationPreserved: false,
+      manualReconciliationRequired: false,
       generation,
       payloadBytes,
       finalGameCount,
@@ -516,6 +584,9 @@ function createHighSchoolImportService({ repository }) {
     publishPlayerAdvancedStats,
     publishPitcherAdvancedStats,
     persistEngineCollection,
+    startOpponentImportRun,
+    failOpponentImportRun,
+    getLinkedOpponentSource,
     ingestOpponentGameCollection,
     deriveGameConfidenceAndStatus,
     invertRowOwnershipForReconstruction,
@@ -532,4 +603,5 @@ module.exports = {
   createHighSchoolImportService,
   createHighSchoolImportRepository,
   IMPORT_RUN_STATUSES,
+  OPPONENT_INGEST_STATES,
 };

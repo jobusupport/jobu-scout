@@ -686,6 +686,9 @@ function createHighSchoolImportRepository(adminClient) {
     ['opponent_source_link_not_linked', 'OPPONENT_SOURCE_LINK_NOT_LINKED', 409],
     ['opponent_identity_unresolved', 'OPPONENT_IDENTITY_UNRESOLVED', 409],
     ['invalid_opponent_import_run_state', 'INVALID_OPPONENT_IMPORT_RUN_STATE', 409],
+    // A later incomplete capture tried to replace a generation that already
+    // carried verified statistics. Fails closed; the prior generation stays current.
+    ['opponent_completeness_regression', 'OPPONENT_COMPLETENESS_REGRESSION', 409],
   ];
 
   // Slice 2D widened the RPC's return from a bare hs_stat_generations row to a

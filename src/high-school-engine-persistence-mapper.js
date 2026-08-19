@@ -128,6 +128,14 @@ const OPPONENT_GAME_STATUSES = new Set([
   'scheduled', 'in_progress', 'final', 'postponed', 'cancelled', 'suspended', 'unknown',
 ]);
 
+// Strips the capture timestamp so identity is decided by WHAT the source said,
+// never by WHEN it was read. Used only by the opponent mapper; the own-team
+// collection contract is unchanged.
+function withoutCaptureTime(game) {
+  const { capturedAt: _capturedAt, ...meta } = game?.meta || {};
+  return { ...game, meta };
+}
+
 function opponentGameStatusFor(game, index) {
   const raw = meaningful(game?.meta?.gameStatus);
   if (!raw) return 'unknown';
@@ -353,11 +361,22 @@ function opponentNameFor(game) {
 function observationsFor(games, rawGames, reconstruction, engineVersion, includeGameStatus = false) {
   const occurrenceByFingerprint = new Map();
   const observationOrdinalByFingerprint = new Map();
-  const entries = games.map((game, index) => ({ game, rawGame: rawGames[index], fingerprint: canonicalSerialize(game) }));
-  entries.sort((a, b) => codePointCompare(a.fingerprint, b.fingerprint));
-  return entries.map(({ game, rawGame, fingerprint }) => {
-    const ordinal = (observationOrdinalByFingerprint.get(fingerprint) || 0) + 1;
-    observationOrdinalByFingerprint.set(fingerprint, ordinal);
+  // `fingerprint` must stay exactly as the engine computed it, because it is
+  // what correlates an observation back to its engine result. `stableKey` is a
+  // separate, capture-time-free projection used only to derive the observation
+  // key, so an unchanged opponent re-scrape produces the same observation keys
+  // instead of a brand-new set every night. For an own-team collection the two
+  // are identical, so Slice 2C observation keys are unchanged.
+  const entries = games.map((game, index) => ({
+    game,
+    rawGame: rawGames[index],
+    fingerprint: canonicalSerialize(game),
+    stableKey: includeGameStatus ? canonicalSerialize(withoutCaptureTime(game)) : canonicalSerialize(game),
+  }));
+  entries.sort((a, b) => codePointCompare(a.stableKey, b.stableKey) || codePointCompare(a.fingerprint, b.fingerprint));
+  return entries.map(({ game, rawGame, fingerprint, stableKey }) => {
+    const ordinal = (observationOrdinalByFingerprint.get(stableKey) || 0) + 1;
+    observationOrdinalByFingerprint.set(stableKey, ordinal);
     const result = gameResultForFingerprint(reconstruction.gameResults, fingerprint, occurrenceByFingerprint);
     const identity = result.identity;
     const reconciliation = identity.reconciliation || {};
@@ -367,7 +386,7 @@ function observationsFor(games, rawGames, reconstruction, engineVersion, include
       { kind: 'box_score', sourceRef, capturedAt, payload: rawGame.boxScore || {}, integrityHash: sha256(rawGame.boxScore || {}) },
       { kind: 'play_by_play', sourceRef, capturedAt, payload: rawGame.plays || [], integrityHash: sha256(rawGame.plays || []) },
     ];
-    const observationKey = sha256(canonicalSerialize([fingerprint, ordinal]));
+    const observationKey = sha256(canonicalSerialize([stableKey, ordinal]));
     return {
       observationKey,
       sourceGameRef: sourceRef,
@@ -536,9 +555,16 @@ function mapHighSchoolOpponentEngineCollection({ context, subject, capturedGames
   // subject's identity evidence participates so two different opponents can
   // never collide on one input-set hash; capture timestamps and JSON key order
   // deliberately do not.
+  //
+  // WHEN the source was read is provenance, not content. An opponent schedule is
+  // re-scraped on a schedule, so if capture time participated here every
+  // unchanged re-scrape would hash differently, mint a brand-new generation, and
+  // supersede the previous one for no reason. The capture time is still recorded
+  // on every snapshot row, so the evidence of when each observation was taken is
+  // fully preserved -- it simply does not decide identity.
   const inputSetHash = sha256({
     subject: [trustedSubject.kind, trustedSubject.opponentTeamId, trustedSubject.sourceTeamId],
-    games: safeGames.map(canonicalSerialize).sort(codePointCompare),
+    games: safeGames.map((game) => canonicalSerialize(withoutCaptureTime(game))).sort(codePointCompare),
     gameStatuses: [...gameStatuses].sort(codePointCompare),
   });
   const finalGameCount = gameStatuses.filter((status) => status === 'final').length;
@@ -560,7 +586,27 @@ function mapHighSchoolOpponentEngineCollection({ context, subject, capturedGames
       && finalGameCount > 0,
   };
   const { importRunId, ...subjectContent } = trustedSubject;
-  return { ...finalizeDto(base, { ...base, subject: subjectContent }), finalGameCount };
+  // The content hash is taken over the same provenance-free projection, so an
+  // unchanged re-scrape is recognised as the collection it already is rather
+  // than reported as a content conflict.
+  //
+  // Two fields are projected out. `snapshots[].capturedAt` is the capture time
+  // itself. `diagnostics` carries digests the engine derived from fingerprints
+  // that embed that same capture time, so it moves for the same reason. Neither
+  // says anything about what the source actually reported: the games themselves
+  // are already pinned by inputSetHash, and identity, validation, statuses,
+  // totals and player lines all remain inside the content hash, so a genuine
+  // content conflict at the same input set is still detected. Both fields are
+  // still stored in full on the rows they belong to.
+  const contentBase = {
+    ...base,
+    subject: subjectContent,
+    observations: observations.map(({ diagnostics: _diagnostics, ...observation }) => ({
+      ...observation,
+      snapshots: observation.snapshots.map(({ capturedAt: _capturedAt, ...snapshot }) => snapshot),
+    })),
+  };
+  return { ...finalizeDto(base, contentBase), finalGameCount };
 }
 
 module.exports = {
