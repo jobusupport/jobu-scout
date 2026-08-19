@@ -705,3 +705,296 @@ test('a wrapper collision cannot retire a prior verified generation', { skip }, 
   assert.equal(current.rows[0].id, verifiedId, 'the prior verified generation remains current');
   assert.equal(current.rows[0].final_game_count, 2);
 });
+
+// ── Production-shaped date proofs (HS 2D date-attribution correction) ───
+//
+// Before this correction, driving twoDateGroupsTwoGamesEach through this exact
+// path produced:
+//   grp-a=2026-04-11  grp-b=null  grp-c=2026-04-18  grp-d=2026-04-11
+// grp-d belongs to April 18 and was handed the PREVIOUS group's date, inside a
+// generation reporting officialTotalsComplete. Reversing the DOM moved the
+// wrong date onto grp-c and minted a different generation from identical source
+// content. These drive the registered route -> real extractor -> collector ->
+// mapper -> validation -> repository -> local persist_hs_engine_collection and
+// prove every one of those symptoms is gone.
+
+const datesFor = async (opponentTeamId) => {
+  const rows = await db.query(
+    `select source_game_ref, game_date from public.hs_opponent_games
+      where opponent_team_id = $1 order by source_game_ref`, [opponentTeamId]);
+  return Object.fromEntries(rows.rows.map((r) => [r.source_game_ref, r.game_date && r.game_date.toISOString().slice(0, 10)]));
+};
+
+test('every game in a date group is published with its OWN group date, never its neighbour\'s', { skip }, async () => {
+  const tenant = await buildTenant('dtgrp');
+  const app = buildApp(tenant, { html: fixtures.twoDateGroupsTwoGamesEach });
+  const res = await startRun(app, tenant);
+  assert.equal(res.status, 201, JSON.stringify(res.body));
+
+  const summary = app.locals.lastSummary;
+  assert.equal(summary.state, 'published_verified');
+  assert.equal(summary.finalGameCount, 4, 'all four games survive extraction and capture');
+
+  assert.deepEqual(await datesFor(tenant.opponentTeamId), {
+    'grp-a': '2026-04-11', 'grp-b': '2026-04-11',
+    'grp-c': '2026-04-18', 'grp-d': '2026-04-18',
+  }, 'grp-d is an April 18 game and must never carry April 11 into hs_opponent_games');
+
+  // Raw evidence keeps the text the source actually rendered.
+  const evidence = await db.query(
+    `select source_game_ref, observed_game_date, diagnostics #>> '{dateResolution,status}' as status,
+            diagnostics #>> '{dateResolution,rawText}' as raw
+       from public.hs_opponent_import_run_games
+      where opponent_import_run_id = $1 order by source_game_ref`, [summary.importRunId || res.body.opponentImportRun.id]);
+  assert.equal(evidence.rows.length, 4);
+  for (const row of evidence.rows) {
+    assert.equal(row.status, 'resolved_date_group', `${row.source_game_ref} records how its date was established`);
+    assert.match(row.raw, /^Apr 1[18], 2026$/, `${row.source_game_ref} preserves the source date text`);
+  }
+});
+
+test('reversing games or whole date groups changes no date and mints no generation', { skip }, async () => {
+  const tenant = await buildTenant('dtrev');
+  const forwards = buildApp(tenant, { html: fixtures.twoDateGroupsTwoGamesEach });
+  await startRun(forwards, tenant);
+  const first = forwards.locals.lastSummary;
+  assert.equal(first.state, 'published_verified');
+  const baseline = await datesFor(tenant.opponentTeamId);
+
+  const hashes = await db.query(
+    'select input_set_hash, content_hash from public.hs_opponent_stat_generations where id = $1', [first.generationId]);
+
+  for (const [label, html] of [
+    ['games reversed within each group', fixtures.twoDateGroupsGamesReversedWithinGroups],
+    ['whole groups reversed', fixtures.twoDateGroupsGroupOrderReversed],
+  ]) {
+    const variant = buildApp(tenant, { html });
+    await startRun(variant, tenant);
+    assert.equal(variant.locals.lastSummary.generationId, first.generationId,
+      `${label}: identical source content must not mint a new generation`);
+    assert.deepEqual(await datesFor(tenant.opponentTeamId), baseline,
+      `${label}: every game keeps its own date`);
+  }
+
+  const after = await db.query(
+    `select id, input_set_hash, content_hash from public.hs_opponent_stat_generations
+      where opponent_team_id = $1`, [tenant.opponentTeamId]);
+  assert.equal(after.rows.length, 1, 'exactly one generation exists across all three orderings');
+  assert.equal(after.rows[0].input_set_hash, hashes.rows[0].input_set_hash, 'DOM order does not move the input-set hash');
+  assert.equal(after.rows[0].content_hash, hashes.rows[0].content_hash, 'nor the content hash');
+});
+
+test('cosmetic date formatting does not mint a new generation', { skip }, async () => {
+  const tenant = await buildTenant('dtfmt');
+  const plain = buildApp(tenant, { html: fixtures.dateGroupTwoCompleted });
+  await startRun(plain, tenant);
+  const first = plain.locals.lastSummary;
+  assert.equal(first.state, 'published_verified');
+
+  const varied = buildApp(tenant, { html: fixtures.dateFormatAndWhitespaceVariation });
+  await startRun(varied, tenant);
+  assert.equal(varied.locals.lastSummary.generationId, first.generationId,
+    '"Saturday,   April   11,    2026" is the same day, so it is the same generation');
+  const generations = await db.query(
+    'select count(*)::int c from public.hs_opponent_stat_generations where opponent_team_id = $1', [tenant.opponentTeamId]);
+  assert.equal(generations.rows[0].c, 1);
+});
+
+test('a genuine reschedule moves the date and creates the next generation without losing identity', { skip }, async () => {
+  const tenant = await buildTenant('dtresc');
+  const before = buildApp(tenant, { html: fixtures.rescheduledStableIdBefore });
+  await startRun(before, tenant);
+  assert.equal(before.locals.lastSummary.state, 'published_schedule_only',
+    'two unplayed games are schedule knowledge, never a verified statistical generation');
+  assert.deepEqual(await datesFor(tenant.opponentTeamId), { 'resched-1': '2026-04-10', 'resched-2': '2026-04-10' });
+
+  const after = buildApp(tenant, { html: fixtures.rescheduledStableIdAfter });
+  await startRun(after, tenant);
+  assert.equal(after.locals.lastSummary.state, 'published_verified');
+  assert.notEqual(after.locals.lastSummary.generationId, before.locals.lastSummary.generationId,
+    'a real change in what the source reported is a real new generation');
+  assert.deepEqual(await datesFor(tenant.opponentTeamId), { 'resched-1': '2026-04-17', 'resched-2': '2026-04-17' },
+    'the date follows the source');
+  const games = await db.query(
+    'select count(*)::int c from public.hs_opponent_games where opponent_team_id = $1', [tenant.opponentTeamId]);
+  assert.equal(games.rows[0].c, 2, 'the stable upstream ids kept the same two canonical games');
+});
+
+test('a doubleheader under one header publishes both halves on that date', { skip }, async () => {
+  const tenant = await buildTenant('dtdh');
+  const app = buildApp(tenant, { html: fixtures.doubleheaderUnderOneDateHeader });
+  await startRun(app, tenant);
+  assert.equal(app.locals.lastSummary.state, 'published_verified');
+  assert.equal(app.locals.lastSummary.finalGameCount, 2);
+  assert.deepEqual(await datesFor(tenant.opponentTeamId), { 'dh-one': '2026-04-11', 'dh-two': '2026-04-11' });
+});
+
+// ── Unsafe dates fail closed and preserve verified history ─────────────
+
+test('an ambiguous or conflicting date publishes nothing and preserves the prior verified generation', { skip }, async () => {
+  const tenant = await buildTenant('dtfail');
+  const good = buildApp(tenant, { html: fixtures.dateGroupTwoCompleted });
+  await startRun(good, tenant);
+  const verified = good.locals.lastSummary;
+  assert.equal(verified.state, 'published_verified');
+
+  for (const [label, html, reason] of [
+    ['a header naming two dates', fixtures.dateGroupWithTwoDatesInHeader, 'date_evidence_is_ambiguous'],
+    ['a row contradicting its group', fixtures.groupDateWithConflictingGameDate, 'date_conflicts_with_date_group'],
+    ['a scheduled game with no date at all', fixtures.dateGroupWithUnrecognizableHeader, 'scheduled_game_without_a_date'],
+  ]) {
+    const bad = buildApp(tenant, { html });
+    const res = await startRun(bad, tenant);
+    assert.equal(res.status, 201, `${label}: the run resource is still created`);
+    const summary = bad.locals.lastSummary;
+    assert.equal(summary.state, 'failed', `${label}: the collection fails closed`);
+    assert.equal(summary.failureReason, 'opponent_schedule_date_unresolved', `${label}: with a named reason`);
+    assert.ok(summary.unsafeScheduleDates.some((row) => row.reason === reason),
+      `${label}: the diagnostic identifies ${reason}`);
+    assert.equal(summary.manualReconciliationRequired, true);
+    assert.equal(summary.priorVerifiedGenerationPreserved, true);
+    assert.equal(bad.locals.trace.some(([kind]) => kind === 'collect'), false,
+      `${label}: nothing is even captured once the date is known to be unsafe`);
+  }
+
+  const current = await db.query(
+    `select id, final_game_count from public.hs_opponent_stat_generations
+      where opponent_team_id = $1 and is_current`, [tenant.opponentTeamId]);
+  assert.equal(current.rowCount, 1);
+  assert.equal(current.rows[0].id, verified.generationId, 'the prior verified generation remains current');
+  assert.equal(current.rows[0].final_game_count, 2, 'and still reports both completed games');
+  assert.deepEqual(await datesFor(tenant.opponentTeamId), { 'done-alpha': '2026-04-11', 'done-bravo': '2026-04-11' },
+    'no rejected candidate wrote a date onto a canonical game');
+});
+
+test('a completed game with a stable id but no date is still publishable; an unidentified one is not', { skip }, async () => {
+  // gameOutsideAnyDateGroup has one dated game and one completed game whose date
+  // the source never expressed. The undated one carries a stable upstream id, so
+  // it is anchored and publishable with a null date.
+  const tenant = await buildTenant('dtnull');
+  const app = buildApp(tenant, { html: fixtures.gameOutsideAnyDateGroup });
+  await startRun(app, tenant);
+  assert.equal(app.locals.lastSummary.state, 'published_verified');
+  assert.deepEqual(await datesFor(tenant.opponentTeamId), { 'grouped-b': '2026-04-18', 'loose-a': null },
+    'the null says exactly what the source said, and nothing was invented');
+
+  // A visible schedule anchor with no game id segment has neither a durable
+  // identity nor a date it could fall back on.
+  const orphan = await buildTenant('dtorph');
+  const bad = buildApp(orphan, { html: fixtures.anchorWithNoGameIdSegment });
+  await startRun(bad, orphan);
+  assert.equal(bad.locals.lastSummary.state, 'failed');
+  const games = await db.query(
+    'select count(*)::int c from public.hs_opponent_games where opponent_team_id = $1', [orphan.opponentTeamId]);
+  assert.equal(games.rows[0].c, 0, 'no phantom canonical game row is created');
+});
+
+// ── The same rules inside the SECURITY INVOKER boundary ────────────────
+
+function directDtoFor(tenant, run, over = {}) {
+  const { mapHighSchoolOpponentEngineCollection } = require('../src/high-school-engine-persistence-mapper');
+  return mapHighSchoolOpponentEngineCollection({
+    context: { orgId: tenant.orgId, programId: tenant.programId, seasonId: tenant.seasonId, sourceProvider: 'gamechanger' },
+    subject: { opponentTeamId: tenant.opponentTeamId, sourceTeamId: tenant.sourceTeamId, importRunId: run.id },
+    capturedGames: [{
+      meta: {
+        gameDate: '2026-04-01', homeTeam: 'Opp', awayTeam: 'Third', ourSide: 'home',
+        capturedAt: '2026-04-01T20:00:00.000Z', gameStatus: 'final', sourceGameId: `direct-${tenant.s}`,
+        dateResolutionStatus: 'resolved_date_group', dateSourceKind: 'date_group', rawDateText: 'Apr 1, 2026',
+        ...over,
+      },
+      boxScore: {
+        batting: [
+          { Player: 'A', TeamSide: 'home', own: true, playerId: 'p1' },
+          { Player: 'B', TeamSide: 'away', own: false, playerId: 'p2' },
+        ],
+        pitching: [],
+      },
+      plays: [{ inning: 'Bottom 1', batterId: 'p1', text: 'Single. A singles to left field, C pitching.' }],
+    }],
+  });
+}
+
+test('the mapper refuses to build a collection whose date the source did not establish', { skip }, async () => {
+  const tenant = await buildTenant('mapdate');
+  const run = await importService.startOpponentImportRun({
+    orgId: tenant.orgId, programId: tenant.programId, seasonId: tenant.seasonId,
+    opponentTeamId: tenant.opponentTeamId, sourceTeamId: tenant.sourceTeamId, triggerKind: 'manual',
+  });
+  for (const over of [
+    { dateResolutionStatus: 'ambiguous', gameDate: null },
+    { dateResolutionStatus: 'conflicting', gameDate: null },
+    { gameDate: null, gameStatus: 'scheduled' },
+  ]) {
+    assert.throws(() => directDtoFor(tenant, run, over),
+      (error) => error.code === 'OPPONENT_SCHEDULE_DATE_UNRESOLVED',
+      `${JSON.stringify(over)} must not be mappable into a publishable collection`);
+  }
+});
+
+test('the database refuses an unsafe date even when the application checks are bypassed', { skip }, async () => {
+  const tenant = await buildTenant('dbdate');
+  const { createHighSchoolImportRepository } = require('../src/high-school-import-repository');
+  const repository = createHighSchoolImportRepository(admin);
+  const run = await importService.startOpponentImportRun({
+    orgId: tenant.orgId, programId: tenant.programId, seasonId: tenant.seasonId,
+    opponentTeamId: tenant.opponentTeamId, sourceTeamId: tenant.sourceTeamId, triggerKind: 'manual',
+  });
+
+  // Built through the mapper so every other field is genuinely well formed, then
+  // mutated the way a privileged caller assembling its own DTO could.
+  const ambiguous = directDtoFor(tenant, run).dto;
+  ambiguous.observations[0].diagnostics.dateResolution.status = 'ambiguous';
+  await assert.rejects(
+    () => repository.persistEngineCollection(ambiguous),
+    (error) => error.code === 'OPPONENT_SCHEDULE_DATE_UNRESOLVED',
+    'the SECURITY INVOKER boundary refuses an explicitly ambiguous date',
+  );
+
+  const undated = directDtoFor(tenant, run).dto;
+  undated.observations[0].gameDate = null;
+  undated.observations[0].gameStatus = 'scheduled';
+  await assert.rejects(
+    () => repository.persistEngineCollection(undated),
+    (error) => error.code === 'OPPONENT_SCHEDULE_DATE_UNRESOLVED',
+    'nor an unplayed game with no date to anchor it',
+  );
+
+  for (const table of ['hs_opponent_stat_generations', 'hs_opponent_games']) {
+    const rows = await db.query(
+      `select count(*)::int c from public.${table} where opponent_team_id = $1`, [tenant.opponentTeamId]);
+    assert.equal(rows.rows[0].c, 0, `${table}: the transaction rolled back completely`);
+  }
+});
+
+test('the database refuses an unresolved identity, so no phantom game accumulates', { skip }, async () => {
+  const tenant = await buildTenant('dbident');
+  const { createHighSchoolImportRepository } = require('../src/high-school-import-repository');
+  const repository = createHighSchoolImportRepository(admin);
+  const run = await importService.startOpponentImportRun({
+    orgId: tenant.orgId, programId: tenant.programId, seasonId: tenant.seasonId,
+    opponentTeamId: tenant.opponentTeamId, sourceTeamId: tenant.sourceTeamId, triggerKind: 'manual',
+  });
+
+  // An observation the engine could not resolve matches nothing, so before this
+  // guard every run inserted another canonical row for the same non-game.
+  const runTwice = async () => {
+    const dto = directDtoFor(tenant, run).dto;
+    dto.observations[0].identityMethod = 'unresolvedScoped';
+    dto.observations[0].sourceGameRef = null;
+    await assert.rejects(
+      () => repository.persistEngineCollection(dto),
+      (error) => error.code === 'OPPONENT_IDENTITY_UNRESOLVED',
+      'the SECURITY INVOKER boundary refuses an unresolvable identity',
+    );
+  };
+  await runTwice();
+  await runTwice();
+
+  const games = await db.query(
+    'select count(*)::int c from public.hs_opponent_games where opponent_team_id = $1', [tenant.opponentTeamId]);
+  assert.equal(games.rows[0].c, 0, 'replay creates no duplicates because nothing is created at all');
+  const generations = await db.query(
+    'select count(*)::int c from public.hs_opponent_stat_generations where opponent_team_id = $1', [tenant.opponentTeamId]);
+  assert.equal(generations.rows[0].c, 0);
+});

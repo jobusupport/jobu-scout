@@ -40,6 +40,71 @@ const { OPPONENT_INGEST_STATES } = require('./high-school-import-service');
 
 const FINAL_STATUS = 'final';
 const COLLECTABLE_STATUSES = new Set([FINAL_STATUS]);
+
+// ── Which date resolutions may be published ─────────────────────────────
+//
+// The extractor reports HOW each row's date was established. A date it could
+// not establish safely must never reach a published schedule or a verified
+// generation: an incorrect opponent game date silently misfiles a real result,
+// and -- because gameDate is inside both inputSetHash and contentHash -- it also
+// mints a generation that can supersede a correct one.
+//
+// 'not_expressed' is the one absence that is sometimes safe. A COMPLETED game
+// carrying a stable upstream id keeps its identity from that id, so publishing
+// it with a null date states exactly what the source said. A game with no
+// durable identity, or a game that has not been played yet, has nothing to
+// anchor it: a schedule entry whose date is unknown is not schedule knowledge,
+// so the collection fails closed instead.
+const DATE_RESOLUTION_UNKNOWN = 'unknown';
+const UNSAFE_DATE_RESOLUTIONS = new Set(['ambiguous', 'conflicting']);
+
+// Returns the reason this row's date makes the collection unpublishable, or
+// null when it is safe.
+//
+// The test is about the DATE, not about who reported it: evidence explicitly
+// marked ambiguous or conflicting is rejected outright, and after that a row
+// either has a date or it does not. That keeps the rule identical for the real
+// extractor and for any other producer, and means declaring provenance can
+// never be a way to get a worse date accepted.
+function unsafeDateReason(entry) {
+  const status = entry?.dateResolutionStatus || DATE_RESOLUTION_UNKNOWN;
+  if (UNSAFE_DATE_RESOLUTIONS.has(status)) {
+    return status === 'conflicting' ? 'date_conflicts_with_date_group' : 'date_evidence_is_ambiguous';
+  }
+  if (entry?.gameDate) return null;
+  // No date at all. A COMPLETED game with a stable upstream id is anchored by
+  // that id and may be published saying exactly what the source said. Anything
+  // else -- an unidentified row, or a game that has not been played yet -- has
+  // nothing to anchor it and is not schedule knowledge.
+  if (!entry?.sourceGameRef) return 'no_durable_identity_and_no_date';
+  if (entry?.gameStatus !== FINAL_STATUS) return 'scheduled_game_without_a_date';
+  return null;
+}
+
+// Collects every row whose date cannot be published, with enough detail for a
+// reviewer to see what the source actually said. Sorted so the diagnostic is
+// identical however the source ordered the rows in the DOM.
+function detectUnsafeScheduleDates(entries) {
+  return entries
+    .map((entry) => ({ entry, reason: unsafeDateReason(entry) }))
+    .filter(({ reason }) => reason !== null)
+    .map(({ entry, reason }) => ({
+      reason,
+      sourceGameRef: entry.sourceGameRef || null,
+      sourceRowIndex: entry.sourceRowIndex,
+      gameStatus: entry.gameStatus,
+      dateResolutionStatus: entry.dateResolutionStatus || DATE_RESOLUTION_UNKNOWN,
+      dateSourceKind: entry.dateSourceKind || 'none',
+      rawDateText: entry.rawDateText || null,
+      dateConflict: entry.dateConflict || null,
+    }))
+    .sort((a, b) => (
+      String(a.sourceGameRef) < String(b.sourceGameRef) ? -1
+        : String(a.sourceGameRef) > String(b.sourceGameRef) ? 1
+          : (a.sourceRowIndex ?? 0) - (b.sourceRowIndex ?? 0)
+    ));
+}
+
 const KNOWN_STATUSES = new Set([
   'scheduled', 'in_progress', 'final', 'postponed', 'cancelled', 'suspended', 'unknown',
 ]);
@@ -66,6 +131,13 @@ function buildScheduleOnlyCapturedGame(entry, capturedAt) {
       ourSide: 'home',
       gameStatus: entry.gameStatus,
       capturedAt,
+      // How this date was established, and the text it came from. The status is
+      // semantic and participates in the input-set hash; rawDateText is
+      // formatting-sensitive provenance and is projected out of every hash by
+      // the mapper, so a cosmetic source change cannot mint a generation.
+      dateResolutionStatus: entry.dateResolutionStatus || null,
+      dateSourceKind: entry.dateSourceKind || null,
+      rawDateText: entry.rawDateText || null,
       ...(entry.startTime ? { startTime: entry.startTime } : {}),
       ...(entry.venue ? { venue: entry.venue } : {}),
       ...(Number.isFinite(entry.gameNumber) ? { gameNumber: entry.gameNumber } : {}),
@@ -100,6 +172,13 @@ function buildOpponentCapturedGame(gameData, entry, capturedAt) {
       ourSide: side,
       gameStatus: entry.gameStatus,
       capturedAt,
+      // Schedule-side date provenance, recorded even though a captured game's
+      // own page may supply the authoritative gameDate: the collection only
+      // reaches here because the schedule date resolved safely, and keeping the
+      // evidence makes that checkable after the fact.
+      dateResolutionStatus: entry.dateResolutionStatus || null,
+      dateSourceKind: entry.dateSourceKind || null,
+      rawDateText: entry.rawDateText || null,
       ...(entry.startTime ? { startTime: entry.startTime } : {}),
       ...(entry.venue ? { venue: entry.venue } : {}),
       ...(Number.isFinite(entry.gameNumber) ? { gameNumber: entry.gameNumber } : {}),
@@ -137,6 +216,14 @@ function toOpponentScheduleEntry(row) {
     venue: row.venue || null,
     gameNumber: Number.isFinite(row.gameNumber) ? row.gameNumber : null,
     rawStatusText: row.rawStatusText || null,
+    // How the date was established, carried so an unsafe one can fail closed
+    // with a reason rather than being published or silently dropped. The status
+    // is canonical (it decides publishability); rawDateText and the conflict
+    // detail are provenance only.
+    dateResolutionStatus: row.dateResolutionStatus || DATE_RESOLUTION_UNKNOWN,
+    dateSourceKind: row.dateSourceKind || 'none',
+    rawDateText: row.rawDateText || null,
+    dateConflict: row.dateConflict || null,
     // Provenance carried only so a collision can be explained; never hashed,
     // never canonical identity.
     sourceRowIndex: Number.isFinite(row.visibleIndex) ? row.visibleIndex : null,
@@ -196,6 +283,7 @@ function summarizeForLog(summary) {
     generationId: summary.generationId || null,
     publicationState: summary.publicationState || null,
     identityCollisionCount: (summary.identityCollisions || []).length,
+    unsafeScheduleDateCount: (summary.unsafeScheduleDates || []).length,
     stopped: summary.stopped,
   };
 }
@@ -227,6 +315,7 @@ async function runOpponentImportCollection({
     stopped: null,
     failureReason: null,
     identityCollisions: [],
+    unsafeScheduleDates: [],
   };
 
   const failRun = async (stage, message) => {
@@ -272,6 +361,10 @@ async function runOpponentImportCollection({
     gameNumber: Number.isFinite(entry?.gameNumber) ? entry.gameNumber : null,
     homeAway: entry?.homeAway || null,
     rawStatusText: entry?.rawStatusText || null,
+    dateResolutionStatus: entry?.dateResolutionStatus || DATE_RESOLUTION_UNKNOWN,
+    dateSourceKind: entry?.dateSourceKind || 'none',
+    rawDateText: entry?.rawDateText || null,
+    dateConflict: entry?.dateConflict || null,
     // Provenance for collision diagnostics. Never hashed, never canonical
     // identity -- it exists only so a reviewer can see WHICH source rows
     // collided.
@@ -301,6 +394,28 @@ async function runOpponentImportCollection({
     });
     await failRun('discovery',
       `Two or more distinct schedule rows claim the same source game identity (${collisions.map((c) => c.sourceGameRef).join(', ')}); no generation was published.`);
+    return summary;
+  }
+
+  // Evaluated in the same place and for the same reason as the collision gate
+  // above: before ANY capture or publication, because a date this collection
+  // cannot establish safely would otherwise be written onto a canonical game
+  // row and mint a generation able to supersede a correct one. Failing here
+  // leaves whatever verified generation already exists exactly as it was.
+  const unsafeDates = detectUnsafeScheduleDates(normalized);
+  if (unsafeDates.length > 0) {
+    summary.failureReason = 'opponent_schedule_date_unresolved';
+    summary.unsafeScheduleDates = unsafeDates;
+    summary.manualReconciliationRequired = true;
+    summary.priorVerifiedGenerationPreserved = true;
+    onProgress({
+      type: 'schedule_date_unresolved',
+      unresolved: unsafeDates.map((row) => ({ sourceGameRef: row.sourceGameRef, reason: row.reason })),
+    });
+    await failRun('discovery',
+      `The source schedule did not establish a usable date for ${unsafeDates.length} row(s) `
+      + `(${unsafeDates.map((row) => `${row.sourceGameRef || 'unidentified row'}: ${row.reason}`).join('; ')}); `
+      + 'no generation was published.');
     return summary;
   }
 
@@ -403,7 +518,8 @@ async function runOpponentImportCollection({
     summary.manualReconciliationRequired = err?.code === 'OPPONENT_COMPLETENESS_REGRESSION'
       || err?.code === 'OPPONENT_IDENTITY_UNRESOLVED'
       || err?.code === 'OPPONENT_SOURCE_EVENT_IDENTITY_COLLISION'
-      || err?.code === 'OPPONENT_SOURCE_LINK_NOT_LINKED';
+      || err?.code === 'OPPONENT_SOURCE_LINK_NOT_LINKED'
+      || err?.code === 'OPPONENT_SCHEDULE_DATE_UNRESOLVED';
     onProgress({ type: 'publication_failed', code: summary.failureReason });
     await failRun('publication', err?.message);
     return summary;
@@ -422,6 +538,8 @@ module.exports = {
   runOpponentImportCollection,
   toOpponentScheduleEntry,
   detectSourceEventIdentityCollisions,
+  detectUnsafeScheduleDates,
+  unsafeDateReason,
   buildOpponentCapturedGame,
   buildScheduleOnlyCapturedGame,
   normalizeStatus,

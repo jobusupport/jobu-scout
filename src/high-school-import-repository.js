@@ -692,6 +692,9 @@ function createHighSchoolImportRepository(adminClient) {
     // Two distinct observations claim one stable upstream game identity; the
     // collection could conceal a second real game, so nothing is published.
     ['opponent_source_event_identity_collision', 'OPPONENT_SOURCE_EVENT_IDENTITY_COLLISION', 409],
+    // An observation carries a date the source did not establish safely; a wrong
+    // opponent game date misfiles a real result, so nothing is published.
+    ['opponent_schedule_date_unresolved', 'OPPONENT_SCHEDULE_DATE_UNRESOLVED', 409],
   ];
 
   // Slice 2D widened the RPC's return from a bare hs_stat_generations row to a

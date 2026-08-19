@@ -128,11 +128,26 @@ const OPPONENT_GAME_STATUSES = new Set([
   'scheduled', 'in_progress', 'final', 'postponed', 'cancelled', 'suspended', 'unknown',
 ]);
 
-// Strips the capture timestamp so identity is decided by WHAT the source said,
-// never by WHEN it was read. Used only by the opponent mapper; the own-team
-// collection contract is unchanged.
+// The identity methods the publication RPC can actually match an opponent
+// observation against. Anything else ('unresolvedScoped') has no durable
+// reference and no sufficient schedule composite, so it can only ever create a
+// new canonical row rather than recognise an existing one.
+const APPROVED_OPPONENT_IDENTITY_METHODS = new Set(['sourceGameId', 'scheduleComposite']);
+
+// Strips the parts of a captured game that say WHEN or HOW it was read rather
+// than WHAT the source reported, so identity is decided by the source's claim
+// alone. `capturedAt` is the capture time. `rawDateText` is the literal date
+// string the page rendered: it is kept on the observation as evidence, but
+// re-typesetting "Apr 11, 2026" as "Saturday, April 11, 2026" is a cosmetic
+// change to the same day, and hashing it would mint a brand-new generation for
+// no semantic difference. The RESOLVED date and the resolution STATUS both stay
+// in, because those are what the source actually said and what decides whether
+// it may be published.
+//
+// Used only by the opponent mapper; the own-team collection contract is
+// unchanged and never carries these fields.
 function withoutCaptureTime(game) {
-  const { capturedAt: _capturedAt, ...meta } = game?.meta || {};
+  const { capturedAt: _capturedAt, rawDateText: _rawDateText, ...meta } = game?.meta || {};
   return { ...game, meta };
 }
 
@@ -402,7 +417,20 @@ function observationsFor(games, rawGames, reconstruction, engineVersion, include
       excludedFromOfficialTotals: result.excludedFromOfficialTotals === true,
       ambiguityComponentDigest: reconciliation.componentId ? sha256(reconciliation.componentId) : null,
       conflictFields: [...(reconciliation.conflictFields || [])].sort(codePointCompare),
-      diagnostics: { reconciliation: digestReconciliation(reconciliation) },
+      // `diagnostics` is stored in full on the run-game row and is projected out
+      // of the content hash, which makes it the right home for date provenance:
+      // the evidence survives for review without a cosmetic re-render of the
+      // source date being able to mint a generation.
+      diagnostics: {
+        reconciliation: digestReconciliation(reconciliation),
+        ...(includeGameStatus ? {
+          dateResolution: {
+            status: meaningful(game.meta?.dateResolutionStatus),
+            sourceKind: meaningful(game.meta?.dateSourceKind),
+            rawText: meaningful(game.meta?.rawDateText),
+          },
+        } : {}),
+      },
       diagnostic: result.diagnosticReconstruction || { status: 'not_run', code: null },
       validation: validationFor(result, reconstruction.summary),
       snapshots,
@@ -550,6 +578,63 @@ function mapHighSchoolOpponentEngineCollection({ context, subject, capturedGames
   if (canonicalPlayers.length > 0) {
     throw importError('OPPONENT_COLLECTION_FORBIDS_CANONICAL_PLAYERS',
       'An opponent collection cannot carry canonical players.', { statusCode: 500 });
+  }
+
+  // ── Nothing unresolvable may become a published opponent game ─────────
+  //
+  // An observation the engine could not resolve has neither a durable source
+  // reference nor a sufficient schedule composite, so the publication RPC has
+  // nothing to match it against: it would insert a BRAND NEW canonical game row
+  // on every single run, quietly accumulating phantom opponent games that
+  // inflate a coach's schedule and can never be reconciled back together.
+  // Capturing such a row as raw evidence is fine; publishing it is not.
+  const unresolved = observations
+    .map((observation, index) => ({ index, method: observation.identityMethod, ref: observation.sourceGameRef }))
+    .filter(({ method }) => !APPROVED_OPPONENT_IDENTITY_METHODS.has(method));
+  if (unresolved.length > 0) {
+    throw importError('OPPONENT_IDENTITY_UNRESOLVED',
+      'An opponent observation has no durable source identity and no sufficient schedule composite, '
+      + 'so it cannot be published as a canonical game; manual reconciliation is required.', {
+        statusCode: 422,
+        context: {
+          unresolvedObservations: unresolved.map(({ index, method, ref }) => ({
+            observationIndex: index, identityMethod: method, sourceGameRef: ref,
+          })),
+        },
+      });
+  }
+
+  // ── Nor may a date the source did not establish ──────────────────────
+  //
+  // The collector already refuses to reach here with an unsafe date. This is the
+  // same rule restated at the mapping boundary so a DIRECT caller assembling its
+  // own DTO cannot skip it, and it is restated a third time inside the
+  // publication RPC so a privileged caller cannot skip this one either.
+  const unsafeDates = observations
+    .map((observation, index) => ({
+      index,
+      ref: observation.sourceGameRef,
+      status: observation.diagnostics?.dateResolution?.status || null,
+      gameDate: observation.gameDate,
+      gameStatus: observation.gameStatus,
+    }))
+    .filter(({ status, gameDate, gameStatus, ref }) => {
+      if (status === 'ambiguous' || status === 'conflicting') return true;
+      if (gameDate) return false;
+      // No date: only a completed game with a durable reference may proceed.
+      return !ref || gameStatus !== 'final';
+    });
+  if (unsafeDates.length > 0) {
+    throw importError('OPPONENT_SCHEDULE_DATE_UNRESOLVED',
+      'An opponent observation carries a date the source did not establish safely, '
+      + 'so it cannot be published; manual reconciliation is required.', {
+        statusCode: 422,
+        context: {
+          unresolvedDates: unsafeDates.map(({ index, ref, status, gameStatus }) => ({
+            observationIndex: index, sourceGameRef: ref, dateResolutionStatus: status, gameStatus,
+          })),
+        },
+      });
   }
   // A season is a set of observations, not an arrival-order sequence. The
   // subject's identity evidence participates so two different opponents can
