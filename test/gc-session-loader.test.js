@@ -612,16 +612,54 @@ test('server.js startup: a real spawned process writes synthetic GC_AUTH_JSON co
     child.stderr.on('data', (c) => { output += String(c); });
 
     try {
+      // Writing the file and flushing the startup log line are SEPARATE events
+      // on separate channels, and neither implies the other has happened yet.
+      // Waiting only for the file and then asserting the log line was already
+      // present made this test fail under parallel load -- not because startup
+      // was wrong, but because the pipe had not been drained yet. Reading the
+      // file the instant it appears is the same race again: a partial write
+      // parses as invalid JSON. So each condition gets its own wait, both share
+      // one bounded deadline, and a timeout names the condition that did not
+      // hold rather than whichever assertion happened to run first.
       const deadline = Date.now() + 8000;
-      while (!fs.existsSync(target) && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 100));
-      }
-      assert.ok(fs.existsSync(target), `expected server.js startup to write the configured session path within the timeout -- output so far: ${output}`);
+      const settled = (label, predicate) => new Promise((resolve) => {
+        const check = () => {
+          let held = false;
+          try { held = predicate(); } catch { held = false; }
+          if (held) return resolve({ label, held: true });
+          if (Date.now() >= deadline) return resolve({ label, held: false });
+          return setTimeout(check, 25);
+        };
+        check();
+      });
+
+      const results = await Promise.all([
+        // Complete and correct content, not merely an existing inode.
+        settled('the configured session path was written with the synthetic session', () => {
+          if (!fs.existsSync(target)) return false;
+          const parsed = JSON.parse(fs.readFileSync(target, 'utf8'));
+          assert.deepEqual(parsed, SYNTHETIC_VALID_SESSION);
+          return true;
+        }),
+        settled('the sanitized startup success log line was emitted', () => output.includes('GC auth session written')),
+      ]);
+      const unmet = results.filter((result) => !result.held).map((result) => result.label);
+      assert.deepEqual(unmet, [],
+        `server.js startup did not satisfy: ${unmet.join('; ')} -- output so far: ${output}`);
+
+      // Re-asserted directly, so the wait above can never be the only thing
+      // standing behind the content guarantee.
       assert.deepEqual(JSON.parse(fs.readFileSync(target, 'utf8')), SYNTHETIC_VALID_SESSION);
       assert.ok(output.includes('GC auth session written'), 'expected the sanitized startup success log line');
       assert.ok(!output.includes(target), 'the resolved path must never appear in startup logs');
     } finally {
+      // Wait for the process to actually go away, so a killed server cannot
+      // linger into the rest of the suite holding a port or a file handle.
+      const exited = new Promise((resolve) => child.once('exit', resolve));
       child.kill('SIGKILL');
+      await exited;
+      child.stdout.removeAllListeners('data');
+      child.stderr.removeAllListeners('data');
     }
   });
 });
