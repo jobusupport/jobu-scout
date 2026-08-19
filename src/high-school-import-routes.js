@@ -469,9 +469,19 @@ function registerHighSchoolImportRoutes(router, deps) {
         importService,
       });
 
-      // Capture, eligibility and verified publication are reported separately;
-      // a 201 here means the run started, never that analysis is ready.
-      res.status(201).json({ opponentImportRun: run, jobId, state: 'captured' });
+      // 201 means exactly two things have happened: the opponent import-run
+      // record was created (status 'running'), and the collector process was
+      // dispatched. NOTHING has been captured, validated, or published yet --
+      // dispatch is asynchronous, so reporting 'captured' here would assert a
+      // state that had not occurred. Callers poll the run record and the
+      // resulting generation for the capture / validated / published_schedule_only
+      // / published_verified / failed outcomes.
+      res.status(201).json({
+        opponentImportRun: run,
+        jobId,
+        state: 'dispatched',
+        meaning: 'opponent import run created and collector dispatched; no capture or publication has occurred yet',
+      });
     } catch (err) {
       return sendResolverError(res, err, 'api/high-school/opponents/:opponentTeamId/import-runs (start)');
     }
@@ -679,4 +689,13 @@ function registerHighSchoolImportRoutes(router, deps) {
   return { killSwitchWatchdogTick };
 }
 
-module.exports = { registerHighSchoolImportRoutes, normalizeAndValidateGcTeamUrl };
+// defaultDispatchOpponentCollection is exported purely as a test seam: it is
+// the function the router uses in production when no dispatcher is injected, so
+// exporting it lets a test exercise the REAL dispatch construction (argv, env,
+// stdio, no shell) with only the process boundary replaced. Production behaviour
+// is unchanged -- the router still defaults to this same function internally.
+module.exports = {
+  registerHighSchoolImportRoutes,
+  normalizeAndValidateGcTeamUrl,
+  defaultDispatchOpponentCollection,
+};
