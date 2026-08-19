@@ -447,3 +447,139 @@ test('cross-tenant and unresolved-link attempts are still denied on this path', 
   assert.equal(res.status, 409);
   assert.equal(unlinkedApp.locals.trace.length, 0, 'no extraction is attempted without a linked identity');
 });
+
+// ── Source event identity collision, route to RPC ──────────────────────
+
+test('two distinct rows sharing one upstream id fail closed without publishing', { skip }, async () => {
+  const tenant = await buildTenant('coll');
+  const app = buildApp(tenant, { html: fixtures.twoRowsSharedIdDifferentScores });
+  const res = await startRun(app, tenant);
+  assert.equal(res.status, 201, 'the run starts; discovery is what fails');
+
+  // Both rows genuinely left the extractor.
+  const extracted = app.locals.trace.find(([kind]) => kind === 'extracted')[1];
+  assert.equal(extracted.split(',').length, 2, 'two observations left the extractor');
+
+  const summary = app.locals.lastSummary;
+  assert.equal(summary.state, 'failed');
+  assert.equal(summary.failureReason, 'opponent_source_event_identity_collision');
+  assert.equal(summary.verifiedGenerationPublished, false);
+  assert.equal(summary.manualReconciliationRequired, true);
+
+  // Structured diagnostics name the colliding rows and keep both observations.
+  assert.equal(summary.identityCollisions.length, 1);
+  const [collision] = summary.identityCollisions;
+  assert.equal(collision.sourceGameRef, 'g-shared-1');
+  assert.deepEqual(collision.sourceRowIndexes, [0, 1]);
+  assert.equal(collision.observations.length, 2, 'both observations are retained for reconciliation');
+
+  // Nothing whatsoever was committed for this new opponent.
+  assert.equal(app.locals.trace.some(([kind]) => kind === 'collect'), false,
+    'no capture is attempted once a collision is known');
+  const generations = await db.query(
+    'select count(*)::int c from public.hs_opponent_stat_generations where opponent_team_id = $1', [tenant.opponentTeamId]);
+  assert.equal(generations.rows[0].c, 0, 'no current generation is created for a new opponent');
+  const games = await db.query(
+    'select count(*)::int c from public.hs_opponent_games where opponent_team_id = $1', [tenant.opponentTeamId]);
+  assert.equal(games.rows[0].c, 0, 'no partial opponent games are committed');
+  const totals = await db.query(
+    'select count(*)::int c from public.hs_opponent_verified_totals where opponent_team_id = $1', [tenant.opponentTeamId]);
+  assert.equal(totals.rows[0].c, 0, 'no totals are committed');
+  const run = await db.query(
+    `select status, failure_stage from public.hs_opponent_import_runs
+      where opponent_team_id = $1 order by created_at desc limit 1`, [tenant.opponentTeamId]);
+  assert.equal(run.rows[0].status, 'failed', 'the import run never reports verified publication success');
+});
+
+test('reversing the DOM order produces the same collision classification', { skip }, async () => {
+  const tenant = await buildTenant('collrev');
+  const app = buildApp(tenant, { html: fixtures.twoRowsSharedHrefReversed });
+  await startRun(app, tenant);
+  const summary = app.locals.lastSummary;
+  assert.equal(summary.state, 'failed');
+  assert.equal(summary.failureReason, 'opponent_source_event_identity_collision');
+  assert.deepEqual(summary.identityCollisions[0].sourceRowIndexes, [0, 1],
+    'the diagnostic is order-independent');
+});
+
+test('a collision cannot retire an existing verified generation', { skip }, async () => {
+  const tenant = await buildTenant('collprior');
+  const verified = buildApp(tenant, { html: fixtures.mixedSchedule });
+  await startRun(verified, tenant);
+  const verifiedId = verified.locals.lastSummary.generationId;
+  assert.equal(verified.locals.lastSummary.state, 'published_verified');
+
+  const colliding = buildApp(tenant, { html: fixtures.twoRowsSharedIdDifferentScores });
+  await startRun(colliding, tenant);
+  assert.equal(colliding.locals.lastSummary.state, 'failed');
+  assert.equal(colliding.locals.lastSummary.failureReason, 'opponent_source_event_identity_collision');
+
+  const current = await db.query(
+    `select id, publication_state, final_game_count from public.hs_opponent_stat_generations
+      where opponent_team_id = $1 and is_current`, [tenant.opponentTeamId]);
+  assert.equal(current.rowCount, 1);
+  assert.equal(current.rows[0].id, verifiedId, 'the prior verified generation is untouched');
+  assert.equal(current.rows[0].publication_state, 'verified');
+  assert.equal(current.rows[0].final_game_count, 1);
+});
+
+test('one row rendering two anchors publishes normally, proving the guard is not over-broad', { skip }, async () => {
+  const tenant = await buildTenant('onerow');
+  const app = buildApp(tenant, { html: fixtures.singleRowTwoAnchors });
+  const res = await startRun(app, tenant);
+  assert.equal(res.status, 201);
+  const summary = app.locals.lastSummary;
+  assert.equal(summary.state, 'published_verified', 'a single row with two anchors is one game, not a collision');
+  assert.equal(summary.finalGameCount, 1);
+  const games = await db.query(
+    'select count(*)::int c from public.hs_opponent_games where opponent_team_id = $1', [tenant.opponentTeamId]);
+  assert.equal(games.rows[0].c, 1);
+});
+
+test('the database rejects a collision even when the application check is bypassed', { skip }, async () => {
+  // A privileged caller building the DTO directly must not be able to publish a
+  // collection whose observations claim one upstream identity.
+  const tenant = await buildTenant('dbguard');
+  const { mapHighSchoolOpponentEngineCollection } = require('../src/high-school-engine-persistence-mapper');
+  const { createHighSchoolImportRepository } = require('../src/high-school-import-repository');
+  const repository = createHighSchoolImportRepository(admin);
+  const run = await importService.startOpponentImportRun({
+    orgId: tenant.orgId, programId: tenant.programId, seasonId: tenant.seasonId,
+    opponentTeamId: tenant.opponentTeamId, sourceTeamId: tenant.sourceTeamId, triggerKind: 'manual',
+  });
+  const sharedRef = `db-guard-${tenant.s}`;
+  const game = (over = {}) => ({
+    meta: {
+      gameDate: '2026-04-01', homeTeam: 'Opp', awayTeam: 'Third', ourSide: 'home',
+      capturedAt: '2026-04-01T20:00:00.000Z', gameStatus: 'final', sourceGameId: sharedRef, ...over,
+    },
+    boxScore: {
+      batting: [
+        { Player: 'A', TeamSide: 'home', own: true, playerId: 'p1' },
+        { Player: 'B', TeamSide: 'away', own: false, playerId: 'p2' },
+      ],
+      pitching: [],
+    },
+    plays: [{ inning: 'Bottom 1', batterId: 'p1', text: 'Single. A singles to left field, C pitching.' }],
+  });
+  const { dto } = mapHighSchoolOpponentEngineCollection({
+    context: { orgId: tenant.orgId, programId: tenant.programId, seasonId: tenant.seasonId, sourceProvider: 'gamechanger' },
+    subject: { opponentTeamId: tenant.opponentTeamId, sourceTeamId: tenant.sourceTeamId, importRunId: run.id },
+    capturedGames: [game(), game({ venue: 'Other Park' })],
+  });
+  assert.equal(dto.observations.length, 2);
+  assert.equal(new Set(dto.observations.map((o) => o.sourceGameRef)).size, 1,
+    'the DTO genuinely claims one upstream identity twice');
+
+  await assert.rejects(
+    () => repository.persistEngineCollection(dto),
+    (error) => error.code === 'OPPONENT_SOURCE_EVENT_IDENTITY_COLLISION',
+    'the SECURITY INVOKER boundary refuses the collection',
+  );
+  const generations = await db.query(
+    'select count(*)::int c from public.hs_opponent_stat_generations where opponent_team_id = $1', [tenant.opponentTeamId]);
+  assert.equal(generations.rows[0].c, 0);
+  const games = await db.query(
+    'select count(*)::int c from public.hs_opponent_games where opponent_team_id = $1', [tenant.opponentTeamId]);
+  assert.equal(games.rows[0].c, 0, 'the transaction rolled back completely');
+});

@@ -165,13 +165,19 @@ test('a same-day doubleheader with distinct ids stays two entries with discrimin
   assert.deepEqual(entries.map((e) => e.scheduledTimeText).sort(), ['10:00 AM', '1:00 PM']);
 });
 
-test('two indistinguishable same-day rows do not silently become two games', async () => {
+test('two indistinguishable same-day rows are preserved and marked as colliding', async () => {
   const entries = await entriesFrom(fixtures.doubleheaderAmbiguous);
-  // Same href, no distinguishing evidence: the extractor reports one row rather
-  // than inventing a second contest out of duplicated markup.
-  assert.equal(entries.length, 1);
-  assert.equal(entries[0].gameNumber, null, 'no game number is fabricated');
-  assert.equal(entries[0].scheduledTimeText, null, 'no start time is fabricated');
+  // Two distinct source rows. Collapsing them to one -- which an earlier
+  // href-based deduplication did -- would silently discard a game the source
+  // actually published. Both survive, both are flagged, and neither is chosen.
+  assert.equal(entries.length, 2, 'a shared upstream id must not erase a row');
+  assert.ok(entries.every((entry) => entry.identityCollision),
+    'the ambiguity reaches the identity layer instead of being resolved here');
+  assert.deepEqual(entries[0].collidingRowIndexes, [0, 1]);
+  for (const entry of entries) {
+    assert.equal(entry.gameNumber, null, 'no game number is fabricated');
+    assert.equal(entry.scheduledTimeText, null, 'no start time is fabricated');
+  }
 });
 
 test('DOM row order does not change what is extracted', async () => {
@@ -207,4 +213,110 @@ test('the status classifier never upgrades an explicit non-final label', () => {
   assert.equal(classify({ rawStatusText: 'vs Rival 7:00 PM' }), 'scheduled');
   assert.equal(classify({ rawStatusText: 'vs Rival TBD' }), 'unknown');
   assert.equal(classify({}), 'unknown');
+});
+
+// ── Extraction identity: rows, not hrefs (HS 2D correction) ────────────
+//
+// The extraction unit is the schedule ROW. Deduplication is permitted only on
+// affirmative evidence that the SAME row root was observed twice; two distinct
+// row roots are always two observations, however identical their content.
+
+test('two anchors inside one row root produce exactly one entry', { skip: false }, async () => {
+  const entries = await entriesFrom(fixtures.singleRowTwoAnchors);
+  assert.equal(entries.length, 1, 'one row component is one observation');
+  assert.equal(entries[0].rowAnchorCount, 2, 'both anchors were recognised as belonging to that row');
+  assert.equal(entries[0].identityCollision, false);
+  // The whole row is read, so a thumbnail-first row does not lose its score.
+  assert.equal(entries[0].result, 'W');
+  assert.equal(entries[0].status, 'final');
+  assert.equal(entries[0].scheduledTimeText, '4:30 PM');
+});
+
+test('responsive markup rendering one row twice does not double-extract', async () => {
+  const entries = await entriesFrom(fixtures.responsiveSingleRow);
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].rowAnchorCount, 2);
+  assert.equal(entries[0].result, 'W', 'the desktop variant carrying the score is still read');
+});
+
+test('two distinct row roots sharing one href stay two observations', async () => {
+  const entries = await entriesFrom(fixtures.twoRowsSharedHref);
+  assert.equal(entries.length, 2, 'a shared href must never erase a row');
+  assert.deepEqual(entries.map((e) => e.rowAnchorCount), [1, 1]);
+  assert.deepEqual(entries.map((e) => e.gameId), ['g-shared-1', 'g-shared-1']);
+  assert.ok(entries.every((e) => e.identityCollision), 'both rows are marked as colliding');
+  assert.deepEqual(entries[0].collidingRowIndexes, [0, 1]);
+  assert.deepEqual(entries[1].collidingRowIndexes, [0, 1]);
+});
+
+test('two byte-identical row roots stay two observations', async () => {
+  const entries = await entriesFrom(fixtures.twoIdenticalRowRoots);
+  assert.equal(entries.length, 2, 'identical content is not evidence of the same row');
+  assert.ok(entries.every((e) => e.identityCollision));
+});
+
+test('conflicting scores under one upstream id are both preserved, never combined', async () => {
+  const entries = await entriesFrom(fixtures.twoRowsSharedIdDifferentScores);
+  assert.equal(entries.length, 2);
+  const results = entries.map((e) => e.result).sort();
+  assert.deepEqual(results, ['L', 'W'], 'neither row is dropped and no score is merged');
+  const scores = entries.map((e) => `${e.scoreUs}-${e.scoreThem}`).sort();
+  assert.deepEqual(scores, ['1-5', '7-2']);
+  assert.ok(entries.every((e) => e.identityCollision));
+});
+
+test('game numbers under one shared href still leave two colliding observations', async () => {
+  const entries = await entriesFrom(fixtures.twoRowsSharedHrefGameNumbers);
+  assert.equal(entries.length, 2);
+  assert.deepEqual(entries.map((e) => e.gameNumber).sort(), [1, 2]);
+  // A discriminator does not make a shared upstream identity safe: the identity
+  // layer still has to decide, so the collision is surfaced rather than resolved.
+  assert.ok(entries.every((e) => e.identityCollision));
+});
+
+test('collision marking is identical when the DOM order is reversed', async () => {
+  const forwards = await entriesFrom(fixtures.twoRowsSharedIdDifferentScores);
+  const reversed = await entriesFrom(fixtures.twoRowsSharedHrefReversed);
+  assert.deepEqual(forwards.map((e) => e.collidingRowIndexes), [[0, 1], [0, 1]]);
+  assert.deepEqual(reversed.map((e) => e.collidingRowIndexes), [[0, 1], [0, 1]]);
+});
+
+test('a distinct-id doubleheader is NOT a collision', async () => {
+  const entries = await entriesFrom(fixtures.doubleheaderDistinct);
+  assert.equal(entries.length, 2);
+  assert.ok(entries.every((e) => e.identityCollision === false),
+    'distinct upstream ids are two legitimate games, not a collision');
+  assert.deepEqual(entries.map((e) => e.gameId).sort(), ['g-dh-1', 'g-dh-2']);
+});
+
+test('an ordinary schedule reports no collision and keeps row index as provenance only', async () => {
+  const entries = await entriesFrom(fixtures.mixedSchedule);
+  assert.ok(entries.every((e) => e.identityCollision === false));
+  assert.deepEqual(entries.map((e) => e.visibleIndex).sort(), [0, 1]);
+  const reordered = await entriesFrom(fixtures.mixedScheduleReordered);
+  const withoutProvenance = (list) => list
+    .map(({ visibleIndex, ...rest }) => rest)
+    .sort((a, b) => (a.gameId < b.gameId ? -1 : 1));
+  assert.deepEqual(withoutProvenance(reordered), withoutProvenance(entries),
+    'reversing DOM order changes only the provenance index');
+});
+
+test('the collision detector is deterministic and never selects a winner', () => {
+  const { detectSourceEventIdentityCollisions } = require('../src/high-school-opponent-gc-import');
+  const rows = [
+    { sourceGameRef: 'a', sourceRowIndex: 1, gameDate: '2026-04-01', gameStatus: 'final', startTime: null, gameNumber: null, rawStatusText: 'W 7-2' },
+    { sourceGameRef: 'a', sourceRowIndex: 0, gameDate: '2026-04-01', gameStatus: 'final', startTime: null, gameNumber: null, rawStatusText: 'L 1-5' },
+    { sourceGameRef: 'b', sourceRowIndex: 2, gameDate: '2026-04-02', gameStatus: 'final', startTime: null, gameNumber: null, rawStatusText: '' },
+  ];
+  const forwards = detectSourceEventIdentityCollisions(rows);
+  const backwards = detectSourceEventIdentityCollisions([...rows].reverse());
+  assert.equal(forwards.length, 1, 'only the genuinely duplicated identity collides');
+  assert.equal(forwards[0].sourceGameRef, 'a');
+  assert.deepEqual(forwards[0].sourceRowIndexes, [0, 1], 'indexes are sorted, so order cannot change the diagnostic');
+  assert.equal(forwards[0].observations.length, 2, 'both observations are retained for reconciliation');
+  assert.deepEqual(backwards, forwards, 'input order does not change the result');
+  // A row with no upstream identifier cannot collide on one.
+  assert.deepEqual(detectSourceEventIdentityCollisions([
+    { sourceGameRef: null, sourceRowIndex: 0 }, { sourceGameRef: null, sourceRowIndex: 1 },
+  ]), []);
 });

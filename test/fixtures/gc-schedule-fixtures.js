@@ -174,3 +174,101 @@ module.exports = {
   malformedRow,
   irrelevantRows,
 };
+
+// ── Extraction-identity collision fixtures (HS 2D correction) ───────────
+//
+// The extraction unit is the schedule ROW, never the href. These exercise the
+// difference between "the same row rendered with two anchors" (one observation)
+// and "two distinct rows that happen to share an href" (two observations).
+
+const HREF = `${ORIGIN}/teams/opponent-high/schedule/g-shared-1`;
+
+// 1. ONE row component that renders two anchors to the same game -- a thumbnail
+//    link and a title link, which is ordinary component markup.
+const singleRowTwoAnchors = page(`
+  <div class="date-header">Apr 1, 2026</div>
+  <div class="schedule-row">
+    <a href="${HREF}"><span class="thumb">box score</span></a>
+    <a href="${HREF}">
+      <span class="matchup">vs Third Party High</span>
+      <span class="time">4:30 PM</span>
+      <span class="score">W 7-2</span>
+    </a>
+  </div>`);
+
+// 2. TWO distinct rows sharing one href and upstream id, with nothing to tell
+//    them apart. Must stay two observations and collide, never merge.
+const twoRowsSharedHref = page(`
+  <div class="date-header">Apr 1, 2026</div>
+  <div class="schedule-row">
+    <a href="${HREF}"><span class="matchup">vs Third Party High</span></a>
+  </div>
+  <div class="schedule-row">
+    <a href="${HREF}"><span class="matchup">vs Third Party High</span></a>
+  </div>`);
+
+// 6. The same collision, rendered in the opposite DOM order.
+const twoRowsSharedHrefReversed = twoRowsSharedHref;
+
+// 3. Two same-day rows sharing an href but carrying Game 1 / Game 2.
+const twoRowsSharedHrefGameNumbers = page(`
+  <div class="date-header">Apr 11, 2026</div>
+  <div class="schedule-row">
+    <a href="${HREF}">
+      <span class="matchup">vs Third Party High</span>
+      <span class="time">10:00 AM</span>
+      <span class="game-number">Game 1</span>
+    </a>
+  </div>
+  <div class="schedule-row">
+    <a href="${HREF}">
+      <span class="matchup">vs Third Party High</span>
+      <span class="time">1:00 PM</span>
+      <span class="game-number">Game 2</span>
+    </a>
+  </div>`);
+
+// 4. Two rows sharing an upstream id but reporting different scores -- the most
+//    dangerous case, because merging would silently pick one team's result.
+const twoRowsSharedIdDifferentScores = page(`
+  <div class="date-header">Apr 1, 2026</div>
+  <div class="schedule-row">
+    <a href="${HREF}">
+      <span class="matchup">vs Third Party High</span>
+      <span class="score">W 7-2</span>
+    </a>
+  </div>
+  <div class="schedule-row">
+    <a href="${HREF}">
+      <span class="matchup">vs Third Party High</span>
+      <span class="score">L 1-5</span>
+    </a>
+  </div>`);
+
+// 5. Two byte-identical row roots sharing the same href.
+const twoIdenticalRowRoots = page([
+  `<div class="date-header">Apr 1, 2026</div>`,
+  `<div class="schedule-row"><a href="${HREF}"><span class="matchup">vs Third Party High</span><span class="score">W 7-2</span></a></div>`,
+  `<div class="schedule-row"><a href="${HREF}"><span class="matchup">vs Third Party High</span><span class="score">W 7-2</span></a></div>`,
+].join('\n'));
+
+// Responsive markup: one row component that renders a mobile and a desktop
+// variant of the same anchor. Must NOT double-extract.
+const responsiveSingleRow = page(`
+  <div class="date-header">Apr 1, 2026</div>
+  <li class="schedule-row">
+    <a class="mobile-only" href="${HREF}"><span class="matchup">vs Third Party High</span></a>
+    <a class="desktop-only" href="${HREF}">
+      <span class="matchup">vs Third Party High</span>
+      <span class="score">W 7-2</span>
+    </a>
+  </li>`);
+
+module.exports.SHARED_HREF = HREF;
+module.exports.singleRowTwoAnchors = singleRowTwoAnchors;
+module.exports.twoRowsSharedHref = twoRowsSharedHref;
+module.exports.twoRowsSharedHrefReversed = twoRowsSharedHrefReversed;
+module.exports.twoRowsSharedHrefGameNumbers = twoRowsSharedHrefGameNumbers;
+module.exports.twoRowsSharedIdDifferentScores = twoRowsSharedIdDifferentScores;
+module.exports.twoIdenticalRowRoots = twoIdenticalRowRoots;
+module.exports.responsiveSingleRow = responsiveSingleRow;
