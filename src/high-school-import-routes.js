@@ -74,7 +74,66 @@ function normalizeAndValidateGcTeamUrl(raw) {
 // through the environment as a discrete variable -- no request value is ever
 // interpolated into a command string, and the child is invoked with an explicit
 // argv array rather than a shell.
-function defaultDispatchOpponentCollection({ jobId, jobs, appendLog, finishJob, attachJobProcess, spawn, ctx, sourceTeamUrl }) {
+// Every High School product kind whose job owns a spawned GameChanger collector
+// child. The runtime kill-switch watchdog signals all of them.
+const OWN_TEAM_COLLECTOR_PRODUCT_KIND = 'high_school_gc_import';
+const OPPONENT_COLLECTOR_PRODUCT_KIND = 'high_school_opponent_gc_import';
+const HS_COLLECTOR_PRODUCT_KINDS = new Set([
+  OWN_TEAM_COLLECTOR_PRODUCT_KIND,
+  OPPONENT_COLLECTOR_PRODUCT_KIND,
+]);
+
+// ── One place where a collector child is wired to its job ───────────────
+//
+// Shared by both dispatchers so neither can drift, and so the 'error' listener
+// exists on both. Without it an ASYNCHRONOUS spawn failure -- ENOENT because the
+// runtime moved, EACCES because the script lost its permissions -- reaches an
+// EventEmitter with no error handler, which Node turns into an uncaught
+// exception that takes the whole server down. spawn() itself returns normally in
+// that case, so a synchronous try/catch never sees it.
+//
+// `onAsyncSpawnError` lets a caller record the failure durably; it is invoked at
+// most once, and never after the child has already closed, so a run the child
+// finalized for itself is not failed a second time.
+function attachCollectorChild({ child, jobId, appendLog, finishJob, attachJobProcess, onAsyncSpawnError }) {
+  attachJobProcess(jobId, child);
+  const forward = (chunk) => String(chunk)
+    .split('\n')
+    .filter(Boolean)
+    .forEach((line) => appendLog(jobId, policy.sanitizeCollectionErrorMessage(line)));
+  child.stdout.on('data', forward);
+  child.stderr.on('data', forward);
+
+  let settled = false;
+  const settle = (ok, code) => {
+    if (settled) return;
+    settled = true;
+    // The child is finished either way; drop our listeners and our reference to
+    // it so a long-lived server does not retain dead processes or their buffers.
+    for (const stream of [child.stdout, child.stderr]) {
+      if (stream && typeof stream.removeAllListeners === 'function') stream.removeAllListeners('data');
+    }
+    finishJob(jobId, ok, code);
+  };
+
+  child.on('error', (err) => {
+    // The collector never ran. Say so in the job log, fail the job, and let the
+    // caller record the run as failed -- reporting anything else would leave a
+    // run sitting in 'running' for ever with no process behind it.
+    appendLog(jobId, policy.sanitizeCollectionErrorMessage(
+      `The collector process could not be started: ${err && err.message ? err.message : 'unknown spawn error'}`));
+    if (typeof onAsyncSpawnError === 'function' && !settled) {
+      try { onAsyncSpawnError(err); } catch { /* recording the failure must never mask it */ }
+    }
+    settle(false, -1);
+  });
+  child.on('close', (code) => settle(code === 0, code));
+  return child;
+}
+
+function defaultDispatchOpponentCollection({
+  jobId, jobs, appendLog, finishJob, attachJobProcess, spawn, ctx, sourceTeamUrl, importService,
+}) {
   const scriptPath = path.join(__dirname, 'high-school-opponent-gc-import.js');
   const child = spawn('node', [scriptPath], {
     cwd: path.join(__dirname, '..'),
@@ -91,11 +150,29 @@ function defaultDispatchOpponentCollection({ jobId, jobs, appendLog, finishJob, 
     stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
     detached: process.platform !== 'win32',
   });
-  attachJobProcess(jobId, child);
-  child.stdout.on('data', (chunk) => String(chunk).split('\n').filter(Boolean).forEach((l) => appendLog(jobId, policy.sanitizeCollectionErrorMessage(l))));
-  child.stderr.on('data', (chunk) => String(chunk).split('\n').filter(Boolean).forEach((l) => appendLog(jobId, policy.sanitizeCollectionErrorMessage(l))));
-  child.on('close', (code) => finishJob(jobId, code === 0, code));
-  return child;
+  return attachCollectorChild({
+    child,
+    jobId,
+    appendLog,
+    finishJob,
+    attachJobProcess,
+    // A child that never started cannot have recorded anything, so the run it
+    // was dispatched for is still sitting in 'running'. The parent holds the
+    // trusted org and run ids from the request that created it, so it can fail
+    // that run safely without trusting anything the child said.
+    onAsyncSpawnError: (err) => {
+      if (!importService || !ctx?.orgId || !ctx?.opponentImportRunId) return;
+      Promise.resolve(importService.failOpponentImportRun({
+        orgId: ctx.orgId,
+        opponentImportRunId: ctx.opponentImportRunId,
+        failureStage: 'discovery',
+        errorSummary: policy.sanitizeCollectionErrorMessage(
+          `The opponent collector process could not be started: ${err && err.message ? err.message : 'unknown spawn error'}`),
+      })).catch((failure) => {
+        console.error('[hs-opponent-dispatch] failed to mark an undispatched run as failed', failure);
+      });
+    },
+  });
 }
 
 function registerHighSchoolImportRoutes(router, deps) {
@@ -172,10 +249,26 @@ function registerHighSchoolImportRoutes(router, deps) {
   // resolves. The child's own graceful shutdown (see high-school-gc-import.js)
   // is still valuable for finishing the in-flight game cleanly, but DB
   // correctness never depends on it.
+  //
+  // Marks whichever KIND of import run this job owns. Own-team and opponent runs
+  // live in different tables and have different failure APIs, so the job's
+  // product kind selects the right one rather than the caller having to know. A
+  // job carrying no run id (or an unrecognised kind) is left alone.
   async function markInterruptedRun(job, { rawErrorMessage }) {
     const importService = sharedImportService;
-    if (!importService || !job.org_id || !job.importRunId) return;
+    if (!importService || !job.org_id) return;
     try {
+      if (job.productKind === OPPONENT_COLLECTOR_PRODUCT_KIND) {
+        if (!job.opponentImportRunId) return;
+        await importService.failOpponentImportRun({
+          orgId: job.org_id,
+          opponentImportRunId: job.opponentImportRunId,
+          failureStage: 'discovery',
+          errorSummary: rawErrorMessage,
+        });
+        return;
+      }
+      if (!job.importRunId) return;
       await importService.failImportRun({
         orgId: job.org_id,
         importRunId: job.importRunId,
@@ -195,7 +288,14 @@ function registerHighSchoolImportRoutes(router, deps) {
     if (policy.isCollectionEnabled()) return [];
     const affected = [];
     for (const job of Object.values(jobs)) {
-      if (job.productKind !== 'high_school_gc_import') continue;
+      // EVERY High School collector kind, not just own-team. The opponent
+      // collector reaches GameChanger exactly as the own-team one does and
+      // already listens for the kill_switch_disabled message -- but nothing was
+      // sending it, so an in-flight opponent collection kept scraping after an
+      // operator disabled collection. A child only ever sees a FROZEN copy of
+      // the environment it was spawned with, so this push is the only thing that
+      // can reach it. Unrelated job kinds are still skipped.
+      if (!HS_COLLECTOR_PRODUCT_KINDS.has(job.productKind)) continue;
       if (job.status !== 'running') continue;
       if (job.killSwitchHandled) continue;
       job.killSwitchHandled = true;
@@ -345,10 +445,27 @@ function registerHighSchoolImportRoutes(router, deps) {
         stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
         detached: process.platform !== 'win32',
       });
-      attachJobProcess(jobId, child);
-      child.stdout.on('data', (chunk) => String(chunk).split('\n').filter(Boolean).forEach((l) => appendLog(jobId, policy.sanitizeCollectionErrorMessage(l))));
-      child.stderr.on('data', (chunk) => String(chunk).split('\n').filter(Boolean).forEach((l) => appendLog(jobId, policy.sanitizeCollectionErrorMessage(l))));
-      child.on('close', (code) => finishJob(jobId, code === 0, code));
+      // Same wiring as the opponent dispatcher, through the same helper, so the
+      // two cannot drift and an asynchronous spawn failure cannot take the
+      // server down on either path. Log forwarding, sanitisation and the exit-
+      // code mapping are unchanged.
+      attachCollectorChild({
+        child,
+        jobId,
+        appendLog,
+        finishJob,
+        attachJobProcess,
+        onAsyncSpawnError: (spawnErr) => {
+          Promise.resolve(importService.failImportRun({
+            orgId: req._orgId,
+            importRunId: run.id,
+            failureStage: 'discovery',
+            rawErrorMessage: `The collector process could not be started: ${spawnErr && spawnErr.message ? spawnErr.message : 'unknown spawn error'}`,
+          })).catch((failure) => {
+            console.error('[hs-gc-import] failed to mark an undispatched run as failed', failure);
+          });
+        },
+      });
 
       res.status(201).json({ importRun: run, jobId });
     } catch (err) {

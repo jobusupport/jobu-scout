@@ -157,7 +157,9 @@ function buildApp(tenant, { entries, collectImpl, collectionEnabled = true, serv
         discoverScheduleEntries: async () => { trace.push(['discover']); return entries || []; },
         collectGame: collectImpl || (async (entry) => { trace.push(['collect', entry.sourceGameRef]); return gameDataFor(); }),
         isCancelled: () => false,
-        isKillSwitchTriggered: () => !collectionEnabled,
+        // Accepts a function so a test can flip the switch MID-RUN, which is
+        // what the runtime kill switch actually does.
+        isKillSwitchTriggered: () => !(typeof collectionEnabled === 'function' ? collectionEnabled() : collectionEnabled),
         sleep: async () => {},
         onProgress: (e) => trace.push(['progress', e.type]),
       });
@@ -524,4 +526,47 @@ test('the own-team import route is unchanged and still spawns its own collector'
     await close();
   }
   assert.equal(app.locals.trace.length, 0, 'the own-team route never uses the opponent dispatcher');
+});
+
+test('a kill switch flipped MID-RUN stops the opponent collection before the next source request', { skip }, async () => {
+  // The watchdog pushes 'kill_switch_disabled' to the child (proved in
+  // test/high-school-gc-collector-process-lifecycle.test.js); this is the other
+  // half -- what the collector does once it observes the flip. It must stop
+  // before asking the source for anything else, and it must not report success.
+  const tenant = await buildTenant('killmid');
+  let enabled = true;
+  const requested = [];
+  const app = buildApp(tenant, {
+    entries: [
+      finalEntry(`km1-${tenant.s}`),
+      finalEntry(`km2-${tenant.s}`),
+      finalEntry(`km3-${tenant.s}`),
+    ],
+    collectionEnabled: () => enabled,
+    collectImpl: async (entry) => {
+      requested.push(entry.sourceGameRef);
+      enabled = false; // the operator disables collection while game 1 is in flight
+      return gameDataFor();
+    },
+  });
+
+  const res = await startRun(app, tenant);
+  assert.equal(res.status, 201, JSON.stringify(res.body));
+
+  assert.deepEqual(requested, [`km1-${tenant.s}`],
+    'no further source request is made once collection is disabled');
+
+  const summary = app.locals.lastSummary;
+  assert.equal(summary.stopped, 'kill_switch', 'the run records WHY it stopped');
+  assert.notEqual(summary.state, 'published_verified', 'an interrupted run must never look verified');
+  assert.equal(summary.verifiedGenerationPublished, false);
+
+  const generations = await db.query(
+    'select count(*)::int c from public.hs_opponent_stat_generations where opponent_team_id = $1',
+    [tenant.opponentTeamId]);
+  assert.equal(generations.rows[0].c, 0, 'a partial collection publishes nothing at all');
+
+  const run = await db.query(
+    'select status from public.hs_opponent_import_runs where id = $1', [res.body.opponentImportRun.id]);
+  assert.notEqual(run.rows[0].status, 'succeeded', 'the import run must not remain falsely successful');
 });

@@ -8,6 +8,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
+const { EventEmitter } = require('node:events');
 
 const { defaultDispatchOpponentCollection } = require('../src/high-school-import-routes');
 
@@ -20,18 +21,29 @@ const CTX = Object.freeze({
   opponentLabel: 'Opponent High Varsity',
 });
 
-function harness({ spawnImpl } = {}) {
+// A real EventEmitter-shaped child, because that is what the defect is about: a
+// ChildProcess is an EventEmitter, and an 'error' emitted on one with no
+// listener is an UNCAUGHT EXCEPTION that takes the server process down. A plain
+// object with stored callbacks cannot demonstrate that, so this uses genuine
+// emitters and genuinely emits.
+function fakeChild() {
+  const child = new EventEmitter();
+  child.pid = 4321;
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.send = () => {};
+  child._stdout = (chunk) => child.stdout.emit('data', chunk);
+  child._stderr = (chunk) => child.stderr.emit('data', chunk);
+  child._close = (code) => child.emit('close', code);
+  child._error = (err) => child.emit('error', err);
+  return child;
+}
+
+function harness({ spawnImpl, importService, child = fakeChild() } = {}) {
   const calls = [];
   const logs = [];
   const finished = [];
   const attached = [];
-  const child = {
-    pid: 4321,
-    stdout: { on(event, cb) { child._stdout = cb; } },
-    stderr: { on(event, cb) { child._stderr = cb; } },
-    on(event, cb) { if (event === 'close') child._close = cb; },
-    send() {},
-  };
   const spawn = spawnImpl || ((cmd, args, opts) => { calls.push({ cmd, args, opts }); return child; });
   const result = defaultDispatchOpponentCollection({
     jobId: 'job-1',
@@ -42,6 +54,7 @@ function harness({ spawnImpl } = {}) {
     spawn,
     ctx: CTX,
     sourceTeamUrl: 'https://web.gc.com/teams/opponent-high',
+    importService,
   });
   return { calls, logs, finished, attached, child, result };
 }
@@ -117,9 +130,22 @@ test('collector output is sanitized into the job log, and exit codes map to job 
   assert.deepEqual(logs.map(([, line]) => line), ['line one', 'line two', 'an error line']);
 
   child._close(0);
-  assert.deepEqual(finished.at(-1), ['job-1', true, 0], 'exit 0 is a successful job');
+  assert.deepEqual(finished, [['job-1', true, 0]], 'exit 0 is a successful job');
+
+  // A real ChildProcess closes exactly once, so each exit code needs its own
+  // child rather than a second close on a settled one.
+  const failing = harness();
+  failing.child._close(1);
+  assert.deepEqual(failing.finished, [['job-1', false, 1]], 'a nonzero exit fails the job');
+});
+
+test('a job is settled exactly once, however many times the child reports finishing', () => {
+  const { finished, child } = harness();
+  child._close(0);
   child._close(1);
-  assert.deepEqual(finished.at(-1), ['job-1', false, 1], 'a nonzero exit fails the job');
+  child._error(new Error('ENOENT'));
+  assert.deepEqual(finished, [['job-1', true, 0]],
+    'a run the child already finalized is never failed a second time');
 });
 
 test('a spawn failure propagates instead of being reported as a started run', () => {
@@ -151,4 +177,68 @@ test('the own-team dispatch path still spawns its own collector entry point', ()
   assert.match(routes, /spawn\('node', \[scriptPath\][\s\S]*?HS_IMPORT_ORG_ID/,
     'the own-team route still spawns high-school-gc-import.js with its own env contract');
   assert.match(routes, /high-school-gc-import\.js/);
+});
+
+// ── Asynchronous spawn failures (HS 2D review correction) ──────────────
+//
+// spawn() returns a ChildProcess and THEN reports ENOENT/EACCES by emitting
+// 'error' on it. With no 'error' listener that is an uncaught exception, so a
+// collector that could not start took the whole server down -- after the route
+// had already answered 201.
+
+test('an asynchronous spawn error does not crash the process and fails the job', () => {
+  const { logs, finished, child } = harness();
+  assert.equal(child.listenerCount('error'), 1,
+    'an EventEmitter with no error listener turns this into an uncaught exception');
+
+  // Genuinely emitted, not a stored callback invoked directly.
+  assert.doesNotThrow(() => child._error(Object.assign(new Error('spawn node ENOENT'), { code: 'ENOENT' })));
+
+  assert.deepEqual(finished, [['job-1', false, -1]], 'the job is failed, never left running');
+  assert.ok(logs.some(([, line]) => /could not be started/.test(line)),
+    'the job log says the collector never ran');
+  assert.equal(logs.some(([, line]) => /captured|published|verified/i.test(line)), false,
+    'nothing claims capture or publication occurred');
+});
+
+test('an asynchronous spawn error transitions the opponent import run out of running', () => {
+  const failed = [];
+  const importService = {
+    failOpponentImportRun: async (args) => { failed.push(args); return {}; },
+  };
+  const { child } = harness({ importService });
+  child._error(Object.assign(new Error('spawn node EACCES'), { code: 'EACCES' }));
+
+  assert.equal(failed.length, 1, 'the run is marked failed exactly once');
+  assert.equal(failed[0].orgId, CTX.orgId, 'using the trusted context the request established');
+  assert.equal(failed[0].opponentImportRunId, CTX.opponentImportRunId);
+  assert.equal(failed[0].failureStage, 'discovery');
+  assert.match(failed[0].errorSummary, /could not be started/);
+});
+
+test('a run the child already finalized is not failed again by a later error', () => {
+  const failed = [];
+  const importService = { failOpponentImportRun: async (args) => { failed.push(args); return {}; } };
+  const { child, finished } = harness({ importService });
+  child._close(0);
+  child._error(new Error('spawn node ENOENT'));
+  assert.deepEqual(finished, [['job-1', true, 0]]);
+  assert.equal(failed.length, 0, 'the child reported its own outcome; the parent must not overwrite it');
+});
+
+test('a failure while recording the run failure is contained rather than rethrown', () => {
+  const importService = {
+    failOpponentImportRun: async () => { throw new Error('database unavailable'); },
+  };
+  const { child, finished } = harness({ importService });
+  assert.doesNotThrow(() => child._error(new Error('spawn node ENOENT')));
+  assert.deepEqual(finished, [['job-1', false, -1]], 'the job is still failed');
+});
+
+test('stream listeners are released once the child has settled', () => {
+  const { child } = harness();
+  assert.equal(child.stdout.listenerCount('data'), 1);
+  child._close(0);
+  assert.equal(child.stdout.listenerCount('data'), 0, 'no dead child keeps its buffers alive');
+  assert.equal(child.stderr.listenerCount('data'), 0);
 });

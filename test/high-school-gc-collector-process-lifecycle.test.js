@@ -290,8 +290,10 @@ function buildTestApp({ cancelGraceMs = 30 } = {}) {
   });
 
   const failImportRunCalls = [];
+  const failOpponentImportRunCalls = [];
   const importService = {
     async failImportRun(args) { failImportRunCalls.push(args); return {}; },
+    async failOpponentImportRun(args) { failOpponentImportRunCalls.push(args); return {}; },
     async getImportRunDetail() { return { run: { id: RUN_A, org_id: ORG_A, team_id: TEAM_A, season_id: SEASON_A, status: 'succeeded' }, games: [], validations: [] }; },
   };
 
@@ -306,7 +308,7 @@ function buildTestApp({ cancelGraceMs = 30 } = {}) {
   app.locals.highSchoolImportService = importService;
 
   return {
-    app, jobs, killSwitchWatchdogTick, failImportRunCalls, stopJobProcessCalls, finishJobCalls,
+    app, jobs, killSwitchWatchdogTick, failImportRunCalls, failOpponentImportRunCalls, stopJobProcessCalls, finishJobCalls,
     restoreEnv: () => { if (originalGrace === undefined) delete process.env.GC_CANCEL_GRACE_MS; else process.env.GC_CANCEL_GRACE_MS = originalGrace; },
   };
 }
@@ -390,6 +392,101 @@ test('kill-switch watchdog: does nothing at all while collection remains enabled
     assert.deepEqual(affected, []);
     assert.equal(failImportRunCalls.length, 0);
     assert.deepEqual(proc.sentMessages, []);
+  } finally {
+    if (originalEnabled === undefined) delete process.env.GC_COLLECTION_ENABLED; else process.env.GC_COLLECTION_ENABLED = originalEnabled;
+    restoreEnv();
+  }
+});
+
+// ── Runtime kill switch reaches opponent collections too (HS 2D review) ──
+//
+// The opponent collector reaches GameChanger exactly as the own-team one does,
+// and its child already listens for 'kill_switch_disabled'. Nothing was sending
+// it: the watchdog only considered 'high_school_gc_import' jobs, so flipping the
+// switch mid-run left an opponent collection scraping until it finished on its
+// own. A child only ever sees a frozen copy of the environment it was spawned
+// with, so this push is the only thing that can reach it.
+
+test('kill-switch watchdog: signals an in-flight OPPONENT collection and marks its opponent run failed', async () => {
+  const {
+    jobs, killSwitchWatchdogTick, failImportRunCalls, failOpponentImportRunCalls,
+    stopJobProcessCalls, finishJobCalls, restoreEnv,
+  } = buildTestApp();
+  const originalEnabled = process.env.GC_COLLECTION_ENABLED;
+  const OPP_RUN = 'aaaaaaaa-9999-4999-8999-999999999999';
+  const OPP_TEAM = 'bbbbbbbb-9999-4999-8999-999999999999';
+  process.env.GC_COLLECTION_ENABLED = 'false';
+  const oppProc = makeFakeProc();
+  const ownProc = makeFakeProc();
+  const otherProc = makeFakeProc();
+  jobs['job-opp-1'] = {
+    id: 'job-opp-1', org_id: ORG_A, opponentImportRunId: OPP_RUN, opponentTeamId: OPP_TEAM,
+    status: 'running', proc: oppProc, productKind: 'high_school_opponent_gc_import',
+  };
+  jobs['job-hs-1'] = {
+    id: 'job-hs-1', org_id: ORG_A, importRunId: RUN_A, status: 'running',
+    proc: ownProc, productKind: 'high_school_gc_import',
+  };
+  jobs['job-travel-1'] = {
+    id: 'job-travel-1', org_id: ORG_A, status: 'running', proc: otherProc, productKind: 'travel_scraper',
+  };
+  try {
+    const affected = killSwitchWatchdogTick();
+    assert.deepEqual(affected.sort(), ['job-hs-1', 'job-opp-1'],
+      'every High School collector kind is stopped, not only own-team');
+
+    // The opponent child actually receives the message.
+    assert.deepEqual(oppProc.sentMessages, [{ type: 'kill_switch_disabled' }]);
+    assert.deepEqual(ownProc.sentMessages, [{ type: 'kill_switch_disabled' }]);
+    assert.deepEqual(otherProc.sentMessages, [], 'an unrelated job kind is still never touched');
+
+    // Each run kind is failed through its OWN api, so neither table is written
+    // with the other's identifier.
+    assert.equal(failOpponentImportRunCalls.length, 1);
+    assert.equal(failOpponentImportRunCalls[0].orgId, ORG_A);
+    assert.equal(failOpponentImportRunCalls[0].opponentImportRunId, OPP_RUN);
+    assert.match(failOpponentImportRunCalls[0].errorSummary, /disabled/i);
+    assert.equal(failImportRunCalls.length, 1);
+    assert.equal(failImportRunCalls[0].importRunId, RUN_A);
+
+    // The job is failed, never left looking successful.
+    const oppFinish = finishJobCalls.filter((c) => c.id === 'job-opp-1');
+    assert.equal(oppFinish.length, 1);
+    assert.equal(oppFinish[0].success, false, 'a killed opponent run must never report success');
+    assert.equal(jobs['job-opp-1'].status, 'failed');
+    // Escalation is timer-driven (grace period, then force-stop) and targets the
+    // process rather than the job record, so wait for the condition and match on
+    // the child itself.
+    const escalatedOpponent = () => stopJobProcessCalls.some((target) => target.proc === oppProc);
+    const deadline = Date.now() + 5000;
+    while (!escalatedOpponent() && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.ok(escalatedOpponent(), 'the escalation path covers the opponent child too');
+
+    // Idempotent per job, exactly as for own-team.
+    killSwitchWatchdogTick();
+    assert.equal(failOpponentImportRunCalls.length, 1,
+      'an already-handled opponent job must not be signaled or marked a second time');
+  } finally {
+    if (originalEnabled === undefined) delete process.env.GC_COLLECTION_ENABLED; else process.env.GC_COLLECTION_ENABLED = originalEnabled;
+    restoreEnv();
+  }
+});
+
+test('kill-switch watchdog: leaves an in-flight opponent collection alone while collection stays enabled', async () => {
+  const { jobs, killSwitchWatchdogTick, failOpponentImportRunCalls, restoreEnv } = buildTestApp();
+  const originalEnabled = process.env.GC_COLLECTION_ENABLED;
+  process.env.GC_COLLECTION_ENABLED = 'true';
+  const proc = makeFakeProc();
+  jobs['job-opp-1'] = {
+    id: 'job-opp-1', org_id: ORG_A, opponentImportRunId: 'aaaaaaaa-9999-4999-8999-999999999999',
+    status: 'running', proc, productKind: 'high_school_opponent_gc_import',
+  };
+  try {
+    assert.deepEqual(killSwitchWatchdogTick(), []);
+    assert.equal(failOpponentImportRunCalls.length, 0);
+    assert.deepEqual(proc.sentMessages, [], 'nothing is signaled while collection is enabled');
   } finally {
     if (originalEnabled === undefined) delete process.env.GC_COLLECTION_ENABLED; else process.env.GC_COLLECTION_ENABLED = originalEnabled;
     restoreEnv();
