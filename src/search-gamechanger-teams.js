@@ -1268,12 +1268,22 @@ const SCHEDULE_ENTRY_STATUSES = Object.freeze([
   'scheduled', 'in_progress', 'final', 'postponed', 'cancelled', 'suspended', 'unknown',
 ]);
 
-// Identifies the element that delimits ONE schedule row, so grouping is done by
-// row rather than by href. Ordered from the most explicit marker to the most
-// generic list/table container. An anchor that matches nothing here is treated
-// as its own row -- deliberately over-reporting rather than risking a merge of
-// two real games. There is no href-based fallback anywhere in this module.
-const ROW_ROOT_SELECTOR = '[data-schedule-row], [data-game-id], .schedule-row, li, tr';
+// Identifies an element that affirmatively delimits ONE schedule row, so
+// grouping is done by row rather than by href.
+//
+// Only EXPLICIT per-game markers qualify. Generic containers such as `li` and
+// `tr` are deliberately NOT listed: a schedule commonly renders a date-group
+// `li`, or a table `tr` with one game per cell, and accepting the nearest such
+// ancestor silently collapsed every game under it into one entry -- dropping
+// real games with no diagnostic at all. Grouping is now an affirmative claim
+// about markup, never a proximity accident.
+//
+// Even an explicit marker is validated before it is trusted: a node containing
+// more than one distinct schedule reference cannot be describing a single game,
+// so it is rejected as a row root. An anchor with no trustworthy row root
+// becomes its own observation, which over-reports rather than merging. There is
+// no href-based fallback anywhere in this module.
+const EXPLICIT_ROW_ROOT_SELECTOR = '[data-schedule-row], [data-game-id], .schedule-row';
 
 // Pure, browser-free, and exported so the classification rules can be tested
 // directly rather than only through a DOM fixture.
@@ -1392,14 +1402,40 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
     }
     const CARDTEXT_MAX_LEN = 260;
 
-    // The nearest ancestor the established markup uses to delimit one schedule
-    // row. When an anchor has no such ancestor the anchor is treated as its own
-    // row: that can only ever over-report, never merge two real rows into one.
-    // There is deliberately no href-based fallback.
+    // Normalized schedule reference: query string and fragment stripped, so two
+    // anchors to the same game with different tracking parameters still count
+    // as one reference.
+    function scheduleRef(anchor) {
+      const href = anchor.getAttribute('href') || '';
+      return href.split('#')[0].split('?')[0];
+    }
+
+    // Counts the DISTINCT games a candidate row root claims to contain. A node
+    // describing one game contains exactly one.
+    function distinctScheduleRefs(node) {
+      const refs = new Set();
+      for (const link of node.querySelectorAll('a[href*="/schedule/"]')) {
+        const ref = scheduleRef(link);
+        if (ref) refs.add(ref);
+      }
+      return refs.size;
+    }
+
+    // The nearest ancestor that AFFIRMATIVELY marks one schedule row, and that
+    // survives validation: a marker containing more than one distinct schedule
+    // reference is not describing a single game, so it is rejected rather than
+    // trusted. When no trustworthy row root exists the anchor becomes its own
+    // row -- which can over-report (two anchors for one game become two
+    // observations, and the collision path then surfaces the ambiguity) but can
+    // never merge or discard a distinct game. There is deliberately no
+    // href-based fallback, and no generic `li`/`tr` container is accepted merely
+    // for being the nearest ancestor.
     function rowRootFor(anchor) {
       let node = anchor;
       for (let depth = 0; depth < 12 && node; depth += 1) {
-        if (node.matches && node.matches(rowRootSelector)) return node;
+        if (node.matches && node.matches(rowRootSelector)) {
+          return distinctScheduleRefs(node) <= 1 ? node : anchor;
+        }
         node = node.parentElement;
       }
       return anchor;
@@ -1426,6 +1462,12 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
       const cardText = clean(root.innerText || root.textContent || '');
       const hrefs = Array.from(new Set(rowAnchors.map((a) => a.getAttribute('href') || '').filter(Boolean)));
 
+      // Date scoping is deliberately narrow: the row's own subtree, its
+      // immediate previous sibling, and its parent's previous sibling. Widening
+      // it to the parent's whole subtree was tried and rejected -- it lets a row
+      // adopt a neighbouring row's date, which is the failure the original
+      // completed-game extractor documents. A row that can see no date in that
+      // scope reports gameDate = null rather than borrowing one.
       const searchRoots = [root];
       if (root.previousElementSibling) searchRoots.push(root.previousElementSibling);
       const parentPrev = root.parentElement && root.parentElement.previousElementSibling;
@@ -1476,7 +1518,7 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
         gameNumberText: within('[data-game-number], .game-number', 'data-game-number'),
       };
     });
-  }, ROW_ROOT_SELECTOR);
+  }, EXPLICIT_ROW_ROOT_SELECTOR);
 
   const entries = rawRows.map((rawRow) => {
     const href = rawRow.hrefs.length ? new URL(rawRow.hrefs[0], page.url()).href : '';
@@ -3661,7 +3703,7 @@ if (require.main !== module) {
     getVisibleScheduleEntries,
     SCHEDULE_EXTRACTION_MODES,
     SCHEDULE_ENTRY_STATUSES,
-    ROW_ROOT_SELECTOR,
+    EXPLICIT_ROW_ROOT_SELECTOR,
     classifyScheduleEntryStatus,
     parseScheduledTimeText,
     parseHomeAway,
