@@ -1241,6 +1241,250 @@ async function getVisibleCompletedGameEntries(page) {
   return entries;
 }
 
+// ── Schedule extraction modes (HS Slice 2D) ────────────────────────────
+//
+// getVisibleCompletedGameEntries above anchors on a score badge, so it can only
+// ever see games that have already been played. That is exactly right for
+// Travel and for High School own-team import, which reconstruct completed
+// games. It is NOT sufficient for High School opponent monitoring, which has to
+// know about a future scheduled game, a postponement, a cancellation and a
+// doubleheader entry BEFORE either half is final.
+//
+// Rather than add a second scraper, this is the one schedule-row extraction
+// boundary, with the mode stated explicitly at the call site:
+//
+//   COMPLETED_ONLY       delegates to getVisibleCompletedGameEntries unchanged
+//   ALL_SCHEDULE_ENTRIES anchors on schedule rows instead of score badges
+//
+// The mode is never inferred from an environment variable or a loosely related
+// flag: an existing caller that wants completed games must keep asking for
+// completed games.
+const SCHEDULE_EXTRACTION_MODES = Object.freeze({
+  COMPLETED_ONLY: 'completed_only',
+  ALL_SCHEDULE_ENTRIES: 'all_schedule_entries',
+});
+
+const SCHEDULE_ENTRY_STATUSES = Object.freeze([
+  'scheduled', 'in_progress', 'final', 'postponed', 'cancelled', 'suspended', 'unknown',
+]);
+
+// Pure, browser-free, and exported so the classification rules can be tested
+// directly rather than only through a DOM fixture.
+//
+// Order matters. A row that says "Postponed" must never be read as final just
+// because some other part of the card carries a stale score, and a row with no
+// recognisable evidence stays 'unknown' rather than being optimistically called
+// 'scheduled'. Nothing here invents a status the source did not express.
+function classifyScheduleEntryStatus({ rawStatusText = '', scoreText = '' } = {}) {
+  const text = String(rawStatusText || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const score = String(scoreText || '').replace(/\s+/g, ' ').trim();
+
+  if (/\b(?:postponed|ppd)\b/.test(text)) return 'postponed';
+  if (/\bcancell?ed\b/.test(text)) return 'cancelled';
+  if (/\bsuspended\b/.test(text)) return 'suspended';
+  if (/\b(?:in progress|live now|top \d|bot(?:tom)? \d|mid \d|end \d)\b/.test(text)) return 'in_progress';
+  if (/\b[WLT]\s*\d+\s*[-–—]\s*\d+\b/i.test(score)) return 'final';
+  if (/\bfinal\b/.test(text)) return 'final';
+  // A clock time is positive evidence the source is advertising an upcoming
+  // game; without it there is nothing to justify any particular status.
+  if (/\b\d{1,2}:\d{2}\s*(?:am|pm)\b/.test(text)) return 'scheduled';
+  if (/\b(?:tbd|tba)\b/.test(text)) return 'unknown';
+  return 'unknown';
+}
+
+// GameChanger schedule rows do not carry a timezone. Rather than guess the
+// viewer's zone (which would silently shift a 7:00 PM first pitch), the
+// uncertainty is recorded explicitly and carried downstream.
+function parseScheduledTimeText(value) {
+  const match = String(value || '').match(/\b(\d{1,2}:\d{2}\s*(?:AM|PM))\b/i);
+  if (!match) return { scheduledTimeText: null, timezoneKnown: false, timezone: null };
+  const zone = String(value || '').match(/\b(EST|EDT|CST|CDT|MST|MDT|PST|PDT|AKST|AKDT|HST|UTC|GMT)\b/i);
+  return {
+    scheduledTimeText: match[1].replace(/\s+/g, ' ').toUpperCase(),
+    timezoneKnown: !!zone,
+    timezone: zone ? zone[1].toUpperCase() : null,
+  };
+}
+
+// "vs" means the subject team is hosting; "@" means it is travelling. Anything
+// else stays null rather than defaulting to home.
+function parseHomeAway(value) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (/(^|\s)@\s*\S/.test(text) || /\bat\s+\S/i.test(text)) return 'away';
+  if (/\bvs\.?\s+\S/i.test(text)) return 'home';
+  return null;
+}
+
+function parseCounterpartyName(value) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  const match = text.match(/(?:\bvs\.?|@|\bat)\s+([^,|•]+?)(?=\s{2,}|\s*[,|•]|\s+\d{1,2}:\d{2}\s*(?:AM|PM)\b|$)/i);
+  if (!match) return null;
+  const name = match[1].replace(/\s+/g, ' ').trim();
+  return name || null;
+}
+
+// A doubleheader marker is the only deterministic discriminator available when
+// two same-day rows share an opponent and no distinct upstream id.
+function parseGameNumber(value) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  const labelled = text.match(/\bgame\s*#?\s*(\d{1,2})\b/i);
+  if (labelled) return Number(labelled[1]);
+  const dh = text.match(/\bdh\s*[-#]?\s*(\d{1,2})\b/i);
+  if (dh) return Number(dh[1]);
+  return null;
+}
+
+function normalizeScheduleEntryText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+// The single schedule-row extraction boundary. `mode` is required and explicit.
+async function getVisibleScheduleEntries(page, { mode } = {}) {
+  if (mode !== SCHEDULE_EXTRACTION_MODES.COMPLETED_ONLY
+    && mode !== SCHEDULE_EXTRACTION_MODES.ALL_SCHEDULE_ENTRIES) {
+    throw new Error(`getVisibleScheduleEntries requires an explicit mode (${Object.values(SCHEDULE_EXTRACTION_MODES).join(' | ')})`);
+  }
+
+  if (mode === SCHEDULE_EXTRACTION_MODES.COMPLETED_ONLY) {
+    // Deliberately the SAME function Travel and own-team import already use --
+    // not a reimplementation -- so their behaviour cannot drift.
+    const completed = await getVisibleCompletedGameEntries(page);
+    return completed.map((entry) => ({
+      ...entry,
+      status: 'final',
+      rawStatusText: entry.scoreText || '',
+      counterpartyName: parseCounterpartyName(entry.cardText),
+      homeAway: parseHomeAway(entry.cardText),
+      venue: null,
+      gameNumber: parseGameNumber(entry.cardText),
+      ...parseScheduledTimeText(entry.cardText),
+    }));
+  }
+
+  await dismissDontMissOutPopup(page);
+  const rowLocator = page.locator('a[href*="/schedule/"]');
+  const count = await rowLocator.count();
+  const entries = [];
+  const seenHrefs = new Set();
+
+  for (let index = 0; index < count; index += 1) {
+    const item = rowLocator.nth(index);
+    try {
+      const box = await item.boundingBox();
+      if (!box || box.width <= 0 || box.height <= 0) continue;
+
+      const raw = await item.evaluate((element) => {
+        function clean(value) { return String(value || '').replace(/\s+/g, ' ').trim(); }
+        function looksLikeDate(value) {
+          return /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\.?[,]?\s*(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}(?:,?\s+(?:20\d{2}|19\d{2}))?\b/i.test(value) ||
+            /\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/.test(value);
+        }
+        const CARDTEXT_MAX_LEN = 260;
+
+        const cardText = clean(element.innerText || element.textContent || '');
+        const href = element.getAttribute('href') || '';
+
+        // Same scoping rule the completed-game extractor uses: the row's own
+        // subtree plus the immediately preceding sibling (a date-group header
+        // commonly sits just above a block of that day's games). Never the whole
+        // document -- that collapses an entire schedule onto one date.
+        const searchRoots = [element];
+        if (element.previousElementSibling) searchRoots.push(element.previousElementSibling);
+        const parentPrev = element.parentElement && element.parentElement.previousElementSibling;
+        if (parentPrev) searchRoots.push(parentPrev);
+
+        const rect = element.getBoundingClientRect();
+        const dateCandidates = [];
+        const seen = new Set();
+        for (const root of searchRoots) {
+          const nodes = [root, ...Array.from(root.querySelectorAll('*'))];
+          for (const candidate of nodes) {
+            if (seen.has(candidate)) continue;
+            seen.add(candidate);
+            const text = clean(candidate.innerText || candidate.textContent || '');
+            if (!text || text.length > 300 || !looksLikeDate(text)) continue;
+            const candidateRect = candidate.getBoundingClientRect();
+            const distance = Math.abs(candidateRect.top - rect.top);
+            const abovePenalty = candidateRect.top <= rect.top + 20 ? 0 : 10000;
+            dateCandidates.push({ text, distance: distance + abovePenalty, top: candidateRect.top });
+          }
+        }
+        dateCandidates.sort((a, b) => a.distance - b.distance || b.top - a.top);
+
+        const scoreNode = Array.from(element.querySelectorAll('*'))
+          .map((node) => clean(node.innerText || node.textContent || ''))
+          .find((text) => /\b[WLT]\s*\d+\s*[-–—]\s*\d+\b/i.test(text) && text.length <= 40);
+
+        const statusNode = Array.from(element.querySelectorAll('[data-status], .status, .game-status'))
+          .map((node) => clean(node.innerText || node.textContent || node.getAttribute('data-status')))
+          .find(Boolean);
+
+        const venueNode = Array.from(element.querySelectorAll('[data-venue], .venue, .location'))
+          .map((node) => clean(node.getAttribute('data-venue') || node.innerText || node.textContent))
+          .find(Boolean);
+
+        // Read from a dedicated element where one exists rather than relying on
+        // the row's concatenated text: adjacent inline nodes run together
+        // without a separator ("Riverside ParkGame 1"), which destroys the word
+        // boundary any text-level parse would need.
+        const gameNumberNode = Array.from(element.querySelectorAll('[data-game-number], .game-number'))
+          .map((node) => clean(node.getAttribute('data-game-number') || node.innerText || node.textContent))
+          .find(Boolean);
+
+        return {
+          cardText: cardText.length <= CARDTEXT_MAX_LEN ? cardText : cardText.slice(0, CARDTEXT_MAX_LEN),
+          href,
+          dateText: dateCandidates[0]?.text || '',
+          scoreText: scoreNode || '',
+          statusText: statusNode || '',
+          venueText: venueNode || '',
+          gameNumberAttr: element.getAttribute('data-game-number') || '',
+          gameNumberText: gameNumberNode || '',
+        };
+      });
+
+      const href = raw.href ? new URL(raw.href, page.url()).href : '';
+      // A schedule page can legitimately render the same game link twice
+      // (mobile + desktop layouts). Row order is provenance, never identity.
+      if (href && seenHrefs.has(href)) continue;
+      if (href) seenHrefs.add(href);
+
+      const scoreParts = parseScoreText(raw.scoreText || raw.cardText || '');
+      const rawStatusText = normalizeScheduleEntryText(`${raw.statusText} ${raw.cardText}`);
+      const status = classifyScheduleEntryStatus({ rawStatusText, scoreText: raw.scoreText });
+      const timing = parseScheduledTimeText(raw.cardText);
+
+      entries.push({
+        visibleIndex: entries.length,
+        status,
+        rawStatusText,
+        scoreText: normalizeScheduleEntryText(raw.scoreText),
+        cardText: normalizeScheduleEntryText(raw.cardText),
+        dateText: normalizeScheduleEntryText(raw.dateText),
+        gameDate: normalizeScheduleDateText(`${raw.cardText || ''} ${raw.dateText || ''}`),
+        result: scoreParts.result,
+        scoreUs: scoreParts.scoreUs,
+        scoreThem: scoreParts.scoreThem,
+        counterpartyName: parseCounterpartyName(raw.cardText),
+        homeAway: parseHomeAway(raw.cardText),
+        venue: normalizeScheduleEntryText(raw.venueText) || null,
+        gameNumber: raw.gameNumberAttr
+          ? Number(raw.gameNumberAttr)
+          : (parseGameNumber(raw.gameNumberText) ?? parseGameNumber(raw.cardText)),
+        scheduledTimeText: timing.scheduledTimeText,
+        timezone: timing.timezone,
+        timezoneKnown: timing.timezoneKnown,
+        href,
+        gameId: href ? extractGameIdFromUrl(href) : '',
+      });
+    } catch {
+      // Ignore stale rows, exactly as the completed-game extractor does.
+    }
+  }
+
+  return entries;
+}
+
 function buildResumeOrderedScheduleIndexes(completedGameCount) {
   const newestFirst = process.env.GC_SCHEDULE_NEWEST_FIRST !== 'false';
   const indexes = [];
@@ -3360,6 +3604,14 @@ if (require.main !== module) {
     normalizeTeamUrl,
     getVisibleCompletedGameCount,
     getVisibleCompletedGameEntries,
+    getVisibleScheduleEntries,
+    SCHEDULE_EXTRACTION_MODES,
+    SCHEDULE_ENTRY_STATUSES,
+    classifyScheduleEntryStatus,
+    parseScheduledTimeText,
+    parseHomeAway,
+    parseCounterpartyName,
+    parseGameNumber,
     setCurrentJobOrgId,
   };
 }
