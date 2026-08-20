@@ -2131,6 +2131,41 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
       return node && node.closest ? node.closest(SCHEDULE_COMPONENT_SELECTOR) : null;
     }
 
+    // ── The no-component fallback needs an AFFIRMATIVE local relationship ──
+    //
+    // When a row sits inside a schedule component the rule above is enough: a
+    // header must share that component. A page that declares no component at
+    // all had only "the header's parent subtree contains the row", which a
+    // distant common ancestor satisfies -- so a page-level header separated
+    // from the games by unrelated content and a nested sibling list still
+    // governed them:
+    //
+    //   <div id="page">
+    //     <div class="date-header">Apr 11, 2026</div>   <-- page level
+    //     <div class="notes">...</div>                  <-- unrelated
+    //     <div id="other"><a href=".../schedule/1">      <-- different list
+    //
+    // Sharing `#page` is not evidence that the header describes that list. Two
+    // narrow shapes are, and nothing else qualifies:
+    //
+    //   1. the header and the row root are DIRECT SIBLINGS -- one parent holds
+    //      the label and the games it labels, with nothing interposed;
+    //   2. an explicit date-group wrapper contains BOTH -- the source drew the
+    //      boundary itself, so the header cannot escape it.
+    //
+    // Anything else fails toward unresolved rather than guessing across an
+    // uncertain boundary.
+    const DATE_GROUP_SELECTOR = '.date-group, [data-date-group]';
+    function nearestDateGroup(node) {
+      return node && node.closest ? node.closest(DATE_GROUP_SELECTOR) : null;
+    }
+    function hasAffirmativeLocalRelationship(headerElement, root) {
+      if (!headerElement || !root) return false;
+      if (headerElement.parentElement && headerElement.parentElement === root.parentElement) return true;
+      const group = nearestDateGroup(headerElement);
+      return !!(group && group !== headerElement && group.contains(root));
+    }
+
     const headers = [];
     for (const element of document.querySelectorAll('*')) {
       if (!isInnermostMarkedDateHeader(element, DATE_HEADER_MAX_LEN)) continue;
@@ -2219,6 +2254,9 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
         // schedule component, only a header inside that SAME component may
         // govern it. A page-level header beside the component cannot reach in.
         if (rootComponent && header.component !== rootComponent) continue;
+        // No component anywhere: the shared-ancestor test alone is too weak, so
+        // require one of the two affirmative local shapes documented above.
+        if (!rootComponent && !hasAffirmativeLocalRelationship(header.element, root)) continue;
         candidates.push(header);
       }
       candidates.sort((a, b) => a.position - b.position);
