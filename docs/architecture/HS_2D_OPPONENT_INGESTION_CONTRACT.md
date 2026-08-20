@@ -407,3 +407,238 @@ A hash collision between two unrelated subjects is theoretically possible and wo
 harmless extra waiting, never an incorrect result. The namespace is the single-argument advisory
 lock space; no other code path in this repository takes advisory locks, so there is no avoidable
 namespace collision to fix.
+
+---
+
+# Addendum B: how a schedule date is established, and what each layer can actually prove
+
+Slice 2D published two wrong dates before this addendum existed, and both came from the same
+unwritten assumption: that an element containing a date is an element *asserting* a schedule
+date. It is not. This addendum is the written contract for how the extractor decides what a
+source said about a date, which of those verdicts may be published, and — importantly — the
+limits of what the database can independently verify.
+
+## B1. Recognized structural markers
+
+An element becomes a **candidate date header** only when the source affirmatively marked it as
+one. Containing a parseable date is necessary but never sufficient:
+
+```text
+[data-schedule-date]   [data-date-header]   .date-header   .schedule-date
+```
+
+A caption, note, label, tournament title, hero banner or "last updated" stamp carries none of
+these, so it governs nothing. A candidate must additionally contain no schedule anchor (a
+container holding games is a group, not a header) and be short enough to be a label. Only the
+**innermost** marked element counts, so a marked wrapper never shadows the marked label inside it.
+
+When nothing marked governs a row the answer is `not_expressed`. The search is never widened to
+look for something merely date-like: widening it is what published the wrong dates.
+
+## B2. The positive date-leading grammar
+
+Structural marking says the source believes the element is a date header. It does not say the
+text is a schedule date. A negative keyword list was tried and failed in both directions — it
+missed synonyms ("Last modified", "Roster freeze", "Published") and it rejected ordinary
+game-day language ("gates open at 5"). The rule is now affirmative:
+
+> A header is read as a schedule date only when a real calendar date **leads** the normalized
+> text, optionally after a weekday, exactly one calendar date is named, and everything left over
+> is punctuation or a supported annotation describing **that game**.
+
+The date must lead. That single rule separates `Saturday, April 11, 2026 - Doubleheader` from
+`Rainout announced Mar 14, 2026`: administrative text says what happened to the schedule before
+it names a date; a schedule header names the day first and then annotates it.
+
+### Allowed annotation grammar
+
+Every supported annotation expresses a property of a scheduled game that this codebase already
+parses elsewhere. Nothing is admitted because it "looks harmless":
+
+```text
+Doubleheader | DH | Game N | Gm N        two games that day, and which one
+Home | Away | Neutral | vs | at          the side designation
+Varsity | JV | Junior Varsity            the team level
+Freshman | Frosh
+Senior Night | Senior Day | Homecoming   a game-day designation for THAT game
+gates open [at] <time>                   the day's timing
+first pitch [at] <time>
+<bare clock time>
+```
+
+Extending this list is a deliberate act that must name which game property the new annotation
+expresses. An administrative phrase describes an action taken *on* the schedule rather than a
+property of the game, so it is absent — and absence is refusal.
+
+Annotations grant permission to read the date; they do **not** populate game fields. Scheduled
+time, game number and home/away are parsed from the row's own text, never from the header. A
+header reading `gates open at 5` therefore cannot become a 5:00 first pitch, and `Game 2` in a
+header cannot renumber a game.
+
+## B3. Structured evidence: strength and precedence
+
+A structured value is one the source published for machines rather than readers. Four forms are
+recognized, and their evidentiary strength is **stated, not assumed**:
+
+| Form | What it proves |
+|---|---|
+| `data-schedule-date` on the marked header | The source names this element's schedule date. |
+| `data-date-header` on the marked header | The source names this element's header date. |
+| `datetime` on a marked `<time>` header | The source names this header's date. |
+| a nested `time[datetime]` **descendant** | Only that *its own contents* are a date. |
+
+The nested case is deliberately weaker in meaning: `<time datetime>` is ordinary, correct HTML
+that marks a string as a date. It says nothing about whether that date is the schedule date for
+the games that follow. `Last modified <time datetime="2026-03-09">Mar 9, 2026</time>` is
+perfectly well-formed markup for a fact that is not a game date.
+
+The governing rule, which applies identically to all four forms:
+
+> **Structured evidence may CONFIRM a date the grammar already accepted, or SUPPLY a date the
+> visible text never expressed. It may never OVERRIDE an unsafe visible verdict.**
+
+Concretely, per candidate header:
+
+* visible `unsupported` → `unsupported_marked_header`, **even when the structured value agrees**;
+* visible `invalid` → `invalid`;
+* visible `ambiguous` → `ambiguous`;
+* visible readable **and** structured value differs → `conflicting`;
+* visible readable **and** structured value agrees → confirmed, resolved;
+* visible expresses no date at all → the structured value supplies it;
+* an empty value, or a Boolean-style marker such as `"1"`, is not a date and supplies nothing;
+* two structured values that disagree → `conflicting`; two that agree → one confirmed date.
+
+No structured form is strong enough to license prose the grammar refused, because none of them
+can observe *why* it was refused. Agreement is not absolution: a header whose prose says
+"Rainout announced" and whose attribute says the same day is still a header this parser cannot
+read, and reading it anyway is precisely the bypass that published `2026-03-14` into a verified
+generation.
+
+## B4. Resolution statuses
+
+```text
+resolved_game_row          the row itself expressed a date
+resolved_date_group        an enclosing marked header expressed exactly one date
+not_expressed              neither did; the source simply did not say
+ambiguous                  the governing evidence names more than one date
+conflicting                row and group disagree, or structured and visible disagree
+invalid                    a named date does not exist on the Gregorian calendar
+unsupported_marked_header  the source MARKED a date header and put date-like text in it
+                           that the positive grammar refuses to read
+```
+
+`unsupported_marked_header` is deliberately **not** folded into `not_expressed`. "The source said
+nothing" and "the source said something I refuse to interpret" call for different handling, and
+only the first may use the completed-game null-date exception (§B6).
+
+## B5. Scope: which header governs which row
+
+A header may govern a row only when it precedes it, is not inside it, and its parent subtree
+contains it. On top of that:
+
+**Rows inside a schedule component.** `.schedule`, `[data-schedule]`, `.schedule-component` and
+`[data-schedule-component]` declare a component. When a row is inside one, only a header inside
+that **same** component may govern it. A page-level header beside the component cannot reach in,
+component A cannot govern component B, and nested components stay isolated.
+
+**Rows on a page with no component at all.** The shared-ancestor test alone is too weak — a
+distant common parent let a page-level header govern an unrelated nested list. Two shapes, and
+only these two, are an affirmative local relationship:
+
+1. the header and the row root are **direct siblings** under one parent; or
+2. an explicit date-group wrapper (`.date-group`, `[data-date-group]`) contains **both**.
+
+Anything else resolves to `not_expressed` rather than guessing across an uncertain boundary.
+
+**The governing run.** Where several marked headers could claim one row, they compete. The run
+*begins* after the last schedule anchor preceding the row — once a game has intervened, an
+earlier header is that game's history, not a rival claim — and *ends* at the row itself, so a
+header after the game never affects it. Only the innermost scope competes, so a month header
+wrapping a day header is context rather than competition. A header in another component is
+excluded before the run is formed.
+
+Within a run, **unsafe evidence participates; it is not a fallback**:
+
+* two readable headers naming the same date → confirmation;
+* two readable headers disagreeing → `ambiguous`;
+* any header `unsupported` → `unsupported_marked_header`;
+* any header `invalid` → `invalid`;
+* any header `conflicting` → `conflicting`;
+* the result never depends on the order the source emitted the headers.
+
+One readable header plus one unreadable header is not unanimous readable evidence. "I cannot read
+this marked header" is strictly less certain than "these two headers disagree", so it cannot
+produce a more confident answer than the ambiguous verdict disagreement already yields.
+
+For the same reason an unsafe governing header outranks a **per-row** date, exactly as a
+`conflicting` header already does: governing evidence is not irrelevant merely because the row
+also spoke.
+
+## B6. The completed-game null-date exception
+
+A collection may publish an observation with `game_date = null` only when the game is `final`
+**and** anchored by a stable upstream `sourceGameRef`. A completed game with a durable id is a
+real, identifiable event whose date the source merely failed to render.
+
+The exception is unavailable to `unsupported_marked_header`, `ambiguous`, `conflicting` and
+`invalid`. Those are unresolved *evidence*, not the absence of evidence. Letting a refused header
+fall through to the exception is how a rejected legitimate header became a verified completed
+game carrying `game_date = null`.
+
+An unplayed game with no date is never publishable: there is no result to anchor it.
+
+## B7. HTTP(S)-only source references
+
+A schedule reference becomes a source identity only if it parses as a URL **and** resolves to
+`http:` or `https:`. `javascript:`, `data:`, `file:`, `ftp:`, `blob:`, `about:`, `mailto:` and
+custom schemes parse perfectly well but are not schedule locations, so they yield no href and no
+game id. Percent-encoded scheme lookalikes (`%6aavascript:`) are not schemes at all; they resolve
+as ordinary same-origin relative paths and are never executed or navigated.
+
+A rejected reference is flagged rather than dropped: the row survives extraction so it can never
+be silently lost, no two rejected rows share a sentinel identity, a rejected row never erases the
+valid rows beside it, and the collection then fails closed with
+`opponent_source_reference_malformed`.
+
+## B8. Where each rule is enforced
+
+```text
+extractor    decides the resolution status from the DOM. This is the ONLY layer that
+             can see the markup.
+collector    refuses to capture a collection containing an unsafe status; names the
+             reason (marked_date_header_is_not_a_readable_schedule_date, and the
+             siblings for ambiguous/conflicting/invalid).
+mapper       refuses to build a DTO from unsafe evidence, before any database call,
+             with OPPONENT_SCHEDULE_DATE_UNRESOLVED.
+RPC          persist_hs_engine_collection restates the rule inside the SECURITY
+             INVOKER boundary and rolls the whole transaction back.
+```
+
+Terminal run states: a rejected run settles `failed` with a `failure_stage`, never lingering
+`running`. A publication-boundary rejection writes zero canonical games, zero generations, zero
+run-game members and zero totals, and leaves the previously current generation current.
+
+## B9. The service-role DTO trust boundary — stated precisely
+
+`persist_hs_engine_collection` runs `SECURITY INVOKER` with `search_path = ''` and is executable
+only by `postgres` and `service_role`. It validates the semantic status **supplied in the DTO**.
+
+> The RPC validates the semantic status supplied in the DTO. It cannot reconstruct DOM evidence
+> that the caller removed or relabeled.
+
+What that means in practice, verified by direct RPC probing:
+
+* a DTO that **retains** `unsupported_marked_header`, `ambiguous`, `conflicting` or `invalid` is
+  rejected by name, with a full transaction rollback and zero writes;
+* a privileged caller that **omits** `diagnostics.dateResolution`, relabels the status to
+  `not_expressed` or `resolved_date_group`, or supplies a fabricated date, is **not** stopped by
+  the database — the DTO no longer contains the evidence the check reads.
+
+This is a property of the trust boundary, not a defect to be patched in SQL. The RPC has no
+access to the page, so it cannot prove source semantics; a third restatement of the rule inside
+the database narrows accidental bypass by the application's own code paths, and nothing more. The
+protection against a malicious privileged caller is that `service_role` credentials are not
+issued to untrusted parties — not that the RPC could detect the forgery.
+
+Nothing in this repository should be read as claiming the RPC independently proves what the
+source said.

@@ -653,3 +653,150 @@ test('protocol-relative and absolute HTTP(S) references are still accepted', asy
   assert.equal(entries[0].gameId, 'pr-1');
   assert.equal(entries[0].sourceReferenceMalformed, false);
 });
+
+// ── Structured evidence confirms or supplies; it never overrides ───────
+//
+// The bypass these pin: an element MARKED as a date header, carrying prose the
+// positive grammar refuses, published that prose's date anyway as soon as the
+// same date also appeared in a machine-readable value. The refused-prose case
+// and the accepted-header case then differed only by semantically correct HTML,
+// which is not a distinction the source intended to make.
+
+test('a nested <time datetime> cannot license administrative prose around it', async () => {
+  for (const [name, fixture] of [
+    ['played', fixtures.nestedTimeUnderAdministrativeProse],
+    ['unplayed', fixtures.nestedTimeUnderAdministrativeProseUnplayed],
+    ['last modified, played', fixtures.nestedTimeUnderLastModified],
+    ['last modified, unplayed', fixtures.nestedTimeUnderLastModifiedUnplayed],
+  ]) {
+    const entries = await entriesFrom(fixture);
+    assert.equal(entries[0].gameDate, null, `${name}: no date may be published`);
+    assert.equal(entries[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.UNSUPPORTED_MARKED_HEADER,
+      `${name}: the grammar's refusal survives an agreeing <time datetime>`);
+  }
+});
+
+test('a header-level structured attribute cannot license administrative prose either', async () => {
+  for (const [name, fixture] of [
+    ['data-schedule-date, played', fixtures.scheduleDateAttributeAgreeingWithProse],
+    ['data-schedule-date, unplayed', fixtures.scheduleDateAttributeAgreeingWithProseUnplayed],
+    ['data-date-header, played', fixtures.dateHeaderAttributeAgreeingWithProse],
+    ['data-date-header, unplayed', fixtures.dateHeaderAttributeAgreeingWithProseUnplayed],
+    ['marked <time> carrying prose, played', fixtures.markedTimeElementCarryingProse],
+    ['marked <time> carrying prose, unplayed', fixtures.markedTimeElementCarryingProseUnplayed],
+  ]) {
+    const entries = await entriesFrom(fixture);
+    assert.equal(entries[0].gameDate, null, `${name}: no date may be published`);
+    assert.equal(entries[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.UNSUPPORTED_MARKED_HEADER,
+      `${name}: a named attribute is not permission to read refused prose`);
+  }
+});
+
+test('legitimate structured headers still resolve', async () => {
+  for (const [name, fixture] of [
+    ['marked <time> element', fixtures.markedTimeElementReadable],
+    ['data-schedule-date beside a supported annotation', fixtures.scheduleDateAttributeWithReadableAnnotation],
+    ['nested <time> inside a readable header', fixtures.nestedTimeInsideReadableHeader],
+    ['structured value with no visible text at all', fixtures.structuredValueWithNoText],
+  ]) {
+    const entries = await entriesFrom(fixture);
+    assert.equal(entries[0].gameDate, '2026-04-11', `${name}: must still publish its date`);
+    assert.equal(entries[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.RESOLVED_DATE_GROUP);
+  }
+});
+
+// ── Unsupported evidence participates in the competition ──────────────
+//
+// One readable header plus one unreadable header is not unanimous readable
+// evidence. "I cannot read this marked header" is strictly less certain than
+// "these two headers disagree", so it cannot yield a more confident answer than
+// the ambiguous verdict the disagreement case already produces.
+
+test('an unreadable marked header is not discarded because another header resolved', async () => {
+  for (const [name, fixture, expected] of [
+    ['readable then unsupported', fixtures.readableThenUnsupportedHeader, DATE_RESOLUTION_STATUSES.UNSUPPORTED_MARKED_HEADER],
+    ['unsupported then readable', fixtures.unsupportedThenReadableHeader, DATE_RESOLUTION_STATUSES.UNSUPPORTED_MARKED_HEADER],
+    ['readable then invalid', fixtures.readableThenInvalidHeader, DATE_RESOLUTION_STATUSES.INVALID],
+    ['invalid then readable', fixtures.invalidThenReadableHeader, DATE_RESOLUTION_STATUSES.INVALID],
+    ['readable then unsupported, unplayed', fixtures.readableThenUnsupportedHeaderUnplayed, DATE_RESOLUTION_STATUSES.UNSUPPORTED_MARKED_HEADER],
+  ]) {
+    const entries = await entriesFrom(fixture);
+    assert.equal(entries[0].gameDate, null, `${name}: nothing may be published`);
+    assert.equal(entries[0].dateResolutionStatus, expected, `${name}: the unsafe verdict must survive`);
+  }
+});
+
+test('DOM order does not decide whether unsafe competing evidence counts', async () => {
+  const forwards = await entriesFrom(fixtures.readableThenUnsupportedHeader);
+  const reversed = await entriesFrom(fixtures.unsupportedThenReadableHeader);
+  assert.equal(forwards[0].dateResolutionStatus, reversed[0].dateResolutionStatus,
+    'which header the source emitted first is not evidence about dates');
+  assert.equal(forwards[0].gameDate, reversed[0].gameDate);
+});
+
+test('a per-row date does not dismiss a marked header the parser refused to read', async () => {
+  const entries = await entriesFrom(fixtures.rowDateUnderUnsupportedHeader);
+  assert.equal(entries[0].gameDate, null);
+  assert.equal(entries[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.UNSUPPORTED_MARKED_HEADER,
+    'governing evidence is not irrelevant merely because the row also spoke');
+});
+
+test('unsafe evidence stays inside its own governing run', async () => {
+  const after = await entriesFrom(fixtures.unsupportedHeaderAfterTheGame);
+  assert.equal(after[0].gameDate, '2026-04-11', 'a header AFTER the game cannot reach back to it');
+
+  const groups = await entriesFrom(fixtures.unsupportedHeaderInNextGroupOnly);
+  assert.deepEqual(datesById(groups), { 'bnd-2': '2026-04-11', 'bnd-3': null },
+    'an unreadable header in the NEXT group does not poison the delimited one before it');
+  assert.equal(byId(groups)['bnd-3'].dateResolutionStatus, DATE_RESOLUTION_STATUSES.UNSUPPORTED_MARKED_HEADER);
+
+  const components = await entriesFrom(fixtures.unsupportedHeaderInAnotherComponent);
+  assert.equal(components[0].gameDate, '2026-04-11', 'another component never competes');
+});
+
+test('nested month and day headers remain context, not competition', async () => {
+  const entries = await entriesFrom(fixtures.nestedDateGroups);
+  assert.equal(entries[0].gameDate, '2026-04-18',
+    'the innermost header is the specific claim; the month around it is not a rival');
+});
+
+// ── Flat-page scope requires an affirmative local relationship ────────
+//
+// Sharing a distant ancestor is not evidence that a header describes a list.
+// Only two shapes are: direct siblings, or an explicit date-group wrapper
+// containing both.
+
+test('a bare page header governs only rows it is affirmatively local to', async () => {
+  for (const [name, fixture, expected] of [
+    ['direct sibling row', fixtures.bareDirectSiblingHeaderAndRow, '2026-04-11'],
+    ['unrelated element between header and a direct row', fixtures.bareHeaderUnrelatedElementThenDirectRow, '2026-04-11'],
+    ['explicit date-group wrapper, row nested inside it', fixtures.bareNestedDateGroupNoComponent, '2026-04-11'],
+    ['row inside a SEPARATE nested list', fixtures.pageHeaderIntoNestedSiblingList, null],
+    ['header in one bare section, row in another', fixtures.bareHeaderInOneSectionRowsInAnother, null],
+    ['header after the row', fixtures.bareHeaderAfterRow, null],
+  ]) {
+    const entries = await entriesFrom(fixture);
+    assert.equal(entries[0].gameDate, expected, `${name}: expected ${expected}`);
+  }
+});
+
+test('a bare page header covers every row it is a direct sibling of', async () => {
+  const entries = await entriesFrom(fixtures.bareDirectSiblingHeaderAndTwoRows);
+  assert.deepEqual(datesById(entries), { 'flat-2': '2026-04-11', 'flat-3': '2026-04-11' });
+});
+
+test('independent bare schedule sections keep their own dates, in either order', async () => {
+  const two = await entriesFrom(fixtures.twoBareScheduleSectionsOneParent);
+  assert.deepEqual(datesById(two), { 'flat-7': '2026-04-11', 'flat-8': '2026-04-18' });
+
+  const reversed = await entriesFrom(fixtures.bareDateGroupsReversedOrder);
+  assert.deepEqual(datesById(reversed), { 'flat-12': '2026-04-18', 'flat-13': '2026-04-11' },
+    'reversing bare date groups moves no date');
+});
+
+test('a bare administrative header cannot reach an unrelated list at all', async () => {
+  const entries = await entriesFrom(fixtures.bareAdministrativeHeaderThenList);
+  assert.equal(entries[0].gameDate, null);
+  assert.equal(entries[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.NOT_EXPRESSED,
+    'it never governs the list, so it expresses nothing about it');
+});

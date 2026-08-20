@@ -913,3 +913,110 @@ module.exports.protocolRelativeReference = page(`
   <div class="date-group"><div class="date-header">Apr 11, 2026</div>
     ${schemeRow('//web.gc.com/teams/opponent-high/schedule/pr-1', 'Alpha')}
   </div>`);
+
+// ── Structured evidence may confirm or supply, never override ──────────
+//
+// Every fixture below pairs administrative prose the positive grammar REFUSES
+// with a structured value that AGREES with the date inside that prose. The
+// agreeing case is the dangerous one and was the gap: the pre-existing
+// contradiction fixture took the conflicting branch and passed, so nothing
+// exercised the path where the attribute and the prose say the same thing.
+//
+// `oneUnplayed` gives each shape a future game too: the completed-game
+// null-date exception cannot rescue an unplayed row, so publishing one would
+// be a second, independent failure.
+const oneUnplayed = (id) => dg(id, 'Alpha High', { time: '5:00 PM' });
+
+const nestedTimeHeader = (prose, iso, text, games) => page(
+  `<div class="date-group"><div class="date-header">${prose} <time datetime="${iso}">${text}</time></div>${games}</div>`);
+
+module.exports.nestedTimeUnderAdministrativeProse = nestedTimeHeader('Rainout announced', '2026-03-14', 'Mar 14, 2026', one('nt-1'));
+module.exports.nestedTimeUnderAdministrativeProseUnplayed = nestedTimeHeader('Rainout announced', '2026-03-14', 'Mar 14, 2026', oneUnplayed('nt-2'));
+module.exports.nestedTimeUnderLastModified = nestedTimeHeader('Last modified', '2026-03-09', 'Mar 9, 2026', one('nt-3'));
+module.exports.nestedTimeUnderLastModifiedUnplayed = nestedTimeHeader('Last modified', '2026-03-09', 'Mar 9, 2026', oneUnplayed('nt-4'));
+
+module.exports.scheduleDateAttributeAgreeingWithProse = structuredHeader('class="date-header" data-schedule-date="2026-03-12"', 'Roster freeze Mar 12, 2026', one('nt-5'));
+module.exports.scheduleDateAttributeAgreeingWithProseUnplayed = structuredHeader('class="date-header" data-schedule-date="2026-03-12"', 'Roster freeze Mar 12, 2026', oneUnplayed('nt-6'));
+module.exports.dateHeaderAttributeAgreeingWithProse = structuredHeader('data-date-header="2026-03-15"', 'Registration closes Mar 15, 2026', one('nt-7'));
+module.exports.dateHeaderAttributeAgreeingWithProseUnplayed = structuredHeader('data-date-header="2026-03-15"', 'Registration closes Mar 15, 2026', oneUnplayed('nt-8'));
+
+module.exports.markedTimeElementCarryingProse = page(
+  `<div class="date-group"><time class="date-header" datetime="2026-03-14">Rainout announced Mar 14, 2026</time>${one('nt-9')}</div>`);
+module.exports.markedTimeElementCarryingProseUnplayed = page(
+  `<div class="date-group"><time class="date-header" datetime="2026-03-14">Rainout announced Mar 14, 2026</time>${oneUnplayed('nt-10')}</div>`);
+
+// Legitimate structured headers that must keep resolving.
+module.exports.markedTimeElementReadable = page(
+  `<div class="date-group"><time class="date-header" datetime="2026-04-11">Apr 11, 2026</time>${one('nt-ok-1')}</div>`);
+module.exports.scheduleDateAttributeWithReadableAnnotation = structuredHeader(
+  'class="date-header" data-schedule-date="2026-04-11"', 'Apr 11, 2026 - Doubleheader', one('nt-ok-2'));
+module.exports.nestedTimeInsideReadableHeader = page(
+  `<div class="date-group"><div class="date-header"><time datetime="2026-04-11">Apr 11, 2026</time></div>${one('nt-ok-3')}</div>`);
+
+// ── Unsupported evidence competes; it is not a fallback ────────────────
+//
+// A readable header standing beside one the parser could not read used to
+// publish the readable date with full confidence, even though two READABLE
+// headers that disagree are ambiguous. Both DOM orders are pinned so the
+// answer cannot depend on which element the source happened to emit first.
+const twoHeaders = (a, b, games) => page(`<div class="date-group">${a}${b}${games}</div>`);
+const H_READ = '<div class="date-header">Apr 11, 2026</div>';
+const H_UNSUP = '<div class="date-header">Roster freeze Mar 12, 2026</div>';
+const H_INVALID = '<div class="date-header">Feb 30, 2026</div>';
+
+module.exports.readableThenUnsupportedHeader = twoHeaders(H_READ, H_UNSUP, one('cmp-1'));
+module.exports.unsupportedThenReadableHeader = twoHeaders(H_UNSUP, H_READ, one('cmp-2'));
+module.exports.readableThenInvalidHeader = twoHeaders(H_READ, H_INVALID, one('cmp-3'));
+module.exports.invalidThenReadableHeader = twoHeaders(H_INVALID, H_READ, one('cmp-4'));
+module.exports.readableThenUnsupportedHeaderUnplayed = twoHeaders(H_READ, H_UNSUP, oneUnplayed('cmp-5'));
+
+// A row carrying its OWN date, governed by a header the parser refused to read.
+// The row date must not dismiss the marked header, exactly as it does not
+// dismiss a CONFLICTING one.
+module.exports.rowDateUnderUnsupportedHeader = page(
+  `<div class="date-group">${H_UNSUP}${dg('cmp-6', 'Alpha High', { score: 'W 5-1', gameDate: 'Apr 11, 2026' })}</div>`);
+
+// Run boundaries: unsafe evidence must not reach across a played game, into a
+// delimited neighbouring group, or out of its own schedule component.
+module.exports.unsupportedHeaderAfterTheGame = page(`<div class="date-group">${H_READ}${one('bnd-1')}${H_UNSUP}</div>`);
+module.exports.unsupportedHeaderInNextGroupOnly = page(
+  `<div class="date-group">${H_READ}${one('bnd-2')}</div><div class="date-group">${H_UNSUP}${one('bnd-3')}</div>`);
+module.exports.unsupportedHeaderInAnotherComponent = `<!doctype html><html><body>
+  <div id="page">
+    <section class="schedule"><div class="date-group">${H_UNSUP}</div></section>
+    <section class="schedule"><div class="date-group">${H_READ}${one('bnd-4')}</div></section>
+  </div></body></html>`;
+
+// ── Flat-page scope needs an affirmative local relationship ────────────
+//
+// A page that declares no schedule component previously let a header govern any
+// row under a shared ancestor. `pageHeaderIntoNestedSiblingList` is the shape
+// that crossed: header, unrelated content, then a SEPARATE nested list.
+module.exports.bareDirectSiblingHeaderAndRow = `<!doctype html><html><body>
+  <div id="page"><div class="date-header">Apr 11, 2026</div>${one('flat-1')}</div></body></html>`;
+module.exports.bareDirectSiblingHeaderAndTwoRows = `<!doctype html><html><body>
+  <div id="page"><div class="date-header">Apr 11, 2026</div>${one('flat-2')}${dg('flat-3', 'Bravo High', { score: 'L 1-2' })}</div></body></html>`;
+module.exports.bareHeaderUnrelatedElementThenDirectRow = `<!doctype html><html><body>
+  <div id="page"><div class="date-header">Apr 11, 2026</div><div class="notes">Team photo day</div>${one('flat-4')}</div></body></html>`;
+module.exports.pageHeaderIntoNestedSiblingList = `<!doctype html><html><body>
+  <div id="page"><div class="date-header">Apr 11, 2026</div><div class="notes">Team photo day</div>
+    <div id="other-list">${one('flat-5')}</div></div></body></html>`;
+module.exports.bareHeaderInOneSectionRowsInAnother = `<!doctype html><html><body>
+  <div id="page"><div><div class="date-header">Apr 11, 2026</div></div><div>${one('flat-6')}</div></div></body></html>`;
+module.exports.twoBareScheduleSectionsOneParent = `<!doctype html><html><body>
+  <div id="page">
+    <div><div class="date-header">Apr 11, 2026</div>${one('flat-7')}</div>
+    <div><div class="date-header">Apr 18, 2026</div>${one('flat-8')}</div>
+  </div></body></html>`;
+module.exports.bareNestedDateGroupNoComponent = `<!doctype html><html><body>
+  <div id="page"><div class="date-group"><div class="date-header">Apr 11, 2026</div>
+    <ul><li>${one('flat-9')}</li></ul></div></div></body></html>`;
+module.exports.bareAdministrativeHeaderThenList = `<!doctype html><html><body>
+  <div id="page">${H_UNSUP}<div id="other-list">${one('flat-10')}</div></div></body></html>`;
+module.exports.bareHeaderAfterRow = `<!doctype html><html><body>
+  <div id="page">${one('flat-11')}<div class="date-header">Apr 11, 2026</div></div></body></html>`;
+module.exports.bareDateGroupsReversedOrder = `<!doctype html><html><body>
+  <div id="page">
+    <div class="date-group"><div class="date-header">Apr 18, 2026</div>${one('flat-12')}</div>
+    <div class="date-group"><div class="date-header">Apr 11, 2026</div>${one('flat-13')}</div>
+  </div></body></html>`;

@@ -1380,3 +1380,122 @@ test('the mapper refuses an unsupported marked header before any database call',
     dateResolutionStatus: 'unsupported_marked_header', gameDate: null,
   }), (error) => error.code === 'OPPONENT_SCHEDULE_DATE_UNRESOLVED');
 });
+
+// ── Structured evidence cannot license refused prose, end to end ──────
+//
+// The extractor-level rule is pinned in test/gc-schedule-date-scoping.test.js.
+// These drive the same markup all the way through the production shape --
+// route -> Chromium -> extractor -> collector -> mapper -> repository ->
+// persist_hs_engine_collection -> database -- because the finding that made
+// this correction necessary was only visible once a date reached
+// hs_opponent_games.game_date inside a VERIFIED generation.
+
+// Reads the id of whichever generation is CURRENT, so a rejected run can be
+// shown to have left the previously verified state exactly as it found it.
+const currentGenerationId = async (opponentTeamId) => {
+  const rows = await db.query(
+    `select id from public.hs_opponent_stat_generations
+      where opponent_team_id = $1 and is_current`, [opponentTeamId]);
+  return rows.rows.length ? rows.rows[0].id : null;
+};
+
+test('an agreeing structured value never publishes administrative prose', { skip }, async () => {
+  for (const [name, fixture] of [
+    ['nested <time>, played', fixtures.nestedTimeUnderAdministrativeProse],
+    ['nested <time>, unplayed', fixtures.nestedTimeUnderAdministrativeProseUnplayed],
+    ['nested <time> "Last modified", played', fixtures.nestedTimeUnderLastModified],
+    ['nested <time> "Last modified", unplayed', fixtures.nestedTimeUnderLastModifiedUnplayed],
+    ['data-schedule-date, played', fixtures.scheduleDateAttributeAgreeingWithProse],
+    ['data-schedule-date, unplayed', fixtures.scheduleDateAttributeAgreeingWithProseUnplayed],
+    ['data-date-header, played', fixtures.dateHeaderAttributeAgreeingWithProse],
+    ['data-date-header, unplayed', fixtures.dateHeaderAttributeAgreeingWithProseUnplayed],
+    ['marked <time> carrying prose, played', fixtures.markedTimeElementCarryingProse],
+    ['marked <time> carrying prose, unplayed', fixtures.markedTimeElementCarryingProseUnplayed],
+  ]) {
+    const tenant = await buildTenant('struct');
+    const before = await currentGenerationId(tenant.opponentTeamId);
+    const app = buildApp(tenant, { html: fixture });
+    await startRun(app, tenant);
+    const summary = app.locals.lastSummary;
+    assert.equal(summary.state, 'failed', `${name}: nothing is published`);
+    assert.equal(summary.failureReason, 'opponent_schedule_date_unresolved', `${name}: refused by name`);
+    assert.equal(summary.unsafeScheduleDates[0].reason,
+      'marked_date_header_is_not_a_readable_schedule_date', `${name}: with the marked-header reason`);
+    assert.deepEqual(await writtenCounts(tenant.opponentTeamId),
+      { games: 0, generations: 0, runGames: 0, totals: 0 }, `${name}: zero partial writes`);
+    assert.deepEqual(await runStatesFor(tenant.opponentTeamId), ['failed/discovery'],
+      `${name}: the run settles terminally`);
+    assert.equal(await currentGenerationId(tenant.opponentTeamId), before,
+      `${name}: the prior verified generation is untouched`);
+  }
+});
+
+test('legitimate structured headers still publish, played and unplayed', { skip }, async () => {
+  for (const [name, fixture, ref] of [
+    ['marked <time> element', fixtures.markedTimeElementReadable, 'nt-ok-1'],
+    ['data-schedule-date beside a supported annotation', fixtures.scheduleDateAttributeWithReadableAnnotation, 'nt-ok-2'],
+    ['nested <time> inside a readable header', fixtures.nestedTimeInsideReadableHeader, 'nt-ok-3'],
+    ['structured value with no visible text', fixtures.structuredValueWithNoText, 'st-2'],
+  ]) {
+    const tenant = await buildTenant('structok');
+    const app = buildApp(tenant, { html: fixture });
+    await startRun(app, tenant);
+    assert.equal(app.locals.lastSummary.state, 'published_verified', `${name}: still publishes`);
+    assert.deepEqual(await datesFor(tenant.opponentTeamId), { [ref]: '2026-04-11' },
+      `${name}: with the date the source actually asserted`);
+  }
+});
+
+test('an unreadable competing header stops publication end to end', { skip }, async () => {
+  for (const [name, fixture] of [
+    ['readable then unsupported', fixtures.readableThenUnsupportedHeader],
+    ['unsupported then readable', fixtures.unsupportedThenReadableHeader],
+    ['readable then unsupported, unplayed', fixtures.readableThenUnsupportedHeaderUnplayed],
+    ['a row date beneath an unreadable header', fixtures.rowDateUnderUnsupportedHeader],
+  ]) {
+    const tenant = await buildTenant('cmp');
+    const before = await currentGenerationId(tenant.opponentTeamId);
+    const app = buildApp(tenant, { html: fixture });
+    await startRun(app, tenant);
+    assert.equal(app.locals.lastSummary.state, 'failed', `${name}: nothing is published`);
+    assert.equal(app.locals.lastSummary.failureReason, 'opponent_schedule_date_unresolved');
+    assert.deepEqual(await writtenCounts(tenant.opponentTeamId),
+      { games: 0, generations: 0, runGames: 0, totals: 0 }, `${name}: zero partial writes`);
+    assert.deepEqual(await runStatesFor(tenant.opponentTeamId), ['failed/discovery']);
+    assert.equal(await currentGenerationId(tenant.opponentTeamId), before,
+      `${name}: prior verified state preserved`);
+  }
+});
+
+test('unsafe competing evidence stays inside its own run, end to end', { skip }, async () => {
+  const after = await buildTenant('bnda');
+  const afterApp = buildApp(after, { html: fixtures.unsupportedHeaderAfterTheGame });
+  await startRun(afterApp, after);
+  assert.equal(afterApp.locals.lastSummary.state, 'published_verified',
+    'a header AFTER the game cannot retroactively block it');
+  assert.deepEqual(await datesFor(after.opponentTeamId), { 'bnd-1': '2026-04-11' });
+
+  const other = await buildTenant('bndc');
+  const otherApp = buildApp(other, { html: fixtures.unsupportedHeaderInAnotherComponent });
+  await startRun(otherApp, other);
+  assert.equal(otherApp.locals.lastSummary.state, 'published_verified',
+    'an unreadable header in ANOTHER component never competes');
+  assert.deepEqual(await datesFor(other.opponentTeamId), { 'bnd-4': '2026-04-11' });
+});
+
+test('a bare page header cannot publish into an unrelated nested list', { skip }, async () => {
+  const crossing = await buildTenant('flatx');
+  const crossingApp = buildApp(crossing, { html: fixtures.pageHeaderIntoNestedSiblingList });
+  await startRun(crossingApp, crossing);
+  assert.equal(crossingApp.locals.lastSummary.state, 'published_verified',
+    'the completed game still publishes -- anchored by its stable upstream id');
+  assert.deepEqual(await datesFor(crossing.opponentTeamId), { 'flat-5': null },
+    'but with NO date, because no header was affirmatively local to that list');
+
+  const local = await buildTenant('flatl');
+  const localApp = buildApp(local, { html: fixtures.bareDirectSiblingHeaderAndRow });
+  await startRun(localApp, local);
+  assert.equal(localApp.locals.lastSummary.state, 'published_verified');
+  assert.deepEqual(await datesFor(local.opponentTeamId), { 'flat-1': '2026-04-11' },
+    'a direct-sibling header is an affirmative local relationship and still governs');
+});
