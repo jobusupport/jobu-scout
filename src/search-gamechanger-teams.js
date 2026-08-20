@@ -1351,15 +1351,153 @@ const EXPLICIT_ROW_ROOT_SELECTOR = '[data-schedule-row], [data-game-id], .schedu
 const DATE_HEADER_SELECTOR = '[data-schedule-date], [data-date-header], .date-header, .schedule-date';
 const GAME_DATE_SELECTOR = '[data-game-date], .game-date';
 
-// Even a marked header can carry an administrative date rather than the date
-// games are played on -- "Updated Apr 20", "Roster locked 4/20", "Registration
-// closes May 1", "Last synced ...". Publishing one of those as a game date
-// would be the same class of error the affirmative marker exists to prevent, so
-// a marked header whose text carries one of these qualifiers is refused and the
-// row falls through to not_expressed. This only ever REMOVES a candidate: it
-// can never promote unmarked text into a header, and it can never turn an
-// absent date into a present one.
-const NON_SCHEDULE_DATE_QUALIFIER = /\b(?:updated?|last\s+sync(?:ed)?|synced?|revised|generated|printed|posted|registration|register|deadline|due|roster\s+lock(?:ed|s)?|locked|closes?|closing|opens?|expires?|as\s+of)\b/i;
+// ── The positive schedule-header grammar ───────────────────────────────
+//
+// Structural marking says the SOURCE believes this element is a date header. It
+// does not say the text is a schedule date. The previous attempt asked only
+// "does this text avoid a known bad word", which failed in both directions: it
+// missed synonyms ("Last modified", "Published", "Roster freeze") and published
+// their dates, and it matched ordinary game-day language ("gates open at 5") and
+// threw away a legitimate one.
+//
+// A blacklist can only ever enumerate the prose someone thought of. This asks
+// the affirmative question instead:
+//
+//   which exact part of this element asserts the game date, and does what
+//   remains fit a bounded schedule-header grammar?
+//
+// A header is accepted only when the date leads the text -- optionally after a
+// weekday -- and everything left over is either punctuation or an annotation
+// that describes THIS GAME. Anything else is unsupported, and unsupported fails
+// closed rather than guessing.
+//
+// The date must LEAD. That single rule is what separates "Saturday, April 11,
+// 2026 - Doubleheader" from "Rainout announced Mar 14, 2026": administrative
+// text says what happened to the schedule before it names a date, whereas a
+// schedule header names the day first and then annotates it.
+const HEADER_WEEKDAY = '(?:mon|tues?|wed(?:nes)?|thur?s?|fri|sat(?:ur)?|sun)(?:day)?\\.?,?\\s*';
+const HEADER_DATE_EXPRESSION = '(?:(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?'
+  + '|aug(?:ust)?|sep(?:t)?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\\.?\\s+\\d{1,2}(?:,?\\s+(?:20\\d{2}|19\\d{2}))?'
+  + '|\\d{1,2}\\/\\d{1,2}(?:\\/\\d{2,4})?)';
+const HEADER_LEADING_DATE = new RegExp(`^(?:${HEADER_WEEKDAY})?(${HEADER_DATE_EXPRESSION})`, 'i');
+const ANY_HEADER_DATE = new RegExp(HEADER_DATE_EXPRESSION, 'gi');
+
+// Separators a source may put between the date and its annotation. Purely
+// typographic: none of these carries meaning, so consuming them cannot change
+// what the header asserts.
+const HEADER_SEPARATOR = '[\\s\\-\\u2013\\u2014,;:|/()\\[\\].\\u00b7\\u2022]+';
+
+// ── Supported annotations ──────────────────────────────────────────────
+//
+// Every entry describes THE GAME played on the header's date, and every one has
+// a counterpart this module already parses elsewhere -- which is the test for
+// admission. Nothing here is included because it "looks harmless"; each is
+// included because the codebase already treats it as a property of a scheduled
+// game:
+//
+//   Doubleheader / Game N   two games that day, and which one -- parseGameNumber
+//   Home / Away / vs / at   the side designation           -- parseHomeAway
+//   Varsity / JV / Freshman the team level                 -- hs_opponent_teams.level
+//   Senior Night / Homecoming  a game-day designation for THAT game
+//   gates open / first pitch / a bare clock time  the day's timing
+//                                                  -- parseScheduledTimeText
+//
+// An administrative phrase ("rainout announced", "roster freeze", "published")
+// describes an action taken ON the schedule, not a property of the game, so it
+// is absent -- and absence is refusal. Extending this list is a deliberate act
+// that must name which game property the new annotation expresses.
+const HEADER_TIME = '\\d{1,2}(?::\\d{2})?\\s*(?:a\\.?m\\.?|p\\.?m\\.?)?';
+const SUPPORTED_HEADER_ANNOTATIONS = [
+  `doubleheader`,
+  `dh`,
+  `(?:game|gm)\\s*\\d{1,2}`,
+  `home`,
+  `away`,
+  `neutral`,
+  `vs\\.?`,
+  `at`,
+  `varsity`,
+  `jv`,
+  `junior\\s+varsity`,
+  `fresh(?:man|men)?`,
+  `frosh`,
+  `senior\\s+(?:night|day)`,
+  `homecoming`,
+  `gates?\\s+open(?:s)?(?:\\s+at)?\\s*${HEADER_TIME}`,
+  `first\\s+pitch(?:\\s+at)?\\s*${HEADER_TIME}`,
+  HEADER_TIME,
+];
+const SUPPORTED_HEADER_SUFFIX = new RegExp(
+  `^(?:${HEADER_SEPARATOR})?(?:(?:${SUPPORTED_HEADER_ANNOTATIONS.join('|')})(?:${HEADER_SEPARATOR})?)*$`, 'i');
+
+// Classifies the visible text of a source-marked date header.
+//
+//   date         the text leads with exactly one real calendar date and every
+//                remaining token is a supported annotation
+//   ambiguous    the text names more than one date
+//   invalid      the leading date is not a real calendar day
+//   unsupported  the element is marked, and does carry date-like text, but the
+//                text is not a schedule header this parser can read -- either
+//                the date does not lead, or material prose follows it
+//   none         no date-like text at all; not a header candidate
+//
+// Pure and exported so the grammar can be tested directly, without a browser
+// and without any markup.
+function parseScheduleHeaderText(value) {
+  const text = normalizeScheduleEntryText(value);
+  if (!text) return { kind: 'none', date: null, dates: [], suffix: '' };
+
+  const dates = (text.match(ANY_HEADER_DATE) || []).map((match) => match.trim());
+  if (dates.length === 0) return { kind: 'none', date: null, dates: [], suffix: '' };
+
+  // More than one distinct calendar date in one header is evidence the parser
+  // must not choose between. Compared as RESOLVED dates so "Apr 11" repeated in
+  // two formats is one date, not two.
+  const resolved = Array.from(new Set(dates.map((d) => normalizeScheduleDateText(d)).filter(Boolean)));
+  if (resolved.length > 1) return { kind: 'ambiguous', date: null, dates: resolved, suffix: '' };
+
+  const leading = text.match(HEADER_LEADING_DATE);
+  if (!leading) {
+    // A date is present but something else came first. That is the shape of
+    // every administrative header: "Rainout announced Mar 14, 2026".
+    return { kind: 'unsupported', date: null, dates: resolved, suffix: text, reason: 'date_does_not_lead_the_header' };
+  }
+
+  const date = normalizeScheduleDateText(leading[1]);
+  if (!date) {
+    return { kind: 'invalid', date: null, dates: [], suffix: '', reason: 'leading_date_is_not_a_real_calendar_date' };
+  }
+
+  const suffix = text.slice(leading[0].length);
+  if (!SUPPORTED_HEADER_SUFFIX.test(suffix)) {
+    return { kind: 'unsupported', date: null, dates: resolved, suffix, reason: 'unsupported_text_follows_the_date' };
+  }
+  return { kind: 'date', date, dates: resolved, suffix };
+}
+
+// A structured value the source published for machines rather than for readers:
+// data-schedule-date="2026-04-11", data-date-header="2026-04-11", or a
+// <time datetime="2026-04-11">. Previously these were treated as bare Boolean
+// markers and their VALUES were thrown away, so a header could carry an explicit
+// machine-readable date and still be read from its prose.
+//
+// Returns the resolved date, or null when the attribute holds no date (an
+// ordinary Boolean marker), or the sentinel 'invalid' when it holds something
+// date-shaped that is not a real day.
+function parseStructuredHeaderDate(value) {
+  const raw = normalizeScheduleEntryText(value);
+  if (!raw) return null;
+  const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T\s].*)?$/);
+  if (iso) {
+    const [, y, m, d] = iso;
+    return isRealCalendarDate(Number(y), Number(m), Number(d))
+      ? `${y}-${m}-${d}`
+      : 'invalid';
+  }
+  if (!ANY_HEADER_DATE.test(raw)) { ANY_HEADER_DATE.lastIndex = 0; return null; }
+  ANY_HEADER_DATE.lastIndex = 0;
+  return normalizeScheduleDateText(raw) || 'invalid';
+}
 
 // How a schedule row's date was established. Carried through the collector as
 // provenance so an unsafe date can fail closed with a reason instead of being
@@ -1376,6 +1514,17 @@ const NON_SCHEDULE_DATE_QUALIFIER = /\b(?:updated?|last\s+sync(?:ed)?|synced?|re
 //                       say something, and saying something impossible is
 //                       evidence of a parsing or upstream fault that a reviewer
 //                       must see, not an absence to be quietly tolerated.
+//   unsupported_marked_header
+//                       the source MARKED an element as a date header and put
+//                       date-like text in it, but the text is not a schedule
+//                       header this parser can read -- the date does not lead,
+//                       or material prose follows it. Deliberately NOT folded
+//                       into not_expressed: "the source said nothing" and "the
+//                       source said something I refuse to interpret" call for
+//                       different handling, and only the second one may not use
+//                       the completed-game null-date exception. Collapsing them
+//                       is how a rejected legitimate header turned into a
+//                       verified completed game carrying game_date = null.
 const DATE_RESOLUTION_STATUSES = Object.freeze({
   RESOLVED_GAME_ROW: 'resolved_game_row',
   RESOLVED_DATE_GROUP: 'resolved_date_group',
@@ -1383,6 +1532,7 @@ const DATE_RESOLUTION_STATUSES = Object.freeze({
   AMBIGUOUS: 'ambiguous',
   CONFLICTING: 'conflicting',
   INVALID: 'invalid',
+  UNSUPPORTED_MARKED_HEADER: 'unsupported_marked_header',
 });
 
 const DATE_SOURCE_KINDS = Object.freeze({
@@ -1479,12 +1629,12 @@ function normalizeScheduleEntryText(value) {
 // Nothing here consults DOM position, row order, or neighbouring rows, so
 // reversing rows within a group, or reversing whole groups, cannot change what
 // any game resolves to.
-function resolveScheduleEntryDate({ rowDateTexts = [], groupDateTexts = [], groupHeaderText = '' } = {}) {
+function resolveScheduleEntryDate({
+  rowDateTexts = [], groupDateTexts = [], groupHeaderText = '', groupHeaders = null,
+} = {}) {
   const distinct = (values) => Array.from(new Set(values.filter(Boolean)));
   const rowRaw = distinct(rowDateTexts.map(normalizeScheduleEntryText));
-  const groupRaw = distinct(groupDateTexts.map(normalizeScheduleEntryText));
   const rowDates = distinct(rowRaw.map((text) => normalizeScheduleDateText(text)));
-  const groupDates = distinct(groupRaw.map((text) => normalizeScheduleDateText(text)));
 
   const base = {
     gameDate: null,
@@ -1493,6 +1643,100 @@ function resolveScheduleEntryDate({ rowDateTexts = [], groupDateTexts = [], grou
     rawDateText: '',
     dateConflict: null,
   };
+
+  // ── Governing header evidence ────────────────────────────────────────
+  //
+  // `groupHeaders` is the evidence-carrying form the DOM pass now emits: the
+  // raw text of each competing marked header plus any structured value it
+  // published. `groupDateTexts` / `groupHeaderText` remain supported so the
+  // rules can still be exercised directly with pre-extracted date text.
+  let groupDates;
+  let groupHeaderLabel;
+  let groupUnsupported = null;
+  let groupStructuredInvalid = false;
+
+  if (Array.isArray(groupHeaders)) {
+    groupHeaderLabel = groupHeaders.map((h) => normalizeScheduleEntryText(h && h.text)).filter(Boolean).join(' | ');
+    const accepted = [];
+    for (const header of groupHeaders) {
+      // A structured value the source published for machines outranks its own
+      // presentation of the same fact. A contradiction between the two is
+      // reported below rather than silently resolved in either direction.
+      const structuredRaw = (header && header.structured) || [];
+      const structured = distinct(structuredRaw.map(parseStructuredHeaderDate));
+      if (structured.includes('invalid')) { groupStructuredInvalid = true; continue; }
+      const visible = parseScheduleHeaderText(header && header.text);
+      if (structured.length > 1) {
+        return {
+          ...base,
+          dateResolutionStatus: DATE_RESOLUTION_STATUSES.CONFLICTING,
+          dateSourceKind: DATE_SOURCE_KINDS.DATE_GROUP,
+          rawDateText: groupHeaderLabel,
+          dateConflict: { reason: 'date_group_structured_values_disagree', candidates: structured.slice().sort() },
+        };
+      }
+      if (structured.length === 1) {
+        if (visible.kind === 'ambiguous') { accepted.push(...visible.dates, structured[0]); continue; }
+        if (visible.dates.length === 1 && visible.dates[0] !== structured[0]) {
+          return {
+            ...base,
+            dateResolutionStatus: DATE_RESOLUTION_STATUSES.CONFLICTING,
+            dateSourceKind: DATE_SOURCE_KINDS.DATE_GROUP,
+            rawDateText: groupHeaderLabel,
+            dateConflict: {
+              reason: 'date_group_structured_value_contradicts_visible_date',
+              structuredDate: structured[0],
+              visibleDate: visible.dates[0],
+            },
+          };
+        }
+        accepted.push(structured[0]);
+        continue;
+      }
+      if (visible.kind === 'invalid') { groupStructuredInvalid = true; continue; }
+      if (visible.kind === 'unsupported') { groupUnsupported = groupUnsupported || visible; continue; }
+      if (visible.kind === 'date') accepted.push(visible.date);
+      else if (visible.kind === 'ambiguous') accepted.push(...visible.dates);
+    }
+    groupDates = distinct(accepted);
+  } else {
+    const groupRaw = distinct(groupDateTexts.map(normalizeScheduleEntryText));
+    groupHeaderLabel = normalizeScheduleEntryText(groupHeaderText);
+    groupDates = distinct(groupRaw.map((text) => normalizeScheduleDateText(text)));
+    if (groupRaw.length > 0 && groupDates.length === 0) groupStructuredInvalid = true;
+  }
+  const groupRaw = groupHeaderLabel ? [groupHeaderLabel] : [];
+  groupHeaderText = groupHeaderLabel;
+
+  // An impossible date anywhere in the governing header is a fault in the
+  // evidence itself, reported before any other rule.
+  if (groupStructuredInvalid && groupDates.length === 0) {
+    return {
+      ...base,
+      dateResolutionStatus: DATE_RESOLUTION_STATUSES.INVALID,
+      dateSourceKind: DATE_SOURCE_KINDS.DATE_GROUP,
+      rawDateText: groupHeaderLabel,
+      dateConflict: { reason: 'date_group_date_is_not_a_real_calendar_date', candidates: groupRaw.slice().sort() },
+    };
+  }
+
+  // The source MARKED this element as a date header and put date-like text in
+  // it, but the text is not a schedule header this parser can read. Refusing it
+  // as a NAMED unsafe status -- rather than as ordinary silence -- is what stops
+  // it reaching the completed-game null-date exception.
+  if (groupUnsupported && groupDates.length === 0 && rowDates.length === 0) {
+    return {
+      ...base,
+      dateResolutionStatus: DATE_RESOLUTION_STATUSES.UNSUPPORTED_MARKED_HEADER,
+      dateSourceKind: DATE_SOURCE_KINDS.DATE_GROUP,
+      rawDateText: groupHeaderLabel,
+      dateConflict: {
+        reason: groupUnsupported.reason || 'unsupported_marked_date_header',
+        headerText: groupHeaderLabel,
+        unsupportedSuffix: normalizeScheduleEntryText(groupUnsupported.suffix),
+      },
+    };
+  }
 
   // The source named something date-shaped that is not a real calendar day.
   // Reported BEFORE every other rule: an impossible date is a fault in the
@@ -1506,15 +1750,6 @@ function resolveScheduleEntryDate({ rowDateTexts = [], groupDateTexts = [], grou
       dateSourceKind: DATE_SOURCE_KINDS.GAME_ROW,
       rawDateText: rowRaw.join(' | '),
       dateConflict: { reason: 'game_row_date_is_not_a_real_calendar_date', candidates: rowRaw.slice().sort() },
-    };
-  }
-  if (impossible(groupRaw, groupDates)) {
-    return {
-      ...base,
-      dateResolutionStatus: DATE_RESOLUTION_STATUSES.INVALID,
-      dateSourceKind: DATE_SOURCE_KINDS.DATE_GROUP,
-      rawDateText: normalizeScheduleEntryText(groupHeaderText),
-      dateConflict: { reason: 'date_group_date_is_not_a_real_calendar_date', candidates: groupRaw.slice().sort() },
     };
   }
 
@@ -1626,12 +1861,8 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
   // happens to publish under one identifier must reach the identity layer as two
   // colliding observations: keeping whichever row parsed first would discard a
   // real game, and with it a real result.
-  const rawRows = await page.evaluate(({
-    rowRootSelector, dateHeaderSelector, gameDateSelector, nonScheduleDateQualifierSource,
-  }) => {
+  const rawRows = await page.evaluate(({ rowRootSelector, dateHeaderSelector, gameDateSelector }) => {
     function clean(value) { return String(value || '').replace(/\s+/g, ' ').trim(); }
-    // Rebuilt inside the page: a RegExp cannot cross the evaluate boundary.
-    const nonScheduleDateQualifier = new RegExp(nonScheduleDateQualifierSource, 'i');
 
     // Every date-like substring, not just the first. A header that names two
     // dates ("Apr 11 - Apr 13") must be reported as ambiguous rather than
@@ -1678,6 +1909,17 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
         parsed = new URL(raw, document.baseURI);
       } catch (err) {
         return ' unparseable:' + raw;
+      }
+      // A schedule reference is an HTTP(S) location. 'javascript:', 'data:',
+      // 'file:' and 'ftp:' are not, and none of them may become a source identity
+      // just because its text happens to contain '/schedule/'. The value is only
+      // ever PARSED here -- never navigated, never executed -- and a rejected
+      // scheme yields a sentinel distinct from every real reference and from every
+      // differently-rejected one, so nothing merges. The URL parser has already
+      // lower-cased and trimmed the scheme, so 'JaVaScRiPt:' and a
+      // leading-whitespace variant are caught here too.
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        return ' unsupported-scheme:' + raw;
       }
       let path = parsed.pathname || '';
       if (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1);
@@ -1742,14 +1984,34 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
     // a group, not a header -- be short enough to be a label rather than a
     // section, and not carry an administrative qualifier that marks it as a
     // date ABOUT the schedule rather than a date the games are played on.
+    // The page decides only WHICH elements are candidate headers and what
+    // evidence they carry. Whether that evidence is a readable schedule header
+    // is decided by the positive grammar in Node (parseScheduleHeaderText), so
+    // the rule is pure, unit-testable without a browser, and identical for every
+    // producer.
+    function structuredHeaderValues(element) {
+      const values = [];
+      for (const attr of ['data-schedule-date', 'data-date-header', 'datetime']) {
+        const raw = element.getAttribute && element.getAttribute(attr);
+        if (raw) values.push(clean(raw));
+      }
+      const time = element.querySelector && element.querySelector('time[datetime]');
+      if (time) {
+        const raw = time.getAttribute('datetime');
+        if (raw) values.push(clean(raw));
+      }
+      return values;
+    }
     function isMarkedDateHeader(element, maxLen) {
       if (!element || element.nodeType !== 1) return false;
       if (!element.matches || !element.matches(dateHeaderSelector)) return false;
       if (element.querySelector(SCHEDULE_ANCHOR_SELECTOR)) return false;
       const text = clean(element.textContent || '');
-      if (!text || text.length > maxLen) return false;
-      if (nonScheduleDateQualifier.test(text)) return false;
-      return looksLikeDate(text);
+      if (text.length > maxLen) return false;
+      // A candidate carries either date-like visible text or a structured value.
+      // A marker with neither is an ordinary Boolean flag and governs nothing.
+      if (looksLikeDate(text)) return true;
+      return structuredHeaderValues(element).length > 0;
     }
     // Only the innermost marked header counts, so a marked wrapper never
     // shadows the marked label it wraps.
@@ -1773,7 +2035,6 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
       if (element.querySelector(SCHEDULE_ANCHOR_SELECTOR)) return false;
       const text = clean(element.textContent || '');
       if (!text || text.length > maxLen) return false;
-      if (nonScheduleDateQualifier.test(text)) return false;
       return looksLikeDate(text);
     }
     function isInnermostRowDateEvidence(element, maxLen) {
@@ -1791,14 +2052,33 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
     // scope is the shared section and the LATEST preceding header wins, which is
     // exactly "the next header ends the previous date's scope". There is no
     // global last-date-seen variable, so nothing can leak between sections.
+    // ── Affirmative scope ────────────────────────────────────────────
+    //
+    // A header's parent subtree bounds it, but that alone let a PAGE-LEVEL
+    // header govern a schedule section merely because a shared wrapper
+    // contained both. A header must now also sit inside the same schedule
+    // component as the row it claims, so an element outside the component that
+    // renders the games cannot reach in.
+    //
+    // The fallback -- no component ancestor at all -- exists only for a bare
+    // single-date page that never declares a component. It cannot cross into a
+    // component, because a row inside one requires its header to be inside the
+    // same one.
+    const SCHEDULE_COMPONENT_SELECTOR = '.schedule, [data-schedule], .schedule-component, [data-schedule-component]';
+    function nearestScheduleComponent(node) {
+      return node && node.closest ? node.closest(SCHEDULE_COMPONENT_SELECTOR) : null;
+    }
+
     const headers = [];
     for (const element of document.querySelectorAll('*')) {
       if (!isInnermostMarkedDateHeader(element, DATE_HEADER_MAX_LEN)) continue;
       headers.push({
         element,
         scope: element.parentElement || document.body,
+        component: nearestScheduleComponent(element),
         position: positionOf(element),
         text: clean(element.textContent || ''),
+        structured: structuredHeaderValues(element),
       });
     }
 
@@ -1866,12 +2146,17 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
       // claim wins. There is no global last-date-seen variable, so nothing
       // leaks between independent schedule sections.
       const rootPosition = positionOf(root);
+      const rootComponent = nearestScheduleComponent(root);
       const candidates = [];
       for (const header of headers) {
         if (header.position < 0 || rootPosition < 0) continue;
         if (header.position >= rootPosition) continue;
         if (root.contains(header.element)) continue;
         if (!header.scope.contains(root)) continue;
+        // Affirmative component relationship: when this row lives inside a
+        // schedule component, only a header inside that SAME component may
+        // govern it. A page-level header beside the component cannot reach in.
+        if (rootComponent && header.component !== rootComponent) continue;
         candidates.push(header);
       }
       candidates.sort((a, b) => a.position - b.position);
@@ -1926,8 +2211,10 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
         rowDateTexts,
         // Every credible claim on this row, not merely the winning one, so two
         // back-to-back headers naming different dates resolve to 'ambiguous'
-        // instead of silently preferring whichever came last.
-        groupDateTexts: competing.flatMap((header) => allDateTexts(header.text)),
+        // instead of silently preferring whichever came last. The RAW text and
+        // any structured value travel out together: the positive grammar that
+        // decides whether this is a readable schedule header lives in Node.
+        groupHeaders: competing.map((header) => ({ text: header.text, structured: header.structured })),
         groupHeaderText: competing.map((header) => header.text).join(' | '),
         scoreText: scoreNode || '',
         statusText: within('[data-status], .status, .game-status', 'data-status'),
@@ -1940,7 +2227,6 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
     rowRootSelector: EXPLICIT_ROW_ROOT_SELECTOR,
     dateHeaderSelector: DATE_HEADER_SELECTOR,
     gameDateSelector: GAME_DATE_SELECTOR,
-    nonScheduleDateQualifierSource: NON_SCHEDULE_DATE_QUALIFIER.source,
   });
 
   const entries = rawRows.map((rawRow) => {
@@ -1957,7 +2243,16 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
     let sourceReferenceMalformed = false;
     if (rawHref) {
       try {
-        href = new URL(rawHref, page.url()).href;
+        const resolved = new URL(rawHref, page.url());
+        // Same HTTP(S)-only rule as the in-page normalizer. A non-HTTP scheme is
+        // not a malformed URL -- it parses perfectly well -- but it is not a
+        // schedule location, so it must not produce a game id.
+        if (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') {
+          href = '';
+          sourceReferenceMalformed = true;
+        } else {
+          href = resolved.href;
+        }
       } catch {
         href = '';
         sourceReferenceMalformed = true;
@@ -4160,7 +4455,8 @@ if (require.main !== module) {
     EXPLICIT_ROW_ROOT_SELECTOR,
     DATE_HEADER_SELECTOR,
     GAME_DATE_SELECTOR,
-    NON_SCHEDULE_DATE_QUALIFIER,
+    parseScheduleHeaderText,
+    parseStructuredHeaderDate,
     DATE_RESOLUTION_STATUSES,
     DATE_SOURCE_KINDS,
     resolveScheduleEntryDate,
