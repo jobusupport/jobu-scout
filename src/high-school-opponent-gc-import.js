@@ -55,8 +55,13 @@ const COLLECTABLE_STATUSES = new Set([FINAL_STATUS]);
 // durable identity, or a game that has not been played yet, has nothing to
 // anchor it: a schedule entry whose date is unknown is not schedule knowledge,
 // so the collection fails closed instead.
+// 'invalid' joins these: a source that named a day which does not exist on the
+// calendar (Feb 30, Apr 31, a non-leap Feb 29) has stated something impossible.
+// Guessing which real day it meant is exactly the kind of invention this gate
+// exists to prevent, and letting it through meant PostgreSQL's date cast was
+// the first thing to object -- after the collection had already been captured.
 const DATE_RESOLUTION_UNKNOWN = 'unknown';
-const UNSAFE_DATE_RESOLUTIONS = new Set(['ambiguous', 'conflicting']);
+const UNSAFE_DATE_RESOLUTIONS = new Set(['ambiguous', 'conflicting', 'invalid']);
 
 // Returns the reason this row's date makes the collection unpublishable, or
 // null when it is safe.
@@ -69,7 +74,9 @@ const UNSAFE_DATE_RESOLUTIONS = new Set(['ambiguous', 'conflicting']);
 function unsafeDateReason(entry) {
   const status = entry?.dateResolutionStatus || DATE_RESOLUTION_UNKNOWN;
   if (UNSAFE_DATE_RESOLUTIONS.has(status)) {
-    return status === 'conflicting' ? 'date_conflicts_with_date_group' : 'date_evidence_is_ambiguous';
+    if (status === 'conflicting') return 'date_conflicts_with_date_group';
+    if (status === 'invalid') return 'date_is_not_a_real_calendar_date';
+    return 'date_evidence_is_ambiguous';
   }
   if (entry?.gameDate) return null;
   // No date at all. A COMPLETED game with a stable upstream id is anchored by
@@ -224,6 +231,11 @@ function toOpponentScheduleEntry(row) {
     dateSourceKind: row.dateSourceKind || 'none',
     rawDateText: row.rawDateText || null,
     dateConflict: row.dateConflict || null,
+    // The extractor could not resolve this row's href to a URL at all. Carried
+    // so the collection fails closed with a named reason instead of the row
+    // being published under a fabricated or empty identity.
+    sourceReferenceMalformed: row.sourceReferenceMalformed === true,
+    rawSourceReference: row.rawSourceReference || null,
     // Provenance carried only so a collision can be explained; never hashed,
     // never canonical identity.
     sourceRowIndex: Number.isFinite(row.visibleIndex) ? row.visibleIndex : null,
@@ -238,6 +250,25 @@ function toOpponentScheduleEntry(row) {
 // Both observations are preserved in the returned diagnostic, no field is
 // combined across them, no row is arbitrarily selected, and no substitute
 // identifier is manufactured.
+// Rows whose schedule reference the URL parser rejected. The extractor keeps
+// such a row rather than dropping it -- a silently discarded row is a game the
+// coach never learns is missing -- but it has no usable upstream identity, and
+// manufacturing one would be inventing a fact. Sorted by row index so the
+// diagnostic is identical however the source ordered the DOM.
+function detectMalformedSourceReferences(entries) {
+  return entries
+    .filter((entry) => entry?.sourceReferenceMalformed === true)
+    .map((entry) => ({
+      reason: 'source_reference_is_not_a_usable_url',
+      sourceRowIndex: entry.sourceRowIndex,
+      gameStatus: entry.gameStatus,
+      // Kept short and sanitized at the log boundary; enough for a reviewer to
+      // find the row, never a full private URL echoed verbatim into a log line.
+      rawSourceReference: entry.rawSourceReference ? String(entry.rawSourceReference).slice(0, 120) : null,
+    }))
+    .sort((a, b) => (a.sourceRowIndex ?? 0) - (b.sourceRowIndex ?? 0));
+}
+
 function detectSourceEventIdentityCollisions(entries) {
   const byRef = new Map();
   for (const entry of entries) {
@@ -284,6 +315,7 @@ function summarizeForLog(summary) {
     publicationState: summary.publicationState || null,
     identityCollisionCount: (summary.identityCollisions || []).length,
     unsafeScheduleDateCount: (summary.unsafeScheduleDates || []).length,
+    malformedSourceReferenceCount: (summary.malformedSourceReferences || []).length,
     stopped: summary.stopped,
   };
 }
@@ -316,8 +348,25 @@ async function runOpponentImportCollection({
     failureReason: null,
     identityCollisions: [],
     unsafeScheduleDates: [],
+    malformedSourceReferences: [],
+    // Set only when the run could not be recorded as failed. The collection
+    // result itself is already decided by then; this exists so an operator can
+    // tell a run that genuinely failed from one whose failure could not be
+    // written down.
+    failureRecordingFailed: false,
   };
 
+  // Records the run as failed. Idempotent: the repository writes a terminal
+  // status, so calling it twice for one run is harmless and the second call
+  // cannot revive or re-open a settled run.
+  //
+  // Recording the failure must never mask the failure being recorded -- the
+  // original error stays the primary result -- but it must not vanish either.
+  // A bare `catch {}` here meant a rejected failureStage was swallowed silently
+  // and the run was left 'running' with nothing to explain why. The diagnostic
+  // is sanitized through the same policy as every other log line, so it carries
+  // no URL, credential, filesystem path, environment value or raw database
+  // error into an operator log.
   const failRun = async (stage, message) => {
     try {
       await importService.failOpponentImportRun({
@@ -326,7 +375,14 @@ async function runOpponentImportCollection({
         failureStage: stage,
         errorSummary: policy.sanitizeCollectionErrorMessage(message),
       });
-    } catch { /* the run row may already be gone; never mask the original failure */ }
+    } catch (recordingError) {
+      summary.failureRecordingFailed = true;
+      console.error('[hs-opponent-collector] could not record an opponent import run as failed',
+        {
+          stage,
+          reason: policy.sanitizeCollectionErrorMessage(recordingError && recordingError.message),
+        });
+    }
   };
 
   if (isKillSwitchTriggered()) {
@@ -365,6 +421,8 @@ async function runOpponentImportCollection({
     dateSourceKind: entry?.dateSourceKind || 'none',
     rawDateText: entry?.rawDateText || null,
     dateConflict: entry?.dateConflict || null,
+    sourceReferenceMalformed: entry?.sourceReferenceMalformed === true,
+    rawSourceReference: entry?.rawSourceReference || null,
     // Provenance for collision diagnostics. Never hashed, never canonical
     // identity -- it exists only so a reviewer can see WHICH source rows
     // collided.
@@ -374,6 +432,28 @@ async function runOpponentImportCollection({
   summary.gamesDiscovered = normalized.length;
   summary.finalGamesDiscovered = normalized.filter((e) => COLLECTABLE_STATUSES.has(e.gameStatus)).length;
   onProgress({ type: 'discovered', count: summary.gamesDiscovered, finals: summary.finalGamesDiscovered });
+
+  // Evaluated in the same place and for the same reason as the collision and
+  // date gates below: before ANY capture or publication. A row whose reference
+  // the URL parser rejected is a real game the source rendered and this run
+  // cannot identify. Publishing the rest would quietly under-report the
+  // opponent's season, so the whole collection fails closed and whatever
+  // verified generation already exists stays exactly as it was.
+  const malformedReferences = detectMalformedSourceReferences(normalized);
+  if (malformedReferences.length > 0) {
+    summary.failureReason = 'opponent_source_reference_malformed';
+    summary.malformedSourceReferences = malformedReferences;
+    summary.manualReconciliationRequired = true;
+    summary.priorVerifiedGenerationPreserved = true;
+    onProgress({
+      type: 'source_reference_malformed',
+      malformed: malformedReferences.map((row) => ({ sourceRowIndex: row.sourceRowIndex, reason: row.reason })),
+    });
+    await failRun('discovery',
+      `${malformedReferences.length} schedule row(s) carry a source reference that is not a usable URL, `
+      + 'so those games cannot be identified; no generation was published.');
+    return summary;
+  }
 
   // Evaluated before ANY capture or publication: if the source presented two
   // distinct rows under one identifier, this collection could conceal a second
@@ -519,7 +599,8 @@ async function runOpponentImportCollection({
       || err?.code === 'OPPONENT_IDENTITY_UNRESOLVED'
       || err?.code === 'OPPONENT_SOURCE_EVENT_IDENTITY_COLLISION'
       || err?.code === 'OPPONENT_SOURCE_LINK_NOT_LINKED'
-      || err?.code === 'OPPONENT_SCHEDULE_DATE_UNRESOLVED';
+      || err?.code === 'OPPONENT_SCHEDULE_DATE_UNRESOLVED'
+      || err?.code === 'OPPONENT_GAME_STATUS_REGRESSION';
     onProgress({ type: 'publication_failed', code: summary.failureReason });
     await failRun('publication', err?.message);
     return summary;
@@ -538,6 +619,7 @@ module.exports = {
   runOpponentImportCollection,
   toOpponentScheduleEntry,
   detectSourceEventIdentityCollisions,
+  detectMalformedSourceReferences,
   detectUnsafeScheduleDates,
   unsafeDateReason,
   buildOpponentCapturedGame,

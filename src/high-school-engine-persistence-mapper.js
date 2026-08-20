@@ -619,7 +619,10 @@ function mapHighSchoolOpponentEngineCollection({ context, subject, capturedGames
       gameStatus: observation.gameStatus,
     }))
     .filter(({ status, gameDate, gameStatus, ref }) => {
-      if (status === 'ambiguous' || status === 'conflicting') return true;
+      // 'invalid' means the source named a day that does not exist on the
+      // calendar. It is unsafe for the same reason as ambiguous and conflicting
+      // evidence: the collection cannot say which real day was meant.
+      if (status === 'ambiguous' || status === 'conflicting' || status === 'invalid') return true;
       if (gameDate) return false;
       // No date: only a completed game with a durable reference may proceed.
       return !ref || gameStatus !== 'final';
