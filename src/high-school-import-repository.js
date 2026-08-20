@@ -695,6 +695,11 @@ function createHighSchoolImportRepository(adminClient) {
     // An observation carries a date the source did not establish safely; a wrong
     // opponent game date misfiles a real result, so nothing is published.
     ['opponent_schedule_date_unresolved', 'OPPONENT_SCHEDULE_DATE_UNRESOLVED', 409],
+    // An observation reports a previously FINAL game as no longer final. A real
+    // upstream retraction is news a human must see, not something to apply
+    // silently over a verified result, so nothing is published and the prior
+    // verified generation stays current.
+    ['opponent_game_status_regression', 'OPPONENT_GAME_STATUS_REGRESSION', 409],
   ];
 
   // Slice 2D widened the RPC's return from a bare hs_stat_generations row to a

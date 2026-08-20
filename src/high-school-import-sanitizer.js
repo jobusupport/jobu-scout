@@ -53,7 +53,18 @@ const { sanitizeSyncError } = require('./high-school-importer-contract');
 const IMPORT_RUN_STATUSES = ['pending', 'running', 'succeeded', 'failed', 'partial'];
 const TRIGGER_KINDS = ['manual', 'scheduled', 'api'];
 const SOURCE_PROVIDERS = ['gamechanger'];
-const FAILURE_STAGES = ['discovery', 'snapshot_capture', 'reconstruction', 'validation', 'aggregation'];
+// 'publication' is a real stage of both pipelines: the point at which a fully
+// captured collection is offered to persist_hs_engine_collection and can still
+// be refused (unresolved identity, an unsafe date, a source-event collision, a
+// completeness regression, a database constraint). It was missing here while
+// the opponent collector already reported it, so every publication-boundary
+// rejection threw inside the validator, was swallowed by the caller, and left
+// the import run sitting in 'running' for ever with no process behind it.
+//
+// Kept in step with the failure_stage CHECK constraints on hs_import_runs and
+// hs_opponent_import_runs -- see
+// 20260819..._add_publication_failure_stage_and_settle_reused_generations.sql.
+const FAILURE_STAGES = ['discovery', 'snapshot_capture', 'reconstruction', 'validation', 'aggregation', 'publication'];
 const DISCOVERY_STATUSES = ['discovered', 'processing', 'processed', 'skipped', 'rejected', 'failed'];
 const GAME_OUTCOMES = ['inserted', 'replaced', 'skipped', 'rejected', 'failed'];
 const SNAPSHOT_KINDS = ['schedule_discovery', 'game_header', 'box_score', 'play_by_play', 'roster'];
