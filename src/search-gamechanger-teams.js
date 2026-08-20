@@ -1046,6 +1046,21 @@ function extractGameIdFromUrl(url) {
   return match ? match[1] : "";
 }
 
+// True only for a date that actually exists on the Gregorian calendar, so
+// month length and leap years both decide the answer. "Feb 30, 2026" and
+// "Apr 31, 2026" parse cleanly as text but name no real day; letting them
+// through meant PostgreSQL's date cast was the first thing to notice, which
+// surfaced as an untyped persistence failure after the collection had already
+// been captured.
+function isRealCalendarDate(year, month, day) {
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return false;
+  if (month < 1 || month > 12 || day < 1) return false;
+  const daysInMonth = [31,
+    (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0 ? 29 : 28,
+    31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return day <= daysInMonth[month - 1];
+}
+
 function normalizeScheduleDateText(value, fallbackYear = TARGET_SEASON_YEAR) {
   const raw = String(value || "").replace(/\s+/g, " ").trim();
   if (!raw) return null;
@@ -1075,9 +1090,13 @@ function normalizeScheduleDateText(value, fallbackYear = TARGET_SEASON_YEAR) {
     const month = monthMap[String(monthNameMatch[1]).toLowerCase().replace(/\.$/, "")];
     const day = Number(monthNameMatch[2]);
     const year = Number(monthNameMatch[3] || fallbackYear);
-    if (month && day >= 1 && day <= 31 && Number.isFinite(year)) {
+    // A real calendar day, not merely a plausible-looking one. An impossible
+    // date returns null here and is reported as 'invalid' by the resolver,
+    // rather than travelling on to be rejected by PostgreSQL's date cast.
+    if (month && isRealCalendarDate(year, month, day)) {
       return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
     }
+    return null;
   }
 
   const slashMatch = raw.match(patterns[1]);
@@ -1086,9 +1105,10 @@ function normalizeScheduleDateText(value, fallbackYear = TARGET_SEASON_YEAR) {
     const day = Number(slashMatch[2]);
     let year = slashMatch[3] ? Number(slashMatch[3]) : Number(fallbackYear);
     if (year < 100) year += 2000;
-    if (month >= 1 && month <= 12 && day >= 1 && day <= 31 && Number.isFinite(year)) {
+    if (isRealCalendarDate(year, month, day)) {
       return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
     }
+    return null;
   }
 
   return null;
@@ -1297,8 +1317,49 @@ const EXPLICIT_ROW_ROOT_SELECTOR = '[data-schedule-row], [data-game-id], .schedu
 //
 // These selectors mark date evidence only. They never make an element a row
 // root, and no generic container is ever reinstated as one.
+//
+// ── The affirmative date-header contract ───────────────────────────────
+//
+// DATE_HEADER_SELECTOR is the ONLY way an element can become a governing date
+// header. It used to be passed into the page and then ignored -- both branches
+// of the old isDateEvidence() returned looksLikeDate(text) -- so any short
+// element containing a parseable date governed every row in its parent's
+// subtree. Two shapes published a wrong date in a verified generation:
+//
+//   * a page-level caption ("Season opener Mar 3, 2026") sitting beside a
+//     schedule section with no header of its own, which handed Mar 3 to a game
+//     the source never dated;
+//   * an unrelated note ("Roster locked 4/20/2026") between two games in one
+//     date group, which handed Apr 20 to every game after it.
+//
+// Neither element claims to be a schedule date boundary. Containing a date is
+// not the same as being one, so containing a date is no longer sufficient.
+//
+// Each accepted form is trustworthy because the SOURCE affirmatively marked it,
+// not because this module guessed from its content:
+//
+//   [data-schedule-date]  an explicit data attribute naming the schedule date
+//   [data-date-header]    an explicit data attribute naming a date header
+//   .date-header          a class whose only meaning is "this is a date header"
+//   .schedule-date        a class whose only meaning is "this is a schedule date"
+//
+// A caption, note, label, tournament title, roster message, "last updated"
+// stamp or any other unmarked element carries none of these, so it can no
+// longer govern anything. When nothing marked governs a row the answer is
+// not_expressed -- the search is never widened to look for something merely
+// date-like, because widening it is exactly what published the wrong dates.
 const DATE_HEADER_SELECTOR = '[data-schedule-date], [data-date-header], .date-header, .schedule-date';
 const GAME_DATE_SELECTOR = '[data-game-date], .game-date';
+
+// Even a marked header can carry an administrative date rather than the date
+// games are played on -- "Updated Apr 20", "Roster locked 4/20", "Registration
+// closes May 1", "Last synced ...". Publishing one of those as a game date
+// would be the same class of error the affirmative marker exists to prevent, so
+// a marked header whose text carries one of these qualifiers is refused and the
+// row falls through to not_expressed. This only ever REMOVES a candidate: it
+// can never promote unmarked text into a header, and it can never turn an
+// absent date into a present one.
+const NON_SCHEDULE_DATE_QUALIFIER = /\b(?:updated?|last\s+sync(?:ed)?|synced?|revised|generated|printed|posted|registration|register|deadline|due|roster\s+lock(?:ed|s)?|locked|closes?|closing|opens?|expires?|as\s+of)\b/i;
 
 // How a schedule row's date was established. Carried through the collector as
 // provenance so an unsafe date can fail closed with a reason instead of being
@@ -1309,12 +1370,19 @@ const GAME_DATE_SELECTOR = '[data-game-date], .game-date';
 //   not_expressed       neither did; the source simply did not say
 //   ambiguous           the governing date evidence names more than one date
 //   conflicting         the row and its date group disagree
+//   invalid             the source named a date that does not exist on the
+//                       Gregorian calendar (Feb 30, Apr 31, month 13, day 0).
+//                       Distinct from not_expressed on purpose: the source DID
+//                       say something, and saying something impossible is
+//                       evidence of a parsing or upstream fault that a reviewer
+//                       must see, not an absence to be quietly tolerated.
 const DATE_RESOLUTION_STATUSES = Object.freeze({
   RESOLVED_GAME_ROW: 'resolved_game_row',
   RESOLVED_DATE_GROUP: 'resolved_date_group',
   NOT_EXPRESSED: 'not_expressed',
   AMBIGUOUS: 'ambiguous',
   CONFLICTING: 'conflicting',
+  INVALID: 'invalid',
 });
 
 const DATE_SOURCE_KINDS = Object.freeze({
@@ -1426,6 +1494,30 @@ function resolveScheduleEntryDate({ rowDateTexts = [], groupDateTexts = [], grou
     dateConflict: null,
   };
 
+  // The source named something date-shaped that is not a real calendar day.
+  // Reported BEFORE every other rule: an impossible date is a fault in the
+  // evidence itself, and no later rule can make it publishable. Checked
+  // separately for the row and the group so the diagnostic names which one.
+  const impossible = (rawTexts, dates) => rawTexts.length > 0 && dates.length === 0;
+  if (impossible(rowRaw, rowDates)) {
+    return {
+      ...base,
+      dateResolutionStatus: DATE_RESOLUTION_STATUSES.INVALID,
+      dateSourceKind: DATE_SOURCE_KINDS.GAME_ROW,
+      rawDateText: rowRaw.join(' | '),
+      dateConflict: { reason: 'game_row_date_is_not_a_real_calendar_date', candidates: rowRaw.slice().sort() },
+    };
+  }
+  if (impossible(groupRaw, groupDates)) {
+    return {
+      ...base,
+      dateResolutionStatus: DATE_RESOLUTION_STATUSES.INVALID,
+      dateSourceKind: DATE_SOURCE_KINDS.DATE_GROUP,
+      rawDateText: normalizeScheduleEntryText(groupHeaderText),
+      dateConflict: { reason: 'date_group_date_is_not_a_real_calendar_date', candidates: groupRaw.slice().sort() },
+    };
+  }
+
   if (rowDates.length > 1) {
     return {
       ...base,
@@ -1513,6 +1605,10 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
         : DATE_RESOLUTION_STATUSES.NOT_EXPRESSED,
       dateSourceKind: entry.gameDate ? DATE_SOURCE_KINDS.GAME_ROW : DATE_SOURCE_KINDS.NONE,
       dateConflict: null,
+      // The completed-only path resolves its own href eagerly and skips a row it
+      // cannot parse, so a malformed reference never reaches here.
+      sourceReferenceMalformed: false,
+      rawSourceReference: '',
       ...parseScheduledTimeText(entry.cardText),
     }));
   }
@@ -1530,8 +1626,12 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
   // happens to publish under one identifier must reach the identity layer as two
   // colliding observations: keeping whichever row parsed first would discard a
   // real game, and with it a real result.
-  const rawRows = await page.evaluate(({ rowRootSelector, dateHeaderSelector, gameDateSelector }) => {
+  const rawRows = await page.evaluate(({
+    rowRootSelector, dateHeaderSelector, gameDateSelector, nonScheduleDateQualifierSource,
+  }) => {
     function clean(value) { return String(value || '').replace(/\s+/g, ' ').trim(); }
+    // Rebuilt inside the page: a RegExp cannot cross the evaluate boundary.
+    const nonScheduleDateQualifier = new RegExp(nonScheduleDateQualifierSource, 'i');
 
     // Every date-like substring, not just the first. A header that names two
     // dates ("Apr 11 - Apr 13") must be reported as ambiguous rather than
@@ -1632,22 +1732,54 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
     }
     const positionOf = (node) => (docIndex.has(node) ? docIndex.get(node) : -1);
 
-    // A date header is an element that expresses a date and contains NO schedule
-    // anchor -- a container that holds games is a group, not a header. Only the
-    // innermost such element counts, so a wrapper never shadows the label it
-    // wraps.
-    function isDateEvidence(element, maxLen) {
+    // A GOVERNING date header must be affirmatively marked as one by the source.
+    // Containing a parseable date is necessary but no longer sufficient: an
+    // unmarked caption, note, label, tournament title or "last updated" stamp
+    // used to qualify here and hand its date to every row in its parent's
+    // subtree, which is how a wrong date reached a verified generation.
+    //
+    // It must also contain NO schedule anchor -- a container that holds games is
+    // a group, not a header -- be short enough to be a label rather than a
+    // section, and not carry an administrative qualifier that marks it as a
+    // date ABOUT the schedule rather than a date the games are played on.
+    function isMarkedDateHeader(element, maxLen) {
+      if (!element || element.nodeType !== 1) return false;
+      if (!element.matches || !element.matches(dateHeaderSelector)) return false;
+      if (element.querySelector(SCHEDULE_ANCHOR_SELECTOR)) return false;
+      const text = clean(element.textContent || '');
+      if (!text || text.length > maxLen) return false;
+      if (nonScheduleDateQualifier.test(text)) return false;
+      return looksLikeDate(text);
+    }
+    // Only the innermost marked header counts, so a marked wrapper never
+    // shadows the marked label it wraps.
+    function isInnermostMarkedDateHeader(element, maxLen) {
+      if (!isMarkedDateHeader(element, maxLen)) return false;
+      for (const child of element.querySelectorAll('*')) {
+        if (isMarkedDateHeader(child, maxLen)) return false;
+      }
+      return true;
+    }
+
+    // A row's OWN date is judged differently, and may be structural rather than
+    // marked. The row root is itself affirmative evidence: it matched
+    // EXPLICIT_ROW_ROOT_SELECTOR and was accepted only after
+    // distinctScheduleRefs(root) <= 1 proved it describes exactly one game, so a
+    // short date element INSIDE it belongs to that game and to no other. The
+    // scan never leaves the row, which is why neither confirmed defect involved
+    // it -- both offending elements sat outside every row.
+    function isRowDateEvidence(element, maxLen) {
       if (!element || element.nodeType !== 1) return false;
       if (element.querySelector(SCHEDULE_ANCHOR_SELECTOR)) return false;
       const text = clean(element.textContent || '');
       if (!text || text.length > maxLen) return false;
-      if (element.matches && element.matches(dateHeaderSelector)) return looksLikeDate(text);
+      if (nonScheduleDateQualifier.test(text)) return false;
       return looksLikeDate(text);
     }
-    function isInnermostDateEvidence(element, maxLen) {
-      if (!isDateEvidence(element, maxLen)) return false;
+    function isInnermostRowDateEvidence(element, maxLen) {
+      if (!isRowDateEvidence(element, maxLen)) return false;
       for (const child of element.querySelectorAll('*')) {
-        if (isDateEvidence(child, maxLen)) return false;
+        if (isRowDateEvidence(child, maxLen)) return false;
       }
       return true;
     }
@@ -1661,7 +1793,7 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
     // global last-date-seen variable, so nothing can leak between sections.
     const headers = [];
     for (const element of document.querySelectorAll('*')) {
-      if (!isInnermostDateEvidence(element, DATE_HEADER_MAX_LEN)) continue;
+      if (!isInnermostMarkedDateHeader(element, DATE_HEADER_MAX_LEN)) continue;
       headers.push({
         element,
         scope: element.parentElement || document.body,
@@ -1671,6 +1803,21 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
     }
 
     const anchors = Array.from(document.querySelectorAll(SCHEDULE_ANCHOR_SELECTOR));
+
+    // Document position of the last schedule anchor strictly before `position`,
+    // or -1. Used only to bound a contiguous run of competing headers: a header
+    // that sits before an intervening game is that game's history, not a rival
+    // claim on a later row.
+    const anchorPositions = anchors.map((anchor) => positionOf(anchor)).filter((p) => p >= 0).sort((a, b) => a - b);
+    function previousAnchorPosition(position) {
+      let last = -1;
+      for (const p of anchorPositions) {
+        if (p >= position) break;
+        last = p;
+      }
+      return last;
+    }
+
     const roots = [];
     const rootIndex = new Map();
     for (const anchor of anchors) {
@@ -1703,23 +1850,59 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
       if (!rowDateTexts.length) {
         const candidates = [root, ...Array.from(root.querySelectorAll('*'))];
         for (const node of candidates) {
-          if (!isInnermostDateEvidence(node, ROW_DATE_MAX_LEN)) continue;
+          if (!isInnermostRowDateEvidence(node, ROW_DATE_MAX_LEN)) continue;
           rowDateTexts.push(...allDateTexts(node.textContent || ''));
         }
       }
 
       // -- The governing date group, if any ------------------------------
-      // The latest header that precedes this row AND whose scope contains it.
-      // A header inside the row is the row's own date, never a group date.
+      //
+      // Every marked header that precedes this row, is not inside it, and whose
+      // scope contains it, is a candidate. The LATEST such header wins: for
+      // sibling date groups a header's scope is its own group, so it cannot
+      // reach the next group at all; for flat headers and rows in one section
+      // the next header simply ends the previous one's scope; and where scopes
+      // nest, the innermost header is also the latest, so the most specific
+      // claim wins. There is no global last-date-seen variable, so nothing
+      // leaks between independent schedule sections.
       const rootPosition = positionOf(root);
-      let governing = null;
+      const candidates = [];
       for (const header of headers) {
         if (header.position < 0 || rootPosition < 0) continue;
         if (header.position >= rootPosition) continue;
         if (root.contains(header.element)) continue;
         if (!header.scope.contains(root)) continue;
-        if (!governing || header.position > governing.position) governing = header;
+        candidates.push(header);
       }
+      candidates.sort((a, b) => a.position - b.position);
+      const governing = candidates.length ? candidates[candidates.length - 1] : null;
+
+      // -- Competing headers -------------------------------------------
+      //
+      // Two marked headers standing back to back immediately before this row,
+      // with no game between them to end the first one's run, both credibly
+      // claim it. Preferring the later one would be a guess, so every header in
+      // that run is reported and the pure resolver turns more than one distinct
+      // date into 'ambiguous'. A run whose headers name the SAME date stays a
+      // single resolved date -- that is confirmation, not competition.
+      //
+      // `previousAnchorPosition` bounds the run: once a game has intervened, an
+      // earlier header is governing history rather than a rival claim, which is
+      // what keeps every later row in a date group resolving to that group's one
+      // header.
+      //
+      // Nesting is NOT competition. A header inside a date group and a header on
+      // the month that contains it both reach this row, but the inner one is the
+      // more specific claim about this game and the outer one is context, so
+      // only the innermost scope's headers compete. Without this a schedule that
+      // labels both its month and its days would resolve every row to
+      // 'ambiguous' and publish nothing -- safe, but wrong about a shape that is
+      // perfectly well formed.
+      const contiguous = candidates.filter((header) => header.position > previousAnchorPosition(rootPosition));
+      const innermost = contiguous.filter((header) => !contiguous.some((other) => other !== header
+        && other.scope !== header.scope && header.scope.contains(other.scope)));
+      const competing = innermost.length > 1 ? innermost
+        : (innermost.length === 1 ? innermost : (governing ? [governing] : []));
 
       const within = (selector, attr) => Array.from(root.querySelectorAll(selector))
         .map((node) => clean((attr && node.getAttribute(attr)) || node.innerText || node.textContent))
@@ -1741,8 +1924,11 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
         hrefs,
         cardText: cardText.length <= CARDTEXT_MAX_LEN ? cardText : cardText.slice(0, CARDTEXT_MAX_LEN),
         rowDateTexts,
-        groupDateTexts: governing ? allDateTexts(governing.text) : [],
-        groupHeaderText: governing ? governing.text : '',
+        // Every credible claim on this row, not merely the winning one, so two
+        // back-to-back headers naming different dates resolve to 'ambiguous'
+        // instead of silently preferring whichever came last.
+        groupDateTexts: competing.flatMap((header) => allDateTexts(header.text)),
+        groupHeaderText: competing.map((header) => header.text).join(' | '),
         scoreText: scoreNode || '',
         statusText: within('[data-status], .status, .game-status', 'data-status'),
         venueText: within('[data-venue], .venue, .location', 'data-venue'),
@@ -1754,10 +1940,29 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
     rowRootSelector: EXPLICIT_ROW_ROOT_SELECTOR,
     dateHeaderSelector: DATE_HEADER_SELECTOR,
     gameDateSelector: GAME_DATE_SELECTOR,
+    nonScheduleDateQualifierSource: NON_SCHEDULE_DATE_QUALIFIER.source,
   });
 
   const entries = rawRows.map((rawRow) => {
-    const href = rawRow.hrefs.length ? new URL(rawRow.hrefs[0], page.url()).href : '';
+    // The in-page reference normalizer already refuses to invent an identity for
+    // an href the URL parser rejects. This absolute form must fail the same way
+    // instead of throwing: an unguarded `new URL` here meant ONE malformed
+    // anchor anywhere on the page aborted the entire extraction with an untyped
+    // TypeError, discarding every valid row with it. A malformed reference now
+    // yields no href and no game id -- so no fabricated identity, and no two
+    // malformed rows collapsed together -- and is flagged so the collection
+    // fails closed with a named reason rather than silently dropping a game.
+    const rawHref = rawRow.hrefs.length ? rawRow.hrefs[0] : '';
+    let href = '';
+    let sourceReferenceMalformed = false;
+    if (rawHref) {
+      try {
+        href = new URL(rawHref, page.url()).href;
+      } catch {
+        href = '';
+        sourceReferenceMalformed = true;
+      }
+    }
     const scoreParts = parseScoreText(rawRow.scoreText || rawRow.cardText || '');
     const rawStatusText = normalizeScheduleEntryText(`${rawRow.statusText} ${rawRow.cardText}`);
     const status = classifyScheduleEntryStatus({ rawStatusText, scoreText: rawRow.scoreText });
@@ -1796,6 +2001,11 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
       timezoneKnown: timing.timezoneKnown,
       href,
       gameId: href ? extractGameIdFromUrl(href) : '',
+      // Provenance for a reference the URL parser rejected. The row is kept so
+      // it can never be silently lost, and the collector refuses to publish the
+      // collection while any row carries one.
+      sourceReferenceMalformed,
+      rawSourceReference: sourceReferenceMalformed ? rawHref : '',
       identityCollision: false,
       collidingRowIndexes: [],
     };
@@ -3950,9 +4160,12 @@ if (require.main !== module) {
     EXPLICIT_ROW_ROOT_SELECTOR,
     DATE_HEADER_SELECTOR,
     GAME_DATE_SELECTOR,
+    NON_SCHEDULE_DATE_QUALIFIER,
     DATE_RESOLUTION_STATUSES,
     DATE_SOURCE_KINDS,
     resolveScheduleEntryDate,
+    isRealCalendarDate,
+    normalizeScheduleDateText,
     classifyScheduleEntryStatus,
     parseScheduledTimeText,
     parseHomeAway,
