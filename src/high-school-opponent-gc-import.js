@@ -60,8 +60,16 @@ const COLLECTABLE_STATUSES = new Set([FINAL_STATUS]);
 // Guessing which real day it meant is exactly the kind of invention this gate
 // exists to prevent, and letting it through meant PostgreSQL's date cast was
 // the first thing to object -- after the collection had already been captured.
+// 'unsupported_marked_header' joins these, and is the one absence that must NOT
+// be treated as ordinary silence. The source MARKED an element as a date header
+// and put date-like text in it that the positive grammar refused to read. That
+// is unresolved evidence, not the absence of evidence -- so the completed-game
+// null-date exception below must not apply to it. Letting it fall through to
+// not_expressed is exactly how a rejected legitimate header became a verified
+// completed game carrying game_date = null.
 const DATE_RESOLUTION_UNKNOWN = 'unknown';
-const UNSAFE_DATE_RESOLUTIONS = new Set(['ambiguous', 'conflicting', 'invalid']);
+const UNSUPPORTED_MARKED_HEADER = 'unsupported_marked_header';
+const UNSAFE_DATE_RESOLUTIONS = new Set(['ambiguous', 'conflicting', 'invalid', UNSUPPORTED_MARKED_HEADER]);
 
 // Returns the reason this row's date makes the collection unpublishable, or
 // null when it is safe.
@@ -76,6 +84,7 @@ function unsafeDateReason(entry) {
   if (UNSAFE_DATE_RESOLUTIONS.has(status)) {
     if (status === 'conflicting') return 'date_conflicts_with_date_group';
     if (status === 'invalid') return 'date_is_not_a_real_calendar_date';
+    if (status === UNSUPPORTED_MARKED_HEADER) return 'marked_date_header_is_not_a_readable_schedule_date';
     return 'date_evidence_is_ambiguous';
   }
   if (entry?.gameDate) return null;

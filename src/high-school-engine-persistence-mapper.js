@@ -622,7 +622,10 @@ function mapHighSchoolOpponentEngineCollection({ context, subject, capturedGames
       // 'invalid' means the source named a day that does not exist on the
       // calendar. It is unsafe for the same reason as ambiguous and conflicting
       // evidence: the collection cannot say which real day was meant.
-      if (status === 'ambiguous' || status === 'conflicting' || status === 'invalid') return true;
+      // 'unsupported_marked_header' is unresolved EVIDENCE, not silence: the
+      // completed-game null-date exception below must never absorb it.
+      if (status === 'ambiguous' || status === 'conflicting' || status === 'invalid'
+        || status === 'unsupported_marked_header') return true;
       if (gameDate) return false;
       // No date: only a completed game with a durable reference may proceed.
       return !ref || gameStatus !== 'final';
