@@ -572,10 +572,16 @@ test('structured and visible dates that disagree are conflicting, never silently
   assert.equal(contradiction[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.CONFLICTING);
   assert.equal(contradiction[0].dateConflict.reason, 'date_group_structured_value_contradicts_visible_date');
 
+  // The same element read as ADMINISTRATIVE prose rather than as a rival date.
+  // The verdict is now the stricter and more honest one: the grammar refused to
+  // read this header at all, so the module cannot also claim to know that its
+  // date "conflicts" -- the date it would be comparing was pulled out of text it
+  // has already declined to interpret. Both statuses are unsafe and both fail
+  // the collection closed; naming the refusal is simply the truthful diagnosis.
   const withProse = await entriesFrom(fixtures.structuredValueWithAdministrativeProse);
   assert.equal(withProse[0].gameDate, null,
-    'a structured value beside a contradicting administrative date is a conflict, not a resolution');
-  assert.equal(withProse[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.CONFLICTING);
+    'a structured value beside administrative prose is never a resolution');
+  assert.equal(withProse[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.UNSUPPORTED_MARKED_HEADER);
 });
 
 test('an impossible structured value is invalid', async () => {

@@ -1659,9 +1659,34 @@ function resolveScheduleEntryDate({
     groupHeaderLabel = groupHeaders.map((h) => normalizeScheduleEntryText(h && h.text)).filter(Boolean).join(' | ');
     const accepted = [];
     for (const header of groupHeaders) {
-      // A structured value the source published for machines outranks its own
-      // presentation of the same fact. A contradiction between the two is
-      // reported below rather than silently resolved in either direction.
+      // ── Structured evidence may CONFIRM or SUPPLY. It may never OVERRIDE. ──
+      //
+      // A structured value (`data-schedule-date`, `data-date-header`, a marked
+      // `<time datetime>`, or a nested `time[datetime]` descendant) used to
+      // outrank the element's own visible text outright. That inverted the
+      // safety property this module exists to provide: a header reading
+      // "Rainout announced Mar 14, 2026" -- which the positive grammar
+      // explicitly REFUSES -- published Mar 14 anyway as soon as the same date
+      // also appeared in a machine-readable attribute, and the two markups
+      // differ only by semantically correct HTML.
+      //
+      // The evidentiary strengths, stated explicitly:
+      //
+      //   data-schedule-date   names the schedule date. Authoritative as a
+      //   data-date-header     SUPPLY when the element expresses no date of its
+      //   <time datetime> on   own, and as a CONFIRMATION of a header the
+      //     the marked header  grammar already accepts.
+      //
+      //   nested time[datetime]  proves only that ITS OWN contents are a date.
+      //                          It says nothing about whether that date is the
+      //                          schedule date for the games that follow, so it
+      //                          is never stronger than the four above.
+      //
+      // None of them is strong enough to license visible prose the grammar
+      // rejected, because none of them can observe WHY the prose was rejected.
+      // So the visible verdict governs whenever the element carries date-like
+      // text at all, and the structured value is consulted only to confirm it,
+      // to contradict it, or to supply a date the visible text never expressed.
       const structuredRaw = (header && header.structured) || [];
       const structured = distinct(structuredRaw.map(parseStructuredHeaderDate));
       if (structured.includes('invalid')) { groupStructuredInvalid = true; continue; }
@@ -1675,9 +1700,25 @@ function resolveScheduleEntryDate({
           dateConflict: { reason: 'date_group_structured_values_disagree', candidates: structured.slice().sort() },
         };
       }
+
+      // An unsafe visible verdict survives any structured value. Checked BEFORE
+      // the structured branch, which is the whole correction: agreement is not
+      // absolution, and an agreeing attribute beside refused prose is still
+      // refused prose.
+      if (visible.kind === 'invalid') { groupStructuredInvalid = true; continue; }
+      if (visible.kind === 'unsupported') { groupUnsupported = groupUnsupported || visible; continue; }
+      if (visible.kind === 'ambiguous') {
+        accepted.push(...visible.dates);
+        if (structured.length === 1) accepted.push(structured[0]);
+        continue;
+      }
+
       if (structured.length === 1) {
-        if (visible.kind === 'ambiguous') { accepted.push(...visible.dates, structured[0]); continue; }
-        if (visible.dates.length === 1 && visible.dates[0] !== structured[0]) {
+        // The visible text is either a header the grammar accepted, or carries
+        // no date at all. Only in those two states may the structured value
+        // speak: to contradict an accepted date (a conflict neither side wins),
+        // or to supply one the source never rendered for a reader.
+        if (visible.kind === 'date' && visible.date !== structured[0]) {
           return {
             ...base,
             dateResolutionStatus: DATE_RESOLUTION_STATUSES.CONFLICTING,
@@ -1686,17 +1727,14 @@ function resolveScheduleEntryDate({
             dateConflict: {
               reason: 'date_group_structured_value_contradicts_visible_date',
               structuredDate: structured[0],
-              visibleDate: visible.dates[0],
+              visibleDate: visible.date,
             },
           };
         }
         accepted.push(structured[0]);
         continue;
       }
-      if (visible.kind === 'invalid') { groupStructuredInvalid = true; continue; }
-      if (visible.kind === 'unsupported') { groupUnsupported = groupUnsupported || visible; continue; }
       if (visible.kind === 'date') accepted.push(visible.date);
-      else if (visible.kind === 'ambiguous') accepted.push(...visible.dates);
     }
     groupDates = distinct(accepted);
   } else {
@@ -1708,9 +1746,27 @@ function resolveScheduleEntryDate({
   const groupRaw = groupHeaderLabel ? [groupHeaderLabel] : [];
   groupHeaderText = groupHeaderLabel;
 
-  // An impossible date anywhere in the governing header is a fault in the
-  // evidence itself, reported before any other rule.
-  if (groupStructuredInvalid && groupDates.length === 0) {
+  // ── Unsafe evidence PARTICIPATES; it is not a fallback ─────────────────
+  //
+  // Both refusals below used to fire only when nothing else resolved
+  // (`groupDates.length === 0 && rowDates.length === 0`), which made them a
+  // last resort rather than a vote. One readable header standing beside one
+  // header this parser could not read then published the readable date with
+  // full confidence -- even though the very next rule down treats two READABLE
+  // headers that disagree as ambiguous. "I cannot read this marked header" is
+  // strictly less certain than "these two headers disagree", so it cannot
+  // produce a more confident answer.
+  //
+  // The run these compete within is bounded by the DOM pass and arrives here
+  // already delimited (see `competing` in getVisibleScheduleEntries): it starts
+  // after the last schedule anchor preceding this row, ends at this row, keeps
+  // only the innermost scope so a month header wrapping a day header is context
+  // rather than a rival, and never includes a header from another schedule
+  // component. So unsafe evidence from an earlier completed group, from after
+  // this game, or from a different component cannot reach this decision at all.
+  //
+  // An impossible date is reported first: it is a fault in the evidence itself.
+  if (groupStructuredInvalid) {
     return {
       ...base,
       dateResolutionStatus: DATE_RESOLUTION_STATUSES.INVALID,
@@ -1724,7 +1780,13 @@ function resolveScheduleEntryDate({
   // it, but the text is not a schedule header this parser can read. Refusing it
   // as a NAMED unsafe status -- rather than as ordinary silence -- is what stops
   // it reaching the completed-game null-date exception.
-  if (groupUnsupported && groupDates.length === 0 && rowDates.length === 0) {
+  //
+  // This now also outranks a per-row date. That is deliberate and matches the
+  // rule already applied to a CONFLICTING group header: the codebase's settled
+  // position is that governing evidence is not irrelevant merely because the
+  // row also spoke, so a row date cannot silently dismiss a marked header the
+  // parser refused to read.
+  if (groupUnsupported) {
     return {
       ...base,
       dateResolutionStatus: DATE_RESOLUTION_STATUSES.UNSUPPORTED_MARKED_HEADER,
