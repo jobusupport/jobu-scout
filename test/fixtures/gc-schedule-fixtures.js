@@ -764,3 +764,152 @@ module.exports.sameGamePostponed = page(group('Apr 11, 2026',
   '</a>', '<span class="status">Postponed</span></a>'));
 module.exports.sameGameFinalRescored = page(group('Apr 11, 2026',
   dg('regress-1', 'Alpha High', { score: 'L 1-9' })));
+
+// ── HS 2D date-header semantics: the positive grammar ──────────────────
+//
+// Structural marking says the SOURCE believes an element is a date header. It
+// does not say the text is a schedule date. Everything below is MARKED
+// (.date-header) and must still be refused, because the date does not lead the
+// text -- which is the shape of every administrative header.
+//
+// The first thirteen are the phrasings a reviewer reproduced publishing their
+// embedded date into a verified generation; the remaining seven were refused by
+// the old keyword list and must stay refused now that the list is gone.
+const markedHeader = (text, games) =>
+  page(`<div class="date-group"><div class="date-header">${text}</div>${games}</div>`);
+
+module.exports.MARKED_ADMINISTRATIVE_HEADERS = Object.freeze({
+  seasonOpener: 'Season opener Mar 3, 2026',
+  tournamentStart: 'Tournament starts Mar 5, 2026',
+  rosterFreeze: 'Roster freeze Mar 12, 2026',
+  lastModified: 'Last modified Mar 9, 2026',
+  eligibility: 'Eligibility through Mar 20, 2026',
+  tryouts: 'Tryouts Mar 4, 2026',
+  rainout: 'Rainout announced Mar 14, 2026',
+  rescheduleNotice: 'Reschedule notice Mar 15, 2026',
+  venueAvailability: 'Venue available Mar 2, 2026',
+  ticketSale: 'Tickets on sale Mar 1, 2026',
+  published: 'Published Mar 8, 2026',
+  effective: 'Effective Mar 10, 2026',
+  through: 'Valid through Mar 21, 2026',
+  registrationDeadline: 'Registration closes Mar 15, 2026',
+  updated: 'Schedule updated Mar 6, 2026',
+  lastSynced: 'Last synced Mar 8, 2026',
+  scheduleGenerated: 'Schedule generated Mar 10, 2026',
+  scoresUpdated: 'Scores updated Mar 11, 2026',
+  posted: 'Posted Mar 18, 2026',
+  currentAsOf: 'Current as of Mar 7, 2026',
+});
+
+// Legitimate schedule headers. Every suffix names a property of the game played
+// on that date, and each has a counterpart this codebase already parses.
+module.exports.SUPPORTED_SCHEDULE_HEADERS = Object.freeze({
+  bareDate: 'Apr 11, 2026',
+  weekdayAndDate: 'Saturday, April 11, 2026',
+  abbreviatedWeekday: 'Sat. Apr 11, 2026',
+  slashForm: '4/11/2026',
+  doubleheader: 'Apr 11, 2026 - Doubleheader',
+  gameOne: 'Apr 11, 2026 - Game 1',
+  gameTwoParenthesised: 'Apr 11, 2026 (Game 2)',
+  home: 'Apr 11, 2026 - Home',
+  away: 'Apr 11, 2026 - Away',
+  seniorNight: 'Apr 11, 2026 - Senior Night',
+  gatesOpen: 'Apr 11, 2026 - gates open at 5',
+  firstPitch: 'Apr 11, 2026 - first pitch 6:30 PM',
+  varsity: 'Apr 11, 2026 - Varsity',
+  juniorVarsity: 'Apr 11, 2026 - JV',
+  bareTime: 'Apr 11, 2026 - 4:30 PM',
+  combined: 'April 11, 2026 - Doubleheader, Home',
+});
+
+module.exports.markedHeaderWith = (text, { played = true } = {}) => markedHeader(
+  text, dg('grammar-1', 'Alpha High', played ? { score: 'W 5-1' } : { time: '4:00 PM' }));
+
+// Annotation BEFORE the date: still administrative ordering, still refused.
+module.exports.annotationBeforeDate = markedHeader('Doubleheader Apr 11, 2026',
+  dg('order-1', 'Alpha High', { score: 'W 5-1' }));
+
+// Material prose after an otherwise valid leading date.
+module.exports.unsupportedProseAfterDate = markedHeader('Apr 11, 2026 - bus leaves at 3 from the north lot',
+  dg('prose-1', 'Alpha High', { score: 'W 5-1' }));
+
+// ── Structured date evidence ───────────────────────────────────────────
+//
+// These attributes were previously read as bare Boolean markers and their
+// VALUES thrown away, so a header could publish a machine-readable date and
+// still be read from its prose.
+const structuredHeader = (attrs, text, games) =>
+  page(`<div class="date-group"><div ${attrs}>${text}</div>${games}</div>`);
+const one = (id) => dg(id, 'Alpha High', { score: 'W 5-1' });
+
+module.exports.structuredValueWithMatchingText = structuredHeader('data-schedule-date="2026-04-11"', 'Apr 11, 2026', one('st-1'));
+module.exports.structuredValueWithNoText = structuredHeader('data-schedule-date="2026-04-11"', '', one('st-2'));
+module.exports.structuredValueContradictingText = structuredHeader('data-schedule-date="2026-04-11"', 'Apr 18, 2026', one('st-3'));
+module.exports.structuredValueImpossible = structuredHeader('data-schedule-date="2026-02-30"', 'Apr 11, 2026', one('st-4'));
+module.exports.structuredValueWithAdministrativeProse = structuredHeader('data-schedule-date="2026-04-11"', 'Rainout announced Mar 14, 2026', one('st-5'));
+module.exports.structuredDateHeaderAttribute = structuredHeader('data-date-header="2026-04-11"', 'Apr 11, 2026', one('st-6'));
+module.exports.structuredTimeElement = page(`<div class="date-group"><time class="schedule-date" datetime="2026-04-11">Apr 11</time>${one('st-7')}</div>`);
+module.exports.structuredBooleanMarkerOnly = structuredHeader('data-date-header="1"', 'Apr 11, 2026', one('st-8'));
+
+// ── Scope containment ──────────────────────────────────────────────────
+//
+// A marked header OUTSIDE the schedule component that renders the games must
+// not reach into it merely because a shared wrapper contains both.
+module.exports.markedHeaderOutsideComponent = `<!doctype html><html><body>
+  <div id="page">
+    <div class="date-header">Mar 3, 2026</div>
+    <section class="schedule"><div class="date-group">${one('scope-1')}</div></section>
+  </div></body></html>`;
+
+module.exports.administrativeHeaderBeforeTwoComponents = `<!doctype html><html><body>
+  <div id="page">
+    <div class="date-header">Schedule updated Mar 6, 2026</div>
+    <section class="schedule"><div class="date-group"><div class="date-header">Apr 11, 2026</div>${one('twoc-a')}</div></section>
+    <section class="schedule"><div class="date-group"><div class="date-header">Apr 18, 2026</div>${one('twoc-b')}</div></section>
+  </div></body></html>`;
+
+module.exports.headerInOneComponentCannotGovernAnother = `<!doctype html><html><body>
+  <div id="page">
+    <section class="schedule"><div class="date-header">Apr 11, 2026</div></section>
+    <section class="schedule"><div class="date-group">${one('cross-1')}</div></section>
+  </div></body></html>`;
+
+module.exports.nestedScheduleComponents = `<!doctype html><html><body>
+  <section class="schedule">
+    <div class="date-header">Apr 11, 2026</div>
+    <section class="schedule"><div class="date-group">${one('nestc-1')}</div></section>
+  </section></body></html>`;
+
+// ── Non-HTTP schedule references ───────────────────────────────────────
+const schemeRow = (href, label) =>
+  `<a class="schedule-row" href="${href}"><span class="matchup">vs ${label}</span> <span class="score">W 5-1</span></a>`;
+module.exports.nonHttpSchemeReferences = page(`
+  <div class="date-group"><div class="date-header">Apr 11, 2026</div>
+    ${schemeRow('javascript:void(0)/schedule/js-1', 'Alpha')}
+  </div>`);
+module.exports.mixedCaseJavascriptScheme = page(`
+  <div class="date-group"><div class="date-header">Apr 11, 2026</div>
+    ${schemeRow('JaVaScRiPt:void(0)/schedule/js-2', 'Alpha')}
+  </div>`);
+module.exports.ftpSchemeReference = page(`
+  <div class="date-group"><div class="date-header">Apr 11, 2026</div>
+    ${schemeRow('ftp://x/schedule/ftp-1', 'Alpha')}
+  </div>`);
+module.exports.dataSchemeReference = page(`
+  <div class="date-group"><div class="date-header">Apr 11, 2026</div>
+    ${schemeRow('data:text/html,/schedule/data-1', 'Alpha')}
+  </div>`);
+module.exports.nonHttpBesideValidRow = page(`
+  <div class="date-group"><div class="date-header">Apr 11, 2026</div>
+    ${one('scheme-ok')}
+    ${schemeRow('javascript:void(0)/schedule/js-3', 'Bravo')}
+  </div>`);
+module.exports.twoDistinctNonHttpSchemes = page(`
+  <div class="date-group"><div class="date-header">Apr 11, 2026</div>
+    ${schemeRow('javascript:void(0)/schedule/js-4', 'Alpha')}
+    ${schemeRow('ftp://x/schedule/ftp-2', 'Bravo')}
+  </div>`);
+module.exports.protocolRelativeReference = page(`
+  <div class="date-group"><div class="date-header">Apr 11, 2026</div>
+    ${schemeRow('//web.gc.com/teams/opponent-high/schedule/pr-1', 'Alpha')}
+  </div>`);

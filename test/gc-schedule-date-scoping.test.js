@@ -373,12 +373,19 @@ test('no unmarked dated element anywhere can govern a game', async () => {
   }
 });
 
-test('even a MARKED header is refused when it carries an administrative qualifier', async () => {
+test('a MARKED header whose text is not a readable schedule date is refused BY NAME', async () => {
+  // This used to report not_expressed, which conflated two different things:
+  // "the source said nothing" and "the source marked a date header and said
+  // something this parser will not interpret". Only the first may reach the
+  // completed-game null-date exception, so they now carry different statuses.
   const entries = await entriesFrom(fixtures.markedHeaderWithUpdatedQualifier);
   assert.equal(entries.length, 1);
   assert.equal(entries[0].gameDate, null,
     '"Updated Apr 20, 2026" is a date about the schedule, not a date games are played on');
-  assert.equal(entries[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.NOT_EXPRESSED);
+  assert.equal(entries[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.UNSUPPORTED_MARKED_HEADER,
+    'marked-but-unreadable is unresolved evidence, not silence');
+  assert.equal(entries[0].dateConflict.reason, 'date_does_not_lead_the_header',
+    'and the diagnostic says WHY the grammar refused it');
 });
 
 test('the data-attribute header form is accepted, so the contract is not just two classes', async () => {
@@ -454,4 +461,189 @@ test('two differently malformed references never collapse into one shared identi
   assert.ok(entries.every((entry) => entry.sourceReferenceMalformed), 'both are flagged');
   assert.ok(entries.every((entry) => entry.identityCollision === false),
     'an empty identity is not an identity, so they are not reported as colliding on one');
+});
+
+// ── The positive schedule-header grammar ───────────────────────────────
+//
+// Structural marking says the SOURCE believes an element is a date header. It
+// does not say the text is a schedule date. The previous boundary was a list of
+// forbidden words, which failed both ways: it missed synonyms of its own entries
+// and published their dates, and it matched ordinary game-day language and threw
+// a legitimate header away.
+
+const { parseScheduleHeaderText, parseStructuredHeaderDate } = scraper;
+
+test('the grammar refuses every administrative header, whatever the wording', () => {
+  // Twenty phrasings, thirteen of which a reviewer reproduced publishing their
+  // embedded date. None depends on a keyword: each is refused because the date
+  // does not LEAD the text, which is the shape administrative prose always has.
+  for (const [name, text] of Object.entries(fixtures.MARKED_ADMINISTRATIVE_HEADERS)) {
+    const parsed = parseScheduleHeaderText(text);
+    assert.equal(parsed.kind, 'unsupported', `${name}: ${JSON.stringify(text)} must not be readable as a schedule date`);
+    assert.equal(parsed.date, null, `${name}: and must yield no date`);
+  }
+});
+
+test('the grammar accepts a leading date with a supported annotation', () => {
+  for (const [name, text] of Object.entries(fixtures.SUPPORTED_SCHEDULE_HEADERS)) {
+    const parsed = parseScheduleHeaderText(text);
+    assert.equal(parsed.kind, 'date', `${name}: ${JSON.stringify(text)} is a legitimate schedule header`);
+    assert.equal(parsed.date, '2026-04-11', `${name}: resolves to the day it names`);
+  }
+});
+
+test('the grammar distinguishes ambiguous, invalid, absent and unsupported', () => {
+  assert.equal(parseScheduleHeaderText('Apr 11 - Apr 13, 2026').kind, 'ambiguous');
+  assert.equal(parseScheduleHeaderText('Feb 30, 2026').kind, 'invalid');
+  assert.equal(parseScheduleHeaderText('Apr 99, 2026').kind, 'invalid');
+  assert.equal(parseScheduleHeaderText('No date at all').kind, 'none');
+  assert.equal(parseScheduleHeaderText('').kind, 'none');
+  // A date that leads but is followed by material prose.
+  const prose = parseScheduleHeaderText('Apr 11, 2026 - bus leaves at 3 from the north lot');
+  assert.equal(prose.kind, 'unsupported');
+  assert.equal(prose.reason, 'unsupported_text_follows_the_date');
+  // An annotation BEFORE the date is administrative ordering, not a header.
+  const ordered = parseScheduleHeaderText('Doubleheader Apr 11, 2026');
+  assert.equal(ordered.kind, 'unsupported');
+  assert.equal(ordered.reason, 'date_does_not_lead_the_header');
+});
+
+test('structured header values are parsed, validated, and not mistaken for booleans', () => {
+  assert.equal(parseStructuredHeaderDate('2026-04-11'), '2026-04-11');
+  assert.equal(parseStructuredHeaderDate('Apr 11, 2026'), '2026-04-11');
+  assert.equal(parseStructuredHeaderDate('2026-02-30'), 'invalid');
+  assert.equal(parseStructuredHeaderDate('Feb 30, 2026'), 'invalid');
+  assert.equal(parseStructuredHeaderDate('1'), null, 'an ordinary boolean marker carries no date');
+  assert.equal(parseStructuredHeaderDate(''), null);
+});
+
+test('no marked administrative header resolves a date through the real DOM', async () => {
+  for (const [name, text] of Object.entries(fixtures.MARKED_ADMINISTRATIVE_HEADERS)) {
+    const entries = await entriesFrom(fixtures.markedHeaderWith(text));
+    assert.equal(entries.length, 1, `${name}: the game itself survives`);
+    assert.equal(entries[0].gameDate, null, `${name}: ${JSON.stringify(text)} must publish no date`);
+    assert.equal(entries[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.UNSUPPORTED_MARKED_HEADER,
+      `${name}: refused BY NAME, not folded into silence`);
+  }
+});
+
+test('every supported schedule header still resolves through the real DOM', async () => {
+  for (const [name, text] of Object.entries(fixtures.SUPPORTED_SCHEDULE_HEADERS)) {
+    const entries = await entriesFrom(fixtures.markedHeaderWith(text));
+    assert.equal(entries[0].gameDate, '2026-04-11', `${name}: ${JSON.stringify(text)} must resolve`);
+    assert.equal(entries[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.RESOLVED_DATE_GROUP);
+  }
+});
+
+test('"gates open at 5" is a schedule header, not an administrative one', async () => {
+  // The keyword list matched `opens?` and threw this away, which silently
+  // published a completed game with a null date and failed an unplayed
+  // collection outright. Both halves are pinned here.
+  for (const played of [true, false]) {
+    const entries = await entriesFrom(fixtures.markedHeaderWith('Apr 11, 2026 - gates open at 5', { played }));
+    assert.equal(entries[0].gameDate, '2026-04-11', `played=${played}: the date the source stated is kept`);
+    assert.equal(entries[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.RESOLVED_DATE_GROUP);
+  }
+});
+
+// ── Structured date evidence ───────────────────────────────────────────
+
+test('a structured value outranks presentation and is validated', async () => {
+  const matching = await entriesFrom(fixtures.structuredValueWithMatchingText);
+  assert.equal(matching[0].gameDate, '2026-04-11');
+
+  const noText = await entriesFrom(fixtures.structuredValueWithNoText);
+  assert.equal(noText[0].gameDate, '2026-04-11', 'a structured value alone is enough');
+
+  const attribute = await entriesFrom(fixtures.structuredDateHeaderAttribute);
+  assert.equal(attribute[0].gameDate, '2026-04-11');
+
+  const timeElement = await entriesFrom(fixtures.structuredTimeElement);
+  assert.equal(timeElement[0].gameDate, '2026-04-11', '<time datetime> is a structured value');
+
+  const booleanOnly = await entriesFrom(fixtures.structuredBooleanMarkerOnly);
+  assert.equal(booleanOnly[0].gameDate, '2026-04-11',
+    'data-date-header="1" is an ordinary marker; the visible header still governs');
+});
+
+test('structured and visible dates that disagree are conflicting, never silently preferred', async () => {
+  const contradiction = await entriesFrom(fixtures.structuredValueContradictingText);
+  assert.equal(contradiction[0].gameDate, null);
+  assert.equal(contradiction[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.CONFLICTING);
+  assert.equal(contradiction[0].dateConflict.reason, 'date_group_structured_value_contradicts_visible_date');
+
+  const withProse = await entriesFrom(fixtures.structuredValueWithAdministrativeProse);
+  assert.equal(withProse[0].gameDate, null,
+    'a structured value beside a contradicting administrative date is a conflict, not a resolution');
+  assert.equal(withProse[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.CONFLICTING);
+});
+
+test('an impossible structured value is invalid', async () => {
+  const entries = await entriesFrom(fixtures.structuredValueImpossible);
+  assert.equal(entries[0].gameDate, null);
+  assert.equal(entries[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.INVALID);
+});
+
+// ── Affirmative scope ──────────────────────────────────────────────────
+
+test('a marked header outside the schedule component cannot reach into it', async () => {
+  const entries = await entriesFrom(fixtures.markedHeaderOutsideComponent);
+  assert.equal(entries[0].gameDate, null,
+    'a shared page wrapper is not a relationship between a header and a game');
+  assert.equal(entries[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.NOT_EXPRESSED,
+    'from inside the component the source expressed nothing at all');
+});
+
+test('a page-level header cannot govern either of two components that head themselves', async () => {
+  const entries = byId(await entriesFrom(fixtures.administrativeHeaderBeforeTwoComponents));
+  assert.equal(entries['twoc-a'].gameDate, '2026-04-11');
+  assert.equal(entries['twoc-b'].gameDate, '2026-04-18');
+});
+
+test('one component\'s header never governs another component', async () => {
+  const entries = await entriesFrom(fixtures.headerInOneComponentCannotGovernAnother);
+  assert.equal(entries[0].gameDate, null, 'Apr 11 belongs to the component that declared it');
+});
+
+test('a header in an outer component still governs a nested one it contains', async () => {
+  const entries = await entriesFrom(fixtures.nestedScheduleComponents);
+  assert.equal(entries[0].gameDate, null,
+    'the nested component is the row\'s nearest component, and it declares no header');
+});
+
+// ── HTTP(S)-only schedule references ───────────────────────────────────
+
+test('a non-HTTP scheme never becomes a source identity', async () => {
+  for (const [name, fixture] of [
+    ['javascript:', fixtures.nonHttpSchemeReferences],
+    ['JaVaScRiPt:', fixtures.mixedCaseJavascriptScheme],
+    ['ftp:', fixtures.ftpSchemeReference],
+    ['data:', fixtures.dataSchemeReference],
+  ]) {
+    const entries = await entriesFrom(fixture);
+    assert.equal(entries.length, 1, `${name}: the row is surfaced, not silently dropped`);
+    assert.equal(entries[0].gameId, '', `${name}: no identity is manufactured from it`);
+    assert.equal(entries[0].href, '', `${name}: and no href is invented`);
+    assert.equal(entries[0].sourceReferenceMalformed, true, `${name}: it is named as unusable`);
+  }
+});
+
+test('a rejected scheme beside a valid row loses neither, and two rejected ones stay distinct', async () => {
+  const mixed = await entriesFrom(fixtures.nonHttpBesideValidRow);
+  assert.equal(mixed.length, 2);
+  assert.ok(mixed.some((e) => e.gameId === 'scheme-ok' && e.sourceReferenceMalformed === false),
+    'the valid row keeps its identity');
+  assert.ok(mixed.some((e) => e.sourceReferenceMalformed === true), 'the rejected one is flagged');
+
+  const two = await entriesFrom(fixtures.twoDistinctNonHttpSchemes);
+  assert.equal(two.length, 2, 'both survive as distinct observations');
+  assert.ok(two.every((e) => e.sourceReferenceMalformed), 'both are rejected');
+  assert.ok(two.every((e) => e.identityCollision === false),
+    'no shared sentinel merges two differently rejected references');
+});
+
+test('protocol-relative and absolute HTTP(S) references are still accepted', async () => {
+  const entries = await entriesFrom(fixtures.protocolRelativeReference);
+  assert.equal(entries[0].gameId, 'pr-1');
+  assert.equal(entries[0].sourceReferenceMalformed, false);
 });

@@ -1225,3 +1225,158 @@ test('the database refuses a status regression even when the application is bypa
     [tenant.opponentTeamId]);
   assert.equal(generations.rows[0].c, 1, 'and no generation was minted by a rejected candidate');
 });
+
+// ── Date-header semantics, end to end ──────────────────────────────────
+//
+// Registered route -> REAL extractor against an offline DOM fixture -> real
+// collector -> real service and repository -> real persist_hs_engine_collection,
+// then the database read directly.
+
+async function runStatesFor(opponentTeamId) {
+  const rows = await db.query(
+    'select status, failure_stage from public.hs_opponent_import_runs where opponent_team_id = $1 order by created_at, id',
+    [opponentTeamId]);
+  return rows.rows.map((row) => `${row.status}/${row.failure_stage || '-'}`);
+}
+
+async function writtenCounts(opponentTeamId) {
+  const one = async (sql) => (await db.query(sql, [opponentTeamId])).rows[0].c;
+  return {
+    games: await one('select count(*)::int c from public.hs_opponent_games where opponent_team_id = $1'),
+    generations: await one('select count(*)::int c from public.hs_opponent_stat_generations where opponent_team_id = $1'),
+    runGames: await one(`select count(*)::int c from public.hs_opponent_import_run_games g
+      where exists (select 1 from public.hs_opponent_import_runs r
+                     where r.id = g.opponent_import_run_id and r.opponent_team_id = $1)`),
+    totals: await one(`select count(*)::int c from public.hs_opponent_verified_totals v
+      where exists (select 1 from public.hs_opponent_stat_generations g
+                     where g.id = v.generation_id and g.opponent_team_id = $1)`),
+  };
+}
+
+test('no marked administrative header reaches the database, played or not', { skip }, async () => {
+  // Thirteen of these were reproduced publishing their embedded date into a
+  // verified generation. None may now write anything, and -- because
+  // 'unsupported_marked_header' is unresolved evidence rather than silence --
+  // the completed-game null-date exception must not absorb the played ones
+  // either.
+  for (const [name, text] of Object.entries(fixtures.MARKED_ADMINISTRATIVE_HEADERS)) {
+    for (const played of [true, false]) {
+      const tenant = await buildTenant('adm');
+      const app = buildApp(tenant, { html: fixtures.markedHeaderWith(text, { played }) });
+      await startRun(app, tenant);
+      const summary = app.locals.lastSummary;
+      assert.equal(summary.state, 'failed', `${name} (played=${played}): nothing is published`);
+      assert.equal(summary.failureReason, 'opponent_schedule_date_unresolved');
+      assert.equal(summary.unsafeScheduleDates[0].reason,
+        'marked_date_header_is_not_a_readable_schedule_date',
+        `${name}: refused by name`);
+      assert.deepEqual(await writtenCounts(tenant.opponentTeamId),
+        { games: 0, generations: 0, runGames: 0, totals: 0 }, `${name}: zero partial writes`);
+      assert.deepEqual(await runStatesFor(tenant.opponentTeamId), ['failed/discovery'],
+        `${name}: the run settles rather than lingering`);
+    }
+  }
+});
+
+test('a legitimate schedule header still publishes the date it states', { skip }, async () => {
+  // "gates open at 5" was thrown away by the old keyword list: the completed
+  // game published with a null date, and the unplayed collection failed
+  // outright. Both are pinned.
+  const played = await buildTenant('gates');
+  const playedApp = buildApp(played, { html: fixtures.markedHeaderWith('Apr 11, 2026 - gates open at 5') });
+  await startRun(playedApp, played);
+  assert.equal(playedApp.locals.lastSummary.state, 'published_verified');
+  assert.deepEqual(await datesFor(played.opponentTeamId), { 'grammar-1': '2026-04-11' },
+    'the date the source actually stated is what is stored');
+
+  const unplayed = await buildTenant('gatesu');
+  const unplayedApp = buildApp(unplayed, { html: fixtures.markedHeaderWith('Apr 11, 2026 - gates open at 5', { played: false }) });
+  await startRun(unplayedApp, unplayed);
+  assert.equal(unplayedApp.locals.lastSummary.state, 'published_schedule_only');
+  assert.deepEqual(await datesFor(unplayed.opponentTeamId), { 'grammar-1': '2026-04-11' });
+});
+
+test('structured header evidence decides the date, and a contradiction fails closed', { skip }, async () => {
+  const trusted = await buildTenant('struct');
+  const trustedApp = buildApp(trusted, { html: fixtures.structuredValueWithNoText });
+  await startRun(trustedApp, trusted);
+  assert.deepEqual(await datesFor(trusted.opponentTeamId), { 'st-2': '2026-04-11' },
+    'a structured value alone is a complete assertion');
+
+  for (const [name, fixture] of [
+    ['structured contradicts visible', fixtures.structuredValueContradictingText],
+    ['structured beside administrative prose', fixtures.structuredValueWithAdministrativeProse],
+    ['impossible structured value', fixtures.structuredValueImpossible],
+  ]) {
+    const tenant = await buildTenant('structbad');
+    const app = buildApp(tenant, { html: fixture });
+    await startRun(app, tenant);
+    assert.equal(app.locals.lastSummary.state, 'failed', `${name}: nothing is published`);
+    assert.deepEqual(await writtenCounts(tenant.opponentTeamId),
+      { games: 0, generations: 0, runGames: 0, totals: 0 });
+    assert.deepEqual(await runStatesFor(tenant.opponentTeamId), ['failed/discovery']);
+  }
+});
+
+test('a marked header outside the schedule component publishes no date into it', { skip }, async () => {
+  const tenant = await buildTenant('scope');
+  const app = buildApp(tenant, { html: fixtures.markedHeaderOutsideComponent });
+  await startRun(app, tenant);
+  assert.deepEqual(await datesFor(tenant.opponentTeamId), { 'scope-1': null },
+    'the page-level Mar 3 must never reach a game inside the component');
+});
+
+test('a non-HTTP schedule reference fails the collection closed', { skip }, async () => {
+  for (const [name, fixture] of [
+    ['javascript:', fixtures.nonHttpSchemeReferences],
+    ['ftp:', fixtures.ftpSchemeReference],
+    ['data:', fixtures.dataSchemeReference],
+    ['mixed-case javascript:', fixtures.mixedCaseJavascriptScheme],
+    ['beside a valid row', fixtures.nonHttpBesideValidRow],
+  ]) {
+    const tenant = await buildTenant('scheme');
+    const app = buildApp(tenant, { html: fixture });
+    await startRun(app, tenant);
+    const summary = app.locals.lastSummary;
+    assert.equal(summary.state, 'failed', `${name}: nothing is published`);
+    assert.equal(summary.failureReason, 'opponent_source_reference_malformed', `${name}: named`);
+    assert.deepEqual(await writtenCounts(tenant.opponentTeamId),
+      { games: 0, generations: 0, runGames: 0, totals: 0 }, `${name}: no canonical game is created`);
+    assert.deepEqual(await runStatesFor(tenant.opponentTeamId), ['failed/discovery'],
+      `${name}: the run settles as failed`);
+  }
+});
+
+test('the database refuses an unsupported marked header even when the application is bypassed', { skip }, async () => {
+  const tenant = await buildTenant('dbunsup');
+  const { createHighSchoolImportRepository } = require('../src/high-school-import-repository');
+  const repository = createHighSchoolImportRepository(admin);
+  const run = await importService.startOpponentImportRun({
+    orgId: tenant.orgId, programId: tenant.programId, seasonId: tenant.seasonId,
+    opponentTeamId: tenant.opponentTeamId, sourceTeamId: tenant.sourceTeamId, triggerKind: 'manual',
+  });
+  // The mapper refuses to build this, so the DTO is assembled from a valid one
+  // and the status flipped -- the shape a privileged caller could present.
+  const { dto } = directDtoFor(tenant, run);
+  dto.observations[0].diagnostics.dateResolution.status = 'unsupported_marked_header';
+  dto.observations[0].gameDate = null;
+  await assert.rejects(
+    () => repository.persistEngineCollection(dto),
+    (error) => error.code === 'OPPONENT_SCHEDULE_DATE_UNRESOLVED',
+    'the SECURITY INVOKER boundary refuses marked-but-unreadable date evidence',
+  );
+  const games = await db.query(
+    'select count(*)::int c from public.hs_opponent_games where opponent_team_id = $1', [tenant.opponentTeamId]);
+  assert.equal(games.rows[0].c, 0, 'and nothing is written');
+});
+
+test('the mapper refuses an unsupported marked header before any database call', { skip }, async () => {
+  const tenant = await buildTenant('mapunsup');
+  const run = await importService.startOpponentImportRun({
+    orgId: tenant.orgId, programId: tenant.programId, seasonId: tenant.seasonId,
+    opponentTeamId: tenant.opponentTeamId, sourceTeamId: tenant.sourceTeamId, triggerKind: 'manual',
+  });
+  assert.throws(() => directDtoFor(tenant, run, {
+    dateResolutionStatus: 'unsupported_marked_header', gameDate: null,
+  }), (error) => error.code === 'OPPONENT_SCHEDULE_DATE_UNRESOLVED');
+});
