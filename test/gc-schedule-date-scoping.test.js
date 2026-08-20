@@ -199,16 +199,22 @@ test('a header naming two dates resolves to no date at all', async () => {
   assert.ok(entries.every((entry) => entry.dateConflict.reason === 'multiple_date_group_dates'));
 });
 
-test('unrecognizable, malformed, or absent headers report not_expressed rather than a guess', async () => {
-  for (const [name, html] of [
-    ['no date in the header', fixtures.dateGroupWithUnrecognizableHeader],
-    ['a day number no calendar has', fixtures.malformedDateHeaderText],
+test('unrecognizable, malformed, or absent headers never guess, and say WHICH kind of nothing they found', async () => {
+  // Two different absences, deliberately reported differently. A header with no
+  // date in it means the source said nothing, which is ordinary. A header naming
+  // a day no calendar has means the source said something impossible, which is
+  // evidence of an upstream or parsing fault a reviewer needs to see -- so it is
+  // 'invalid', not folded into the same bucket as silence. Neither invents a
+  // date, and both keep the games themselves.
+  for (const [name, html, expected] of [
+    ['no date in the header', fixtures.dateGroupWithUnrecognizableHeader, DATE_RESOLUTION_STATUSES.NOT_EXPRESSED],
+    ['a day number no calendar has', fixtures.malformedDateHeaderText, DATE_RESOLUTION_STATUSES.INVALID],
   ]) {
     const entries = await entriesFrom(html);
     assert.equal(entries.length, 2, `${name}: the games themselves still survive`);
     assert.ok(entries.every((entry) => entry.gameDate === null), `${name}: nothing is invented`);
-    assert.ok(entries.every((entry) => entry.dateResolutionStatus === DATE_RESOLUTION_STATUSES.NOT_EXPRESSED),
-      `${name}: and the absence is stated, not silent`);
+    assert.ok(entries.every((entry) => entry.dateResolutionStatus === expected),
+      `${name}: expected every row to report ${expected}`);
   }
 });
 
@@ -281,4 +287,171 @@ test('two separate rows sharing one reference still reach collision handling', a
   assert.equal(entries.length, 2, 'cross-row observations stay separate');
   assert.ok(entries.every((entry) => entry.identityCollision),
     'reference normalization groups anchors within a row, never across rows');
+});
+
+// ── HS 2D final-review correction ──────────────────────────────────────
+//
+// The affirmative date-header contract. DATE_HEADER_SELECTOR used to be passed
+// into the page and ignored, so any short element containing a parseable date
+// governed every row in its parent's subtree. Two shapes were reproduced
+// publishing a WRONG date into a verified generation; both are pinned here
+// alongside the whole family of unmarked dated text they belong to.
+
+test('the pure resolver reports an impossible calendar date as invalid, not as silence', () => {
+  const impossible = resolveScheduleEntryDate({ groupDateTexts: ['Feb 30, 2026'], groupHeaderText: 'Feb 30, 2026' });
+  assert.equal(impossible.gameDate, null);
+  assert.equal(impossible.dateResolutionStatus, DATE_RESOLUTION_STATUSES.INVALID);
+  assert.equal(impossible.dateConflict.reason, 'date_group_date_is_not_a_real_calendar_date');
+
+  const silent = resolveScheduleEntryDate({});
+  assert.equal(silent.dateResolutionStatus, DATE_RESOLUTION_STATUSES.NOT_EXPRESSED,
+    'saying nothing and saying something impossible are different answers');
+});
+
+test('real calendar arithmetic decides which days exist', () => {
+  const { isRealCalendarDate } = scraper;
+  for (const [y, m, d, expected] of [
+    [2026, 2, 28, true], [2026, 2, 29, false], [2028, 2, 29, true], [2026, 2, 30, false],
+    [2026, 4, 30, true], [2026, 4, 31, false], [2026, 12, 31, true], [2026, 13, 1, false],
+    [2026, 1, 0, false], [2026, 0, 1, false], [1900, 2, 29, false], [2000, 2, 29, true],
+  ]) {
+    assert.equal(isRealCalendarDate(y, m, d), expected, `${y}-${m}-${d} should be ${expected}`);
+  }
+});
+
+test('an impossible calendar date never normalizes to a nearby real one', () => {
+  const { normalizeScheduleDateText } = scraper;
+  assert.equal(normalizeScheduleDateText('Feb 30, 2026'), null);
+  assert.equal(normalizeScheduleDateText('Apr 31, 2026'), null);
+  assert.equal(normalizeScheduleDateText('2/30/2026'), null);
+  assert.equal(normalizeScheduleDateText('Feb 29, 2026'), null);
+  assert.equal(normalizeScheduleDateText('Feb 29, 2028'), '2028-02-29');
+  assert.equal(normalizeScheduleDateText('Apr 30, 2026'), '2026-04-30');
+});
+
+// The two shapes the final review reproduced publishing a wrong date.
+
+test('a page caption beside a headerless schedule dates nothing', async () => {
+  const entries = await entriesFrom(fixtures.captionBeforeHeaderlessSchedule);
+  assert.equal(entries.length, 1, 'the game itself survives');
+  assert.equal(entries[0].gameDate, null, 'the caption date 2026-03-03 is NOT adopted');
+  assert.equal(entries[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.NOT_EXPRESSED);
+  assert.equal(entries[0].dateSourceKind, DATE_SOURCE_KINDS.NONE);
+});
+
+test('an unrelated dated note between two games governs neither of them', async () => {
+  const entries = byId(await entriesFrom(fixtures.datedNoteBetweenGames));
+  // Before the correction note-b took 2026-04-20 from the note. Its group says
+  // Apr 11, and that is the only marked claim on it.
+  assert.equal(entries['note-a'].gameDate, '2026-04-11');
+  assert.equal(entries['note-b'].gameDate, '2026-04-11',
+    'the note date 2026-04-20 must never reach the game after it');
+  assert.equal(entries['note-b'].dateSourceKind, DATE_SOURCE_KINDS.DATE_GROUP);
+});
+
+test('no unmarked dated element anywhere can govern a game', async () => {
+  for (const [name, fixture] of [
+    ['a note before the first game', fixtures.datedNoteBeforeFirstGame],
+    ['a note after the last game', fixtures.datedNoteAfterLastGame],
+    ['a tournament title', fixtures.datedTournamentTitle],
+    ['a registration deadline', fixtures.registrationClosesDate],
+    ['a last-synced stamp', fixtures.lastSyncedDate],
+    ['a caption inside the group', fixtures.datedCaptionInsideGroup],
+    ['a caption outside the component', fixtures.datedCaptionOutsideComponent],
+  ]) {
+    const entries = await entriesFrom(fixture);
+    const governed = entries.filter((entry) => entry.gameDate !== null);
+    // datedNoteAfterLastGame carries a real marked header, so its game IS dated;
+    // what matters is that the note's own date is not the one that won.
+    for (const entry of governed) {
+      assert.equal(entry.gameDate, '2026-04-11', `${name}: only a marked header may date a game`);
+    }
+    for (const entry of entries.filter((e) => e.gameDate === null)) {
+      assert.equal(entry.dateResolutionStatus, DATE_RESOLUTION_STATUSES.NOT_EXPRESSED,
+        `${name}: the absence is stated, not silent`);
+    }
+  }
+});
+
+test('even a MARKED header is refused when it carries an administrative qualifier', async () => {
+  const entries = await entriesFrom(fixtures.markedHeaderWithUpdatedQualifier);
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].gameDate, null,
+    '"Updated Apr 20, 2026" is a date about the schedule, not a date games are played on');
+  assert.equal(entries[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.NOT_EXPRESSED);
+});
+
+test('the data-attribute header form is accepted, so the contract is not just two classes', async () => {
+  const entries = await entriesFrom(fixtures.dataAttributeDateHeader);
+  assert.equal(entries[0].gameDate, '2026-04-11');
+  assert.equal(entries[0].dateSourceKind, DATE_SOURCE_KINDS.DATE_GROUP);
+});
+
+test('two schedule components under one parent never share a date', async () => {
+  const entries = byId(await entriesFrom(fixtures.twoComponentsOneParent));
+  assert.equal(entries['comp-a'].gameDate, '2026-05-05');
+  assert.equal(entries['comp-b'].gameDate, '2026-04-05');
+});
+
+test('a nested month header yields to the day header inside it', async () => {
+  const entries = await entriesFrom(fixtures.nestedDateGroups);
+  assert.equal(entries[0].gameDate, '2026-04-18',
+    'the innermost header is the more specific claim, and nesting is not competition');
+  assert.equal(entries[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.RESOLVED_DATE_GROUP);
+});
+
+test('two marked headers naming different dates make the row ambiguous, not a guess', async () => {
+  const competing = await entriesFrom(fixtures.competingMarkedHeaders);
+  assert.equal(competing[0].gameDate, null);
+  assert.equal(competing[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.AMBIGUOUS);
+
+  const repeated = await entriesFrom(fixtures.repeatedIdenticalMarkedHeaders);
+  assert.equal(repeated[0].gameDate, '2026-04-11',
+    'the same date twice is confirmation, not competition');
+  assert.equal(repeated[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.RESOLVED_DATE_GROUP);
+});
+
+test('a headerless game is undated whether or not it has been played', async () => {
+  for (const [name, fixture] of [
+    ['completed', fixtures.headerlessCompletedGame],
+    ['scheduled', fixtures.headerlessScheduledGame],
+  ]) {
+    const entries = await entriesFrom(fixture);
+    assert.equal(entries[0].gameDate, null, `${name}: nothing is invented`);
+    assert.equal(entries[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.NOT_EXPRESSED);
+  }
+});
+
+test('an impossible calendar date in a header is reported as invalid through the real DOM', async () => {
+  for (const [name, fixture] of [
+    ['Feb 30', fixtures.februaryThirtieth],
+    ['Apr 31', fixtures.aprilThirtyFirst],
+    ['Feb 29 in a non-leap year', fixtures.nonLeapFebruaryTwentyNinth],
+  ]) {
+    const entries = await entriesFrom(fixture);
+    assert.equal(entries[0].gameDate, null, `${name}: no nearby real day is substituted`);
+    assert.equal(entries[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.INVALID, `${name}: reported as invalid`);
+  }
+  const leap = await entriesFrom(fixtures.leapFebruaryTwentyNinth);
+  assert.equal(leap[0].gameDate, '2028-02-29', 'a real leap day is still a real date');
+});
+
+test('one malformed href neither throws out of extraction nor takes the valid rows with it', async () => {
+  const entries = await entriesFrom(fixtures.malformedHrefBesideValidRow);
+  assert.equal(entries.length, 2, 'both rows survive; extraction does not abort');
+  const valid = entries.find((entry) => entry.gameId === 'mal-ok');
+  const broken = entries.find((entry) => entry.sourceReferenceMalformed);
+  assert.ok(valid, 'the valid row is still extracted with its identity intact');
+  assert.equal(valid.sourceReferenceMalformed, false);
+  assert.ok(broken, 'the malformed row is surfaced rather than silently dropped');
+  assert.equal(broken.gameId, '', 'no identity is fabricated for it');
+  assert.equal(broken.href, '', 'and no href is invented either');
+});
+
+test('two differently malformed references never collapse into one shared identity', async () => {
+  const entries = await entriesFrom(fixtures.twoDistinctMalformedHrefs);
+  assert.equal(entries.length, 2, 'both rows survive as distinct observations');
+  assert.ok(entries.every((entry) => entry.sourceReferenceMalformed), 'both are flagged');
+  assert.ok(entries.every((entry) => entry.identityCollision === false),
+    'an empty identity is not an identity, so they are not reported as colliding on one');
 });

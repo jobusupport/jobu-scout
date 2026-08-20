@@ -569,3 +569,198 @@ module.exports.anchorWithNoGameIdSegment = page(`
   <div class="schedule-row">
     <a href="${ORIGIN}/teams/opponent-high/schedule/"><span class="matchup">vs Alpha High</span><span class="score">W 3-1</span></a>
   </div>`);
+
+// ── HS 2D final-review correction: unmarked dated text must not govern ──
+//
+// Everything below carries a real, parseable date in an element the source
+// never marked as a schedule date boundary. Before the correction each of these
+// governed the games in its parent's subtree, and the first two were reproduced
+// publishing a WRONG date into a verified generation. Each must now resolve
+// not_expressed: the games survive, and no date is invented for them.
+//
+// `unmarked` keeps the shape identical across the whole family so the only
+// thing under test is which element carries the date and where it sits.
+const unmarked = (cls, text) => `<div class="${cls}">${text}</div>`;
+
+// 1. A page-level caption beside a schedule that has no header of its own.
+//    Reproduced publishing 2026-03-03 onto a game the source never dated.
+module.exports.captionBeforeHeaderlessSchedule = `<!doctype html><html><body>
+  <div id="page">
+    ${unmarked('page-caption', 'Season opener Mar 3, 2026')}
+    <section class="schedule"><div class="date-group">
+      ${dg('cap-a', 'Alpha High', { score: 'W 7-2' })}
+    </div></section>
+  </div></body></html>`;
+
+// 1b. The same shape with an UNPLAYED game. The completed-game exception cannot
+//     reach this one -- there is no result to anchor it -- so it must fail
+//     closed at the collector rather than publish an undated schedule entry.
+module.exports.captionBeforeHeaderlessScheduledGame = `<!doctype html><html><body>
+  <div id="page">
+    ${unmarked('page-caption', 'Season opener Mar 3, 2026')}
+    <section class="schedule"><div class="date-group">
+      ${dg('cap-sched', 'Alpha High', { time: '4:00 PM' })}
+    </div></section>
+  </div></body></html>`;
+
+// 2. An unrelated dated note BETWEEN two games in one date group. Reproduced
+//    handing 2026-04-20 to the game after it while the group says Apr 11.
+module.exports.datedNoteBetweenGames = page(`
+  <div class="date-group">
+    <div class="date-header">Apr 11, 2026</div>
+    ${dg('note-a', 'Alpha High', { score: 'W 5-1' })}
+    ${unmarked('note', 'Roster locked 4/20/2026')}
+    ${dg('note-b', 'Bravo High', { score: 'L 2-7' })}
+  </div>`);
+
+// 3. A dated note BEFORE the first game, with no marked header anywhere.
+module.exports.datedNoteBeforeFirstGame = page(`
+  <div class="date-group">
+    ${unmarked('note', 'Printed 4/1/2026')}
+    ${dg('pre-a', 'Alpha High', { score: 'W 5-1' })}
+  </div>`);
+
+// 4. A dated note AFTER the final game. It follows every row, so it governs
+//    nothing even under the old rule -- kept so a future change that starts
+//    scanning forwards is caught immediately.
+module.exports.datedNoteAfterLastGame = page(`
+  <div class="date-group">
+    <div class="date-header">Apr 11, 2026</div>
+    ${dg('post-a', 'Alpha High', { score: 'W 5-1' })}
+    ${unmarked('note', 'Updated 4/30/2026')}
+  </div>`);
+
+// 5. A tournament title that happens to name a date.
+module.exports.datedTournamentTitle = page(`
+  ${unmarked('tournament-title', 'Spring Classic Apr 3, 2026')}
+  <div class="date-group">${dg('tour-a', 'Alpha High', { score: 'W 5-1' })}</div>`);
+
+// 6. Administrative dates. The last of these is MARKED as a date header, so it
+//    proves the qualifier guard and not merely the marker requirement.
+module.exports.registrationClosesDate = page(`
+  ${unmarked('banner', 'Registration closes Apr 5, 2026')}
+  <div class="date-group">${dg('reg-a', 'Alpha High', { score: 'W 5-1' })}</div>`);
+module.exports.lastSyncedDate = page(`
+  ${unmarked('meta', 'Last synced 4/19/2026')}
+  <div class="date-group">${dg('sync-a', 'Alpha High', { score: 'W 5-1' })}</div>`);
+module.exports.markedHeaderWithUpdatedQualifier = page(`
+  <div class="date-group">
+    <div class="date-header">Updated Apr 20, 2026</div>
+    ${dg('upd-a', 'Alpha High', { score: 'W 5-1' })}
+  </div>`);
+
+// 7. A dated caption INSIDE a date group that has no header of its own.
+module.exports.datedCaptionInsideGroup = page(`
+  <div class="date-group">
+    ${unmarked('caption', 'Photos from 4/2/2026')}
+    ${dg('capin-a', 'Alpha High', { score: 'W 5-1' })}
+  </div>`);
+
+// 8. A dated caption OUTSIDE the schedule component but sharing its parent.
+module.exports.datedCaptionOutsideComponent = `<!doctype html><html><body>
+  <div id="page">
+    ${unmarked('hero', 'Homecoming Apr 25, 2026')}
+    <section class="schedule"><div class="date-group">
+      ${dg('hero-a', 'Alpha High', { score: 'W 5-1' })}
+    </div></section>
+  </div></body></html>`;
+
+// 9. Two schedule components under one common parent, each properly headed.
+//    Neither component's date may reach the other.
+module.exports.twoComponentsOneParent = `<!doctype html><html><body>
+  <div id="page">
+    <div class="component">${group('May 5, 2026', dg('comp-a', 'Alpha High', { score: 'W 5-1' }))}</div>
+    <div class="component">${group('Apr 5, 2026', dg('comp-b', 'Bravo High', { score: 'L 1-2' }))}</div>
+  </div></body></html>`;
+
+// 10. Nested date groups: a month header wrapping a day header. The INNER
+//     header is the more specific claim and must win. This is not competition,
+//     and treating it as such would publish nothing for a well-formed schedule.
+module.exports.nestedDateGroups = page(`
+  <div class="month">
+    <div class="date-header">Apr 11, 2026</div>
+    <div class="date-group">
+      <div class="date-header">Apr 18, 2026</div>
+      ${dg('nest-a', 'Alpha High', { score: 'W 5-1' })}
+    </div>
+  </div>`);
+
+// 15. Two MARKED headers back to back before one row, naming different dates.
+//     Both credibly claim it, so the row is ambiguous rather than guessed.
+module.exports.competingMarkedHeaders = page(`
+  <div class="date-group">
+    <div class="date-header">Apr 11, 2026</div>
+    <div class="date-header">Apr 18, 2026</div>
+    ${dg('comp-x', 'Alpha High', { score: 'W 5-1' })}
+  </div>`);
+
+// 15b. The same shape naming the SAME date twice: confirmation, not competition.
+module.exports.repeatedIdenticalMarkedHeaders = page(`
+  <div class="date-group">
+    <div class="date-header">Apr 11, 2026</div>
+    <div class="date-header">Apr 11, 2026</div>
+    ${dg('comp-y', 'Alpha High', { score: 'W 5-1' })}
+  </div>`);
+
+// 16/17. Headerless games. The completed one may publish undated under the
+//        documented exception; the unplayed one has nothing to anchor it.
+module.exports.headerlessCompletedGame = page(`
+  <div class="date-group">${dg('bare-final', 'Alpha High', { score: 'W 5-1' })}</div>`);
+module.exports.headerlessScheduledGame = page(`
+  <div class="date-group">${dg('bare-sched', 'Alpha High', { time: '4:00 PM' })}</div>`);
+
+// 30. The data-attribute header form, so the contract is not accidentally
+//     narrowed to the two class selectors.
+module.exports.dataAttributeDateHeader = page(`
+  <div class="date-group">
+    <div data-schedule-date="Apr 11, 2026">Apr 11, 2026</div>
+    ${dg('attr-a', 'Alpha High', { score: 'W 5-1' })}
+  </div>`);
+
+// ── Impossible calendar dates ──────────────────────────────────────────
+module.exports.februaryThirtieth = page(group('Feb 30, 2026',
+  dg('cal-feb30', 'Alpha High', { score: 'W 5-1' })));
+module.exports.aprilThirtyFirst = page(group('Apr 31, 2026',
+  dg('cal-apr31', 'Alpha High', { score: 'W 5-1' })));
+module.exports.nonLeapFebruaryTwentyNinth = page(group('Feb 29, 2026',
+  dg('cal-feb29-bad', 'Alpha High', { score: 'W 5-1' })));
+module.exports.leapFebruaryTwentyNinth = page(group('Feb 29, 2028',
+  dg('cal-feb29-ok', 'Alpha High', { score: 'W 5-1' })));
+
+// ── Malformed schedule references ──────────────────────────────────────
+//
+// A bracketed host the URL parser rejects, sitting beside a perfectly good row.
+// Before the correction this threw an untyped TypeError out of extraction and
+// took the valid row down with it.
+module.exports.malformedHrefBesideValidRow = page(`
+  <div class="date-group">
+    <div class="date-header">Apr 11, 2026</div>
+    ${dg('mal-ok', 'Alpha High', { score: 'W 5-1' })}
+    <a class="schedule-row" href="http://[bad/schedule/x"><span class="matchup">vs Bravo High</span> <span class="score">L 1-2</span></a>
+  </div>`);
+
+// Two DIFFERENTLY malformed references. Neither may be given an identity, and
+// they must not collapse into one shared empty or sentinel identity either.
+module.exports.twoDistinctMalformedHrefs = page(`
+  <div class="date-group">
+    <div class="date-header">Apr 11, 2026</div>
+    <a class="schedule-row" href="http://[bad-one/schedule/a"><span class="matchup">vs Alpha High</span> <span class="score">W 5-1</span></a>
+    <a class="schedule-row" href="http://[bad-two/schedule/b"><span class="matchup">vs Bravo High</span> <span class="score">L 1-2</span></a>
+  </div>`);
+
+// ── Source status regression: ONE game, same upstream id, two statuses ──
+//
+// Distinct from a completeness regression, which is what happens when a
+// previously verified game disappears from the candidate altogether. Here the
+// game is still present under the same id and the source has walked its status
+// back -- a retraction, which must be surfaced rather than applied silently
+// over a verified result.
+module.exports.sameGameFinal = page(group('Apr 11, 2026',
+  dg('regress-1', 'Alpha High', { score: 'W 5-1' })));
+module.exports.sameGameScheduled = page(group('Apr 11, 2026',
+  dg('regress-1', 'Alpha High', { time: '4:00 PM' })));
+module.exports.sameGamePostponed = page(group('Apr 11, 2026',
+  dg('regress-1', 'Alpha High', { time: '4:00 PM' })).replace(
+  '</a>', '<span class="status">Postponed</span></a>'));
+module.exports.sameGameFinalRescored = page(group('Apr 11, 2026',
+  dg('regress-1', 'Alpha High', { score: 'L 1-9' })));
