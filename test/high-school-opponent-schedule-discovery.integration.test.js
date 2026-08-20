@@ -998,3 +998,230 @@ test('the database refuses an unresolved identity, so no phantom game accumulate
     'select count(*)::int c from public.hs_opponent_stat_generations where opponent_team_id = $1', [tenant.opponentTeamId]);
   assert.equal(generations.rows[0].c, 0);
 });
+
+// ── HS 2D final-review corrections, end to end ─────────────────────────
+//
+// Everything below drives the registered route -> the REAL extractor against an
+// offline DOM fixture -> the real collector -> the real service and repository
+// -> the real persist_hs_engine_collection, and then reads the database
+// directly. Nothing is asserted from the returned JavaScript object alone.
+
+async function runStateFor(opponentTeamId) {
+  const rows = await db.query(
+    'select status, failure_stage from public.hs_opponent_import_runs where opponent_team_id = $1 order by created_at, id',
+    [opponentTeamId]);
+  return rows.rows.map((row) => `${row.status}/${row.failure_stage || '-'}`);
+}
+
+async function persistedCounts(opponentTeamId) {
+  const one = async (sql) => (await db.query(sql, [opponentTeamId])).rows[0].c;
+  return {
+    games: await one('select count(*)::int c from public.hs_opponent_games where opponent_team_id = $1'),
+    generations: await one('select count(*)::int c from public.hs_opponent_stat_generations where opponent_team_id = $1'),
+    runGames: await one(`select count(*)::int c from public.hs_opponent_import_run_games g
+      where exists (select 1 from public.hs_opponent_import_runs r
+                     where r.id = g.opponent_import_run_id and r.opponent_team_id = $1)`),
+    totals: await one(`select count(*)::int c from public.hs_opponent_verified_totals v
+      where exists (select 1 from public.hs_opponent_stat_generations g
+                     where g.id = v.generation_id and g.opponent_team_id = $1)`),
+  };
+}
+
+test('unmarked dated text never publishes a date it invented', { skip }, async () => {
+  // The two shapes the final independent review reproduced writing a WRONG date
+  // into a verified generation. The caption said Mar 3 and the note said Apr 20;
+  // neither is a marked schedule date boundary, so neither may reach the
+  // database.
+  const captioned = await buildTenant('capfix');
+  const capApp = buildApp(captioned, { html: fixtures.captionBeforeHeaderlessSchedule });
+  await startRun(capApp, captioned);
+  assert.deepEqual(await datesFor(captioned.opponentTeamId), { 'cap-a': null },
+    'the caption date 2026-03-03 must never be published for this game');
+
+  const noted = await buildTenant('notefix');
+  const noteApp = buildApp(noted, { html: fixtures.datedNoteBetweenGames });
+  await startRun(noteApp, noted);
+  assert.deepEqual(await datesFor(noted.opponentTeamId),
+    { 'note-a': '2026-04-11', 'note-b': '2026-04-11' },
+    'the note date 2026-04-20 must never reach the game rendered after it');
+});
+
+test('the undated-completed-game exception does not extend to an unplayed one', { skip }, async () => {
+  // A COMPLETED game with a stable upstream id is anchored by that id, so
+  // publishing it with a null date states exactly what the source said. The
+  // identical page with an UNPLAYED game has nothing to anchor it, so the whole
+  // collection fails closed rather than inventing schedule knowledge.
+  const played = await buildTenant('excok');
+  const okApp = buildApp(played, { html: fixtures.captionBeforeHeaderlessSchedule });
+  await startRun(okApp, played);
+  assert.equal(okApp.locals.lastSummary.state, 'published_verified');
+  assert.deepEqual(await datesFor(played.opponentTeamId), { 'cap-a': null });
+  assert.deepEqual(await runStateFor(played.opponentTeamId), ['succeeded/-']);
+
+  const unplayed = await buildTenant('excbad');
+  const badApp = buildApp(unplayed, { html: fixtures.captionBeforeHeaderlessScheduledGame });
+  await startRun(badApp, unplayed);
+  assert.equal(badApp.locals.lastSummary.state, 'failed');
+  assert.equal(badApp.locals.lastSummary.failureReason, 'opponent_schedule_date_unresolved');
+  assert.deepEqual(await persistedCounts(unplayed.opponentTeamId),
+    { games: 0, generations: 0, runGames: 0, totals: 0 });
+  assert.deepEqual(await runStateFor(unplayed.opponentTeamId), ['failed/discovery'],
+    'a refused collection settles its run rather than leaving it running');
+});
+
+test('an impossible calendar date fails the collection closed before PostgreSQL sees it', { skip }, async () => {
+  for (const [name, fixture] of [
+    ['Feb 30', fixtures.februaryThirtieth],
+    ['Apr 31', fixtures.aprilThirtyFirst],
+    ['Feb 29 in a non-leap year', fixtures.nonLeapFebruaryTwentyNinth],
+  ]) {
+    const tenant = await buildTenant('cal');
+    const app = buildApp(tenant, { html: fixture });
+    await startRun(app, tenant);
+    const summary = app.locals.lastSummary;
+    assert.equal(summary.state, 'failed', `${name}: nothing is published`);
+    assert.equal(summary.failureReason, 'opponent_schedule_date_unresolved');
+    assert.equal(summary.unsafeScheduleDates[0].reason, 'date_is_not_a_real_calendar_date',
+      `${name}: named, not a generic persistence failure`);
+    assert.deepEqual(await persistedCounts(tenant.opponentTeamId),
+      { games: 0, generations: 0, runGames: 0, totals: 0 }, `${name}: zero partial writes`);
+    assert.deepEqual(await runStateFor(tenant.opponentTeamId), ['failed/discovery']);
+  }
+
+  // A real leap day is still a real date and still publishes.
+  const leap = await buildTenant('calok');
+  const leapApp = buildApp(leap, { html: fixtures.leapFebruaryTwentyNinth });
+  await startRun(leapApp, leap);
+  assert.equal(leapApp.locals.lastSummary.state, 'published_verified');
+  assert.deepEqual(await datesFor(leap.opponentTeamId), { 'cal-feb29-ok': '2028-02-29' });
+});
+
+test('one malformed reference fails the collection closed instead of aborting extraction', { skip }, async () => {
+  const tenant = await buildTenant('malref');
+  const app = buildApp(tenant, { html: fixtures.malformedHrefBesideValidRow });
+  await startRun(app, tenant);
+  const summary = app.locals.lastSummary;
+
+  // The valid row was still extracted -- the failure is a refusal to publish an
+  // incomplete season, not a crash that lost it.
+  const extracted = app.locals.trace.find(([kind]) => kind === 'extracted')[1];
+  assert.match(extracted, /mal-ok/, 'the valid row survived extraction');
+
+  assert.equal(summary.state, 'failed');
+  assert.equal(summary.failureReason, 'opponent_source_reference_malformed');
+  assert.equal(summary.malformedSourceReferences.length, 1);
+  assert.equal(summary.manualReconciliationRequired, true);
+  assert.deepEqual(await persistedCounts(tenant.opponentTeamId),
+    { games: 0, generations: 0, runGames: 0, totals: 0 });
+  assert.deepEqual(await runStateFor(tenant.opponentTeamId), ['failed/discovery']);
+});
+
+test('every publication-boundary rejection settles its import run as failed', { skip }, async () => {
+  // The defect this replaces: 'publication' was not an accepted failure stage,
+  // the validator threw, the collector swallowed it, and the run sat 'running'
+  // for ever -- blocking the next retry and looking exactly like a hung import.
+  const cases = [
+    ['unresolved identity', fixtures.anchorWithNoGameIdSegment, 'publication'],
+    ['ambiguous date', fixtures.competingMarkedHeaders, 'discovery'],
+    ['source-event identity collision', fixtures.genericWrapperSameHref, 'discovery'],
+  ];
+  for (const [name, html, expectedStage] of cases) {
+    if (!html) continue;
+    const tenant = await buildTenant('pubstage');
+    const app = buildApp(tenant, { html });
+    await startRun(app, tenant);
+    assert.equal(app.locals.lastSummary.state, 'failed', `${name}: nothing is published`);
+    const states = await runStateFor(tenant.opponentTeamId);
+    assert.deepEqual(states, [`failed/${expectedStage}`],
+      `${name}: the run must be failed at the ${expectedStage} stage, never left running`);
+    assert.deepEqual(await persistedCounts(tenant.opponentTeamId),
+      { games: 0, generations: 0, runGames: 0, totals: 0 }, `${name}: zero partial writes`);
+  }
+});
+
+test('replaying an unchanged collection settles the replay run too', { skip }, async () => {
+  // Only the INSERT path used to mark a run succeeded, so every idempotent
+  // replay -- the normal outcome of a scheduled re-scrape -- stranded a run in
+  // 'running' on the SUCCESS path.
+  const tenant = await buildTenant('replay');
+  const first = buildApp(tenant, { html: fixtures.dateGroupTwoCompleted });
+  await startRun(first, tenant);
+  const generationId = first.locals.lastSummary.generationId;
+
+  const again = buildApp(tenant, { html: fixtures.dateGroupTwoCompleted });
+  await startRun(again, tenant);
+  assert.equal(again.locals.lastSummary.generationId, generationId, 'the same generation is reused');
+
+  assert.deepEqual(await runStateFor(tenant.opponentTeamId), ['succeeded/-', 'succeeded/-'],
+    'both runs settle; a replay is a success, not an unfinished import');
+  const generations = await db.query(
+    'select count(*)::int c from public.hs_opponent_stat_generations where opponent_team_id = $1',
+    [tenant.opponentTeamId]);
+  assert.equal(generations.rows[0].c, 1, 'and no second generation is minted');
+});
+
+test('a previously final game cannot be walked back to a non-final status', { skip }, async () => {
+  // A genuine upstream retraction is news a human must see. Silently applying it
+  // over a verified result -- or, at the idempotent-reuse branch, returning
+  // success while the canonical row quietly stays final -- would hide it.
+  // ONE game under ONE upstream id, whose status the source walks back. That is
+  // a retraction, and it is a different thing from a completeness regression
+  // (where the verified game leaves the candidate altogether).
+  const tenant = await buildTenant('regress');
+  const published = buildApp(tenant, { html: fixtures.sameGameFinal });
+  await startRun(published, tenant);
+  const before = await datesFor(tenant.opponentTeamId);
+  const generationId = published.locals.lastSummary.generationId;
+
+  const regressed = buildApp(tenant, { html: fixtures.sameGameScheduled });
+  await startRun(regressed, tenant);
+  assert.equal(regressed.locals.lastSummary.state, 'failed');
+  assert.equal(regressed.locals.lastSummary.failureReason, 'OPPONENT_GAME_STATUS_REGRESSION',
+    'named, so the caller learns what happened rather than seeing a generic failure');
+  assert.equal(regressed.locals.lastSummary.manualReconciliationRequired, true);
+
+  assert.deepEqual(await datesFor(tenant.opponentTeamId), before, 'the canonical games are untouched');
+  const current = await db.query(
+    `select id from public.hs_opponent_stat_generations
+      where opponent_team_id = $1 and is_current`, [tenant.opponentTeamId]);
+  assert.equal(current.rowCount, 1);
+  assert.equal(current.rows[0].id, generationId, 'the prior verified generation is still current');
+  assert.deepEqual(await runStateFor(tenant.opponentTeamId), ['succeeded/-', 'failed/publication']);
+});
+
+test('the database refuses a status regression even when the application is bypassed', { skip }, async () => {
+  // A privileged caller presenting a regressed observation at the SAME
+  // inputSetHash used to match the existing generation, reuse it, and return
+  // success while the canonical row stayed 'final'.
+  const tenant = await buildTenant('regrpc');
+  const { createHighSchoolImportRepository } = require('../src/high-school-import-repository');
+  const repository = createHighSchoolImportRepository(admin);
+  const run = await importService.startOpponentImportRun({
+    orgId: tenant.orgId, programId: tenant.programId, seasonId: tenant.seasonId,
+    opponentTeamId: tenant.opponentTeamId, sourceTeamId: tenant.sourceTeamId, triggerKind: 'manual',
+  });
+  const published = await repository.persistEngineCollection(directDtoFor(tenant, run).dto);
+  assert.ok(published.id);
+
+  for (const status of ['scheduled', 'postponed', 'cancelled', 'suspended', 'in_progress']) {
+    const retry = await importService.startOpponentImportRun({
+      orgId: tenant.orgId, programId: tenant.programId, seasonId: tenant.seasonId,
+      opponentTeamId: tenant.opponentTeamId, sourceTeamId: tenant.sourceTeamId, triggerKind: 'manual',
+    });
+    const { dto } = directDtoFor(tenant, retry, { gameStatus: status });
+    await assert.rejects(
+      () => repository.persistEngineCollection(dto),
+      (error) => error.code === 'OPPONENT_GAME_STATUS_REGRESSION',
+      `the SECURITY INVOKER boundary refuses final -> ${status}`,
+    );
+  }
+
+  const games = await db.query(
+    'select game_status from public.hs_opponent_games where opponent_team_id = $1', [tenant.opponentTeamId]);
+  assert.equal(games.rowCount, 1);
+  assert.equal(games.rows[0].game_status, 'final', 'the canonical row never silently changed');
+  const generations = await db.query(
+    'select count(*)::int c from public.hs_opponent_stat_generations where opponent_team_id = $1',
+    [tenant.opponentTeamId]);
+  assert.equal(generations.rows[0].c, 1, 'and no generation was minted by a rejected candidate');
+});

@@ -567,6 +567,14 @@ test('a kill switch flipped MID-RUN stops the opponent collection before the nex
   assert.equal(generations.rows[0].c, 0, 'a partial collection publishes nothing at all');
 
   const run = await db.query(
-    'select status from public.hs_opponent_import_runs where id = $1', [res.body.opponentImportRun.id]);
-  assert.notEqual(run.rows[0].status, 'succeeded', 'the import run must not remain falsely successful');
+    'select status, failure_stage from public.hs_opponent_import_runs where id = $1',
+    [res.body.opponentImportRun.id]);
+  // The TERMINAL state, not merely "anything but succeeded". The weaker
+  // assertion also passed while the run sat in 'running' for ever with no
+  // process behind it -- which is exactly the defect the final review found, so
+  // this assertion has to be the one that would have caught it.
+  assert.equal(run.rows[0].status, 'failed',
+    'an interrupted run must settle as failed, never linger as running');
+  assert.equal(run.rows[0].failure_stage, 'discovery',
+    'and it must say where it stopped');
 });
