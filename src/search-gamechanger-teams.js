@@ -1041,6 +1041,48 @@ async function getVisibleCompletedGameCount(page) {
   return visibleCount;
 }
 
+// ── Schedule-reference origin authority ────────────────────────────────
+//
+// extractGameIdFromUrl takes the path segment after '/schedule/' and throws the
+// HOST away. That is only safe once the host has been proven authoritative
+// first, because otherwise any page-embedded anchor whose path merely LOOKS
+// like a schedule link donates a canonical opponent game:
+//
+//   https://other.example/schedule/foreign-1  ->  sourceGameRef 'foreign-1'
+//
+// which published a game GameChanger never served. Scheme alone does not
+// establish authority -- 'https:' says the transport, not the publisher -- and
+// neither does the presence of '/schedule/' in the path.
+//
+// This application talks to exactly one GameChanger schedule origin. Every team
+// URL it will accept is already pinned to it (see GC_TEAM_URL_RE in
+// src/high-school-import-routes.js: /^https:\/\/web\.gc\.com\/teams\/.../), and
+// normalizeTeamUrl below prefixes bare '/teams/...' paths with the same origin.
+// The only other gc.com origin anywhere in this codebase is the OWN-TEAM login
+// page (src/login-gamechanger.js), which serves no schedules. So exactly one
+// origin is admitted and no sibling domain is speculatively added.
+const AUTHORITATIVE_SCHEDULE_ORIGIN = 'https://web.gc.com';
+
+// Compared as a WHOLE normalized origin, never by substring or suffix. The URL
+// parser lower-cases the host, drops a default port, and resolves user-info, so
+// exact origin equality already rejects every near-miss this must refuse:
+//
+//   http://web.gc.com/...              origin 'http://web.gc.com'        scheme differs
+//   https://web.gc.com:444/...         origin 'https://web.gc.com:444'   port differs
+//   https://web.gc.com.evil.example/   origin 'https://web.gc.com.evil.example'
+//   https://evil-web.gc.com/...        origin 'https://evil-web.gc.com'
+//   https://api.web.gc.com/...         origin 'https://api.web.gc.com'   subdomain
+//   https://web.gc.com./...            origin 'https://web.gc.com.'      trailing dot
+//   https://web.gc.com@evil.example/   origin 'https://evil.example'     user-info trick
+//   https://gc.com/...                 origin 'https://gc.com'           different host
+//
+// A substring or endsWith() check would admit several of those, which is
+// exactly why authority is decided on the parsed origin and nothing else.
+function isAuthoritativeScheduleOrigin(resolvedUrl) {
+  if (!resolvedUrl || typeof resolvedUrl.origin !== 'string') return false;
+  return resolvedUrl.origin === AUTHORITATIVE_SCHEDULE_ORIGIN;
+}
+
 function extractGameIdFromUrl(url) {
   const match = String(url || "").match(/\/schedule\/([^/?#]+)/i);
   return match ? match[1] : "";
@@ -2341,6 +2383,8 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
     const rawHref = rawRow.hrefs.length ? rawRow.hrefs[0] : '';
     let href = '';
     let sourceReferenceMalformed = false;
+    let sourceReferenceUntrustedOrigin = false;
+    let untrustedSourceOrigin = '';
     if (rawHref) {
       try {
         const resolved = new URL(rawHref, page.url());
@@ -2350,12 +2394,40 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
         if (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') {
           href = '';
           sourceReferenceMalformed = true;
+        } else if (!isAuthoritativeScheduleOrigin(resolved)) {
+          // HTTP(S) but not OUR GameChanger origin. Authority is settled here,
+          // BEFORE extractGameIdFromUrl strips the host, so a foreign anchor can
+          // never donate a path-derived identity.
+          href = '';
+          sourceReferenceUntrustedOrigin = true;
+          untrustedSourceOrigin = resolved.origin;
         } else {
           href = resolved.href;
         }
       } catch {
         href = '';
         sourceReferenceMalformed = true;
+      }
+    }
+
+    // Authority is judged on EVERY anchor this row claims, not merely the first.
+    // A row root is accepted when it describes one game, so a foreign anchor can
+    // legitimately sit beside the trusted one inside a single row -- and reading
+    // only hrefs[0] meant that when the trusted anchor came first the foreign one
+    // was silently absorbed and never surfaced anywhere. Skipping it is exactly
+    // the outcome this gate exists to prevent, so any untrusted anchor in the row
+    // makes the whole row untrusted.
+    for (const candidate of rawRow.hrefs) {
+      if (sourceReferenceUntrustedOrigin) break;
+      try {
+        const resolved = new URL(candidate, page.url());
+        if (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') continue;
+        if (isAuthoritativeScheduleOrigin(resolved)) continue;
+        href = '';
+        sourceReferenceUntrustedOrigin = true;
+        untrustedSourceOrigin = resolved.origin;
+      } catch {
+        // Already accounted for by the malformed-reference gate above.
       }
     }
     const scoreParts = parseScoreText(rawRow.scoreText || rawRow.cardText || '');
@@ -2401,6 +2473,13 @@ async function getVisibleScheduleEntries(page, { mode } = {}) {
       // collection while any row carries one.
       sourceReferenceMalformed,
       rawSourceReference: sourceReferenceMalformed ? rawHref : '',
+      // Provenance for a reference whose ORIGIN is not authoritative. Only the
+      // normalized origin travels: a path, query or fragment on a foreign URL is
+      // attacker-chosen content, and echoing it into a diagnostic or a log line
+      // would carry whatever it happens to contain. The origin is the whole
+      // reason the row was refused and is all a reviewer needs.
+      sourceReferenceUntrustedOrigin,
+      untrustedSourceOrigin: sourceReferenceUntrustedOrigin ? untrustedSourceOrigin : '',
       identityCollision: false,
       collidingRowIndexes: [],
     };
@@ -4544,6 +4623,8 @@ if (require.main !== module) {
     extractBoxScore,
     extractPlays,
     extractGameIdFromUrl,
+    AUTHORITATIVE_SCHEDULE_ORIGIN,
+    isAuthoritativeScheduleOrigin,
     getTeamOutputDir,
     scrapeTeamById,   // ← add this
     normalizeTeamUrl,

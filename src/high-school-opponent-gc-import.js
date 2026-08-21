@@ -245,6 +245,14 @@ function toOpponentScheduleEntry(row) {
     // being published under a fabricated or empty identity.
     sourceReferenceMalformed: row.sourceReferenceMalformed === true,
     rawSourceReference: row.rawSourceReference || null,
+    // The extractor resolved this row's href to a perfectly valid HTTP(S) URL
+    // that is NOT this application's GameChanger schedule origin. Carried for
+    // the same reason as the malformed flag: the collection must fail closed
+    // with a named reason rather than let a foreign anchor's path donate a
+    // canonical identity. Only the normalized origin travels -- never the
+    // attacker-chosen path, query or fragment.
+    sourceReferenceUntrustedOrigin: row.sourceReferenceUntrustedOrigin === true,
+    untrustedSourceOrigin: row.untrustedSourceOrigin || null,
     // Provenance carried only so a collision can be explained; never hashed,
     // never canonical identity.
     sourceRowIndex: Number.isFinite(row.visibleIndex) ? row.visibleIndex : null,
@@ -274,6 +282,29 @@ function detectMalformedSourceReferences(entries) {
       // Kept short and sanitized at the log boundary; enough for a reviewer to
       // find the row, never a full private URL echoed verbatim into a log line.
       rawSourceReference: entry.rawSourceReference ? String(entry.rawSourceReference).slice(0, 120) : null,
+    }))
+    .sort((a, b) => (a.sourceRowIndex ?? 0) - (b.sourceRowIndex ?? 0));
+}
+
+// Rows whose schedule reference resolved to an origin this application does not
+// treat as authoritative. Distinct from a malformed reference: the URL parsed
+// cleanly and uses HTTP(S), it simply was not published by GameChanger, so the
+// path-derived identity behind it is not a GameChanger game id and the row is
+// not a GameChanger game.
+//
+// Reported per row and sorted by row index so the diagnostic is identical
+// however the source ordered the DOM. Only the normalized origin is retained:
+// the path, query and fragment of a foreign URL are content this application did
+// not author, and copying them into a summary or a log line would carry whatever
+// they contain.
+function detectUntrustedSourceOrigins(entries) {
+  return entries
+    .filter((entry) => entry?.sourceReferenceUntrustedOrigin === true)
+    .map((entry) => ({
+      reason: 'schedule_source_reference_origin_is_not_authoritative',
+      sourceRowIndex: entry.sourceRowIndex,
+      gameStatus: entry.gameStatus,
+      untrustedOrigin: entry.untrustedSourceOrigin || null,
     }))
     .sort((a, b) => (a.sourceRowIndex ?? 0) - (b.sourceRowIndex ?? 0));
 }
@@ -432,6 +463,14 @@ async function runOpponentImportCollection({
     dateConflict: entry?.dateConflict || null,
     sourceReferenceMalformed: entry?.sourceReferenceMalformed === true,
     rawSourceReference: entry?.rawSourceReference || null,
+    // Carried through this second normalization for the same reason as the
+    // malformed flag: anything not named here is dropped, and a dropped
+    // untrusted-origin flag would let the row travel all the way to the
+    // publication boundary and be refused there as a generic unresolved
+    // identity -- true, but the wrong diagnosis, at the wrong stage, after the
+    // collection had already been captured.
+    sourceReferenceUntrustedOrigin: entry?.sourceReferenceUntrustedOrigin === true,
+    untrustedSourceOrigin: entry?.untrustedSourceOrigin || null,
     // Provenance for collision diagnostics. Never hashed, never canonical
     // identity -- it exists only so a reviewer can see WHICH source rows
     // collided.
@@ -461,6 +500,38 @@ async function runOpponentImportCollection({
     await failRun('discovery',
       `${malformedReferences.length} schedule row(s) carry a source reference that is not a usable URL, `
       + 'so those games cannot be identified; no generation was published.');
+    return summary;
+  }
+
+  // Evaluated before ANY capture or publication, and deliberately BEFORE the
+  // collision gate below. A foreign anchor that happens to share a final path
+  // segment with a real game would otherwise be reported as an identity
+  // collision, which describes the wrong problem: the row is not a competing
+  // claim on one game, it is not a GameChanger game at all. Source authority is
+  // therefore settled first, and collision detection remains what it always was
+  // -- a separate downstream defence between two rows that ARE authoritative.
+  //
+  // The whole collection fails. A foreign row beside legitimate ones is not
+  // skipped and the legitimate rows are not partially published: a page that
+  // carries a schedule-shaped link this application cannot vouch for is a page
+  // this run does not understand, and publishing part of it would quietly
+  // under- or over-report the opponent's season.
+  const untrustedOrigins = detectUntrustedSourceOrigins(normalized);
+  if (untrustedOrigins.length > 0) {
+    summary.failureReason = 'opponent_schedule_source_ref_untrusted_origin';
+    summary.untrustedSourceOrigins = untrustedOrigins;
+    summary.manualReconciliationRequired = true;
+    summary.priorVerifiedGenerationPreserved = true;
+    onProgress({
+      type: 'schedule_source_reference_untrusted_origin',
+      untrusted: untrustedOrigins.map((row) => ({
+        sourceRowIndex: row.sourceRowIndex, reason: row.reason, untrustedOrigin: row.untrustedOrigin,
+      })),
+    });
+    await failRun('discovery',
+      `${untrustedOrigins.length} schedule row(s) reference an origin that is not the authoritative `
+      + 'GameChanger schedule origin, so those games cannot be attributed to this source; '
+      + 'no generation was published.');
     return summary;
   }
 
