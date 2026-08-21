@@ -642,3 +642,163 @@ issued to untrusted parties — not that the RPC could detect the forgery.
 
 Nothing in this repository should be read as claiming the RPC independently proves what the
 source said.
+
+---
+
+# Addendum C: schedule-reference origin authority
+
+Addendum B §B7 established that a schedule reference must parse as a URL and use
+`http:` or `https:`. That is a rule about *transport*, and it turned out not to be a rule about
+*publisher*. Because `extractGameIdFromUrl` keeps only the path segment after `/schedule/` and
+discards the host, any anchor anywhere on the page whose path merely looked like a schedule link
+donated a canonical opponent game:
+
+```text
+https://other.example/schedule/foreign-1   ->  sourceGameRef 'foreign-1'  ->  published_verified
+```
+
+That game was never served by GameChanger. This addendum states the origin rule that now runs
+before any identity is derived, and supersedes §B7's implication that HTTP(S) alone is enough.
+
+## C1. The authoritative origin
+
+```text
+https://web.gc.com
+```
+
+Exactly one origin, chosen from what this application actually uses rather than from what
+GameChanger might plausibly own:
+
+* `src/high-school-import-routes.js` already pins every acceptable team URL to it
+  (`GC_TEAM_URL_RE = /^https:\/\/web\.gc\.com\/teams\/([^/]+)\/([^/?#]+)/i`);
+* `normalizeTeamUrl` in `src/search-gamechanger-teams.js` prefixes bare `/teams/...` paths with
+  the same origin;
+* the collector navigates only to a URL derived from that team URL.
+
+The only other gc.com origin in this repository is `https://gc.com/`, the OWN-TEAM login page in
+`src/login-gamechanger.js`. It serves no schedules, so it is **not** admitted. No sibling or
+speculative GameChanger domain is admitted either. Widening this list is a deliberate act that
+must cite an origin this application actually reads schedules from.
+
+## C2. How a reference is resolved and judged
+
+Every candidate anchor is resolved with the WHATWG URL parser against the document that produced
+it, and then judged on its **normalized origin**, compared for whole-string equality:
+
+* **Relative** (`/teams/x/schedule/g-1`) — resolved against the document origin. It is accepted
+  only because that document is itself on the authoritative origin; a relative reference on any
+  other document resolves to that other origin and is refused.
+* **Absolute** (`https://web.gc.com/...`) — accepted only when `url.origin` equals the
+  authoritative origin exactly.
+* **Protocol-relative** (`//host/...`) — inherits the document's scheme, then judged as an
+  absolute reference. `//web.gc.com/...` on an HTTPS document is accepted; `//other.example/...`
+  is not.
+
+Scheme alone establishes nothing. `/schedule/` appearing in the path establishes nothing. Host
+*resemblance* establishes nothing — authority is never decided by substring, prefix or suffix
+matching, which is precisely why each of these is refused:
+
+```text
+http://web.gc.com/...             origin http://web.gc.com          scheme differs
+https://web.gc.com:444/...        origin https://web.gc.com:444      port differs
+https://web.gc.com.evil.example/  origin https://web.gc.com.evil.example
+https://evil-web.gc.com/...       origin https://evil-web.gc.com
+https://api.web.gc.com/...        origin https://api.web.gc.com      subdomain
+https://web.gc.com./...           origin https://web.gc.com.         trailing dot
+https://web.gc.com@evil.example/  origin https://evil.example        user-info trick
+https://gc.com/...                origin https://gc.com              different host
+```
+
+An explicit default port (`:443`) and an uppercase host are normalized away by the parser, so
+both remain authoritative. Query strings, fragments and dot segments do not affect the origin and
+are accepted.
+
+Authority is judged on **every** anchor a row claims, not merely the first. A row root is
+accepted only after it is shown to describe one game, so a foreign anchor can legitimately sit
+beside the trusted one inside a single row — and reading only the first href meant that when the
+trusted anchor came first, the foreign one was silently absorbed and surfaced nowhere at all.
+
+## C3. Ordering: authority before identity
+
+```text
+resolve URL -> scheme check -> ORIGIN AUTHORITY -> derive sourceGameRef from path
+```
+
+Stripping the host out of `sourceGameRef` is safe **only** because authority is settled first.
+Once a reference is known to come from `https://web.gc.com`, its path segment is a GameChanger
+game id and nothing else can have produced it. Reversing these two steps is the entire defect.
+
+## C4. Failing closed, not skipping
+
+An untrusted schedule-shaped reference fails the whole collection before capture or publication:
+
+```text
+failureReason               opponent_schedule_source_ref_untrusted_origin
+per-row typed reason        schedule_source_reference_origin_is_not_authoritative
+manualReconciliationRequired true
+run                         failed / discovery
+canonical games, generations, run-game members, totals   all 0
+prior current generation                                  unchanged
+```
+
+The foreign row is **not** skipped and the legitimate rows beside it are **not** partially
+published. A page carrying a schedule-shaped link this application cannot vouch for is a page
+this run does not understand; publishing part of it would quietly under- or over-report the
+opponent's season. No substitute identifier is manufactured.
+
+This gate runs **before** source-event identity collision detection. A foreign anchor that
+happens to share a final path segment with a real game would otherwise be reported as a
+collision, which describes the wrong problem — the row is not a competing claim on one game, it
+is not one of our games at all. Collision detection remains what it always was: a separate
+downstream defence between two rows that are *both* authoritative.
+
+Both played and unplayed foreign observations fail. The completed-game null-date exception is
+irrelevant here: this is a failure of identity authority, not of date evidence.
+
+## C5. The diagnostic
+
+Only the normalized origin is retained (`untrustedOrigin: "https://other.example"`). The path,
+query and fragment of a foreign URL are content this application did not author; copying them
+into a summary, a progress event or a log line would carry whatever they happen to contain,
+including credentials or tokens someone embedded there. The origin is the entire reason the row
+was refused and is all a reviewer needs to act.
+
+Trusted and untrusted observations are distinguishable in the diagnostic by row index and origin,
+with no sensitive URL material crossing the boundary.
+
+## C6. What survives into the DTO, and what the database can prove
+
+An untrusted row is refused at the collector, so no DTO is built from it and nothing reaches the
+RPC. That is the intended path.
+
+If such a row somehow bypassed the collector, an empirical probe of the mapper output shows what
+the database would have to work with:
+
+* the observation carries `sourceGameUrl`, so a foreign URL string *would* be present;
+* it carries no separate origin-evidence field, and `sourceGameRef` would be null because the
+  extractor refused to derive one.
+
+The existing `opponent_identity_unresolved` gate inside `persist_hs_engine_collection` therefore
+already rejects this shape and rolls the transaction back — verified empirically: before the
+collector carried the flag through, every foreign fixture failed at `failed/publication` with
+`OPPONENT_IDENTITY_UNRESOLVED` and wrote nothing. That is a real database backstop, and it is why
+no new migration was added.
+
+What the database **cannot** do is verify origin authority itself:
+
+> The RPC validates the reference material supplied in the DTO. It cannot observe the document
+> that produced an anchor, and `sourceGameUrl` is a caller-supplied field like any other, so a
+> privileged caller can set it to any value. The browser is the only layer that can see where a
+> reference actually came from.
+
+Adding an origin check in SQL would hard-code a scraping hostname into the persistence layer
+while proving nothing a caller did not already assert. As with date evidence (§B9), nothing here
+should be read as claiming the RPC independently proves what the source served.
+
+## C7. Test origin
+
+No test-only trust seam exists, and none was added. Every browser test that exercises the
+extractor already navigates to `https://web.gc.com/__fixture__/...` and serves its fixture from a
+route interceptor, so the document origin in tests *is* the authoritative production origin and
+relative references resolve exactly as they do in production. Production enforcement is therefore
+identical to test enforcement, with no branch that a future change could widen.
