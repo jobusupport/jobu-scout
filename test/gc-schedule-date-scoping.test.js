@@ -800,3 +800,132 @@ test('a bare administrative header cannot reach an unrelated list at all', async
   assert.equal(entries[0].dateResolutionStatus, DATE_RESOLUTION_STATUSES.NOT_EXPRESSED,
     'it never governs the list, so it expresses nothing about it');
 });
+
+// ── Schedule-reference origin authority ────────────────────────────────
+//
+// The host is thrown away when a schedule id is derived, so the host must be
+// proven first. These pin that ordering: a foreign anchor never reaches
+// extractGameIdFromUrl, and no near-miss origin inherits authority.
+
+test('the authoritative origin is a single, exactly-compared origin', () => {
+  assert.equal(scraper.AUTHORITATIVE_SCHEDULE_ORIGIN, 'https://web.gc.com');
+  const { isAuthoritativeScheduleOrigin } = scraper;
+  assert.equal(isAuthoritativeScheduleOrigin(new URL('https://web.gc.com/teams/a/schedule/1')), true);
+  assert.equal(isAuthoritativeScheduleOrigin(new URL('https://web.gc.com:443/teams/a/schedule/1')), true,
+    'the default port is not part of a normalized origin');
+  assert.equal(isAuthoritativeScheduleOrigin(new URL('https://WEB.GC.COM/teams/a/schedule/1')), true,
+    'the URL parser lower-cases the host');
+  for (const hostile of [
+    'http://web.gc.com/teams/a/schedule/1',
+    'https://web.gc.com:444/teams/a/schedule/1',
+    'https://web.gc.com.evil.example/schedule/1',
+    'https://evil-web.gc.com/schedule/1',
+    'https://api.web.gc.com/schedule/1',
+    'https://web.gc.com./schedule/1',
+    'https://web.gc.com@evil.example/schedule/1',
+    'https://gc.com/schedule/1',
+    'https://other.example/schedule/1',
+  ]) {
+    assert.equal(isAuthoritativeScheduleOrigin(new URL(hostile)), false,
+      `${hostile} must not inherit authority`);
+  }
+  assert.equal(isAuthoritativeScheduleOrigin(null), false);
+  assert.equal(isAuthoritativeScheduleOrigin({}), false);
+});
+
+test('references on the authoritative origin still resolve to a source id', async () => {
+  for (const [name, fixture, ref] of [
+    ['absolute', fixtures.trustedAbsoluteReference, 'trust-1'],
+    ['relative', fixtures.trustedRelativeReference, 'trust-2'],
+    ['with query', fixtures.trustedReferenceWithQuery, 'trust-3'],
+    ['with fragment', fixtures.trustedReferenceWithFragment, 'trust-4'],
+    ['dot segments', fixtures.trustedReferenceDotSegments, 'trust-5'],
+    ['explicit default port', fixtures.trustedReferenceDefaultPort, 'trust-6'],
+    ['uppercase host', fixtures.trustedReferenceUppercaseHost, 'trust-7'],
+    ['unplayed', fixtures.trustedReferenceUnplayed, 'trust-8'],
+  ]) {
+    const entries = await entriesFrom(fixture);
+    assert.equal(entries.length, 1, `${name}: one row`);
+    assert.equal(entries[0].gameId, ref, `${name}: keeps its path-derived id`);
+    assert.equal(entries[0].sourceReferenceUntrustedOrigin, false, `${name}: is trusted`);
+    assert.equal(entries[0].sourceReferenceMalformed, false, `${name}: is not malformed`);
+  }
+});
+
+test('several trusted anchors in one validated row remain one trusted game', async () => {
+  const entries = await entriesFrom(fixtures.trustedMultiAnchorRow);
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].gameId, 'trust-multi');
+  assert.equal(entries[0].sourceReferenceUntrustedOrigin, false);
+});
+
+test('an HTTP(S) reference from any other origin yields no source id', async () => {
+  for (const [name, fixture] of [
+    ['foreign absolute', fixtures.foreignAbsoluteReference],
+    ['foreign absolute, unplayed', fixtures.foreignAbsoluteReferenceUnplayed],
+    ['protocol-relative foreign', fixtures.foreignProtocolRelativeReference],
+    ['http on the authoritative host', fixtures.insecureAuthoritativeHostReference],
+    ['suffix lookalike host', fixtures.suffixLookalikeHostReference],
+    ['prefix lookalike host', fixtures.prefixLookalikeHostReference],
+    ['foreign port', fixtures.foreignPortReference],
+    ['user-info lookalike', fixtures.userInfoLookalikeReference],
+    ['trailing-dot host', fixtures.trailingDotHostReference],
+    ['subdomain of the authority', fixtures.subdomainOfAuthorityReference],
+    ['bare gc.com', fixtures.bareGcComReference],
+  ]) {
+    const entries = await entriesFrom(fixture);
+    assert.equal(entries.length, 1, `${name}: the row is kept, never silently dropped`);
+    assert.equal(entries[0].gameId, '', `${name}: no path-derived identity is minted`);
+    assert.equal(entries[0].href, '', `${name}: and no href survives`);
+    assert.equal(entries[0].sourceReferenceUntrustedOrigin, true, `${name}: flagged by origin, not by shape`);
+    assert.equal(entries[0].sourceReferenceMalformed, false,
+      `${name}: it parsed cleanly -- this is an authority refusal, not a parse failure`);
+  }
+});
+
+test('the retained diagnostic names the origin and nothing else from the URL', async () => {
+  const entries = await entriesFrom(fixtures.foreignAbsoluteReference);
+  assert.equal(entries[0].untrustedSourceOrigin, 'https://other.example');
+  assert.ok(!/\/schedule\//.test(entries[0].untrustedSourceOrigin),
+    'the attacker-chosen path must not travel with the diagnostic');
+});
+
+test('a foreign anchor absorbed into a trusted row still refuses the row', async () => {
+  const entries = await entriesFrom(fixtures.foreignAnchorInsideTrustedRow);
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].rowAnchorCount, 2, 'both anchors belong to this row');
+  assert.equal(entries[0].sourceReferenceUntrustedOrigin, true,
+    'authority is judged on every anchor the row claims, not merely the first');
+  assert.equal(entries[0].gameId, '');
+});
+
+test('origin authority does not depend on DOM order', async () => {
+  const forwards = await entriesFrom(fixtures.foreignBesideTrustedGames);
+  const reversed = await entriesFrom(fixtures.foreignBeforeTrustedGames);
+  const summarize = (entries) => entries
+    .map((entry) => `${entry.gameId || '-'}:${entry.sourceReferenceUntrustedOrigin}`)
+    .sort();
+  assert.deepEqual(summarize(forwards), summarize(reversed),
+    'which anchor the source emitted first is not evidence about authority');
+  assert.equal(forwards.filter((e) => e.sourceReferenceUntrustedOrigin).length, 1);
+  assert.equal(reversed.filter((e) => e.sourceReferenceUntrustedOrigin).length, 1);
+});
+
+test('a trusted and a foreign anchor sharing one id are separated by authority', async () => {
+  const entries = await entriesFrom(fixtures.trustedAndForeignSharingId);
+  assert.equal(entries.length, 2);
+  const trusted = entries.filter((e) => !e.sourceReferenceUntrustedOrigin);
+  const foreign = entries.filter((e) => e.sourceReferenceUntrustedOrigin);
+  assert.equal(trusted.length, 1);
+  assert.equal(foreign.length, 1);
+  assert.equal(trusted[0].gameId, 'shared-id');
+  assert.equal(foreign[0].gameId, '',
+    'the foreign row never reaches the id derivation, so it cannot collide with the real game');
+});
+
+test('non-HTTP and malformed references keep their own distinct refusal', async () => {
+  const scheme = await entriesFrom(fixtures.nonHttpSchemeReferences);
+  assert.equal(scheme[0].sourceReferenceMalformed, true, 'still a malformed-reference refusal');
+  assert.equal(scheme[0].sourceReferenceUntrustedOrigin, false,
+    'a non-HTTP scheme is refused for its scheme, not for its origin');
+});

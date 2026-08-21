@@ -1499,3 +1499,103 @@ test('a bare page header cannot publish into an unrelated nested list', { skip }
   assert.deepEqual(await datesFor(local.opponentTeamId), { 'flat-1': '2026-04-11' },
     'a direct-sibling header is an affirmative local relationship and still governs');
 });
+
+// ── Schedule-reference origin authority, end to end ───────────────────
+//
+// The extractor-level rule is pinned in test/gc-schedule-date-scoping.test.js.
+// These drive it through the production shape -- route -> Chromium -> extractor
+// -> collector -> mapper -> repository -> persist_hs_engine_collection ->
+// database -- because the finding was only visible once a foreign anchor's path
+// segment reached hs_opponent_games.source_game_ref as a canonical game.
+
+test('a foreign schedule reference fails the collection closed, played or not', { skip }, async () => {
+  for (const [name, fixture] of [
+    ['foreign absolute', fixtures.foreignAbsoluteReference],
+    ['foreign absolute, unplayed', fixtures.foreignAbsoluteReferenceUnplayed],
+    ['protocol-relative foreign', fixtures.foreignProtocolRelativeReference],
+    ['http on the authoritative host', fixtures.insecureAuthoritativeHostReference],
+    ['suffix lookalike host', fixtures.suffixLookalikeHostReference],
+    ['foreign port', fixtures.foreignPortReference],
+    ['user-info lookalike', fixtures.userInfoLookalikeReference],
+    ['foreign anchor absorbed into a trusted row', fixtures.foreignAnchorInsideTrustedRow],
+  ]) {
+    const tenant = await buildTenant('xorig');
+    const before = await currentGenerationId(tenant.opponentTeamId);
+    const app = buildApp(tenant, { html: fixture });
+    await startRun(app, tenant);
+    const summary = app.locals.lastSummary;
+    assert.equal(summary.state, 'failed', `${name}: nothing is published`);
+    assert.equal(summary.failureReason, 'opponent_schedule_source_ref_untrusted_origin',
+      `${name}: refused by name`);
+    assert.equal(summary.untrustedSourceOrigins[0].reason,
+      'schedule_source_reference_origin_is_not_authoritative', `${name}: with the typed reason`);
+    assert.equal(summary.manualReconciliationRequired, true, `${name}: a human must look`);
+    assert.deepEqual(await writtenCounts(tenant.opponentTeamId),
+      { games: 0, generations: 0, runGames: 0, totals: 0 }, `${name}: zero partial writes`);
+    assert.deepEqual(await runStatesFor(tenant.opponentTeamId), ['failed/discovery'],
+      `${name}: settles terminally at discovery, before capture`);
+    assert.equal(await currentGenerationId(tenant.opponentTeamId), before,
+      `${name}: the prior verified generation is untouched`);
+  }
+});
+
+test('a foreign reference beside legitimate games publishes NONE of them', { skip }, async () => {
+  for (const [name, fixture] of [
+    ['trusted first', fixtures.foreignBesideTrustedGames],
+    ['foreign first', fixtures.foreignBeforeTrustedGames],
+  ]) {
+    const tenant = await buildTenant('xomix');
+    const app = buildApp(tenant, { html: fixture });
+    await startRun(app, tenant);
+    assert.equal(app.locals.lastSummary.state, 'failed', `${name}: the whole collection fails`);
+    assert.equal(app.locals.lastSummary.failureReason, 'opponent_schedule_source_ref_untrusted_origin');
+    assert.deepEqual(await writtenCounts(tenant.opponentTeamId),
+      { games: 0, generations: 0, runGames: 0, totals: 0 },
+      `${name}: the legitimate row is NOT partially published`);
+    assert.deepEqual(await runStatesFor(tenant.opponentTeamId), ['failed/discovery']);
+  }
+});
+
+test('source authority is settled before identity collision becomes relevant', { skip }, async () => {
+  const tenant = await buildTenant('xocol');
+  const app = buildApp(tenant, { html: fixtures.trustedAndForeignSharingId });
+  await startRun(app, tenant);
+  const summary = app.locals.lastSummary;
+  assert.equal(summary.state, 'failed');
+  assert.equal(summary.failureReason, 'opponent_schedule_source_ref_untrusted_origin',
+    'a foreign row is not a competing claim on one real game -- it is not a game of ours at all');
+  assert.deepEqual(summary.identityCollisions, [],
+    'collision detection never ran: it stays a separate downstream defence between rows that are BOTH authoritative');
+  assert.deepEqual(await writtenCounts(tenant.opponentTeamId),
+    { games: 0, generations: 0, runGames: 0, totals: 0 });
+  assert.deepEqual(await runStatesFor(tenant.opponentTeamId), ['failed/discovery']);
+});
+
+test('the retained origin diagnostic carries no path, query or fragment', { skip }, async () => {
+  const tenant = await buildTenant('xodiag');
+  const app = buildApp(tenant, { html: fixtures.foreignAbsoluteReference });
+  await startRun(app, tenant);
+  const [first] = app.locals.lastSummary.untrustedSourceOrigins;
+  assert.equal(first.untrustedOrigin, 'https://other.example');
+  const serialized = JSON.stringify(app.locals.lastSummary.untrustedSourceOrigins);
+  assert.ok(!serialized.includes('/schedule/'),
+    'a foreign URL path is content this application did not author and must not be echoed');
+});
+
+test('references on the authoritative origin still publish end to end', { skip }, async () => {
+  for (const [name, fixture, ref, expected] of [
+    ['absolute', fixtures.trustedAbsoluteReference, 'trust-1', 'published_verified'],
+    ['relative', fixtures.trustedRelativeReference, 'trust-2', 'published_verified'],
+    ['with query', fixtures.trustedReferenceWithQuery, 'trust-3', 'published_verified'],
+    ['explicit default port', fixtures.trustedReferenceDefaultPort, 'trust-6', 'published_verified'],
+    ['several trusted anchors, one row', fixtures.trustedMultiAnchorRow, 'trust-multi', 'published_verified'],
+    ['unplayed', fixtures.trustedReferenceUnplayed, 'trust-8', 'published_schedule_only'],
+  ]) {
+    const tenant = await buildTenant('xotrust');
+    const app = buildApp(tenant, { html: fixture });
+    await startRun(app, tenant);
+    assert.equal(app.locals.lastSummary.state, expected, `${name}: still publishes`);
+    assert.deepEqual(await datesFor(tenant.opponentTeamId), { [ref]: '2026-04-11' },
+      `${name}: with the identity the authoritative source actually served`);
+  }
+});

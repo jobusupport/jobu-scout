@@ -1020,3 +1020,81 @@ module.exports.bareDateGroupsReversedOrder = `<!doctype html><html><body>
     <div class="date-group"><div class="date-header">Apr 18, 2026</div>${one('flat-12')}</div>
     <div class="date-group"><div class="date-header">Apr 11, 2026</div>${one('flat-13')}</div>
   </div></body></html>`;
+
+// ── Schedule-reference ORIGIN authority ────────────────────────────────
+//
+// extractGameIdFromUrl keeps only the path segment after '/schedule/', so the
+// host is discarded. That is safe only once the host has been proven to be this
+// application's GameChanger schedule origin. Before it was,
+// `https://other.example/schedule/foreign-1` published a canonical opponent game
+// with sourceGameRef 'foreign-1' that GameChanger never served.
+//
+// Every rejected form below parses cleanly and uses HTTP(S). None of them is
+// refused for being malformed; each is refused because its normalized ORIGIN is
+// not authoritative. Authority is compared as a whole origin, never by substring
+// or suffix, which is what makes the lookalike and user-info forms fail.
+const originRow = (href, label, { played = true } = {}) => `
+    <a class="schedule-row" href="${href}">
+      <span class="matchup">vs ${label}</span>
+      ${played ? '<span class="score">W 5-1</span> <span class="status">Final</span>' : '<span class="time">5:00 PM</span>'}
+    </a>`;
+const originPage = (rows) => page(`<div class="date-group"><div class="date-header">Apr 11, 2026</div>${rows}</div>`);
+
+// Accepted controls -- the authoritative origin, reached every legitimate way.
+module.exports.trustedAbsoluteReference = originPage(originRow(`${ORIGIN}/teams/opponent-high/schedule/trust-1`, 'Alpha'));
+module.exports.trustedRelativeReference = originPage(originRow('/teams/opponent-high/schedule/trust-2', 'Alpha'));
+module.exports.trustedReferenceWithQuery = originPage(originRow(`${ORIGIN}/teams/opponent-high/schedule/trust-3?tab=box`, 'Alpha'));
+module.exports.trustedReferenceWithFragment = originPage(originRow(`${ORIGIN}/teams/opponent-high/schedule/trust-4#lineup`, 'Alpha'));
+module.exports.trustedReferenceDotSegments = originPage(originRow('/teams/opponent-high/../opponent-high/schedule/trust-5', 'Alpha'));
+module.exports.trustedReferenceDefaultPort = originPage(originRow('https://web.gc.com:443/teams/opponent-high/schedule/trust-6', 'Alpha'));
+module.exports.trustedReferenceUppercaseHost = originPage(originRow('https://WEB.GC.COM/teams/opponent-high/schedule/trust-7', 'Alpha'));
+module.exports.trustedReferenceUnplayed = originPage(originRow(`${ORIGIN}/teams/opponent-high/schedule/trust-8`, 'Alpha', { played: false }));
+
+// One explicitly validated row carrying several TRUSTED anchors for one game.
+module.exports.trustedMultiAnchorRow = originPage(`
+    <div class="schedule-row">
+      <a href="${ORIGIN}/teams/opponent-high/schedule/trust-multi"><span class="matchup">vs Alpha</span></a>
+      <a href="${ORIGIN}/teams/opponent-high/schedule/trust-multi"><span class="score">W 5-1</span></a>
+      <span class="status">Final</span>
+    </div>`);
+
+// Rejected references, each an origin the application does not vouch for.
+module.exports.foreignAbsoluteReference = originPage(originRow('https://other.example/schedule/foreign-1', 'Foreign'));
+module.exports.foreignAbsoluteReferenceUnplayed = originPage(originRow('https://other.example/schedule/foreign-1', 'Foreign', { played: false }));
+module.exports.foreignProtocolRelativeReference = originPage(originRow('//other.example/schedule/foreign-2', 'Foreign'));
+module.exports.insecureAuthoritativeHostReference = originPage(originRow('http://web.gc.com/teams/opponent-high/schedule/trust-1', 'Foreign'));
+module.exports.suffixLookalikeHostReference = originPage(originRow('https://web.gc.com.evil.example/schedule/trust-1', 'Foreign'));
+module.exports.prefixLookalikeHostReference = originPage(originRow('https://evil-web.gc.com/schedule/trust-1', 'Foreign'));
+module.exports.foreignPortReference = originPage(originRow('https://web.gc.com:444/teams/opponent-high/schedule/trust-1', 'Foreign'));
+module.exports.userInfoLookalikeReference = originPage(originRow('https://web.gc.com@evil.example/schedule/trust-1', 'Foreign'));
+module.exports.trailingDotHostReference = originPage(originRow('https://web.gc.com./teams/opponent-high/schedule/trust-1', 'Foreign'));
+module.exports.subdomainOfAuthorityReference = originPage(originRow('https://api.web.gc.com/teams/opponent-high/schedule/trust-1', 'Foreign'));
+module.exports.bareGcComReference = originPage(originRow('https://gc.com/teams/opponent-high/schedule/trust-1', 'Foreign'));
+
+// A trusted and a foreign anchor sharing one final schedule id. Source authority
+// must settle this BEFORE it can be mistaken for an identity collision between
+// two competing claims on one real game.
+module.exports.trustedAndForeignSharingId = originPage(
+  originRow(`${ORIGIN}/teams/opponent-high/schedule/shared-id`, 'Alpha')
+  + originRow('https://other.example/schedule/shared-id', 'Foreign'));
+
+// A foreign link beside otherwise perfectly good games, in both DOM orders. The
+// WHOLE collection must fail; the legitimate rows must not be partially
+// published.
+module.exports.foreignBesideTrustedGames = originPage(
+  originRow(`${ORIGIN}/teams/opponent-high/schedule/beside-1`, 'Alpha')
+  + originRow('https://other.example/schedule/foreign-3', 'Foreign'));
+module.exports.foreignBeforeTrustedGames = originPage(
+  originRow('https://other.example/schedule/foreign-3', 'Foreign')
+  + originRow(`${ORIGIN}/teams/opponent-high/schedule/beside-1`, 'Alpha'));
+
+// A foreign anchor absorbed into a single trusted row. Reading only the first
+// href meant this row looked entirely trustworthy and the foreign anchor was
+// never surfaced anywhere -- the one shape where skipping, rather than failing,
+// would have hidden the problem completely.
+module.exports.foreignAnchorInsideTrustedRow = originPage(`
+    <div class="schedule-row">
+      <a href="${ORIGIN}/teams/opponent-high/schedule/absorbed"><span class="matchup">vs Alpha</span></a>
+      <a href="https://other.example/teams/opponent-high/schedule/absorbed"><span class="score">W 5-1</span></a>
+      <span class="status">Final</span>
+    </div>`);
