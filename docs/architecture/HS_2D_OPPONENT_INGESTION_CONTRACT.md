@@ -680,10 +680,29 @@ The only other gc.com origin in this repository is `https://gc.com/`, the OWN-TE
 speculative GameChanger domain is admitted either. Widening this list is a deliberate act that
 must cite an origin this application actually reads schedules from.
 
+`https://web.gc.com` is currently the *only* production origin this application is willing to
+treat as authoritative. If GameChanger ever begins serving schedule-game references from a
+different or additional origin, ingestion of those references will not adapt automatically — it
+will intentionally fail closed at discovery (§C4) until that origin is deliberately reviewed,
+added here, tested, documented, and independently confirmed. This is a fail-safe operational
+dependency, not an automatic-origin-discovery mechanism, and no GameChanger-looking domain,
+subdomain, redirect, or origin is ever trusted on resemblance alone.
+
 ## C2. How a reference is resolved and judged
 
-Every candidate anchor is resolved with the WHATWG URL parser against the document that produced
-it, and then judged on its **normalized origin**, compared for whole-string equality:
+Origin authority is only ever evaluated for anchors this extractor selects as schedule-shaped in
+the first place, via `SCHEDULE_ANCHOR_SELECTOR = 'a[href*="/schedule/"]'`. An anchor whose raw
+`href` attribute does not contain the literal substring `/schedule/` is never classified as a
+schedule-game reference, so it never reaches the origin check described below — it is neither
+accepted nor rejected, it simply falls outside this extractor's observation set. If GameChanger
+changes its schedule-link markup so that legitimate game links no longer match this selector,
+ingestion may surface no usable observations, or otherwise fail closed, until the selector
+contract itself is reviewed and updated; it does not mean every other link on the page has been
+origin-validated.
+
+Every candidate anchor — every anchor selected by `SCHEDULE_ANCHOR_SELECTOR` — is resolved with
+the WHATWG URL parser against the document that produced it, and then judged on its **normalized
+origin**, compared for whole-string equality:
 
 * **Relative** (`/teams/x/schedule/g-1`) — resolved against the document origin. It is accepted
   only because that document is itself on the authoritative origin; a relative reference on any
