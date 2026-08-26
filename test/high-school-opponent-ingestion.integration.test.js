@@ -935,6 +935,111 @@ test('a privileged caller cannot label schedule-only data as verified through th
   );
 });
 
+// ── Direct-RPC source-event identity collision (post-preview-validation fix) ─
+//
+// Preview validation of PR #43 found that the RPC's collision guard grouped
+// only on the caller-supplied `sourceGameRef` string. A privileged service_role
+// caller invoking the RPC directly -- bypassing the mapper and repository,
+// which never produce this shape -- could submit two observations with
+// DIFFERENT sourceGameRef text but the SAME identityDigest, both falsely
+// labelled identityStatus='single', and the RPC accepted them, silently
+// converging both into one canonical game and one generation instead of
+// rejecting the request. The migration
+// 20260826180000_harden_opponent_source_event_identity_collision_guard.sql
+// adds a second, independent guard grouped on the normalized
+// (identityMethod, identityDigest) pair, which never inspects identityStatus.
+// These tests invoke the RPC directly (bypassing the mapper/repository
+// entirely) to prove the guard holds even when the caller does not go through
+// the trusted client code path.
+
+function directOpponentDto(tenant, run, opponent, overrides = {}) {
+  const base = opponentDto(tenant, run, [capturedGame(`direct-collision-${tenant.suffix}-${crypto.randomUUID().slice(0, 8)}`)], opponent);
+  return { ...base, ...overrides };
+}
+
+test('a hand-assembled DTO with two observations sharing one identity digest and false identityStatus=single is rejected', { skip }, async () => {
+  const opponent = await createOpponent(A.orgId, A.programId, A.seasonId, `collision-guard ${crypto.randomUUID().slice(0, 6)}`);
+  const run = await startRun(A, opponent);
+  const dto = directOpponentDto(A, run, opponent);
+  const sharedDigest = dto.observations[0].identityDigest;
+  const second = {
+    ...dto.observations[0],
+    observationKey: crypto.createHash('sha256').update(`second-${crypto.randomUUID()}`).digest('hex'),
+    sourceGameRef: `distinct-ref-${crypto.randomUUID().slice(0, 8)}`,
+    identityStatus: 'single',
+    identityDigest: sharedDigest,
+  };
+  dto.observations = [{ ...dto.observations[0], identityStatus: 'single' }, second];
+
+  const client = await db.connect();
+  try {
+    await client.query('begin');
+    await client.query('set local role service_role');
+    await assert.rejects(
+      client.query('select public.persist_hs_engine_collection($1::jsonb)', [dto]),
+      (error) => /opponent_source_event_identity_collision/.test(String(error.message)),
+      'two distinct observations claiming one identity digest must be rejected even when both claim identityStatus=single',
+    );
+    await client.query('rollback');
+  } finally {
+    client.release();
+  }
+
+  const games = await db.query('select count(*)::int c from public.hs_opponent_games where opponent_team_id = $1', [opponent.teamId]);
+  assert.equal(games.rows[0].c, 0, 'no partial canonical game may persist');
+  const generations = await db.query('select count(*)::int c from public.hs_opponent_stat_generations where opponent_team_id = $1', [opponent.teamId]);
+  assert.equal(generations.rows[0].c, 0, 'no partial generation may persist');
+  const runGames = await db.query('select count(*)::int c from public.hs_opponent_import_run_games where opponent_import_run_id = $1', [run.id]);
+  assert.equal(runGames.rows[0].c, 0, 'no run-game row may persist from a rejected request');
+  const runState = await db.query('select status from public.hs_opponent_import_runs where id = $1', [run.id]);
+  assert.equal(runState.rows[0].status, 'running', 'a rejected request must not settle the run to a terminal state on the caller\'s behalf');
+});
+
+for (const label of ['single', 'deduplicated', 'reconciled']) {
+  test(`caller-supplied identityStatus='${label}' cannot relabel a genuine identity-digest collision as safe`, { skip }, async () => {
+    const opponent = await createOpponent(A.orgId, A.programId, A.seasonId, `label-${label} ${crypto.randomUUID().slice(0, 6)}`);
+    const run = await startRun(A, opponent);
+    const dto = directOpponentDto(A, run, opponent);
+    const sharedDigest = dto.observations[0].identityDigest;
+    const second = {
+      ...dto.observations[0],
+      observationKey: crypto.createHash('sha256').update(`second-${label}-${crypto.randomUUID()}`).digest('hex'),
+      sourceGameRef: `distinct-ref-${label}-${crypto.randomUUID().slice(0, 8)}`,
+      identityStatus: label,
+      identityDigest: sharedDigest,
+    };
+    dto.observations = [{ ...dto.observations[0], identityStatus: label }, second];
+
+    const client = await db.connect();
+    try {
+      await client.query('begin');
+      await client.query('set local role service_role');
+      await assert.rejects(
+        client.query('select public.persist_hs_engine_collection($1::jsonb)', [dto]),
+        (error) => /opponent_source_event_identity_collision|opponent_identity_unresolved/.test(String(error.message)),
+        `identityStatus='${label}' on both observations must not bypass either collision defence`,
+      );
+      await client.query('rollback');
+    } finally {
+      client.release();
+    }
+    const games = await db.query('select count(*)::int c from public.hs_opponent_games where opponent_team_id = $1', [opponent.teamId]);
+    assert.equal(games.rows[0].c, 0);
+  });
+}
+
+test('two observations with genuinely different identity digests are never treated as a collision', { skip }, async () => {
+  const opponent = await createOpponent(A.orgId, A.programId, A.seasonId, `distinct-ids ${crypto.randomUUID().slice(0, 6)}`);
+  const run = await startRun(A, opponent);
+  const result = await ingest(A, run, [
+    capturedGame(`distinct-a-${A.suffix}`, { gameDate: '2026-05-01' }),
+    capturedGame(`distinct-b-${A.suffix}`, { gameDate: '2026-05-08' }),
+  ], opponent);
+  assert.equal(result.state, 'published_verified');
+  const games = await db.query('select count(*)::int c from public.hs_opponent_games where opponent_team_id = $1', [opponent.teamId]);
+  assert.equal(games.rows[0].c, 2, 'two genuinely distinct upstream identities must both publish as separate games');
+});
+
 test('a doubleheader where only one game is final publishes verified with exactly that one game', { skip }, async () => {
   const opponent = await createOpponent(A.orgId, A.programId, A.seasonId, `dhmix ${crypto.randomUUID().slice(0, 6)}`);
   const result = await ingest(A, await startRun(A, opponent), [

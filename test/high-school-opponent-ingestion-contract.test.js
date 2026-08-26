@@ -24,6 +24,10 @@ const sql = fs.readFileSync(migrationPath, 'utf8');
 // mistaken for a granted one.
 const executableSql = sql.replace(/^\s*--.*$/gm, '');
 
+const collisionGuardMigrationPath = path.join(__dirname, '..', 'supabase', 'migrations',
+  '20260826180000_harden_opponent_source_event_identity_collision_guard.sql');
+const collisionGuardSql = fs.readFileSync(collisionGuardMigrationPath, 'utf8');
+
 const NEW_TABLES = [
   'hs_opponent_import_runs', 'hs_opponent_games', 'hs_opponent_game_identity_aliases',
   'hs_opponent_import_run_games', 'hs_opponent_raw_snapshots', 'hs_opponent_game_validation_results',
@@ -137,6 +141,76 @@ test('the widened RPC stays SECURITY INVOKER, search-path-locked, and free of dy
   assert.doesNotMatch(fn, /\bexecute\s+(?:format|'|")/i, 'the RPC must contain no dynamic SQL');
   assert.match(sql, /revoke execute on function public\.persist_hs_engine_collection\(jsonb\) from public, anon, authenticated;/i);
   assert.match(sql, /grant execute on function public\.persist_hs_engine_collection\(jsonb\) to postgres, service_role;/i);
+});
+
+// ── Source-event collision hardening (post-preview-validation fix) ──────
+
+test('the hardened RPC still stays SECURITY INVOKER, search-path-locked, and free of dynamic SQL', () => {
+  const fn = collisionGuardSql.match(/create function public\.persist_hs_engine_collection[\s\S]*?\$function\$;/i)?.[0] || '';
+  assert.ok(fn, 'the hardened function must exist');
+  assert.match(fn, /security invoker/i);
+  assert.doesNotMatch(fn, /security definer/i);
+  assert.match(fn, /set search_path = ''/i);
+  assert.doesNotMatch(fn, /\bexecute\s+(?:format|'|")/i, 'the RPC must contain no dynamic SQL');
+  assert.match(collisionGuardSql, /revoke execute on function public\.persist_hs_engine_collection\(jsonb\) from public, anon, authenticated;/i);
+  assert.match(collisionGuardSql, /grant execute on function public\.persist_hs_engine_collection\(jsonb\) to postgres, service_role;/i);
+});
+
+test('the hardened RPC creates no second publication function and adds no SECURITY DEFINER', () => {
+  const created = collisionGuardSql.match(/create (?:or replace )?function public\.(\w+)/gi) || [];
+  assert.deepEqual(created.map((c) => c.split('.').pop()), ['persist_hs_engine_collection']);
+  assert.doesNotMatch(collisionGuardSql, /security definer/i);
+});
+
+test('the migration adds no table, column, index, constraint, policy or grant beyond the RPC redefinition', () => {
+  const withoutFunctionBody = collisionGuardSql.replace(/create function public\.persist_hs_engine_collection[\s\S]*?\$function\$;/i, '');
+  assert.doesNotMatch(withoutFunctionBody, /create table/i);
+  assert.doesNotMatch(withoutFunctionBody, /alter table/i);
+  assert.doesNotMatch(withoutFunctionBody, /create policy/i);
+  assert.doesNotMatch(withoutFunctionBody, /create index/i);
+  assert.doesNotMatch(withoutFunctionBody, /create (?:unique )?index/i);
+});
+
+test('a second, independent collision guard is grouped on the normalized identity pair, not on identityStatus or sourceGameRef alone', () => {
+  const fn = collisionGuardSql.match(/create function public\.persist_hs_engine_collection[\s\S]*?\$function\$;/i)?.[0] || '';
+  const guards = fn.match(/if exists \([\s\S]*?having count\(\*\) > 1[\s\S]*?end if;/gi) || [];
+  assert.equal(guards.length, 2, 'exactly two independent collision guards must exist: sourceGameRef-based and identity-pair-based');
+
+  const sourceRefGuard = guards.find((g) => /group by observation ->> 'sourceGameRef'/i.test(g));
+  const identityGuard = guards.find((g) => /group by observation ->> 'identityMethod', observation ->> 'identityDigest'/i.test(g));
+  assert.ok(sourceRefGuard, 'the original sourceGameRef-based guard must remain intact');
+  assert.ok(identityGuard, 'a new identity-pair-based guard must exist');
+
+  // The new guard must never key off, or filter by, the caller-supplied
+  // identityStatus label -- that is precisely the field a privileged caller
+  // could falsify to smuggle a collision past a status-based check.
+  assert.doesNotMatch(identityGuard, /identityStatus/i,
+    'the identity-pair collision guard must not reference identityStatus at all');
+  assert.match(identityGuard, /identityMethod/i);
+  assert.match(identityGuard, /identityDigest/i);
+
+  // Both guards must raise the one established, stable error.
+  for (const guard of guards) {
+    assert.match(guard, /raise exception 'opponent_source_event_identity_collision: two or more distinct observations claim one source game identity' using errcode = 'P0001';/i);
+  }
+});
+
+test('the identity-pair collision guard runs before any INSERT in the opponent branch', () => {
+  const fn = collisionGuardSql.match(/create function public\.persist_hs_engine_collection[\s\S]*?\$function\$;/i)?.[0] || '';
+  const identityGuardIndex = fn.search(/group by observation ->> 'identityMethod', observation ->> 'identityDigest'/i);
+  assert.ok(identityGuardIndex > -1, 'the identity-pair guard must be present');
+  const opponentBranchIndex = fn.search(/v_subject_kind = 'opponent_team' then/i);
+  const firstOpponentInsert = fn.slice(opponentBranchIndex).search(/\binsert into public\.hs_opponent_/i);
+  assert.ok(firstOpponentInsert > -1, 'the opponent branch must eventually insert a canonical row');
+  assert.ok(identityGuardIndex < opponentBranchIndex + firstOpponentInsert,
+    'the identity-pair collision guard must execute before any opponent-lineage INSERT');
+});
+
+test('the correction migration does not touch any of the 47 previously canonical migrations', () => {
+  const migrationsDir = path.join(__dirname, '..', 'supabase', 'migrations');
+  const files = fs.readdirSync(migrationsDir).filter((f) => f.endsWith('.sql'));
+  assert.equal(files.length, 48, 'exactly one migration must be added to the prior 47');
+  assert.ok(files.includes('20260826180000_harden_opponent_source_event_identity_collision_guard.sql'));
 });
 
 test('opponent currency is scoped by opponent team, never by the organization own team', () => {
