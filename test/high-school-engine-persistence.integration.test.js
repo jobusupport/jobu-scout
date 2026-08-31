@@ -162,9 +162,69 @@ function dto(run, games, contextIds = ids) {
   }).dto;
 }
 
+// ── Database readiness ─────────────────────────────────────────────────
+//
+// `supabase db reset --local` restarts its containers as its LAST step, so the
+// command can return while PostgreSQL is still coming back. This suite then
+// began inserting fixtures immediately and, further down, gave the concurrency
+// proof a fixed 5s budget to witness two backends contending on a lock. On a
+// stack that had not settled, that budget could elapse before either backend
+// reached the lock -- which surfaced as "database overlap witness timed out",
+// a message about the harness rather than about serialization.
+//
+// This is an ACTIVE bounded check, not a sleep: it returns the moment a real
+// connection answers a real query, and it is the last thing that happens before
+// any fixture is written. It cannot mask a genuine defect, because it asserts
+// nothing about the code under test -- it only refuses to start measuring
+// before the thing being measured exists.
+//
+// The diagnostics deliberately distinguish the failure modes the reviewer asked
+// to be told apart. This one covers "database unavailable" and "reachable but
+// migrations incomplete"; a fixture insert failing afterwards is "fixture setup
+// failed"; `waitForDatabaseOverlap` throwing is "contention never observed";
+// and an assertion on the surviving generation is "contention occurred but
+// serialization was wrong".
+const READINESS_TIMEOUT_MS = 30_000;
+
+async function waitForDatabaseReadiness() {
+  const deadline = Date.now() + READINESS_TIMEOUT_MS;
+  let lastError = null;
+  let attempts = 0;
+  while (Date.now() < deadline) {
+    attempts += 1;
+    try {
+      // A real connection AND a real query. `select 1` alone would pass against
+      // a server that is up but has no schema yet, so this also confirms the
+      // migrations this suite depends on have actually been applied.
+      const alive = await fixtureDb.query('select 1 as ok');
+      if (alive.rows[0].ok !== 1) throw new Error('unexpected response to select 1');
+      const schema = await fixtureDb.query(
+        `select to_regclass('public.hs_stat_generations') generations,
+                to_regclass('public.hs_opponent_stat_generations') opponent_generations,
+                to_regproc('public.persist_hs_engine_collection') publisher`);
+      const { generations, opponent_generations: opponentGenerations, publisher } = schema.rows[0];
+      if (!generations || !opponentGenerations || !publisher) {
+        throw new Error(`database is reachable but migrations are incomplete after ${attempts} attempt(s): `
+          + `hs_stat_generations=${generations || 'missing'}, `
+          + `hs_opponent_stat_generations=${opponentGenerations || 'missing'}, `
+          + `persist_hs_engine_collection=${publisher || 'missing'}`);
+      }
+      return { attempts, waitedMs: READINESS_TIMEOUT_MS - (deadline - Date.now()) };
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  throw new Error(`the local database was not ready within ${READINESS_TIMEOUT_MS}ms `
+    + `after ${attempts} attempt(s); last error: ${lastError && lastError.message}`);
+}
+
 test.before(async () => {
   if (!canRun) return;
   assert.ok(loopbackOnly, 'relational tests must target loopback');
+  // Before ANY fixture is written, so a cold stack is reported as a cold stack
+  // rather than as a fixture failure or a phantom concurrency flake.
+  await waitForDatabaseReadiness();
   const suffix = crypto.randomUUID().slice(0, 8);
   const org = await fixtureInsert('organizations', {
     name: `HS engine local ${suffix}`,
@@ -675,7 +735,19 @@ async function waitForDatabaseOverlap(blockerPid, baselinePids) {
     lastSeen = observed.rows;
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
-  throw new Error(`database overlap witness timed out ${JSON.stringify({ blockerPid, baselinePids, observed: lastSeen })}`);
+  // Says WHICH of the two very different things went wrong. If no backend ever
+  // ran the RPC the harness never got started -- a readiness or dispatch
+  // problem. If backends ran but never queued behind the blocker, the lock was
+  // not taken where this test believes it is, which would be a real
+  // serialization finding rather than a flake. The readiness gate in
+  // test.before() rules out the first cause before measurement begins.
+  const sawAnyBackend = lastSeen.length > 0;
+  throw new Error('database overlap witness timed out: '
+    + (sawAnyBackend
+      ? 'backends ran the publication RPC but never queued behind the blocker, '
+        + 'so the expected advisory/row lock was not taken where this proof asserts it is'
+      : 'no backend ever reached the publication RPC, so no contention could be observed at all')
+    + ` ${JSON.stringify({ blockerPid, baselinePids, observed: lastSeen })}`);
 }
 
 test('concurrency harness requires a PostgreSQL lock-wait witness rather than dispatch timing', () => {

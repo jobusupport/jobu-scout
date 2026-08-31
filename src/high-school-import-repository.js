@@ -676,26 +676,131 @@ function createHighSchoolImportRepository(adminClient) {
     ['idempotency_content_mismatch', 'IDEMPOTENCY_CONTENT_MISMATCH', 409],
     ['player_not_on_roster', 'PLAYER_NOT_ON_ROSTER', 409],
     ['invalid_canonical_player_role', 'INVALID_CANONICAL_PLAYER_ROLE', 400],
+    // Slice 2D opponent-subject outcomes.
+    ['invalid_subject_kind', 'INVALID_SUBJECT_KIND', 400],
+    ['ambiguous_collection_subject', 'AMBIGUOUS_COLLECTION_SUBJECT', 400],
+    ['missing_collection_subject', 'MISSING_COLLECTION_SUBJECT', 400],
+    ['opponent_collection_forbids_canonical_players', 'OPPONENT_COLLECTION_FORBIDS_CANONICAL_PLAYERS', 400],
+    ['opponent_team_not_found_for_org_program', 'OPPONENT_TEAM_NOT_FOUND_FOR_ORG', 404],
+    ['source_team_not_found_for_org', 'SOURCE_TEAM_NOT_FOUND_FOR_ORG', 404],
+    ['opponent_source_link_not_linked', 'OPPONENT_SOURCE_LINK_NOT_LINKED', 409],
+    ['opponent_identity_unresolved', 'OPPONENT_IDENTITY_UNRESOLVED', 409],
+    ['invalid_opponent_import_run_state', 'INVALID_OPPONENT_IMPORT_RUN_STATE', 409],
+    // A later incomplete capture tried to replace a generation that already
+    // carried verified statistics. Fails closed; the prior generation stays current.
+    ['opponent_completeness_regression', 'OPPONENT_COMPLETENESS_REGRESSION', 409],
+    // Two distinct observations claim one stable upstream game identity; the
+    // collection could conceal a second real game, so nothing is published.
+    ['opponent_source_event_identity_collision', 'OPPONENT_SOURCE_EVENT_IDENTITY_COLLISION', 409],
+    // An observation carries a date the source did not establish safely; a wrong
+    // opponent game date misfiles a real result, so nothing is published.
+    ['opponent_schedule_date_unresolved', 'OPPONENT_SCHEDULE_DATE_UNRESOLVED', 409],
+    // An observation reports a previously FINAL game as no longer final. A real
+    // upstream retraction is news a human must see, not something to apply
+    // silently over a verified result, so nothing is published and the prior
+    // verified generation stays current.
+    ['opponent_game_status_regression', 'OPPONENT_GAME_STATUS_REGRESSION', 409],
   ];
 
+  // Slice 2D widened the RPC's return from a bare hs_stat_generations row to a
+  // discriminated envelope { subjectKind, generation }, so an opponent
+  // generation (which lives in hs_opponent_stat_generations) can never be
+  // mistaken for an own-team one. Callers keep receiving exactly the generation
+  // row they always did; only the transport shape changed. A response without
+  // the envelope means the database is older than this code, which must fail
+  // closed rather than silently returning undefined to a publication caller.
   async function persistEngineCollection(dto) {
     const { data, error } = await adminClient.rpc('persist_hs_engine_collection', { p_dto: dto });
-    if (!error) return data;
+    if (!error) {
+      if (!data || typeof data !== 'object' || !data.generation) {
+        throw persistenceFailed('hs_stat_generations', new Error('persist_hs_engine_collection returned no generation envelope'));
+      }
+      return data.generation;
+    }
     const rawMessage = String(error.message || '');
     const match = ENGINE_COLLECTION_RPC_ERRORS.find(([prefix]) => rawMessage.startsWith(prefix));
     if (match) {
       const [prefix, code, statusCode] = match;
+      const opponentSubject = prefix.startsWith('opponent_') || prefix.startsWith('invalid_opponent_')
+        || prefix === 'source_team_not_found_for_org';
       throw importError(code, prefix.replaceAll('_', ' '), {
         statusCode,
-        retryable: code === 'INVALID_IMPORT_RUN_STATE',
-        context: { table: 'hs_stat_generations' },
+        retryable: code === 'INVALID_IMPORT_RUN_STATE' || code === 'INVALID_OPPONENT_IMPORT_RUN_STATE',
+        context: { table: opponentSubject ? 'hs_opponent_stat_generations' : 'hs_stat_generations' },
       });
     }
     throw persistenceFailed('hs_stat_generations', error);
   }
 
+  // ── hs_opponent_import_runs (Slice 2D) ───────────────────────────────
+  //
+  // Deliberately a separate lineage from hs_import_runs: that table's team_id
+  // is not null and references hs_teams, so recording an opponent import there
+  // would mean falsely claiming one of the organization's own teams as the
+  // subject. Keeping the two apart also makes it structurally impossible for a
+  // single logical import to claim both subjects.
+
+  async function createOpponentImportRun({ orgId, programId, opponentTeamId, seasonId, sourceTeamId, sourceProvider, triggerKind, config }) {
+    const { data, error } = await adminClient
+      .from('hs_opponent_import_runs')
+      .insert({
+        org_id: orgId,
+        program_id: programId,
+        opponent_team_id: opponentTeamId,
+        season_id: seasonId,
+        source_team_id: sourceTeamId,
+        source_provider: sourceProvider ?? 'gamechanger',
+        trigger_kind: triggerKind ?? 'manual',
+        status: 'running',
+        started_at: new Date().toISOString(),
+        config: config ?? {},
+      })
+      .select('*')
+      .single();
+    if (error) throw persistenceFailed('hs_opponent_import_runs', error);
+    return data;
+  }
+
+  async function failOpponentImportRun({ orgId, opponentImportRunId, failureStage, errorSummary }) {
+    const { data, error } = await adminClient
+      .from('hs_opponent_import_runs')
+      .update({
+        status: 'failed',
+        completed_at: new Date().toISOString(),
+        failure_stage: failureStage ?? null,
+        error_summary: errorSummary ?? null,
+      })
+      .eq('org_id', orgId)
+      .eq('id', opponentImportRunId)
+      .select('*')
+      .single();
+    if (error) throw persistenceFailed('hs_opponent_import_runs', error);
+    return data;
+  }
+
+  // Resolves the reviewed source link that authorises publication for a
+  // monitored opponent. Returns null when no CURRENTLY LINKED row exists, so a
+  // pending / needs_review / rejected / superseded identity is reported rather
+  // than quietly treated as authorised.
+  async function getLinkedOpponentSource({ orgId, programId, opponentTeamId, seasonId }) {
+    const { data, error } = await adminClient
+      .from('hs_opponent_source_links')
+      .select('id, source_team_id, status')
+      .eq('org_id', orgId)
+      .eq('program_id', programId)
+      .eq('opponent_team_id', opponentTeamId)
+      .eq('season_id', seasonId)
+      .eq('status', 'linked')
+      .maybeSingle();
+    if (error) throw persistenceFailed('hs_opponent_source_links', error);
+    return data ?? null;
+  }
+
   return {
     createImportRun,
+    createOpponentImportRun,
+    failOpponentImportRun,
+    getLinkedOpponentSource,
     getImportRun,
     listImportRuns,
     recordDiscoveredCount,

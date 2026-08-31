@@ -511,15 +511,19 @@ function createFakeSupabaseClient() {
       rpcCalls.push({ name, params: structuredClone(params || {}) });
       if (name === 'persist_hs_engine_collection') {
         const dto = params?.p_dto || {};
+        // Mirrors the Slice 2D discriminated envelope the real RPC returns.
         return Promise.resolve({
           data: {
-            id: nextId(),
-            engine_version: dto.engineVersion,
-            input_set_hash: dto.inputSetHash,
-            content_hash: dto.contentHash,
-            payload_bytes: dto.payloadBytes,
-            status: 'completed',
-            is_current: true,
+            subjectKind: dto?.subject?.kind === 'opponent_team' ? 'opponent_team' : 'own_team',
+            generation: {
+              id: nextId(),
+              engine_version: dto.engineVersion,
+              input_set_hash: dto.inputSetHash,
+              content_hash: dto.contentHash,
+              payload_bytes: dto.payloadBytes,
+              status: 'completed',
+              is_current: true,
+            },
           },
           error: null,
         });

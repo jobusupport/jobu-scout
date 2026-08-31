@@ -67,6 +67,114 @@ function normalizeAndValidateGcTeamUrl(raw) {
   return { normalizedUrl: withScheme.split(/[?#]/)[0], externalTeamId: match[2] };
 }
 
+// Slice 2D production dispatcher. Mirrors the own-team importer's process
+// model exactly (spawn the collector as its own Node process, attach it to the
+// job record so the existing cancel/kill-switch machinery reaches it, stream
+// sanitized output into the job log). Every value handed to the child goes
+// through the environment as a discrete variable -- no request value is ever
+// interpolated into a command string, and the child is invoked with an explicit
+// argv array rather than a shell.
+// Every High School product kind whose job owns a spawned GameChanger collector
+// child. The runtime kill-switch watchdog signals all of them.
+const OWN_TEAM_COLLECTOR_PRODUCT_KIND = 'high_school_gc_import';
+const OPPONENT_COLLECTOR_PRODUCT_KIND = 'high_school_opponent_gc_import';
+const HS_COLLECTOR_PRODUCT_KINDS = new Set([
+  OWN_TEAM_COLLECTOR_PRODUCT_KIND,
+  OPPONENT_COLLECTOR_PRODUCT_KIND,
+]);
+
+// ── One place where a collector child is wired to its job ───────────────
+//
+// Shared by both dispatchers so neither can drift, and so the 'error' listener
+// exists on both. Without it an ASYNCHRONOUS spawn failure -- ENOENT because the
+// runtime moved, EACCES because the script lost its permissions -- reaches an
+// EventEmitter with no error handler, which Node turns into an uncaught
+// exception that takes the whole server down. spawn() itself returns normally in
+// that case, so a synchronous try/catch never sees it.
+//
+// `onAsyncSpawnError` lets a caller record the failure durably; it is invoked at
+// most once, and never after the child has already closed, so a run the child
+// finalized for itself is not failed a second time.
+function attachCollectorChild({ child, jobId, appendLog, finishJob, attachJobProcess, onAsyncSpawnError }) {
+  attachJobProcess(jobId, child);
+  const forward = (chunk) => String(chunk)
+    .split('\n')
+    .filter(Boolean)
+    .forEach((line) => appendLog(jobId, policy.sanitizeCollectionErrorMessage(line)));
+  child.stdout.on('data', forward);
+  child.stderr.on('data', forward);
+
+  let settled = false;
+  const settle = (ok, code) => {
+    if (settled) return;
+    settled = true;
+    // The child is finished either way; drop our listeners and our reference to
+    // it so a long-lived server does not retain dead processes or their buffers.
+    for (const stream of [child.stdout, child.stderr]) {
+      if (stream && typeof stream.removeAllListeners === 'function') stream.removeAllListeners('data');
+    }
+    finishJob(jobId, ok, code);
+  };
+
+  child.on('error', (err) => {
+    // The collector never ran. Say so in the job log, fail the job, and let the
+    // caller record the run as failed -- reporting anything else would leave a
+    // run sitting in 'running' for ever with no process behind it.
+    appendLog(jobId, policy.sanitizeCollectionErrorMessage(
+      `The collector process could not be started: ${err && err.message ? err.message : 'unknown spawn error'}`));
+    if (typeof onAsyncSpawnError === 'function' && !settled) {
+      try { onAsyncSpawnError(err); } catch { /* recording the failure must never mask it */ }
+    }
+    settle(false, -1);
+  });
+  child.on('close', (code) => settle(code === 0, code));
+  return child;
+}
+
+function defaultDispatchOpponentCollection({
+  jobId, jobs, appendLog, finishJob, attachJobProcess, spawn, ctx, sourceTeamUrl, importService,
+}) {
+  const scriptPath = path.join(__dirname, 'high-school-opponent-gc-import.js');
+  const child = spawn('node', [scriptPath], {
+    cwd: path.join(__dirname, '..'),
+    env: {
+      ...process.env,
+      HS_OPP_IMPORT_ORG_ID: ctx.orgId,
+      HS_OPP_IMPORT_PROGRAM_ID: ctx.programId,
+      HS_OPP_IMPORT_OPPONENT_TEAM_ID: ctx.opponentTeamId,
+      HS_OPP_IMPORT_SEASON_ID: ctx.seasonId,
+      HS_OPP_IMPORT_RUN_ID: ctx.opponentImportRunId,
+      HS_OPP_IMPORT_OPPONENT_LABEL: ctx.opponentLabel || '',
+      HS_OPP_IMPORT_SOURCE_TEAM_URL: sourceTeamUrl || '',
+    },
+    stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
+    detached: process.platform !== 'win32',
+  });
+  return attachCollectorChild({
+    child,
+    jobId,
+    appendLog,
+    finishJob,
+    attachJobProcess,
+    // A child that never started cannot have recorded anything, so the run it
+    // was dispatched for is still sitting in 'running'. The parent holds the
+    // trusted org and run ids from the request that created it, so it can fail
+    // that run safely without trusting anything the child said.
+    onAsyncSpawnError: (err) => {
+      if (!importService || !ctx?.orgId || !ctx?.opponentImportRunId) return;
+      Promise.resolve(importService.failOpponentImportRun({
+        orgId: ctx.orgId,
+        opponentImportRunId: ctx.opponentImportRunId,
+        failureStage: 'discovery',
+        errorSummary: policy.sanitizeCollectionErrorMessage(
+          `The opponent collector process could not be started: ${err && err.message ? err.message : 'unknown spawn error'}`),
+      })).catch((failure) => {
+        console.error('[hs-opponent-dispatch] failed to mark an undispatched run as failed', failure);
+      });
+    },
+  });
+}
+
 function registerHighSchoolImportRoutes(router, deps) {
   const {
     adminClient,
@@ -82,6 +190,12 @@ function registerHighSchoolImportRoutes(router, deps) {
     stopJobProcess,
     importService: sharedImportService, // direct reference for the watchdog, which runs outside any request and has no `req.app.locals` to read
     spawn = realSpawn, // overridable in tests only -- production always uses the real child_process.spawn
+    // Slice 2D. Same shape and rationale as `spawn` above: production always
+    // uses the real spawning dispatcher, and only a test substitutes an
+    // in-process runner so the full route -> collector -> service ->
+    // repository -> RPC path can be exercised with just the upstream source
+    // mocked, and without launching a browser.
+    dispatchOpponentCollection = defaultDispatchOpponentCollection,
   } = deps;
 
   // ── Genuine, runtime-responsive kill-switch propagation ────────────────
@@ -135,10 +249,26 @@ function registerHighSchoolImportRoutes(router, deps) {
   // resolves. The child's own graceful shutdown (see high-school-gc-import.js)
   // is still valuable for finishing the in-flight game cleanly, but DB
   // correctness never depends on it.
+  //
+  // Marks whichever KIND of import run this job owns. Own-team and opponent runs
+  // live in different tables and have different failure APIs, so the job's
+  // product kind selects the right one rather than the caller having to know. A
+  // job carrying no run id (or an unrecognised kind) is left alone.
   async function markInterruptedRun(job, { rawErrorMessage }) {
     const importService = sharedImportService;
-    if (!importService || !job.org_id || !job.importRunId) return;
+    if (!importService || !job.org_id) return;
     try {
+      if (job.productKind === OPPONENT_COLLECTOR_PRODUCT_KIND) {
+        if (!job.opponentImportRunId) return;
+        await importService.failOpponentImportRun({
+          orgId: job.org_id,
+          opponentImportRunId: job.opponentImportRunId,
+          failureStage: 'discovery',
+          errorSummary: rawErrorMessage,
+        });
+        return;
+      }
+      if (!job.importRunId) return;
       await importService.failImportRun({
         orgId: job.org_id,
         importRunId: job.importRunId,
@@ -158,7 +288,14 @@ function registerHighSchoolImportRoutes(router, deps) {
     if (policy.isCollectionEnabled()) return [];
     const affected = [];
     for (const job of Object.values(jobs)) {
-      if (job.productKind !== 'high_school_gc_import') continue;
+      // EVERY High School collector kind, not just own-team. The opponent
+      // collector reaches GameChanger exactly as the own-team one does and
+      // already listens for the kill_switch_disabled message -- but nothing was
+      // sending it, so an in-flight opponent collection kept scraping after an
+      // operator disabled collection. A child only ever sees a FROZEN copy of
+      // the environment it was spawned with, so this push is the only thing that
+      // can reach it. Unrelated job kinds are still skipped.
+      if (!HS_COLLECTOR_PRODUCT_KINDS.has(job.productKind)) continue;
       if (job.status !== 'running') continue;
       if (job.killSwitchHandled) continue;
       job.killSwitchHandled = true;
@@ -308,10 +445,27 @@ function registerHighSchoolImportRoutes(router, deps) {
         stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
         detached: process.platform !== 'win32',
       });
-      attachJobProcess(jobId, child);
-      child.stdout.on('data', (chunk) => String(chunk).split('\n').filter(Boolean).forEach((l) => appendLog(jobId, policy.sanitizeCollectionErrorMessage(l))));
-      child.stderr.on('data', (chunk) => String(chunk).split('\n').filter(Boolean).forEach((l) => appendLog(jobId, policy.sanitizeCollectionErrorMessage(l))));
-      child.on('close', (code) => finishJob(jobId, code === 0, code));
+      // Same wiring as the opponent dispatcher, through the same helper, so the
+      // two cannot drift and an asynchronous spawn failure cannot take the
+      // server down on either path. Log forwarding, sanitisation and the exit-
+      // code mapping are unchanged.
+      attachCollectorChild({
+        child,
+        jobId,
+        appendLog,
+        finishJob,
+        attachJobProcess,
+        onAsyncSpawnError: (spawnErr) => {
+          Promise.resolve(importService.failImportRun({
+            orgId: req._orgId,
+            importRunId: run.id,
+            failureStage: 'discovery',
+            rawErrorMessage: `The collector process could not be started: ${spawnErr && spawnErr.message ? spawnErr.message : 'unknown spawn error'}`,
+          })).catch((failure) => {
+            console.error('[hs-gc-import] failed to mark an undispatched run as failed', failure);
+          });
+        },
+      });
 
       res.status(201).json({ importRun: run, jobId });
     } catch (err) {
@@ -321,6 +475,133 @@ function registerHighSchoolImportRoutes(router, deps) {
 
   router.post('/teams/:teamId/seasons/:seasonId/import-runs', requireAuth, resolveSupportSession, requireHighSchoolAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
     return startImportRun(req, res, 'api/high-school/import-runs (start)');
+  }));
+
+  // ── Slice 2D: start an opponent-game ingestion run ───────────────────
+  //
+  // The backend execution path only. The coach-facing interface for choosing
+  // and reviewing monitored opponents is HS 2I and is deliberately absent.
+  //
+  // Every identifier below is re-resolved against req._orgId, which comes from
+  // the authenticated session, never from the request body. A body cannot name
+  // another organization: the opponent lookup is filtered by org_id, so an
+  // opponent belonging to a different tenant simply does not resolve.
+  async function loadOpponentAndSeason(orgId, opponentTeamId, seasonId) {
+    const { data: opponent, error: opponentError } = await adminClient
+      .from('hs_opponent_teams')
+      .select('id, org_id, program_id, season_id, display_name, is_active')
+      .eq('org_id', orgId)
+      .eq('id', opponentTeamId)
+      .maybeSingle();
+    if (opponentError) throw opponentError;
+    if (!opponent) throw rosterService.typedError('Opponent team not found', 404);
+    const season = await rosterService.getSeasonInOrg({ orgId, seasonId, adminClient });
+    if (!season) throw rosterService.typedError('Season not found', 404);
+    // The opponent team row is season-scoped; a mismatched pair is a caller bug,
+    // not a silently acceptable cross-season import.
+    if (opponent.season_id !== season.id) {
+      throw rosterService.typedError('Opponent team does not belong to that season', 400);
+    }
+    return { opponent, season };
+  }
+
+  router.post('/opponents/:opponentTeamId/seasons/:seasonId/import-runs', requireAuth, resolveSupportSession, requireHighSchoolAccess, blockWriteDuringReadOnlySupport, asyncHandler(async (req, res) => {
+    try {
+      const { opponent, season } = await loadOpponentAndSeason(req._orgId, req.params.opponentTeamId, req.params.seasonId);
+      if (!policy.isCollectionEnabled()) {
+        return res.status(503).json({ error: 'Automated GameChanger collection is currently disabled.' });
+      }
+      if (countActiveHsImportJobsForOrg(req._orgId) >= policy.getMaxConcurrentImportJobs()) {
+        return res.status(429).json({ error: 'Too many High School imports are already running for your organization. Try again shortly.' });
+      }
+
+      const importService = req.app.locals.highSchoolImportService;
+
+      // Only a reviewed, currently linked source identity authorises ingestion.
+      // pending / needs_review / rejected / superseded all stop here, BEFORE any
+      // collection is attempted or any run row is created.
+      const link = await importService.getLinkedOpponentSource({
+        orgId: req._orgId,
+        programId: opponent.program_id,
+        opponentTeamId: opponent.id,
+        seasonId: season.id,
+      });
+      if (!link) {
+        return res.status(409).json({
+          error: 'This opponent has no reviewed, linked GameChanger source identity yet.',
+          state: 'failed',
+          manualReconciliationRequired: true,
+        });
+      }
+
+      const { data: sourceTeam, error: sourceTeamError } = await adminClient
+        .from('hs_source_teams')
+        .select('id, source_team_url, source_team_ref')
+        .eq('org_id', req._orgId)
+        .eq('id', link.source_team_id)
+        .maybeSingle();
+      if (sourceTeamError) throw sourceTeamError;
+      if (!sourceTeam) {
+        return res.status(409).json({ error: 'The linked GameChanger source team is no longer available.', state: 'failed' });
+      }
+
+      const run = await importService.startOpponentImportRun({
+        orgId: req._orgId,
+        programId: opponent.program_id,
+        seasonId: season.id,
+        opponentTeamId: opponent.id,
+        sourceTeamId: link.source_team_id,
+        triggerKind: 'manual',
+        config: {},
+      });
+
+      const jobId = createJobRecord(jobs, `High School opponent import — ${opponent.display_name || 'opponent'}`, req._orgId, { createdByUserId: req.user.id });
+      jobs[jobId].productKind = 'high_school_opponent_gc_import';
+      jobs[jobId].opponentImportRunId = run.id;
+      jobs[jobId].opponentTeamId = opponent.id;
+      jobs[jobId].seasonId = season.id;
+
+      // Dispatch follows the same process model as the own-team importer: a
+      // separate collector process, tracked as a job so the existing cancel and
+      // kill-switch machinery reaches it. Injectable so an end-to-end test can
+      // drive the real service, repository and RPC with only the upstream
+      // source mocked, without spawning a browser.
+      await dispatchOpponentCollection({
+        jobId,
+        jobs,
+        appendLog,
+        finishJob,
+        attachJobProcess,
+        spawn,
+        ctx: {
+          orgId: req._orgId,
+          programId: opponent.program_id,
+          opponentTeamId: opponent.id,
+          seasonId: season.id,
+          opponentImportRunId: run.id,
+          opponentLabel: opponent.display_name || null,
+        },
+        sourceTeamUrl: sourceTeam.source_team_url || null,
+        sourceTeamRef: sourceTeam.source_team_ref || null,
+        importService,
+      });
+
+      // 201 means exactly two things have happened: the opponent import-run
+      // record was created (status 'running'), and the collector process was
+      // dispatched. NOTHING has been captured, validated, or published yet --
+      // dispatch is asynchronous, so reporting 'captured' here would assert a
+      // state that had not occurred. Callers poll the run record and the
+      // resulting generation for the capture / validated / published_schedule_only
+      // / published_verified / failed outcomes.
+      res.status(201).json({
+        opponentImportRun: run,
+        jobId,
+        state: 'dispatched',
+        meaning: 'opponent import run created and collector dispatched; no capture or publication has occurred yet',
+      });
+    } catch (err) {
+      return sendResolverError(res, err, 'api/high-school/opponents/:opponentTeamId/import-runs (start)');
+    }
   }));
 
   // ── List recent import runs for a team+season ────────────────────────
@@ -525,4 +806,13 @@ function registerHighSchoolImportRoutes(router, deps) {
   return { killSwitchWatchdogTick };
 }
 
-module.exports = { registerHighSchoolImportRoutes, normalizeAndValidateGcTeamUrl };
+// defaultDispatchOpponentCollection is exported purely as a test seam: it is
+// the function the router uses in production when no dispatcher is injected, so
+// exporting it lets a test exercise the REAL dispatch construction (argv, env,
+// stdio, no shell) with only the process boundary replaced. Production behaviour
+// is unchanged -- the router still defaults to this same function internally.
+module.exports = {
+  registerHighSchoolImportRoutes,
+  normalizeAndValidateGcTeamUrl,
+  defaultDispatchOpponentCollection,
+};
